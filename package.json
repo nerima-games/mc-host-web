@@ -1,0 +1,74 @@
+{
+  "name": "@nerima-games/mc-host-web",
+  "version": "0.0.0",
+  "private": false,
+  "type": "module",
+  "description": "Browser host runtime for the nerima-games Minecraft clone.",
+  "homepage": "https://github.com/nerima-games/mc-host-web#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nerima-games/mc-host-web.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nerima-games/mc-host-web/issues"
+  },
+  "author": "takeokunn",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24.0.0",
+    "pnpm": ">=11.24.0"
+  },
+  "packageManager": "pnpm@12.14.0",
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com",
+    "access": "public"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "keywords": [
+    "minecraft",
+    "effect-ts",
+    "typescript",
+    "browser",
+    "host"
+  ],
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.build.json --pretty false && tsc -p tsconfig.test.json --pretty false",
+    "build": "node scripts/clean-dist.mjs && tsc -p tsconfig.release.json --pretty false",
+    "lint": "oxlint --deny-warnings src test scripts && ast-grep scan",
+    "lint:fix": "oxlint --fix src test scripts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "verify": "pnpm typecheck && pnpm lint && pnpm test",
+    "package:verify": "pnpm build && node scripts/verify-package.mjs",
+    "prepublishOnly": "pnpm verify && pnpm package:verify",
+    "e2e:browser": "playwright test --pass-with-no-tests"
+  },
+  "dependencies": {
+    "effect": "4.0.5"
+  },
+  "devDependencies": {
+    "@changesets/changelog-github": "1.0.1",
+    "@changesets/cli": "3.0.3",
+    "@effect/vitest": "4.0.5",
+    "@playwright/test": "1.64.1",
+    "@types/node": "26.6.5",
+    "@vitest/coverage-v8": "5.0.5",
+    "typescript": "7.0.2",
+    "vitest": "5.0.5"
+  }
+}

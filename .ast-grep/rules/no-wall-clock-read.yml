@@ -1,0 +1,13 @@
+id: no-wall-clock-read
+language: TypeScript
+severity: error
+files:
+  - "src/**/*.ts"
+message: >-
+  Pass time into host code instead of reading the process-global clock.
+rule:
+  any:
+    - pattern: Date.now()
+    - pattern: performance.now()
+    - pattern: new Date()
+    - pattern: new Date($$$ARGS)
