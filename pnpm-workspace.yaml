@@ -1,5 +1,11 @@
 packages:
   - .
 
+overrides:
+  effect: 3.22.1
+
 allowBuilds:
   esbuild: true
+
+minimumReleaseAgeExclude:
+  - '@nerima-games/mc-server@0.1.0'
