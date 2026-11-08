@@ -115,6 +115,7 @@ try {
       JSON_INDENT
     )}\n`
   );
+  await fs.copyFile(path.join(root, ".npmrc"), path.join(consumerDirectory, ".npmrc"));
   failOnCommand(
     "npm",
     [
