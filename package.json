@@ -46,29 +46,50 @@
     "host"
   ],
   "scripts": {
-    "typecheck": "tsc -p tsconfig.build.json --pretty false && tsc -p tsconfig.test.json --pretty false",
+    "typecheck": "tsc -p tsconfig.build.json --pretty false && tsc -p tsconfig.test.json --pretty false && tsc -p tsconfig.preview.json --pretty false",
     "build": "node scripts/clean-dist.mjs && tsc -p tsconfig.release.json --pretty false",
-    "lint": "oxlint --deny-warnings src test scripts && ast-grep scan",
-    "lint:fix": "oxlint --fix src test scripts",
+    "dev": "vite",
+    "build:web": "vite build",
+    "lint": "oxlint --deny-warnings src scripts/clean-dist.mjs scripts/verify-package.mjs && oxlint --deny-warnings --config .oxlintrc.migrated.json apps e2e test scripts/verify-development-pages.mjs && ast-grep scan",
+    "lint:fix": "oxlint --fix src scripts/clean-dist.mjs scripts/verify-package.mjs && oxlint --fix --config .oxlintrc.migrated.json apps e2e test scripts/verify-development-pages.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "verify": "pnpm typecheck && pnpm lint && pnpm test",
-    "package:verify": "pnpm build && node scripts/verify-package.mjs",
+    "package:verify": "pnpm build && pnpm build:web && node scripts/verify-development-pages.mjs && node scripts/verify-package.mjs",
     "prepublishOnly": "pnpm verify && pnpm package:verify",
-    "e2e:browser": "playwright test --pass-with-no-tests"
+    "e2e:browser": "playwright test"
   },
   "dependencies": {
-    "effect": "4.0.5"
+    "@nerima-games/mc-audio": "0.2.8",
+    "@nerima-games/mc-compose": "0.2.13",
+    "@nerima-games/mc-kernel": "0.7.1",
+    "@nerima-games/mc-physics": "0.2.2",
+    "@nerima-games/mc-render": "0.7.0",
+    "@nerima-games/mc-save": "0.4.2",
+    "@nerima-games/mc-server": "0.1.0",
+    "@nerima-games/mc-sim": "0.4.2",
+    "@nerima-games/mc-worldgen": "0.3.2",
+    "@nerima-games/mx-gameplay": "0.6.0",
+    "@nerima-games/mx-multiplayer": "0.11.0",
+    "@nerima-games/mx-redstone": "0.3.3",
+    "@nerima-games/mx-ui": "0.5.4",
+    "effect": "3.22.1"
   },
   "devDependencies": {
     "@changesets/changelog-github": "1.0.1",
     "@changesets/cli": "3.0.3",
-    "@effect/vitest": "4.0.5",
+    "@effect/vitest": "0.30.0",
     "@playwright/test": "1.64.1",
     "@types/node": "26.6.5",
-    "@vitest/coverage-v8": "5.0.5",
+    "@types/three": "0.186.0",
+    "@types/ws": "8.18.2",
+    "@vitest/coverage-v8": "4.1.11",
+    "three": "0.186.1",
+    "tsx": "4.23.15",
     "typescript": "7.0.2",
-    "vitest": "5.0.5"
+    "vite": "8.3.5",
+    "vitest": "4.1.11",
+    "ws": "8.22.0"
   }
 }

@@ -1,0 +1,7 @@
+diff --git a/examples/jsm/lines/LineMaterial.d.ts b/examples/jsm/lines/LineMaterial.d.ts
+index d7b2b342e630ad37df87ebca67a8bb218d41312e..9945488c3df279eb9314ead21fda03630620feb4 100644
+--- a/examples/jsm/lines/LineMaterial.d.ts
++++ b/examples/jsm/lines/LineMaterial.d.ts
+@@ -4 +4 @@ export interface LineMaterialParameters extends ShaderMaterialParameters {
+-    alphaToCoverage?: boolean | undefined;
++    alphaToCoverage?: boolean;
