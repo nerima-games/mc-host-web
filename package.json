@@ -1,6 +1,6 @@
 {
   "name": "@nerima-games/mc-host-web",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": false,
   "type": "module",
   "description": "Browser host runtime for the nerima-games Minecraft clone.",
