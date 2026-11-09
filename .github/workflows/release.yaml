@@ -3,13 +3,16 @@ name: Release
 on:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   detect:
-    if: github.event.before != '0000000000000000000000000000000000000000'
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' || github.event.before != '0000000000000000000000000000000000000000')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -26,12 +29,17 @@ jobs:
         id: version
         env:
           BEFORE_SHA: ${{ github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
         shell: bash
         run: |
           set -euo pipefail
           current="$(node -p "require('./package.json').version")"
-          previous="$(git show "${BEFORE_SHA}:package.json" | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).version")"
           printf 'current=%s\n' "${current}" >> "${GITHUB_OUTPUT}"
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            printf 'changed=true\n' >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          previous="$(git show "${BEFORE_SHA}:package.json" | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).version")"
           if [[ "${current}" == "${previous}" ]]; then
             printf 'changed=false\n' >> "${GITHUB_OUTPUT}"
           else
@@ -69,7 +77,9 @@ jobs:
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - name: Configure GitHub Packages authentication
-        run: pnpm config set --location=global //npm.pkg.github.com/:_authToken "$NODE_AUTH_TOKEN"
+        run: |
+          pnpm config set --location=global //npm.pkg.github.com/:_authToken "$NODE_AUTH_TOKEN"
+          npm config set --location=user //npm.pkg.github.com/:_authToken "$NODE_AUTH_TOKEN"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
