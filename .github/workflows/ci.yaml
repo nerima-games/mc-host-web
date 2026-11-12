@@ -26,7 +26,6 @@ jobs:
         uses: ./.github/actions/nix-setup
         with:
           cachix-cache: ${{ vars.CACHIX_CACHE }}
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - name: Check shared conformance
         uses: nerima-games/.github/conformance/ast-grep@f594176eb568341ab31babbfef16a260979f75f2
@@ -56,7 +55,6 @@ jobs:
         uses: ./.github/actions/nix-setup
         with:
           cachix-cache: ${{ vars.CACHIX_CACHE }}
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - name: Configure GitHub Packages authentication
         run: |
