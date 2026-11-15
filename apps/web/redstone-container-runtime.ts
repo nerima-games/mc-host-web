@@ -40,7 +40,7 @@ import {
   type MobBehaviour,
 } from '@nerima-games/mx-gameplay'
 import { type ChestStorageSlotCount } from '@nerima-games/mx-ui'
-import type { PersistedLeverState } from './session-persistence'
+import { snapshotResidentChunks, type PersistedLeverState } from './session-persistence'
 import type { DroppedItemMetadata } from './dropped-item-metadata'
 
 // These built-in blocks must exist in the kernel registry used by this host.
@@ -247,15 +247,11 @@ export const makeRedstoneContainerRuntime = (
   } = deps
 
   const syncRedstoneSnapshot = (context: RedstoneDimensionChunkContext): void => {
-    const residents = Effect.runSync(Effect.gen(function* () {
-      const coords = yield* context.worldgenChunkStore.loadedCoords
-      return yield* Effect.forEach(coords, context.worldgenChunkStore.snapshot)
-    }))
+    const residents = Effect.runSync(snapshotResidentChunks(context.worldgenChunkStore))
     const components: Array<RedstoneComponentSnapshot> = []
     const observedLevers = new Set<string>()
     const observedPlates = new Set<string>()
     for (const chunk of residents) {
-      if (chunk === undefined) continue
       for (let lx = 0; lx < 16; lx += 1) {
         for (let lz = 0; lz < 16; lz += 1) {
           for (let y = 0; y < 256; y += 1) {
@@ -539,7 +535,8 @@ export const makeRedstoneContainerRuntime = (
     if (outcome.kind === 'noop' || outcome.kind === 'refused') return
 
     Effect.runSync(Effect.gen(function* () {
-      if (outcome.kind === 'failed') return yield* Effect.fail(outcome.failure)
+      // BlockId validates each lookup input; only a broken built-in registry can fail here.
+      if (outcome.kind === 'failed') return yield* Effect.die(outcome.failure)
       yield* applyPistonPlan(outcome.plan, {
         commit: (plan: PistonMovementPlan) => Effect.gen(function* () {
           for (const move of plan.moves) {

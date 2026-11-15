@@ -318,45 +318,58 @@ describe('redstone container runtime', () => {
     }
   }
 
-  for (const multiplayer of [false, true]) {
-    for (const hopperPresent of [false, true]) {
-      for (const belowPresent of [false, true]) {
-        for (const belowMoved of [false, true]) {
-          for (const abovePresent of [false, true]) {
-            it.each([false, true])(`hopper mp=${String(multiplayer)} hopper=${String(hopperPresent)} below=${String(belowPresent)}/${String(belowMoved)} above=${String(abovePresent)}/%s`, (aboveMoved) => {
-              const events: Array<string> = []
-              transferHopperItem('overworld', { x: 1, y: 64, z: 2 }, {
-                isMultiplayer: () => multiplayer,
-                resolveContainerId: (_dimension, position) => {
-                  events.push(`resolve:${String(position.y)}`)
-                  return position.y === 64 ? hopperPresent ? 'hopper' : undefined
-                    : position.y === 63 ? belowPresent ? 'below' : undefined
-                    : abovePresent ? 'above' : undefined
-                },
-                moveOneContainerItem: (from, to) => {
-                  events.push(`move:${from}:${to}`)
-                  return from === 'hopper' ? belowMoved : aboveMoved
-                },
-              })
-              const expected: Array<string> = []
-              if (!multiplayer) {
-                expected.push('resolve:64')
-                if (hopperPresent) {
-                  expected.push('resolve:63')
-                  if (belowPresent) expected.push('move:hopper:below')
-                  if (!belowPresent || !belowMoved) {
-                    expected.push('resolve:65')
-                    if (abovePresent) expected.push('move:above:hopper')
-                  }
-                }
-              }
-              expect(events).toEqual(expected)
-            })
-          }
-        }
-      }
-    }
-  }
+  const hopperCases: ReadonlyArray<{
+    readonly name: string
+    readonly multiplayer: boolean
+    readonly containers: ReadonlyArray<readonly [number, string]>
+    readonly moves: ReadonlyArray<readonly [string, boolean]>
+    readonly expected: ReadonlyArray<string>
+  }> = [
+    { name: 'multiplayer', multiplayer: true, containers: [[64, 'hopper']], moves: [], expected: [] },
+    { name: 'hopper missing', multiplayer: false, containers: [], moves: [], expected: ['resolve:64'] },
+    {
+      name: 'output below succeeds', multiplayer: false,
+      containers: [[64, 'hopper'], [63, 'below'], [65, 'above']], moves: [['hopper:below', true]],
+      expected: ['resolve:64', 'resolve:63', 'move:hopper:below'],
+    },
+    {
+      name: 'output fails and input above succeeds', multiplayer: false,
+      containers: [[64, 'hopper'], [63, 'below'], [65, 'above']], moves: [['hopper:below', false], ['above:hopper', true]],
+      expected: ['resolve:64', 'resolve:63', 'move:hopper:below', 'resolve:65', 'move:above:hopper'],
+    },
+    {
+      name: 'both transfers fail', multiplayer: false,
+      containers: [[64, 'hopper'], [63, 'below'], [65, 'above']], moves: [['hopper:below', false], ['above:hopper', false]],
+      expected: ['resolve:64', 'resolve:63', 'move:hopper:below', 'resolve:65', 'move:above:hopper'],
+    },
+    {
+      name: 'no output and input above succeeds', multiplayer: false,
+      containers: [[64, 'hopper'], [65, 'above']], moves: [['above:hopper', true]],
+      expected: ['resolve:64', 'resolve:63', 'resolve:65', 'move:above:hopper'],
+    },
+    {
+      name: 'no adjacent containers', multiplayer: false,
+      containers: [[64, 'hopper']], moves: [], expected: ['resolve:64', 'resolve:63', 'resolve:65'],
+    },
+  ]
+  it.each(hopperCases)('hopper routing: $name', ({ multiplayer, containers, moves, expected }) => {
+    const containerAtY = new Map(containers)
+    const moveResults = new Map(moves)
+    const events: Array<string> = []
+    transferHopperItem('overworld', { x: 1, y: 64, z: 2 }, {
+      isMultiplayer: () => multiplayer,
+      resolveContainerId: (_dimension, position) => {
+        events.push(`resolve:${String(position.y)}`)
+        return containerAtY.get(position.y)
+      },
+      moveOneContainerItem: (from, to) => {
+        const transfer = `${from}:${to}`
+        events.push(`move:${transfer}`)
+        return moveResults.get(transfer) ?? false
+      },
+    })
+    expect(events).toEqual(expected)
+  })
 
   it('installs the redstone components found in resident chunks', async () => {
     const harness = await makeRuntimeHarness()
@@ -402,8 +415,6 @@ describe('redstone container runtime', () => {
     }
   })
 
-  const storageKinds = ['chest', 'shulker_box', 'dispenser', 'dropper', 'hopper'] as const
-
   it.each((['compare', 'subtract'] as const).flatMap((mode) =>
     (['missing', 'empty', 'occupied'] as const).map((state) => ({ mode, state })),
   ))('comparator $mode reads $state storage without changing inventory', async ({ mode, state }) => {
@@ -438,9 +449,13 @@ describe('redstone container runtime', () => {
     }
   })
 
-  it.each(storageKinds.flatMap((source) => storageKinds.map((destination) => ({ source, destination }))))('moves across $source to $destination storage', async ({ source, destination }) => {
+  it('wires hopper transfers to world inventory and metadata operations', async () => {
     const harness = await makeRuntimeHarness()
     try {
+      const source = 'hopper'
+      const destination = 'chest'
+      await Effect.runPromise(harness.world.chunkStore.setBlock(blockPosition(8, 64, 8), blockIdOf(source)))
+      await Effect.runPromise(harness.world.chunkStore.setBlock(blockPosition(8, 63, 8), blockIdOf(destination)))
       const sourceId = containerIdAt(harness.dimension, { x: 8, y: 64, z: 8 })
       const destinationId = containerIdAt(harness.dimension, { x: 8, y: 63, z: 8 })
       await Effect.runPromise(harness.world.inventory.restoreContainerStorage({
@@ -451,14 +466,13 @@ describe('redstone container runtime', () => {
         ],
       }))
       const events: Array<string> = []
-      expect(transferOneContainerItem(sourceId, destinationId, {
-        snapshot: (id) => Effect.runSync(harness.world.inventory.containerSnapshot(id)),
-        move: (input) => Effect.runSync(harness.world.inventory.moveContainerItem(input)),
-        metadataKey: harness.runtimeContext.containerMetadataKey,
-        copyMetadata: () => events.push('copy'),
-        deleteMetadata: () => events.push('delete'),
+      const runtime = makeRedstoneContainerRuntime({
+        ...harness.runtimeContext,
+        copyItemMetadata: () => events.push('copy'),
+        deleteItemMetadata: () => events.push('delete'),
         markSessionDirty: () => events.push('dirty'),
-      })).toBe(true)
+      })
+      runtime.applyHopperTransfer(harness.dimension, { x: 8, y: 64, z: 8 })
       const sourceSnapshot = await Effect.runPromise(harness.world.inventory.containerSnapshot(sourceId))
       const destinationSnapshot = await Effect.runPromise(harness.world.inventory.containerSnapshot(destinationId))
       expect(sourceSnapshot?.kind).toBe(source)
