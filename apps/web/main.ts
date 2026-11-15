@@ -2193,7 +2193,7 @@ const bootGame = async (
   )
 
   if (Exit.isFailure(composedExit)) {
-    failBoot('composeGame rejected the stage set', Cause.squash(composedExit.cause))
+    failBoot('module registration or composeGame failed', Cause.squash(composedExit.cause))
     return
   }
 

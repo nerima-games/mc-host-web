@@ -36,7 +36,7 @@ import {
 } from '@nerima-games/mc-compose'
 import { type PersistedLeverState } from './session-persistence'
 
-/** The roster tag at the host's behaviour type; the key is shared with mc-sim's. */
+/** mc-sim's EntityManager tag, typed for the host's mob behaviour. */
 export const MobEntityManager: Context.Service<EntityManager, EntityManagerApi<MobBehaviour>> =
   entityManagerTag<MobBehaviour>()
 
@@ -55,9 +55,9 @@ export type HostServices =
 /**
  * The service instances `main.ts` already owns. Every module registers against
  * one Context built from these, so sim, gameplay, render and redstone stages
- * reach the same instances the host reads and writes. Each package's `layers`
- * would build a second instance of each service (`Layer.effect` builds once
- * per provide), which is why no module Layer is ever built here.
+ * reach the same instances the host reads and writes. The `layers` of
+ * mc-sim, mc-render and mx-redstone build a new instance on every provide, so
+ * no module Layer is built here.
  */
 export type HostServiceInstances = {
   readonly time: TimeServiceApi
