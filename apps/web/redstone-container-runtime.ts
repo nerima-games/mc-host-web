@@ -536,25 +536,27 @@ export const makeRedstoneContainerRuntime = (
         pistonImmovable: (block) => capabilityOfBlockId(BlockId(Number(block)), 'pistonImmovable'),
       },
     )
-    if (outcome.kind === 'failed') return Effect.runSync(Effect.fail(outcome.failure))
-    if (outcome.kind !== 'move') return
+    if (outcome.kind === 'noop' || outcome.kind === 'refused') return
 
-    Effect.runSync(applyPistonPlan(outcome.plan, {
-      commit: (plan: PistonMovementPlan) => Effect.gen(function* () {
-        for (const move of plan.moves) {
-          const source = yield* context.chunkStore.getBlock(asBlockPosition(move.from))
-          if (source._tag !== 'Block' || source.block !== BlockId(Number(move.block))) {
-            return yield* Effect.die(new Error('piston source changed before commit'))
+    Effect.runSync(Effect.gen(function* () {
+      if (outcome.kind === 'failed') return yield* Effect.fail(outcome.failure)
+      yield* applyPistonPlan(outcome.plan, {
+        commit: (plan: PistonMovementPlan) => Effect.gen(function* () {
+          for (const move of plan.moves) {
+            const source = yield* context.chunkStore.getBlock(asBlockPosition(move.from))
+            if (source._tag !== 'Block' || source.block !== BlockId(Number(move.block))) {
+              return yield* Effect.die(new Error('piston source changed before commit'))
+            }
           }
-        }
-        const head = pistonPositionAt(plan.piston, plan.facing, pistonHeadOffset)
-        if (plan.toState === 'retracted') yield* context.chunkStore.setBlock(asBlockPosition(head), blockIdOf('air'))
-        for (const move of plan.moves) {
-          yield* context.chunkStore.setBlock(asBlockPosition(move.to), BlockId(Number(move.block)))
-          yield* context.chunkStore.setBlock(asBlockPosition(move.from), blockIdOf('air'))
-        }
-        if (plan.toState === 'extended') yield* context.chunkStore.setBlock(asBlockPosition(head), blockIdOf('piston_head'))
-      }),
+          const head = pistonPositionAt(plan.piston, plan.facing, pistonHeadOffset)
+          if (plan.toState === 'retracted') yield* context.chunkStore.setBlock(asBlockPosition(head), blockIdOf('air'))
+          for (const move of plan.moves) {
+            yield* context.chunkStore.setBlock(asBlockPosition(move.to), BlockId(Number(move.block)))
+            yield* context.chunkStore.setBlock(asBlockPosition(move.from), blockIdOf('air'))
+          }
+          if (plan.toState === 'extended') yield* context.chunkStore.setBlock(asBlockPosition(head), blockIdOf('piston_head'))
+        }),
+      })
     }))
     markSessionDirty()
     setRedstoneDirty(true)
