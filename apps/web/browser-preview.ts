@@ -1,5 +1,5 @@
 /* oxlint-disable curly, func-names, init-declarations, max-statements, no-magic-numbers, no-ternary, no-undefined, prefer-const, sort-keys -- Lifecycle orchestration is intentionally kept linear; splitting it obscures rollback order. */
-import { Cause, Deferred, Effect, Option, Ref } from 'effect'
+import { Cause, Deferred, Effect, Option, Ref, Semaphore } from 'effect'
 import { type DeltaTimeSecs, MonotonicTimeSecs } from '@nerima-games/mc-kernel'
 import { type GameLoopApi, makeGameLoop } from '@nerima-games/mc-sim'
 import { requestNextFrameIfActive } from './frame-scheduling.js'
@@ -79,7 +79,7 @@ export const makeBrowserPreview = (
   options: BrowserPreviewOptions,
 ): Effect.Effect<BrowserPreviewApi> => Effect.gen(function* () {
   const current = yield* Ref.make(Option.none<Generation>())
-  const mutex = yield* Effect.makeSemaphore(1)
+  const mutex = yield* Semaphore.make(1)
 
   const stopGeneration = (generation: Generation) => generation.stop
 
@@ -197,7 +197,8 @@ export const makeBrowserPreview = (
             ),
           )
         })
-        yield* gameLoop.start(frameHandler)
+        // start fails only for an invalid initial tick; makeGameLoop() defaults to SimulationTick(0).
+        yield* Effect.orDie(gameLoop.start(frameHandler))
         const tick: FrameRequestCallback = (timestamp) => {
           if (stopped) return
           Effect.runFork(loop.submitFrame(MonotonicTimeSecs(timestamp / 1_000)))

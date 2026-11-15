@@ -6,7 +6,8 @@ import {
 import { Effect } from 'effect'
 import { describe, expect, it } from 'vitest'
 import { makeSurvivalHungerCoordinator } from '../apps/web/survival-hunger-runtime'
-import type { DeltaTimeSecs } from '@nerima-games/mc-kernel'
+import { DeltaTimeSecs } from '@nerima-games/mc-kernel'
+import { EntityHealthPoints, FoodSaturation, FoodTimerSecs, HungerPoints } from '@nerima-games/mc-sim'
 
 type HungerVitals = SurvivalHungerState['vitals']
 
@@ -22,10 +23,10 @@ const setup = (vitals: HungerVitals = initialVitals()) => {
 
 describe('survival hunger web coordinator', () => {
   it('applies queued activity and four-second food ticks to canonical vitals', () => {
-    const { canonical, hunger } = setup(initialVitals({ healthPoints: 18 }))
+    const { canonical, hunger } = setup(initialVitals({ healthPoints: EntityHealthPoints(18) }))
     hunger.submit({ _tag: 'walk', distance: 10 })
 
-    const outcome = hunger.tick(4 as DeltaTimeSecs)
+    const outcome = hunger.tick(DeltaTimeSecs(4))
 
     expect(outcome.exhaustionAdded).toBe(0.1)
     expect(outcome.foodTicks).toBe(1)
@@ -38,7 +39,7 @@ describe('survival hunger web coordinator', () => {
 
     hunger.respawn()
     expect(Effect.runSync(canonical.snapshot).healthPoints).toBe(20)
-    Effect.runSync(canonical.restore(initialVitals({ hungerPoints: 10 })))
+    Effect.runSync(canonical.restore(initialVitals({ hungerPoints: HungerPoints(10) })))
     const eaten = hunger.eat(4, 0.3)
     expect(eaten.hungerPoints).toBe(14)
     expect(Effect.runSync(canonical.snapshot)).toEqual(eaten)
@@ -46,14 +47,14 @@ describe('survival hunger web coordinator', () => {
 
   it('keeps starvation at the configured difficulty floor', () => {
     const canonical = Effect.runSync(makeInMemoryVitals(initialVitals({
-      healthPoints: 10,
-      hungerPoints: 0,
-      saturation: 0,
-      foodTimerSecs: 0,
+      healthPoints: EntityHealthPoints(10),
+      hungerPoints: HungerPoints(0),
+      saturation: FoodSaturation(0),
+      foodTimerSecs: FoodTimerSecs(0),
     })))
     const hunger = makeSurvivalHungerCoordinator(canonical, 'easy')
 
-    hunger.tick(40 as DeltaTimeSecs)
+    hunger.tick(DeltaTimeSecs(40))
 
     expect(Effect.runSync(canonical.snapshot).healthPoints).toBe(10)
   })

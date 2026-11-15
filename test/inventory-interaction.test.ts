@@ -1,4 +1,4 @@
-import { Effect } from 'effect'
+import { Effect, Result } from 'effect'
 import { describe, expect, it } from 'vitest'
 import {
   emptyInventory,
@@ -15,6 +15,10 @@ import {
   type InteractionInventory,
   type InteractionRecipeMatch,
 } from '../apps/web/inventory-interaction'
+import type { ItemType } from '@nerima-games/mc-kernel'
+
+// Fixture literals are in-range stack counts.
+const stackOf = (item: ItemType, count: number) => Result.getOrThrow(itemStack(item, count))
 
 type Item = 'oak_log' | 'oak_planks' | 'stone'
 
@@ -412,9 +416,9 @@ describe('inventory interaction', () => {
   it('uses canonical left-click pickup, placement, merging, and swapping', () => {
     const initial: Inventory = {
       slots: [
-        itemStack('stone', 60),
-        itemStack('stone', 10),
-        itemStack('dirt', 7),
+        stackOf('stone', 60),
+        stackOf('stone', 10),
+        stackOf('dirt', 7),
         ...emptyInventory().slots.slice(3),
       ],
     }
@@ -422,34 +426,34 @@ describe('inventory interaction', () => {
     const interaction = createInventoryInteraction(service)
 
     expect(Effect.runSync(interaction.clickInventoryItem(1, 'left')).inventoryCarried)
-      .toEqual(itemStack('stone', 10))
+      .toEqual(stackOf('stone', 10))
     expect(Effect.runSync(interaction.clickInventoryItem(0, 'left')).inventoryCarried)
-      .toEqual(itemStack('stone', 6))
-    expect(Effect.runSync(service.snapshot).slots[0]).toEqual(itemStack('stone', 64))
+      .toEqual(stackOf('stone', 6))
+    expect(Effect.runSync(service.snapshot).slots[0]).toEqual(stackOf('stone', 64))
 
     expect(Effect.runSync(interaction.clickInventoryItem(2, 'left')).inventoryCarried)
-      .toEqual(itemStack('dirt', 7))
-    expect(Effect.runSync(service.snapshot).slots[2]).toEqual(itemStack('stone', 6))
+      .toEqual(stackOf('dirt', 7))
+    expect(Effect.runSync(service.snapshot).slots[2]).toEqual(stackOf('stone', 6))
 
     expect(Effect.runSync(interaction.clickInventoryItem(3, 'left')).inventoryCarried)
       .toBeUndefined()
-    expect(Effect.runSync(service.snapshot).slots[3]).toEqual(itemStack('dirt', 7))
+    expect(Effect.runSync(service.snapshot).slots[3]).toEqual(stackOf('dirt', 7))
   })
 
   it('uses canonical right-click half pickup and one-item placement', () => {
     const initial: Inventory = {
-      slots: [itemStack('stone', 5), ...emptyInventory().slots.slice(1)],
+      slots: [stackOf('stone', 5), ...emptyInventory().slots.slice(1)],
     }
     const service = Effect.runSync(makeInventoryService(initial))
     const interaction = createInventoryInteraction(service)
 
     expect(Effect.runSync(interaction.clickInventoryItem(0, 'right')).inventoryCarried)
-      .toEqual(itemStack('stone', 3))
-    expect(Effect.runSync(service.snapshot).slots[0]).toEqual(itemStack('stone', 2))
+      .toEqual(stackOf('stone', 3))
+    expect(Effect.runSync(service.snapshot).slots[0]).toEqual(stackOf('stone', 2))
 
     expect(Effect.runSync(interaction.clickInventoryItem(1, 'right')).inventoryCarried)
-      .toEqual(itemStack('stone', 2))
-    expect(Effect.runSync(service.snapshot).slots[1]).toEqual(itemStack('stone', 1))
+      .toEqual(stackOf('stone', 2))
+    expect(Effect.runSync(service.snapshot).slots[1]).toEqual(stackOf('stone', 1))
   })
 
   it('notifies the complete inventory transition after a successful click', () => {
@@ -539,7 +543,7 @@ describe('inventory interaction', () => {
 
   it('restores carried inventory through a successful close transition', () => {
     const initial: Inventory = {
-      slots: [itemStack('stone', 3), ...emptyInventory().slots.slice(1)],
+      slots: [stackOf('stone', 3), ...emptyInventory().slots.slice(1)],
     }
     const service = Effect.runSync(makeInventoryService(initial))
     const transitions: Array<unknown> = []
@@ -551,18 +555,18 @@ describe('inventory interaction', () => {
     const closed = Effect.runSync(interaction.close())
 
     expect(closed.inventoryCarried).toBeUndefined()
-    expect(Effect.runSync(service.snapshot).slots[0]).toEqual(itemStack('stone', 3))
+    expect(Effect.runSync(service.snapshot).slots[0]).toEqual(stackOf('stone', 3))
     expect(transitions.at(-1)).toEqual({
       slotIndex: 0,
       slotBefore: undefined,
-      carriedBefore: itemStack('stone', 3),
+      carriedBefore: stackOf('stone', 3),
       result: { _tag: 'Placed', carried: undefined },
     })
   })
 
   it('returns a real carried stack before creating a one-item crafting draft', () => {
     const initial: Inventory = {
-      slots: [itemStack('oak_log', 4), ...emptyInventory().slots.slice(1)],
+      slots: [stackOf('oak_log', 4), ...emptyInventory().slots.slice(1)],
     }
     const service = Effect.runSync(makeInventoryService(initial))
     const interaction = createInventoryInteraction(service)
@@ -571,15 +575,15 @@ describe('inventory interaction', () => {
     const drafted = Effect.runSync(interaction.interactCraftingCellFromInventory(0))
 
     expect(drafted.inventoryCarried).toBeUndefined()
-    expect(drafted.grid.cells[0]).toEqual(itemStack('oak_log', 1))
-    expect(Effect.runSync(service.snapshot).slots[0]).toEqual(itemStack('oak_log', 4))
+    expect(drafted.grid.cells[0]).toEqual({ item: 'oak_log', count: 1 })
+    expect(Effect.runSync(service.snapshot).slots[0]).toEqual(stackOf('oak_log', 4))
   })
 
   it('returns carried metadata to the actual accepted slot before crafting', () => {
     const initial: Inventory = {
       slots: [
-        itemStack('stone', 60),
-        itemStack('stone', 3),
+        stackOf('stone', 60),
+        stackOf('stone', 3),
         ...emptyInventory().slots.slice(2),
       ],
     }
@@ -606,18 +610,18 @@ describe('inventory interaction', () => {
     Effect.runSync(interaction.clickInventoryItem(1, 'left'))
     const drafted = Effect.runSync(interaction.interactCraftingCellFromInventory(0))
 
-    expect(Effect.runSync(service.snapshot).slots[0]).toEqual(itemStack('stone', 60))
-    expect(Effect.runSync(service.snapshot).slots[1]).toEqual(itemStack('stone', 3))
+    expect(Effect.runSync(service.snapshot).slots[0]).toEqual(stackOf('stone', 60))
+    expect(Effect.runSync(service.snapshot).slots[1]).toEqual(stackOf('stone', 3))
     expect(slotNames.get(0)).toBe('first')
     expect(slotNames.get(1)).toBe('second')
     expect(carriedName).toBeUndefined()
     expect(drafted.inventoryCarried).toBeUndefined()
-    expect(drafted.grid.cells[0]).toEqual(itemStack('stone', 1))
+    expect(drafted.grid.cells[0]).toEqual({ item: 'stone', count: 1 })
   })
 
   it('returns a real carried stack to canonical inventory on close', () => {
     const initial: Inventory = {
-      slots: [itemStack('stone', 3), ...emptyInventory().slots.slice(1)],
+      slots: [stackOf('stone', 3), ...emptyInventory().slots.slice(1)],
     }
     const service = Effect.runSync(makeInventoryService(initial))
     const interaction = createInventoryInteraction(service)
@@ -626,13 +630,13 @@ describe('inventory interaction', () => {
     const closed = Effect.runSync(interaction.close())
 
     expect(closed.inventoryCarried).toBeUndefined()
-    expect(Effect.runSync(service.snapshot).slots[0]).toEqual(itemStack('stone', 3))
+    expect(Effect.runSync(service.snapshot).slots[0]).toEqual(stackOf('stone', 3))
   })
 
   it('returns canonical carried inventory exactly once across consecutive closes', () => {
     let dirtyCount = 0
     const initial: Inventory = {
-      slots: [itemStack('stone', 2), ...emptyInventory().slots.slice(1)],
+      slots: [stackOf('stone', 2), ...emptyInventory().slots.slice(1)],
     }
     const service = Effect.runSync(makeInventoryService(initial))
     const interaction = createInventoryInteraction(service, {
@@ -643,7 +647,7 @@ describe('inventory interaction', () => {
     const closed = Effect.runSync(interaction.close())
     const closedAgain = Effect.runSync(interaction.close())
 
-    expect(Effect.runSync(service.snapshot).slots[0]).toEqual(itemStack('stone', 2))
+    expect(Effect.runSync(service.snapshot).slots[0]).toEqual(stackOf('stone', 2))
     expect(closed.inventoryCarried).toBeUndefined()
     expect(closed.carried).toBeUndefined()
     expect(closed.grid.cells.every((cell) => cell === undefined)).toBe(true)
@@ -653,7 +657,7 @@ describe('inventory interaction', () => {
 
   it('preserves carried inventory when every return destination is rejected', () => {
     const initial: Inventory = {
-      slots: [itemStack('stone', 2), ...emptyInventory().slots.slice(1)],
+      slots: [stackOf('stone', 2), ...emptyInventory().slots.slice(1)],
     }
     const service = Effect.runSync(makeInventoryService(initial))
     const interaction = createInventoryInteraction(service, {

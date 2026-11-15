@@ -38,7 +38,8 @@
  * make a tile-index bug look like a texture.
  */
 import * as THREE from 'three'
-import { Context, Effect, Layer, Scope } from 'effect'
+import { Context, Effect, Layer, Result, Scope } from 'effect'
+import { ChunkAxis, type ChunkKey } from '@nerima-games/mc-kernel'
 import {
   ATLAS_COLUMNS,
   browserInputLayer,
@@ -132,6 +133,10 @@ type TerrainFixture = {
   }>
 }
 
+/** The fixture is committed data; a non-integral axis means the file itself is broken. */
+const fixtureChunkCoord = (chunk: TerrainFixture['chunks'][number]): ChunkRef =>
+  Result.getOrThrow(Result.all({ cx: ChunkAxis.result(chunk.cx), cz: ChunkAxis.result(chunk.cz) }))
+
 /** The tile the generator resolved, not one this page invents. */
 // mc-render's QuadTile signature is `(quad: GeometryQuad) => number`, wider than
 // the MeshQuad-only fixtures this preview builds; the cast below is unchanged,
@@ -208,7 +213,7 @@ const main = async (): Promise<void> => {
   const fixture = (await (await fetch(fixtureUrl)).json()) as TerrainFixture
 
   const quadsByKey = new Map<string, ReadonlyArray<FixtureQuad>>(
-    fixture.chunks.map((chunk) => [chunkKeyOf(chunk), chunk.quads]),
+    fixture.chunks.map((chunk) => [chunkKeyOf(fixtureChunkCoord(chunk)), chunk.quads]),
   )
 
   /**
@@ -225,7 +230,7 @@ const main = async (): Promise<void> => {
     Effect.sync(() => quadsByKey.get(chunkKeyOf(chunk)))
 
   /** Chunks currently in the scene, so a batch can be a DIFFERENCE. */
-  const loaded = new Set<string>()
+  const loaded = new Map<ChunkKey, ChunkRef>()
 
   /** Chunks within `STREAM_RADIUS_CHUNKS` of a world position. */
   const desiredAround = (x: number, z: number): ReadonlyArray<ChunkRef> => {
@@ -234,7 +239,8 @@ const main = async (): Promise<void> => {
     const wanted: Array<ChunkRef> = []
     for (let cx = cx0 - STREAM_RADIUS_CHUNKS; cx <= cx0 + STREAM_RADIUS_CHUNKS; cx += 1) {
       for (let cz = cz0 - STREAM_RADIUS_CHUNKS; cz <= cz0 + STREAM_RADIUS_CHUNKS; cz += 1) {
-        wanted.push({ cx, cz })
+        // The pose stays finite, so `Math.round` above makes every axis an integer.
+        wanted.push({ cx: ChunkAxis(cx), cz: ChunkAxis(cz) })
       }
     }
     return wanted
@@ -255,14 +261,11 @@ const main = async (): Promise<void> => {
       const wantedKeys = new Set(wanted.map(chunkKeyOf))
       const changed = wanted.filter((chunk) => !loaded.has(chunkKeyOf(chunk)))
       const removed = [...loaded]
-        .filter((key) => !wantedKeys.has(key))
-        .map((key) => {
-          const [cx, cz] = key.split(',')
-          return { cx: Number(cx), cz: Number(cz) }
-        })
+        .filter(([key]) => !wantedKeys.has(key))
+        .map(([, chunk]) => chunk)
       for (const chunk of changed) {
         if (quadsByKey.has(chunkKeyOf(chunk))) {
-          loaded.add(chunkKeyOf(chunk))
+          loaded.set(chunkKeyOf(chunk), chunk)
         }
       }
       for (const chunk of removed) {
@@ -338,6 +341,7 @@ const main = async (): Promise<void> => {
   const scope = Effect.runSync(Scope.make())
   const inputLayer = browserInputLayer({
     targets: { window, document },
+    runSync: Effect.runSync,
     canvas,
     allowsPointerLock: () => true,
   })

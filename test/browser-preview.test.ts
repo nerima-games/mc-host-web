@@ -91,11 +91,11 @@ describe('browser preview', () => {
       expect(dom.children).toHaveLength(1)
 
       animation.runNext(100)
-      yield* Effect.yieldNow()
+      yield* Effect.yieldNow
       animation.runNext(116)
-      yield* Effect.yieldNow()
+      yield* Effect.yieldNow
       animation.runNext(1_000)
-      yield* Effect.yieldNow()
+      yield* Effect.yieldNow
       expect(frames).toStrictEqual([0.016, 0.016, 0.05])
 
       const second = yield* preview.restart
@@ -136,18 +136,18 @@ describe('browser preview', () => {
 
       yield* preview.start
       animation.runNext(100)
-      yield* Effect.yieldNow()
+      yield* Effect.yieldNow
       expect(frames).toStrictEqual([0.016])
       expect(animation.callbacks.size).toBe(1)
 
       animation.runNext(116)
-      yield* Effect.yieldNow()
+      yield* Effect.yieldNow
       expect(frames).toStrictEqual([0.016])
       yield* Deferred.succeed(firstFrame, undefined)
-      yield* Effect.yieldNow()
+      yield* Effect.yieldNow
       expect(animation.callbacks.size).toBe(1)
       animation.runNext(132)
-      yield* Effect.yieldNow()
+      yield* Effect.yieldNow
       expect(frames).toStrictEqual([0.016, 0.016])
       yield* preview.stop
     }),
@@ -174,9 +174,9 @@ describe('browser preview', () => {
 
       yield* preview.start
       animation.runNext(100)
-      yield* Effect.yieldNow()
+      yield* Effect.yieldNow
       animation.runNext(116)
-      yield* Effect.yieldNow()
+      yield* Effect.yieldNow
 
       expect(frames).toStrictEqual([0.016, 0.016])
       expect(frameReads).toBe(1)
@@ -206,7 +206,7 @@ describe('browser preview', () => {
 
       const handle = yield* preview.start
       animation.runNext(100)
-      yield* Effect.yieldNow()
+      yield* Effect.yieldNow
       yield* handle.stop
       expect(events).toStrictEqual(['frame:start', 'frame:release', 'runtime:stop'])
       expect(animation.callbacks.size).toBe(0)
@@ -255,8 +255,8 @@ describe('browser preview', () => {
 
       const handle = yield* preview.start
       external.abort()
-      yield* Effect.yieldNow()
-      yield* Effect.yieldNow()
+      yield* Effect.yieldNow
+      yield* Effect.yieldNow
       expect(stops).toBe(1)
       expect(yield* handle.isRunning).toBe(false)
       expect(dom.children).toStrictEqual([dom.canvas])
@@ -359,8 +359,8 @@ describe('browser preview', () => {
 
       const handle = yield* preview.start
       animation.runNext(100)
-      yield* Effect.yieldNow()
-      yield* Effect.yieldNow()
+      yield* Effect.yieldNow
+      yield* Effect.yieldNow
       expect(yield* handle.isRunning).toBe(false)
       expect(Option.isNone(yield* preview.current)).toBe(true)
     }),

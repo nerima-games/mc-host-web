@@ -54,8 +54,8 @@ const { encodeFrame } = await tsImport(
 
 const encodeProtocol = (message: NetworkMessage): string => {
   const result = encodeFrame(message)
-  if (result._tag === 'Left') throw result.left
-  return result.right
+  if (result._tag === 'Failure') throw result.failure
+  return result.success
 }
 
 const encodeWither = (message: WireMessage): string => JSON.stringify(message)

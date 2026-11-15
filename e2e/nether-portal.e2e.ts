@@ -1,6 +1,6 @@
 import { expect, test, type ConsoleMessage, type Page } from '@playwright/test'
 import { overworldToNether } from '@nerima-games/mc-worldgen'
-import { blockPosition } from '@nerima-games/mc-kernel'
+import { BlockAxis, blockPosition } from '@nerima-games/mc-kernel'
 
 import { startGameSession } from './helpers/session'
 import { waitForSimulationProgress } from './helpers/simulation-wait'
@@ -10,7 +10,7 @@ const QA_GLOBAL_KEY = '__NERIMA_GAMES_QA__'
 // Mirrors qa-fixtures.ts's QA_PORTAL_ANCHOR — the interior cell
 // seedPortalArrivalIntoSolidGround (apps/web/main.ts) restores the player
 // into and registers as the Overworld side of the crossing.
-const QA_PORTAL_ANCHOR = blockPosition(120, 65, 8)
+const QA_PORTAL_ANCHOR = blockPosition(BlockAxis(120), BlockAxis(65), BlockAxis(8))
 
 type Dimension = 'overworld' | 'nether' | 'end'
 type Position = Readonly<{ x: number; y: number; z: number }>

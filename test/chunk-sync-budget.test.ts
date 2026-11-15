@@ -1,3 +1,4 @@
+import { ChunkAxis, chunkCoord } from '@nerima-games/mc-kernel'
 import type { DirtyBatch, DirtySource } from '@nerima-games/mc-render'
 import { Effect } from 'effect'
 import { describe, expect, it } from 'vitest'
@@ -5,7 +6,7 @@ import { describe, expect, it } from 'vitest'
 import { makeBudgetedDirtySource } from '../apps/web/chunk-sync-budget'
 
 const emptyBatch: DirtyBatch = { changed: [], removed: [] }
-const chunk = (cx: number, cz: number) => ({ cx, cz })
+const chunk = (cx: number, cz: number) => chunkCoord(ChunkAxis(cx), ChunkAxis(cz))
 const sourceFrom = (...batches: ReadonlyArray<DirtyBatch>): DirtySource => {
   let index = 0
   return {
@@ -50,10 +51,10 @@ describe('budgeted chunk dirty source', () => {
   it('renders chunks loaded before the first source notification', () => {
     const source = makeBudgetedDirtySource(sourceFrom({ changed: [], removed: [] }), 1)
 
-    source.enqueue({ changed: [{ cx: 8, cz: -3 }], removed: [] })
+    source.enqueue({ changed: [chunk(8, -3)], removed: [] })
 
     expect(drain(source)).toEqual({
-      changed: [{ cx: 8, cz: -3 }],
+      changed: [chunk(8, -3)],
       removed: [],
     })
   })

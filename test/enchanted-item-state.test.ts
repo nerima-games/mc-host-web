@@ -1,4 +1,6 @@
+import { Result } from 'effect'
 import { describe, expect, it } from 'vitest'
+import type { ItemType } from '@nerima-games/mc-kernel'
 import { itemStack } from '@nerima-games/mc-sim'
 
 import {
@@ -6,10 +8,13 @@ import {
   projectEnchantedItem,
 } from '../apps/web/enchanted-item-state'
 
+// Fixture literals are in-range stack counts.
+const stackOf = (item: ItemType, count: number) => Result.getOrThrow(itemStack(item, count))
+
 describe('enchanted item state', () => {
   it('uses authoritative durability for a damageable item', () => {
     expect(projectEnchantedItem(
-      itemStack('diamond_pickaxe', 1),
+      stackOf('diamond_pickaxe', 1),
       { current: 1400, max: 1561 },
       {
         item: 'diamond_pickaxe',
@@ -25,7 +30,7 @@ describe('enchanted item state', () => {
 
   it('does not attach stale enchantments to a replacement item', () => {
     expect(projectEnchantedItem(
-      itemStack('iron_sword', 1),
+      stackOf('iron_sword', 1),
       { current: 250, max: 250 },
       {
         item: 'diamond_pickaxe',
@@ -40,7 +45,7 @@ describe('enchanted item state', () => {
   })
 
   it('rejects malformed and mismatched persisted metadata', () => {
-    const stack = itemStack('stone_pickaxe', 1)
+    const stack = stackOf('stone_pickaxe', 1)
     const durability = { current: 100, max: 131 }
     expect(decodeProjectedEnchantedItem('{', stack, durability)).toBeNull()
     expect(decodeProjectedEnchantedItem(JSON.stringify({
