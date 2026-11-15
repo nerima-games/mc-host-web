@@ -82,9 +82,10 @@
  * block edits and mc-render meshing all observe the same mc-worldgen store;
  * dirty chunk notifications are the only render synchronization path.
  */
-import { Cause, Context, Effect, Exit, Option, Ref } from 'effect'
+import { Cause, Context, Effect, Exit, Option, Ref, Result } from 'effect'
 import {
   BLOCK_PROPERTY_DEFAULTS,
+  BlockAxis,
   BlockId,
   blockIdOf,
   blockPosition,
@@ -92,6 +93,7 @@ import {
   DeltaTimeSecs,
   chunkCoord,
   isEmpty,
+  PositionAxis,
   propertyOfBlockId,
   resolvedBlockOfId,
   StageId,
@@ -99,7 +101,14 @@ import {
   type MonotonicTimeSecs,
   type Position as Vec3,
 } from '@nerima-games/mc-kernel'
-import { aabbOfCollisionShape } from '@nerima-games/mc-physics'
+import {
+  aabbOfCollisionShape,
+  blockEnvironmentFromKernel,
+  BlockLength,
+  BlocksPerSecond,
+  HalfHeight,
+  type BlockIdAt,
+} from '@nerima-games/mc-physics'
 import {
   addExperience as addVitalsExperience,
   containerIdAt,
@@ -798,7 +807,7 @@ const bootGame = async (
       if (!(slot in storage.equipment.slots)) return undefined
       const item = storage.equipment.slots[slot as EquipmentSlotId]
       if (item === null || item === undefined) return undefined
-      return { stack: itemStack(item.item, item.count), durability: item.durability }
+      return { stack: item, durability: item.durability }
     }
     const location = containerMetadataLocation(key)
     if (location === undefined) return undefined
@@ -807,7 +816,7 @@ const bootGame = async (
       ?.slots[location.slot]
     return stack === null || stack === undefined
       ? undefined
-      : { stack: itemStack(stack.item, stack.count), durability: stack.durability ?? undefined }
+      : { stack, durability: stack.durability ?? undefined }
   }
   for (const [slot, name] of Object.entries(restoredWorkstations?.customNames ?? {})) {
     if (resolveMetadataStack(slot) === undefined) continue
@@ -1041,11 +1050,11 @@ const bootGame = async (
       }),
     )),
   }
-  // mx-redstone's PistonPosition/RedstonePosition stayed plain {x,y,z}; the kernel's
-  // BlockPosition now brands each axis, so every redstone-domain position needs this
-  // conversion before it can address a chunkStore read or write.
+  // The host's redstone positions are plain {x,y,z}; the kernel's BlockPosition
+  // brands each axis, so they need this conversion before a chunkStore read or write.
+  // Callers pass block-cell coordinates, which are always integers.
   const asBlockPosition = (position: { readonly x: number; readonly y: number; readonly z: number }): BlockPosition =>
-    blockPosition(position.x, position.y, position.z)
+    blockPosition(BlockAxis(position.x), BlockAxis(position.y), BlockAxis(position.z))
   const leverKeyOf = (lever: Pick<PersistedLeverState, 'dimension' | 'position'>): string =>
     JSON.stringify([lever.dimension, lever.position.x, lever.position.y, lever.position.z])
   const leverStates = new Map<string, PersistedLeverState>(
@@ -1104,7 +1113,8 @@ const bootGame = async (
       : OccupantId(String(entity.occupant))
     Effect.runSync(vehicleService.updateState(current.id, {
       dimension: current.dimension,
-      position: entity.at,
+      // mx-multiplayer's Vec3 wire schema rejects non-finite axes at decodeFrame.
+      position: { x: PositionAxis(entity.at.x), y: PositionAxis(entity.at.y), z: PositionAxis(entity.at.z) },
       velocity: current.velocity,
       yawRadians: current.yawRadians,
       occupant,
@@ -1427,16 +1437,23 @@ const bootGame = async (
   // kernel-world.ts adapter uses.
   const blockPropertiesAt: SimPhysicsConfig['resolve']['blockPropertiesAt'] = (blockX, blockY, blockZ) => {
     const reading = Effect.runSync(currentChunkStore.getBlock(blockPosition(blockX, blockY, blockZ)))
-    if (reading._tag !== 'Block') return BLOCK_PROPERTY_DEFAULTS
-    return isEmpty(reading.block) ? null : (resolvedBlockOfId(reading.block)?.properties ?? null)
+    if (reading._tag !== 'Block') return Result.succeed(BLOCK_PROPERTY_DEFAULTS)
+    if (isEmpty(reading.block)) return Result.succeed(null)
+    return Result.map(resolvedBlockOfId(reading.block), (resolved) => resolved?.properties ?? null)
+  }
+  // Surface, hazard and fluid sampling read loaded cells only; an unloaded cell
+  // samples as air, while `blockPropertiesAt` above keeps it solid for collision.
+  const blockIdAt: BlockIdAt = (blockX, blockY, blockZ) => {
+    const reading = Effect.runSync(currentChunkStore.getBlock(blockPosition(blockX, blockY, blockZ)))
+    return reading._tag === 'Block' ? reading.block : null
   }
   const simPhysicsConfig: SimPhysicsConfig = {
     resolve: {
       blockPropertiesAt,
-      halfWidth: PLAYER_HALF_WIDTH,
-      // mc-sim exposes this branded field but not the brand constructor.
-      halfHeight: PLAYER_HALF_HEIGHT as SimPhysicsConfig['resolve']['halfHeight'],
-      stepHeight: PLAYER_STEP_HEIGHT_M,
+      environment: blockEnvironmentFromKernel(blockIdAt),
+      halfWidth: BlockLength(PLAYER_HALF_WIDTH),
+      halfHeight: HalfHeight(PLAYER_HALF_HEIGHT),
+      stepHeight: BlockLength(PLAYER_STEP_HEIGHT_M),
     },
     walkSpeed: WALK_SPEED_M_PER_S,
     jumpSpeed: JUMP_SPEED_M_PER_S,
@@ -1487,9 +1504,11 @@ const bootGame = async (
     y: number,
     z: number,
   ): boolean => {
-    const reading = Effect.runSync(currentChunkStore.getBlock(blockPosition(x, y, z)))
+    // Callers pass pressure-plate block cells, which are always integers.
+    const reading = Effect.runSync(currentChunkStore.getBlock(blockPosition(BlockAxis(x), BlockAxis(y), BlockAxis(z))))
     if (reading._tag !== 'Block') return false
-    const shape = aabbOfCollisionShape(propertyOfBlockId(reading.block, 'collisionShape'))
+    // A chunk-store BlockId is already validated and the static registry always builds.
+    const shape = aabbOfCollisionShape(Result.getOrThrow(propertyOfBlockId(reading.block, 'collisionShape')))
     if (shape === null) return false
     return (
       intervalOverlap(
@@ -1550,11 +1569,12 @@ const bootGame = async (
           z < Math.ceil(maxZ + physicsContactEpsilon);
           z += 1
         ) {
-          const reading = Effect.runSync(currentChunkStore.getBlock(blockPosition(x, y, z)))
+          const reading = Effect.runSync(currentChunkStore.getBlock(blockPosition(BlockAxis(x), BlockAxis(y), BlockAxis(z))))
           if (reading._tag !== 'Block') continue
-          const block = blockTypeOfId(reading.block)
+          // A chunk-store BlockId is already validated and the static registry always builds.
+          const block = Result.getOrThrow(blockTypeOfId(reading.block))
           if (block !== 'lava' && block !== 'cactus') continue
-          const contactDamage = propertyOfBlockId(reading.block, 'contactDamage')
+          const contactDamage = Result.getOrThrow(propertyOfBlockId(reading.block, 'contactDamage'))
           if (contactDamage === undefined) continue
           if (
             block === 'lava' &&
@@ -1601,7 +1621,7 @@ const bootGame = async (
     Effect.runSync(Ref.set(simState.resolvedFeetPosition, Option.none()))
     Effect.runSync(Ref.set(simState.movementIntent, { forward: 0, strafe: 0 }))
     Effect.runSync(Ref.set(simState.jumpIntent, false))
-    Effect.runSync(Ref.set(simState.velocity, { x: 0, y: 0, z: 0 }))
+    Effect.runSync(Ref.set(simState.velocity, { x: BlocksPerSecond(0), y: BlocksPerSecond(0), z: BlocksPerSecond(0) }))
     Effect.runSync(Ref.set(simState.isGrounded, false))
     Effect.runSync(resetLandingImpact(simState))
     Effect.runSync(
@@ -1671,7 +1691,12 @@ const bootGame = async (
       dimension,
       [...portalStates.values()]
         .filter((portal) => portal.dimension === dimension)
-        .map((portal) => blockPosition(portal.position.x, portal.position.y, portal.position.z)),
+        // Portal positions are block cells: integers by BlockCoordinateSchema or kernel BlockPosition.
+        .map((portal) => blockPosition(
+          BlockAxis(portal.position.x),
+          BlockAxis(portal.position.y),
+          BlockAxis(portal.position.z),
+        )),
     )
   const syncPortalCandidateSnapshots = (): Effect.Effect<void> =>
     Effect.asVoid(Effect.all(portalDimensions.map(syncPortalCandidatesFor)))
@@ -1835,7 +1860,7 @@ const bootGame = async (
       if (carved) markSessionDirty()
 
       const pose = yield* playerApi.pose
-      yield* playerApi.moveTo({ ...pose.feetPosition, y: resolvedFloorY + 1 })
+      yield* playerApi.moveTo({ ...pose.feetPosition, y: PositionAxis(resolvedFloorY + 1) })
     })
   const applyPortalTravels = (): Effect.Effect<void> =>
     Effect.gen(function* () {
