@@ -19,7 +19,7 @@ import {
   type StorageError,
   type StoragePort,
 } from '@nerima-games/mc-save'
-import { Effect, Option, Schema } from 'effect'
+import { Effect, Option, Result, Schema } from 'effect'
 
 export const PLAYER_SETTINGS_FORMAT_NAME = '@nerima-games/mc-compose/player-settings'
 export const PLAYER_SETTINGS_KEY: SaveKey = SaveKey('mc-compose/player-settings')
@@ -46,11 +46,18 @@ export const DEFAULT_PLAYER_SETTINGS: PlayerSettingsV1 = {
   captionsEnabled: true,
 }
 
-export const PLAYER_SETTINGS_FORMAT: SaveFormat<unknown, unknown> = defineFormat({
-  name: PLAYER_SETTINGS_FORMAT_NAME,
-  version: 1,
-  schema: Schema.Unknown,
-})
+// defineFormat only rejects a blank name or a version that is not a safe
+// integer >= 1. Both inputs here are module constants that satisfy that, so a
+// failure means the constants were edited into an invalid state; failing at
+// module load surfaces that before any settings are read or written.
+export const PLAYER_SETTINGS_FORMAT: SaveFormat<unknown, unknown> = Result.getOrThrowWith(
+  defineFormat({
+    name: PLAYER_SETTINGS_FORMAT_NAME,
+    version: 1,
+    schema: Schema.Unknown,
+  }),
+  (problems) => new Error(`invalid player settings save format: ${problems.join('; ')}`),
+)
 
 export type PlayerSettingsPersistenceError = StorageError | SaveDecodeError
 

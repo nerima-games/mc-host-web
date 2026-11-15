@@ -1,153 +1,59 @@
 import {
+  createTouchControlRoster as createRenderTouchControlRoster,
   defaultBindings,
-  TOUCH_LOOK_IDLE,
-  touchLookStep,
-  unboundTouchActions,
-  type InputAction,
+  type TouchControlAction,
+  type TouchControlRosterError,
   type TouchControlTarget,
-  type TouchLookState,
-  type TouchPoint,
+  type TouchLookContact,
+} from '@nerima-games/mc-render'
+import { Result } from 'effect'
+
+// mc-render 0.11 lowered this file's roster and look-drag state machine into
+// its browser input adapter, so the host re-exports them instead of keeping a
+// second copy that could drift from the adapter that consumes the roster.
+export {
+  advanceTouchLook,
+  consumeTouchLook,
+  resetTouchLook,
+  TOUCH_CONTROL_ACTIONS,
+  TOUCH_LOOK_CONTROLLER_IDLE,
+  type ConsumedTouchLook,
+  type TouchControlAction,
+  type TouchLookContactPhase,
+  type TouchLookControllerState,
+  type TouchLookResetReason,
 } from '@nerima-games/mc-render'
 
-export const TOUCH_CONTROL_ACTIONS: readonly [
-  'moveForward',
-  'moveBackward',
-  'moveLeft',
-  'moveRight',
-  'jump',
-  'attack',
-  'use',
-  'openInventory',
-  'escape',
-] = [
-  'moveForward',
-  'moveBackward',
-  'moveLeft',
-  'moveRight',
-  'jump',
-  'attack',
-  'use',
-  'openInventory',
-  'escape',
-] as const satisfies ReadonlyArray<InputAction>
-
-export type TouchControlAction = (typeof TOUCH_CONTROL_ACTIONS)[number]
-
+// Every action is required here, unlike mc-render's Partial map, so a missing
+// HUD element is a type error at the call site rather than a runtime failure.
 export type TouchControlTargets<Target = unknown> = Readonly<
   Record<TouchControlAction, Target>
 >
 
+export type TouchContact = TouchLookContact
+
+const rosterErrorMessage = (error: TouchControlRosterError): string => {
+  switch (error.reason) {
+    case 'unbound-actions':
+      return `Touch controls have no input binding: ${error.actions.join(', ')}`
+    case 'missing-target':
+      return `Touch control target is missing: ${error.action}`
+    case 'shared-target':
+      return `Touch control target is shared by ${error.owner} and ${error.action}`
+  }
+}
+
+// Throws rather than returning the Result: the roster is built once from the
+// static HUD markup during startup, where any failure is a markup defect with
+// no recovery path, and this function's thrown-error contract predates the
+// Result-returning mc-render API.
 export const createTouchControlRoster = <Target>(
   targets: TouchControlTargets<Target>,
-): ReadonlyArray<TouchControlTarget> => {
-  const unavailable = unboundTouchActions(defaultBindings(), TOUCH_CONTROL_ACTIONS)
-  if (unavailable.length > 0) {
-    throw new Error(`Touch controls have no input binding: ${unavailable.join(', ')}`)
-  }
-
-  const owners = new Map<unknown, TouchControlAction>()
-  return TOUCH_CONTROL_ACTIONS.map((action) => {
-    const target = targets[action]
-    if (target === null || target === undefined) {
-      throw new Error(`Touch control target is missing: ${action}`)
-    }
-    const owner = owners.get(target)
-    if (owner !== undefined) {
-      throw new Error(`Touch control target is shared by ${owner} and ${action}`)
-    }
-    owners.set(target, action)
-    return { action, target }
-  })
-}
-
-export type TouchContact = {
-  readonly identifier: number
-  readonly clientX: number
-  readonly clientY: number
-}
-
-export type TouchLookControllerState = {
-  readonly activeIdentifier: number | null
-  readonly gesture: TouchLookState
-  readonly pending: TouchPoint
-}
-
-const ZERO_TOUCH_DELTA: TouchPoint = { positionX: 0, positionY: 0 }
-
-export const TOUCH_LOOK_CONTROLLER_IDLE: TouchLookControllerState = {
-  activeIdentifier: null,
-  gesture: TOUCH_LOOK_IDLE,
-  pending: ZERO_TOUCH_DELTA,
-}
-
-export type TouchLookContactPhase = 'start' | 'move' | 'end' | 'cancel'
-
-const pointOf = (contact: TouchContact): TouchPoint => ({
-  positionX: contact.clientX,
-  positionY: contact.clientY,
-})
-
-const accumulate = (pending: TouchPoint, delta: TouchPoint): TouchPoint => ({
-  positionX: pending.positionX + delta.positionX,
-  positionY: pending.positionY + delta.positionY,
-})
-
-export const advanceTouchLook = (
-  state: TouchLookControllerState,
-  phase: TouchLookContactPhase,
-  contact: TouchContact,
-): TouchLookControllerState => {
-  if (phase === 'start') {
-    if (state.activeIdentifier !== null) return state
-    const next = touchLookStep(state.gesture, 'press', pointOf(contact))
-    return {
-      activeIdentifier: contact.identifier,
-      gesture: next.state,
-      pending: accumulate(state.pending, next.delta),
-    }
-  }
-
-  if (contact.identifier !== state.activeIdentifier) return state
-  if (phase === 'end' || phase === 'cancel') {
-    touchLookStep(state.gesture, 'release', pointOf(contact))
-    return {
-      activeIdentifier: null,
-      gesture: TOUCH_LOOK_IDLE,
-      pending: state.pending,
-    }
-  }
-
-  const next = touchLookStep(state.gesture, 'move', pointOf(contact))
-  return {
-    activeIdentifier: state.activeIdentifier,
-    gesture: next.state,
-    pending: accumulate(state.pending, next.delta),
-  }
-}
-
-export type ConsumedTouchLook = {
-  readonly state: TouchLookControllerState
-  readonly delta: TouchPoint
-}
-
-export const consumeTouchLook = (state: TouchLookControllerState): ConsumedTouchLook => ({
-  state: { ...state, pending: ZERO_TOUCH_DELTA },
-  delta: state.pending,
-})
-
-export type TouchLookResetReason = 'blur' | 'visibility-hidden' | 'state-transition'
-
-export const resetTouchLook = (
-  _state: TouchLookControllerState,
-  reason: TouchLookResetReason,
-): TouchLookControllerState => {
-  switch (reason) {
-    case 'blur':
-    case 'visibility-hidden':
-    case 'state-transition':
-      return TOUCH_LOOK_CONTROLLER_IDLE
-  }
-}
+): ReadonlyArray<TouchControlTarget> =>
+  Result.getOrThrowWith(
+    createRenderTouchControlRoster(targets, defaultBindings()),
+    (error) => new Error(rosterErrorMessage(error)),
+  )
 
 export type TouchControlsUiState = {
   readonly touchAvailable: boolean
