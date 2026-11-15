@@ -1,12 +1,19 @@
 import {
+  AudioCaptionText,
+  AudioCount,
+  AudioVolume,
   makeRecordingBackend,
+  SoundCueId,
   type AudioBackend,
   type WebAudioBackend,
 } from '@nerima-games/mc-audio'
 import {
+  AngleRadians,
   EpochMillis,
   FixedClockLayer,
   MonotonicTimeSecs,
+  PositionAxis,
+  position,
   type ClockPort,
   type Position,
 } from '@nerima-games/mc-kernel'
@@ -43,17 +50,22 @@ const makeBackend = (
     return 'ready' as const
   }),
   preloadSamples: () =>
-    Effect.succeed({ requested: 0, loaded: 0, cached: 0, failed: 0 }),
+    Effect.succeed({ requested: AudioCount(0), loaded: AudioCount(0), cached: AudioCount(0), failed: AudioCount(0) }),
   dispose: Effect.sync(() => {
     lifecycle.closes += 1
   }),
 })
 
+const at = (x: number, y: number, z: number): Position =>
+  position(PositionAxis(x), PositionAxis(y), PositionAxis(z))
+
+const ORIGIN = at(0, 0, 0)
+
 describe('web audio runtime', () => {
   it('derives the horizontal listener direction from camera yaw', () => {
-    expect(horizontalListenerForward(0)).toEqual({ x: -0, y: 0, z: -1 })
-    expect(horizontalListenerForward(Math.PI / 2).x).toBeCloseTo(-1)
-    expect(horizontalListenerForward(-Math.PI / 2).x).toBeCloseTo(1)
+    expect(horizontalListenerForward(AngleRadians(0))).toEqual({ x: -0, y: 0, z: -1 })
+    expect(horizontalListenerForward(AngleRadians(Math.PI / 2)).x).toBeCloseTo(-1)
+    expect(horizontalListenerForward(AngleRadians(-Math.PI / 2)).x).toBeCloseTo(1)
   })
 
   it('rotates world-space placement panning with the listener', async () => {
@@ -63,19 +75,19 @@ describe('web audio runtime', () => {
       makeAudioRuntime({
         backend: makeBackend(recording.backend, { unlocks: 0, closes: 0 }),
         clockLayer: fixedClockLayer(0),
-        listener: () => ({ x: 0, y: 0, z: 0 }),
-        listenerForward: () => horizontalListenerForward(yawRadians),
+        listener: () => ORIGIN,
+        listenerForward: () => horizontalListenerForward(AngleRadians(yawRadians)),
       }),
     )
 
-    runtime.play('blockPlace', { position: { x: 12, y: 0, z: 0 } })
+    runtime.play(SoundCueId('blockPlace'), { position: at(12, 0, 0) })
     yawRadians = Math.PI
-    runtime.play('blockPlace', { position: { x: 12, y: 0, z: 0 } })
+    runtime.play(SoundCueId('blockPlace'), { position: at(12, 0, 0) })
 
     const played = await Effect.runPromise(recording.played)
     expect(played[0]?.pan).toBeCloseTo(1)
     expect(played[1]?.pan).toBeCloseTo(-1)
-    expect(runtime.snapshot(MonotonicTimeSecs(0)).listenerForward).toEqual(horizontalListenerForward(Math.PI))
+    expect(runtime.snapshot(MonotonicTimeSecs(0)).listenerForward).toEqual(horizontalListenerForward(AngleRadians(Math.PI)))
   })
 
   it('emits the damage caption while autoplay remains locked', async () => {
@@ -84,11 +96,11 @@ describe('web audio runtime', () => {
       makeAudioRuntime({
         backend: makeBackend(recording.backend, { unlocks: 0, closes: 0 }),
         clockLayer: fixedClockLayer(12),
-        listener: () => ({ x: 0, y: 0, z: 0 }),
+        listener: () => ORIGIN,
       }),
     )
 
-    runtime.play('playerHurt')
+    runtime.play(SoundCueId('playerHurt'))
 
     expect(runtime.visible(MonotonicTimeSecs(12))).toMatchObject([
       { cueId: 'playerHurt', atSecs: 12, reason: 'gate-blocked' },
@@ -102,7 +114,7 @@ describe('web audio runtime', () => {
       makeAudioRuntime({
         backend: makeBackend(recording.backend, { unlocks: 0, closes: 0 }),
         clockLayer: fixedClockLayer(0),
-        listener: () => ({ x: 0, y: 0, z: 0 }),
+        listener: () => ORIGIN,
       }),
     )
 
@@ -117,14 +129,14 @@ describe('web audio runtime', () => {
       makeAudioRuntime({
         backend: makeBackend(recording.backend, { unlocks: 0, closes: 0 }),
         clockLayer: fixedClockLayer(0),
-        listener: () => ({ x: 0, y: 0, z: 0 }),
+        listener: () => ORIGIN,
       }),
     )
 
-    runtime.configure({ masterVolume: 0.4, sfxVolume: 0.25, audioEnabled: true })
-    runtime.play('playerHurt')
-    runtime.configure({ masterVolume: 0.9, sfxVolume: 1, audioEnabled: false })
-    runtime.play('inventoryOpen')
+    runtime.configure({ masterVolume: AudioVolume(0.4), sfxVolume: AudioVolume(0.25), audioEnabled: true })
+    runtime.play(SoundCueId('playerHurt'))
+    runtime.configure({ masterVolume: AudioVolume(0.9), sfxVolume: AudioVolume(1), audioEnabled: false })
+    runtime.play(SoundCueId('inventoryOpen'))
 
     expect(await Effect.runPromise(recording.masterGains)).toEqual([0.4, 0])
     expect((await Effect.runPromise(recording.played))[0]).toMatchObject({ gain: 0.125 })
@@ -137,7 +149,7 @@ describe('web audio runtime', () => {
       makeAudioRuntime({
         backend: makeBackend(recording.backend, { unlocks: 0, closes: 0 }),
         clockLayer: fixedClockLayer(0),
-        listener: () => ({ x: 0, y: 0, z: 0 }),
+        listener: () => ORIGIN,
       }),
     )
 
@@ -153,15 +165,15 @@ describe('web audio runtime', () => {
       play: (cueId, options) => plays.push({ cueId, position: options?.position }),
     })
 
-    latch.request({ x: 4, y: 5, z: 6 })
+    latch.request(at(4, 5, 6))
     latch.request()
     expect(latch.confirm([])).toBe(false)
-    latch.request({ x: -2, y: 1, z: 3 })
+    latch.request(at(-2, 1, 3))
     expect(latch.confirm(['stone'])).toBe(true)
     expect(latch.confirm(['stone'])).toBe(true)
 
     expect(plays).toEqual([
-      { cueId: 'blockPlace', position: { x: -2, y: 1, z: 3 } },
+      { cueId: 'blockPlace', position: at(-2, 1, 3) },
       { cueId: 'blockPlace', position: undefined },
     ])
   })
@@ -173,7 +185,7 @@ describe('web audio runtime', () => {
       makeAudioRuntime({
         backend: makeBackend(recording.backend, lifecycle),
         clockLayer: fixedClockLayer(0),
-        listener: () => ({ x: 0, y: 0, z: 0 }),
+        listener: () => ORIGIN,
       }),
     )
 
@@ -182,7 +194,7 @@ describe('web audio runtime', () => {
     runtime.close()
     runtime.close()
     await Promise.resolve()
-    runtime.play('playerHurt')
+    runtime.play(SoundCueId('playerHurt'))
     runtime.unlock()
     await Promise.resolve()
 
@@ -205,7 +217,7 @@ describe('web audio runtime', () => {
           }),
         },
         clockLayer: fixedClockLayer(0),
-        listener: () => ({ x: 0, y: 0, z: 0 }),
+        listener: () => ORIGIN,
       }),
     )
 
@@ -228,8 +240,8 @@ describe('web audio runtime', () => {
 
   it('uses all rendered caption fields in a stable signature', () => {
     const caption = {
-      cueId: 'playerHurt' as const,
-      text: 'Player hurt',
+      cueId: SoundCueId('playerHurt'),
+      text: AudioCaptionText('Player hurt'),
       reason: 'gate-blocked' as const,
       atSecs: MonotonicTimeSecs(12),
     }
@@ -250,19 +262,19 @@ describe('web audio runtime', () => {
           playTone: () => Effect.die(new Error('backend defect')),
         }, { unlocks: 0, closes: 0 }),
         clockLayer: fixedClockLayer(4),
-        listener: () => ({ x: 0, y: 0, z: 0 }),
+        listener: () => ORIGIN,
       }),
     )
 
-    expect(() => runtime.play('playerHurt')).not.toThrow()
+    expect(() => runtime.play(SoundCueId('playerHurt'))).not.toThrow()
     expect(runtime.snapshot(MonotonicTimeSecs(4)).cueIds).toEqual(['playerHurt'])
   })
 
   it('prunes only expired caption history across read times', () => {
     const captions = [
-      { cueId: 'playerHurt' as const, text: 'Expired', reason: 'audible' as const, atSecs: MonotonicTimeSecs(0) },
-      { cueId: 'inventoryOpen' as const, text: 'Current', reason: 'audible' as const, atSecs: MonotonicTimeSecs(2) },
-      { cueId: 'inventoryClose' as const, text: 'Future', reason: 'audible' as const, atSecs: MonotonicTimeSecs(8) },
+      { cueId: SoundCueId('playerHurt'), text: AudioCaptionText('Expired'), reason: 'audible' as const, atSecs: MonotonicTimeSecs(0) },
+      { cueId: SoundCueId('inventoryOpen'), text: AudioCaptionText('Current'), reason: 'audible' as const, atSecs: MonotonicTimeSecs(2) },
+      { cueId: SoundCueId('inventoryClose'), text: AudioCaptionText('Future'), reason: 'audible' as const, atSecs: MonotonicTimeSecs(8) },
     ]
 
     const atFour = pruneExpiredCaptionEvents(captions, MonotonicTimeSecs(4))
