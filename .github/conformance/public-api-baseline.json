@@ -87,7 +87,7 @@
     "count": 1,
     "file": "apps/shader-probe/probe.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runPromise(renderer.setChunk('0,0', buildChunkGeometry([QUAD], 0, 0)))"
+    "text": "Effect.runPromise( renderer.setChunk(chunkKeyOf({ cx: ChunkAxis(0), cz: ChunkAxis(0) }), buildChunkGeometry([QUAD], 0, 0)), )"
   },
   {
     "count": 1,
