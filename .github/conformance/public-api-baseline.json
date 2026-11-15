@@ -1845,7 +1845,7 @@
     "count": 1,
     "file": "apps/web/redstone-container-runtime.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync( spawnDroppedItems(world.entities, [ { ...extracted.stack, at: { x: position.x + 0.5, y: position.y + 0.5, z: position.z - 0.25, }, ...(metadata.customName === undefined && metadata.enchantedItem === undefined ? {} : { eligibleFromFrame: getFramesTotal() + 1 }), }, ]), )"
+    "text": "Effect.runSync( spawnDroppedItems(world.entities, [ { ...extracted.stack, at: worldPosition(PositionAxis(position.x + 0.5), PositionAxis(position.y + 0.5), PositionAxis(position.z - 0.25)), ...(metadata.customName === undefined && metadata.enchantedItem === undefined ? {} : { eligibleFromFrame: getFramesTotal() + 1 }), }, ]), )"
   },
   {
     "count": 1,
@@ -1857,13 +1857,13 @@
     "count": 1,
     "file": "apps/web/redstone-container-runtime.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(applyPistonPlan(outcome.plan, { commit: (plan: PistonMovementPlan) => Effect.gen(function* () { for (const move of plan.moves) { const source = yield* context.chunkStore.getBlock(asBlockPosition(move.from)) if (source._tag !== 'Block' || source.block !== BlockId(Number(move.block))) { return yield* Effect.dieMessage('piston source changed before commit') } } const head = pistonPositionAt(plan.piston, plan.facing, 1) if (plan.toState === 'retracted') yield* context.chunkStore.setBlock(asBlockPosition(head), blockIdOf('air')) for (const move of plan.moves) { yield* context.chunkStore.setBlock(asBlockPosition(move.to), BlockId(Number(move.block))) yield* context.chunkStore.setBlock(asBlockPosition(move.from), blockIdOf('air')) } if (plan.toState === 'extended') yield* context.chunkStore.setBlock(asBlockPosition(head), blockIdOf('piston_head')) }), }))"
+    "text": "Effect.runSync(Effect.gen(function* () { // BlockId validates each lookup input; only a broken built-in registry can fail here. if (outcome.kind === 'failed') return yield* Effect.die(outcome.failure) yield* applyPistonPlan(outcome.plan, { commit: (plan: PistonMovementPlan) => Effect.gen(function* () { for (const move of plan.moves) { const source = yield* context.chunkStore.getBlock(asBlockPosition(move.from)) if (source._tag !== 'Block' || source.block !== BlockId(Number(move.block))) { return yield* Effect.die(new Error('piston source changed before commit')) } } const head = pistonPositionAt(plan.piston, plan.facing, pistonHeadOffset) if (plan.toState === 'retracted') yield* context.chunkStore.setBlock(asBlockPosition(head), blockIdOf('air')) for (const move of plan.moves) { yield* context.chunkStore.setBlock(asBlockPosition(move.to), BlockId(Number(move.block))) yield* context.chunkStore.setBlock(asBlockPosition(move.from), blockIdOf('air')) } if (plan.toState === 'extended') yield* context.chunkStore.setBlock(asBlockPosition(head), blockIdOf('piston_head')) }), }) }))"
   },
   {
     "count": 1,
     "file": "apps/web/redstone-container-runtime.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(context.chunkStore.getBlock( asBlockPosition(pistonPositionAt(position, 'north', 1)), ))"
+    "text": "Effect.runSync(context.chunkStore.getBlock( pistonPositionAt(position, 'north', pistonHeadOffset), ))"
   },
   {
     "count": 3,
@@ -1881,7 +1881,7 @@
     "count": 1,
     "file": "apps/web/redstone-container-runtime.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(redstoneRuntime.syncSnapshot({ dimension: context.dimension, components }))"
+    "text": "Effect.runSync(redstoneRuntime.syncSnapshot({ dimension: Schema.decodeUnknownSync(DimensionIdSchema)(context.dimension), components }))"
   },
   {
     "count": 1,
