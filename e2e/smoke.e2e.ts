@@ -229,7 +229,7 @@ test.describe('smoke — the composed frame in a real browser', () => {
    * the transcript has already been wrong once, listing six stage ids that no
    * module registered, and staying green for it.
    *
-   * Eighteen stages across the composed modules. The exact ids are asserted
+   * Nineteen stages across the composed modules. The exact ids are asserted
    * rather than the count, because a count is satisfied by any set of stages.
    */
   test('#3b the resolved stage order is the one the loaded modules declare', async ({ page }) => {
@@ -246,10 +246,12 @@ test.describe('smoke — the composed frame in a real browser', () => {
     // That is the property worth reading off this list: `gameplay:interactions`
     // lands after `render:input` because it consumes the frame's input, and
     // `gameplay:time-weather` after the redstone pair — neither placement is
-    // written anywhere in `apps/web/main.ts`.
+    // written anywhere in `apps/web/main.ts`. mc-compose 0.3.0 places
+    // `gameplay:vehicles` in the physics phase, right after `sim:physics`.
     expect(order?.split(' ')).toEqual([
       'render:input',
       'sim:physics',
+      'gameplay:vehicles',
       'gameplay:interactions',
       'gameplay:fire',
       'gameplay:survival-hunger',
@@ -266,7 +268,6 @@ test.describe('smoke — the composed frame in a real browser', () => {
       'render:draw',
       'ui:hud-sync',
       'ui:overlay-sync',
-      'gameplay:vehicles',
     ])
   })
 
