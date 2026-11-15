@@ -12,7 +12,7 @@ import {
   type WeatherLoopKind,
   type WebAudioBackend,
 } from '@nerima-games/mc-audio'
-import { type Position as Vec3, type StageRegistration } from '@nerima-games/mc-kernel'
+import { type Position as Vec3 } from '@nerima-games/mc-kernel'
 import { indexedDbStorageLayer, StoragePort } from '@nerima-games/mc-save'
 import {
   browserInputLayer,
@@ -26,7 +26,6 @@ import {
   type WorldRenderer,
 } from '@nerima-games/mc-render'
 import {
-  makeRuntimeRedstoneStages,
   RedstoneWorldRuntime,
   RedstoneWorldRuntimeLayer,
   type RedstoneWorldRuntimeService,
@@ -92,10 +91,9 @@ export type PlatformAdapters = {
   readonly sessionMetadata: SessionMetadata
   readonly isCreativeMode: boolean
   readonly initialDimension: SessionState['dimension']
-  readonly inputLayer: Layer.Layer<InputService>
   readonly inputContext: Context.Context<InputService>
   readonly redstoneRuntime: RedstoneWorldRuntimeService
-  readonly runtimeRedstoneStages: ReadonlyArray<StageRegistration>
+  readonly redstoneContext: Context.Context<RedstoneWorldRuntime>
   readonly atlasTexture: THREE.DataTexture
   readonly softwareRenderer: boolean
   readonly renderQuality: GraphicsQuality | undefined
@@ -286,9 +284,6 @@ export const makePlatformAdapters = async (deps: {
     Effect.provideService(Layer.build(RedstoneWorldRuntimeLayer), Scope.Scope, scope),
   )
   const redstoneRuntime = Context.get(redstoneContext, RedstoneWorldRuntime)
-  const runtimeRedstoneStages = await Effect.runPromise(
-    Effect.provide(makeRuntimeRedstoneStages, redstoneContext),
-  )
 
   // The renderer. mc-render builds it; this file supplies only the two things
   // it cannot reach — the `three` namespace and the element to draw on.
@@ -399,10 +394,9 @@ export const makePlatformAdapters = async (deps: {
     sessionMetadata,
     isCreativeMode,
     initialDimension,
-    inputLayer,
     inputContext,
     redstoneRuntime,
-    runtimeRedstoneStages,
+    redstoneContext,
     atlasTexture,
     softwareRenderer,
     renderQuality,

@@ -151,42 +151,6 @@
   },
   {
     "count": 1,
-    "file": "apps/web/host-modules.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runPromise( Effect.provide( registerModule({ name: '@nerima-games/mc-render', layers: adapters.inputLayer, frameStages: render.frameStages, }), adapters.inputContext, ), )"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/host-modules.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runPromise( registerModule({ name: '@nerima-games/mc-render/world-sync', layers: EMPTY_MODULE_LAYER, frameStages: Effect.succeed([chunkSyncStage]), }), )"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/host-modules.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runPromise( registerModule({ name: '@nerima-games/mc-sim', layers: EMPTY_MODULE_LAYER, frameStages: Effect.succeed(simStages(simState, time, playerApi, crops)), }), )"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/host-modules.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runPromise( registerModule({ name: '@nerima-games/mx-gameplay', layers: EMPTY_MODULE_LAYER, frameStages: Effect.succeed( gameplayStages( gameplayState, currentChunkStore, world.entities, world.inventory, world.player, time, vehicleService, { isActiveDimension, isPoweredRailAt: (dimension, position) => poweredRails.has(leverKeyOf({ dimension, position })), controlsForVehicle: (vehicle) => String(vehicle.id) === getMountedVehicleId() ? getVehicleControls() : { throttle: 0, steering: 0 }, onVehicleExit: (vehicle) => { if (String(vehicle.id) === getMountedVehicleId()) setMountedVehicleId(undefined) }, }, { // This pickup configuration preserves // metadata/durability/custom names that the stage-level pickup does // not; droppedItemPickup: false keeps the two from consuming the // same inventory in one frame (restored in mx-gameplay 0.3.3). droppedItemPickup: false, mobSimulation: multiplayer === undefined, }, ), ), }), )"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/host-modules.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runPromise( registerModule({ name: '@nerima-games/mx-redstone', layers: EMPTY_MODULE_LAYER, frameStages: Effect.succeed(adapters.runtimeRedstoneStages), }), )"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/host-modules.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runPromise( registerModule({ name: '@nerima-games/mx-ui', layers: EMPTY_MODULE_LAYER, frameStages: Effect.succeed(uiStages(uiFrameState)), }), )"
-  },
-  {
-    "count": 1,
     "file": "apps/web/multiplayer-client.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runPromise( Effect.gen(function* () { const reconnectTokenKey = multiplayerReconnectTokenKey( multiplayerQuery.url, context.sessionId, multiplayerQuery.player, ) let reconnectToken: string | undefined const transport = yield* makeBrowserWebSocketTransport({ url: multiplayerUrlValidation?.url.href ?? multiplayerQuery.url, reconnectAuth: { playerId: String(multiplayerQuery.player), loadToken: () => { if (reconnectToken !== undefined) return reconnectToken try { reconnectToken = context.getLocalStorage().getItem(reconnectTokenKey) ?? undefined } catch { // Fall back to the latest token retained for this page lifetime. } return reconnectToken }, saveToken: (token) => { reconnectToken = token context.getLocalStorage().setItem(reconnectTokenKey, token) }, loadRegistrationToken: () => registrationToken, clearRegistrationToken: () => { registrationToken = undefined }, }, }) const host = yield* makeMultiplayerHost.pipe( Effect.provideService(TransportPort, transport), ) yield* host.transitionConnection({ _tag: 'ConnectRequested' }) return { query: multiplayerQuery, host, transport, players: new Map<PlayerId, RemotePlayer>(), } satisfies MultiplayerRuntime }), )"
@@ -508,12 +472,6 @@
     "file": "apps/web/multiplayer-websocket.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(Queue.shutdown(witherInbound))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/platform-adapters.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runPromise( Effect.provide(makeRuntimeRedstoneStages, redstoneContext), )"
   },
   {
     "count": 1,

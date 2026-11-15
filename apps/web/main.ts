@@ -82,7 +82,7 @@
  * block edits and mc-render meshing all observe the same mc-worldgen store;
  * dirty chunk notifications are the only render synchronization path.
  */
-import { Context, Effect, Option, Ref } from 'effect'
+import { Cause, Context, Effect, Exit, Option, Ref } from 'effect'
 import {
   BLOCK_PROPERTY_DEFAULTS,
   BlockId,
@@ -351,7 +351,7 @@ import {
   makePlatformAdapters,
   type SettingsWriteQueue,
 } from './platform-adapters'
-import { makeHostModules } from './host-modules'
+import { makeHostServiceContext, registerHostModules } from './host-modules'
 import { bootTitleMenu } from './title-menu'
 import {
   handleLocalPlayerDeath as handleLocalPlayerDeathUi,
@@ -2152,42 +2152,52 @@ const bootGame = async (
     requestIdFor,
   } = createMultiplayerClient(multiplayerClientContext)
 
-  const modules = await makeHostModules({
-    adapters,
-    spawnPose,
-    chunkSyncStage,
-    uiFrameState,
-    simState,
+  const services = makeHostServiceContext({
     time,
-    playerApi,
+    player: playerApi,
     crops,
-    gameplayState,
-    currentChunkStore,
-    world,
-    vehicleService,
-    isActiveDimension: (dimension) => dimension === currentChunkContext.dimension,
-    poweredRails,
-    leverKeyOf,
-    getMountedVehicleId: () => mountedVehicleId,
-    setMountedVehicleId: (id) => {
-      mountedVehicleId = id
-    },
-    getVehicleControls: () => vehicleControls,
-    multiplayer,
+    inventory: world.inventory,
+    vehicles: vehicleService,
+    entities: world.entities,
+    chunkStore: currentChunkStore,
+    inputContext: adapters.inputContext,
+    redstoneContext: adapters.redstoneContext,
   })
 
   // -------------------------------------------------------------------------
   // 3. Composition
   // -------------------------------------------------------------------------
 
-  const composed = composeGame(modules)
+  const composedExit = await Effect.runPromiseExit(
+    Effect.flatMap(
+      registerHostModules({
+        services,
+        renderQuality: adapters.renderQuality,
+        draw: adapters.worldRenderer,
+        chunkSyncStage,
+        uiFrameState,
+        simState,
+        gameplayState,
+        isActiveDimension: (dimension) => dimension === currentChunkContext.dimension,
+        poweredRails,
+        leverKeyOf,
+        getMountedVehicleId: () => mountedVehicleId,
+        setMountedVehicleId: (id) => {
+          mountedVehicleId = id
+        },
+        getVehicleControls: () => vehicleControls,
+        multiplayer,
+      }),
+      (modules) => composeGame(modules),
+    ),
+  )
 
-  if (composed._tag === 'Left') {
-    failBoot('composeGame rejected the stage set', composed.left)
+  if (Exit.isFailure(composedExit)) {
+    failBoot('composeGame rejected the stage set', Cause.squash(composedExit.cause))
     return
   }
 
-  const game = composed.right
+  const game = composedExit.value
 
   // Reported, never enforced — `domain/composition.ts` on why a dangling `after`
   // is legal and still worth printing.
