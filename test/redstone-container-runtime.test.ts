@@ -1,15 +1,15 @@
-import { blockIdOf, blockPosition, chunkCoord } from '@nerima-games/mc-kernel'
-import { Context, Effect, Exit, Layer, Scope } from 'effect'
+import { BlockAxis, BlockId, blockIdOf as registeredBlockIdOf, blockPosition as kernelBlockPosition, ChunkAxis, chunkCoord as kernelChunkCoord, DimensionIdSchema, type BlockType, type BlockPosition } from '@nerima-games/mc-kernel'
+import { Context, Effect, Exit, Layer, Option, Result, Schema, Scope } from 'effect'
 import {
   CONTAINER_STORAGE_SNAPSHOT_VERSION,
   containerIdAt,
-  itemStack,
+  containerCapacity,
+  itemStack as makeItemStack,
   type ItemStack,
 } from '@nerima-games/mc-sim'
 import {
   CHUNK_SIZE_XZ,
   CHUNK_VOLUME,
-  FALLBACK_BIOME,
   type ChunkSource,
   type Dimension,
 } from '@nerima-games/mc-worldgen'
@@ -39,13 +39,18 @@ import {
   type RedstoneContainerRuntimeContext,
   type RedstoneDimensionChunkContext,
 } from '../apps/web/redstone-container-runtime'
-import { type DroppedItemMetadata } from '../apps/web/dropped-item-metadata'
-import { type PersistedLeverState } from '../apps/web/session-persistence'
+import type { DroppedItemMetadata } from '../apps/web/dropped-item-metadata'
+import type { PersistedLeverState } from '../apps/web/session-persistence'
+
+// Fixtures use registered built-ins and valid stack/coordinate inputs.
+const blockIdOf = (type: BlockType): BlockId => Option.getOrThrow(registeredBlockIdOf(type))
+const blockPosition = (x: number, y: number, z: number): BlockPosition => kernelBlockPosition(BlockAxis(x), BlockAxis(y), BlockAxis(z))
+const itemStack = (...args: Parameters<typeof makeItemStack>): ItemStack => Result.getOrThrow(makeItemStack(...args))
 
 const allAirChunkSource: ChunkSource = (coord) => Effect.succeed({
   coord,
-  blocks: new Uint8Array(CHUNK_VOLUME).fill(blockIdOf('air')),
-  biomes: Array.from({ length: CHUNK_SIZE_XZ * CHUNK_SIZE_XZ }, () => FALLBACK_BIOME),
+  blocks: new Uint16Array(CHUNK_VOLUME).fill(blockIdOf('air')),
+  biomes: Array.from({ length: CHUNK_SIZE_XZ * CHUNK_SIZE_XZ }, () => 'plains'),
 })
 
 const makeRuntimeHarness = async () => {
@@ -53,7 +58,7 @@ const makeRuntimeHarness = async () => {
     chunkSource: allAirChunkSource,
     dimension: 'overworld',
   }))
-  const chunk = chunkCoord(0, 0)
+  const chunk = kernelChunkCoord(ChunkAxis(0), ChunkAxis(0))
   await Effect.runPromise(world.worldgenChunkStore.load(chunk))
 
   const scope = Effect.runSync(Scope.make())
@@ -64,7 +69,7 @@ const makeRuntimeHarness = async () => {
       scope,
     ),
   )
-  const dimension: Dimension = 'overworld'
+  const dimension = Schema.decodeUnknownSync(DimensionIdSchema)('overworld')
   const dimensionContext: RedstoneDimensionChunkContext = {
     dimension,
     chunkStore: world.chunkStore,
@@ -131,6 +136,8 @@ describe('redstone container runtime', () => {
     expect(containerKindForStorageBlock('dispenser')).toBe('dispenser')
     expect(containerKindForStorageBlock('dropper')).toBe('dropper')
     expect(containerKindForStorageBlock('hopper')).toBe('hopper')
+    expect(containerKindForStorageBlock('furnace')).toBeUndefined()
+    expect(containerKindForStorageBlock('brewing_stand')).toBeUndefined()
     expect(containerKindForStorageBlock('stone')).toBeUndefined()
   })
 
@@ -274,6 +281,96 @@ describe('redstone container runtime', () => {
     expect(events).toEqual([])
   })
 
+  for (const sourceState of ['missing', 'empty', 'one', 'two'] as const) {
+    for (const destinationState of ['missing', 'full', 'empty'] as const) {
+      it.each([false, true])(`transfer ${sourceState} to ${destinationState}, accepted=%s`, (accepted) => {
+        const source = sourceState === 'missing' ? null : {
+          slots: [sourceState === 'empty' ? null : itemStack('dirt', sourceState === 'one' ? 1 : 2)],
+        }
+        const destination = destinationState === 'missing' ? null : {
+          slots: [destinationState === 'full' ? itemStack('stone', 64) : null],
+        }
+        const events: Array<string> = []
+        const canMove = (sourceState === 'one' || sourceState === 'two') && destinationState === 'empty'
+        const moved = transferOneContainerItem('source', 'destination', {
+          snapshot: (id) => id === 'source' ? source : destination,
+          move: () => {
+            events.push('move')
+            if (!accepted) return { _tag: 'Rejected' }
+            if (source !== null && destination !== null) {
+              source.slots[0] = sourceState === 'one' ? null : itemStack('dirt', 1)
+              destination.slots[0] = itemStack('dirt', 1)
+            }
+            return { _tag: 'Moved' }
+          },
+          metadataKey: (id, slot) => `${id}:${String(slot)}`,
+          copyMetadata: (from, to) => events.push(`copy:${from}:${to}`),
+          deleteMetadata: (key) => events.push(`delete:${key}`),
+          markSessionDirty: () => events.push('dirty'),
+        })
+        expect(moved).toBe(canMove && accepted)
+        expect(events).toEqual(!canMove ? [] : !accepted ? ['move'] : [
+          'move', 'copy:source:0:destination:0',
+          ...(sourceState === 'one' ? ['delete:source:0'] : []), 'dirty',
+        ])
+        if (canMove && accepted) expect(destination?.slots[0]).toEqual(itemStack('dirt', 1))
+      })
+    }
+  }
+
+  const hopperCases: ReadonlyArray<{
+    readonly name: string
+    readonly multiplayer: boolean
+    readonly containers: ReadonlyArray<readonly [number, string]>
+    readonly moves: ReadonlyArray<readonly [string, boolean]>
+    readonly expected: ReadonlyArray<string>
+  }> = [
+    { name: 'multiplayer', multiplayer: true, containers: [[64, 'hopper']], moves: [], expected: [] },
+    { name: 'hopper missing', multiplayer: false, containers: [], moves: [], expected: ['resolve:64'] },
+    {
+      name: 'output below succeeds', multiplayer: false,
+      containers: [[64, 'hopper'], [63, 'below'], [65, 'above']], moves: [['hopper:below', true]],
+      expected: ['resolve:64', 'resolve:63', 'move:hopper:below'],
+    },
+    {
+      name: 'output fails and input above succeeds', multiplayer: false,
+      containers: [[64, 'hopper'], [63, 'below'], [65, 'above']], moves: [['hopper:below', false], ['above:hopper', true]],
+      expected: ['resolve:64', 'resolve:63', 'move:hopper:below', 'resolve:65', 'move:above:hopper'],
+    },
+    {
+      name: 'both transfers fail', multiplayer: false,
+      containers: [[64, 'hopper'], [63, 'below'], [65, 'above']], moves: [['hopper:below', false], ['above:hopper', false]],
+      expected: ['resolve:64', 'resolve:63', 'move:hopper:below', 'resolve:65', 'move:above:hopper'],
+    },
+    {
+      name: 'no output and input above succeeds', multiplayer: false,
+      containers: [[64, 'hopper'], [65, 'above']], moves: [['above:hopper', true]],
+      expected: ['resolve:64', 'resolve:63', 'resolve:65', 'move:above:hopper'],
+    },
+    {
+      name: 'no adjacent containers', multiplayer: false,
+      containers: [[64, 'hopper']], moves: [], expected: ['resolve:64', 'resolve:63', 'resolve:65'],
+    },
+  ]
+  it.each(hopperCases)('hopper routing: $name', ({ multiplayer, containers, moves, expected }) => {
+    const containerAtY = new Map(containers)
+    const moveResults = new Map(moves)
+    const events: Array<string> = []
+    transferHopperItem('overworld', { x: 1, y: 64, z: 2 }, {
+      isMultiplayer: () => multiplayer,
+      resolveContainerId: (_dimension, position) => {
+        events.push(`resolve:${String(position.y)}`)
+        return containerAtY.get(position.y)
+      },
+      moveOneContainerItem: (from, to) => {
+        const transfer = `${from}:${to}`
+        events.push(`move:${transfer}`)
+        return moveResults.get(transfer) ?? false
+      },
+    })
+    expect(events).toEqual(expected)
+  })
+
   it('installs the redstone components found in resident chunks', async () => {
     const harness = await makeRuntimeHarness()
     try {
@@ -318,12 +415,123 @@ describe('redstone container runtime', () => {
     }
   })
 
-  it.each(['dispenser', 'dropper'] as const)('%s consumes one item and spawns its dropped state', async (kind) => {
+  it.each((['compare', 'subtract'] as const).flatMap((mode) =>
+    (['missing', 'empty', 'occupied'] as const).map((state) => ({ mode, state })),
+  ))('comparator $mode reads $state storage without changing inventory', async ({ mode, state }) => {
+    const harness = await makeRuntimeHarness()
+    try {
+      const comparator = blockPosition(8, 64, 8)
+      await Effect.runPromise(harness.world.worldgenChunkStore.setBlock(comparator, blockIdOf('comparator')))
+      const id = containerIdAt(harness.dimension, { x: 8, y: 64, z: 9 })
+      if (state !== 'missing') await Effect.runPromise(harness.world.inventory.restoreContainerStorage({
+        version: CONTAINER_STORAGE_SNAPSHOT_VERSION,
+        containers: [{ id, kind: 'hopper', slots: [state === 'empty' ? null : { ...itemStack('dirt', 32), durability: null }, null, null, null, null] }],
+      }))
+      harness.runtimeContext.comparatorModes.set(harness.runtimeContext.leverKeyOf({ dimension: harness.dimension, position: comparator }), mode)
+      const snapshots: Array<RedstoneWorldSnapshot> = []
+      const realRuntime = harness.runtimeContext.redstoneRuntime
+      const runtime = makeRedstoneContainerRuntime({
+        ...harness.runtimeContext,
+        redstoneRuntime: { ...realRuntime, syncSnapshot: (snapshot) => { snapshots.push(snapshot); return realRuntime.syncSnapshot(snapshot) } },
+      })
+      const before = await Effect.runPromise(harness.world.inventory.containerStorageSnapshot)
+      runtime.syncRedstoneSnapshot(harness.dimensionContext)
+      const component = snapshots[0]?.components.find((entry) => entry.kind === 'comparator')
+      expect(component?.mode).toBe(mode)
+      expect(component?.containerSlots).toEqual(state === 'missing' ? undefined : [
+        { count: state === 'empty' ? 0 : 32, maxStack: 64 },
+        ...Array.from({ length: 4 }, () => ({ count: 0, maxStack: 64 })),
+      ])
+      expect(await Effect.runPromise(harness.world.inventory.containerStorageSnapshot)).toEqual(before)
+      expect(harness.sessionDirtyCalls()).toBe(0)
+    } finally {
+      await harness.close()
+    }
+  })
+
+  it('wires hopper transfers to world inventory and metadata operations', async () => {
+    const harness = await makeRuntimeHarness()
+    try {
+      const source = 'hopper'
+      const destination = 'chest'
+      await Effect.runPromise(harness.world.chunkStore.setBlock(blockPosition(8, 64, 8), blockIdOf(source)))
+      await Effect.runPromise(harness.world.chunkStore.setBlock(blockPosition(8, 63, 8), blockIdOf(destination)))
+      const sourceId = containerIdAt(harness.dimension, { x: 8, y: 64, z: 8 })
+      const destinationId = containerIdAt(harness.dimension, { x: 8, y: 63, z: 8 })
+      await Effect.runPromise(harness.world.inventory.restoreContainerStorage({
+        version: CONTAINER_STORAGE_SNAPSHOT_VERSION,
+        containers: [
+          { id: sourceId, kind: source, slots: [{ ...itemStack('dirt', 2), durability: null }, ...Array.from({ length: containerCapacity(source) - 1 }, () => null)] },
+          { id: destinationId, kind: destination, slots: Array.from({ length: containerCapacity(destination) }, () => null) },
+        ],
+      }))
+      const events: Array<string> = []
+      const runtime = makeRedstoneContainerRuntime({
+        ...harness.runtimeContext,
+        copyItemMetadata: () => events.push('copy'),
+        deleteItemMetadata: () => events.push('delete'),
+        markSessionDirty: () => events.push('dirty'),
+      })
+      runtime.applyHopperTransfer(harness.dimension, { x: 8, y: 64, z: 8 })
+      const sourceSnapshot = await Effect.runPromise(harness.world.inventory.containerSnapshot(sourceId))
+      const destinationSnapshot = await Effect.runPromise(harness.world.inventory.containerSnapshot(destinationId))
+      expect(sourceSnapshot?.kind).toBe(source)
+      expect(destinationSnapshot?.kind).toBe(destination)
+      expect(sourceSnapshot?.slots[0]).toEqual({ ...itemStack('dirt', 1), durability: null })
+      expect(destinationSnapshot?.slots[0]).toEqual({ ...itemStack('dirt', 1), durability: null })
+      expect(events).toEqual(['copy', 'dirty'])
+    } finally {
+      await harness.close()
+    }
+  })
+
+  it.each((['dispenser', 'dropper'] as const).flatMap((kind) =>
+    (['multiplayer', 'missing-dimension', 'unreadable', 'wrong-block', 'empty', 'wrong-container'] as const).map((state) => ({ kind, state })),
+  ))('$kind $state leaves stored items and entities unchanged', async ({ kind, state }) => {
+    const harness = await makeRuntimeHarness()
+    try {
+      const position = { x: 8, y: state === 'unreadable' ? 300 : 64, z: 8 }
+      const id = containerIdAt(harness.dimension, position)
+      if (state !== 'unreadable') await Effect.runPromise(harness.world.chunkStore.setBlock(
+        blockPosition(position.x, position.y, position.z), blockIdOf(state === 'wrong-block' ? 'stone' : kind),
+      ))
+      const containerKind = state === 'wrong-container' ? 'chest' : kind
+      await Effect.runPromise(harness.world.inventory.restoreContainerStorage({
+        version: CONTAINER_STORAGE_SNAPSHOT_VERSION,
+        containers: [{ id, kind: containerKind, slots: [state === 'empty' ? null : { ...itemStack('dirt', 2), durability: null }, ...Array.from({ length: containerCapacity(containerKind) - 1 }, () => null)] }],
+      }))
+      const before = await Effect.runPromise(harness.world.inventory.containerStorageSnapshot)
+      const runtime = makeRedstoneContainerRuntime({
+        ...harness.runtimeContext,
+        isMultiplayer: () => state === 'multiplayer',
+        dimensionContexts: state === 'missing-dimension' ? new Map() : harness.runtimeContext.dimensionContexts,
+      })
+      if (kind === 'dispenser') runtime.applyDispenserTrigger(harness.dimension, position)
+      else runtime.applyDropperTrigger(harness.dimension, position)
+      expect(await Effect.runPromise(harness.world.inventory.containerStorageSnapshot)).toEqual(before)
+      expect((await Effect.runPromise(harness.world.entities.snapshot)).entities).toEqual([])
+      expect(harness.runtimeContext.droppedItemMetadata.size).toBe(0)
+      expect(harness.sessionDirtyCalls()).toBe(0)
+    } finally {
+      await harness.close()
+    }
+  })
+
+  const dropCases = (['dispenser', 'dropper'] as const).flatMap((kind) =>
+    [1, 2].flatMap((count) => [false, true].flatMap((named) => [false, true].map((enchanted) => ({ kind, count, named, enchanted })))),
+  )
+  it.each(dropCases)('$kind count=$count named=$named enchanted=$enchanted preserves dropped state', async ({ kind, count, named, enchanted }) => {
     const harness = await makeRuntimeHarness()
     try {
       const position = { x: 8, y: 64, z: 8 }
       const containerId = containerIdAt(harness.dimension, position)
       const customName = `Named ${kind} item`
+      const enchantedItem: EnchantedItem = { item: 'dirt', durability: null, enchantments: [] }
+      const deleted: Array<string> = []
+      const runtime = makeRedstoneContainerRuntime({
+        ...harness.runtimeContext,
+        deleteItemMetadata: (key) => deleted.push(key),
+      })
       await Effect.runPromise(harness.world.chunkStore.setBlock(
         blockPosition(position.x, position.y, position.z),
         blockIdOf(kind),
@@ -334,25 +542,24 @@ describe('redstone container runtime', () => {
           id: containerId,
           kind,
           slots: [
-            { ...itemStack('dirt', 2), durability: null },
+            { ...itemStack('dirt', count), durability: null },
             ...Array.from({ length: 8 }, () => null),
           ],
         }],
       }))
-      harness.runtimeContext.customNames.set(
-        harness.runtimeContext.containerMetadataKey(containerId, 0),
-        customName,
-      )
+      const metadataKey = harness.runtimeContext.containerMetadataKey(containerId, 0)
+      if (named) harness.runtimeContext.customNames.set(metadataKey, customName)
+      if (enchanted) harness.runtimeContext.enchantedItems.set(metadataKey, enchantedItem)
 
       if (kind === 'dispenser') {
-        harness.runtime.applyDispenserTrigger(harness.dimension, position)
+        runtime.applyDispenserTrigger(harness.dimension, position)
       } else {
-        harness.runtime.applyDropperTrigger(harness.dimension, position)
+        runtime.applyDropperTrigger(harness.dimension, position)
       }
 
       const container = await Effect.runPromise(harness.world.inventory.containerSnapshot(containerId))
       expect(container?.kind).toBe(kind)
-      expect(container?.slots[0]).toMatchObject({ item: 'dirt', count: 1 })
+      expect(container?.slots[0]).toEqual(count === 1 ? null : { ...itemStack('dirt', 1), durability: null })
       expect(container?.slots.slice(1)).toEqual(Array.from({ length: 8 }, () => null))
 
       const roster = await Effect.runPromise(harness.world.entities.snapshot)
@@ -364,12 +571,16 @@ describe('redstone container runtime', () => {
           _tag: 'DroppedItem',
           item: 'dirt',
           count: 1,
-          eligibleFromFrame: 1,
+          ...(named || enchanted ? { eligibleFromFrame: 1 } : {}),
         },
       })
       expect(harness.runtimeContext.droppedItemMetadata.get(
         harness.runtimeContext.droppedItemMetadataKey(harness.dimension, String(dropped?.id)),
-      )).toEqual({ customName })
+      )).toEqual({ ...(named ? { customName } : {}), ...(enchanted ? { enchantedItem } : {}) })
+      if (!named && !enchanted && dropped?.behaviour?._tag === 'DroppedItem') {
+        expect(dropped.behaviour.eligibleFromFrame).toBeUndefined()
+      }
+      expect(deleted).toEqual(count === 1 ? [metadataKey] : [])
       expect(harness.sessionDirtyCalls()).toBe(1)
     } finally {
       await harness.close()
@@ -379,7 +590,7 @@ describe('redstone container runtime', () => {
   it('extends a piston and commits the moved block and piston head to the world store', async () => {
     const harness = await makeRuntimeHarness()
     try {
-      const piston = { x: 8, y: 64, z: 8 }
+      const piston = blockPosition(8, 64, 8)
       const source = { x: 8, y: 64, z: 7 }
       const destination = { x: 8, y: 64, z: 6 }
       await Effect.runPromise(harness.world.chunkStore.setBlock(
@@ -419,7 +630,7 @@ describe('redstone container runtime', () => {
   it('leaves an immovable block and retracted piston unchanged when extension is blocked', async () => {
     const harness = await makeRuntimeHarness()
     try {
-      const piston = { x: 8, y: 64, z: 8 }
+      const piston = blockPosition(8, 64, 8)
       const source = { x: 8, y: 64, z: 7 }
       const head = { x: 8, y: 64, z: 7 }
       await Effect.runPromise(harness.world.chunkStore.setBlock(
@@ -462,7 +673,7 @@ describe('redstone container runtime', () => {
   it('does not commit a piston plan when its source changes before commit', async () => {
     const harness = await makeRuntimeHarness()
     try {
-      const piston = { x: 8, y: 64, z: 8 }
+      const piston = blockPosition(8, 64, 8)
       const source = { x: 8, y: 64, z: 7 }
       const destination = { x: 8, y: 64, z: 6 }
       await Effect.runPromise(harness.world.chunkStore.setBlock(
@@ -531,7 +742,7 @@ describe('redstone container runtime', () => {
   it('pulls the sticky piston block back when the piston retracts', async () => {
     const harness = await makeRuntimeHarness()
     try {
-      const piston = { x: 8, y: 64, z: 8 }
+      const piston = blockPosition(8, 64, 8)
       const head = { x: 8, y: 64, z: 7 }
       const pulledBlock = { x: 8, y: 64, z: 6 }
       await Effect.runPromise(harness.world.chunkStore.setBlock(

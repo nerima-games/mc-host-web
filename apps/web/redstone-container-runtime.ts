@@ -1,11 +1,18 @@
 import {
   BlockId,
-  blockIdOf,
+  blockIdOf as registeredBlockIdOf,
+  chunkCoord,
+  ChunkAxis,
+  DimensionIdSchema,
+  NonNegativeTickCount,
+  position as worldPosition,
+  PositionAxis,
   blockTypeOfId,
   capabilityOfBlockId,
   type BlockPosition,
+  type BlockType,
 } from '@nerima-games/mc-kernel'
-import { Effect } from 'effect'
+import { Effect, Option, Result, Schema } from 'effect'
 import { chunkKeyOf } from '@nerima-games/mc-render'
 import {
   containerIdAt,
@@ -16,6 +23,9 @@ import {
 import { type Dimension } from '@nerima-games/mc-worldgen'
 import {
   applyPistonPlan,
+  ContainerItemCountSchema,
+  MaxStackSizeSchema,
+  PistonBlockOffsetSchema,
   pistonPositionAt,
   planPistonTransition,
   type PistonMovementPlan,
@@ -30,11 +40,12 @@ import {
   type MobBehaviour,
 } from '@nerima-games/mx-gameplay'
 import { type ChestStorageSlotCount } from '@nerima-games/mx-ui'
-import {
-  snapshotResidentChunks,
-  type PersistedLeverState,
-} from './session-persistence'
-import { type DroppedItemMetadata } from './dropped-item-metadata'
+import { snapshotResidentChunks, type PersistedLeverState } from './session-persistence'
+import type { DroppedItemMetadata } from './dropped-item-metadata'
+
+// These built-in blocks must exist in the kernel registry used by this host.
+const blockIdOf = (type: BlockType): BlockId => Option.getOrThrow(registeredBlockIdOf(type))
+const pistonHeadOffset = Schema.decodeUnknownSync(PistonBlockOffsetSchema)(1)
 
 export type RedstoneBlockPosition = {
   readonly x: number
@@ -96,7 +107,7 @@ export type RedstoneContainerRuntime = {
 }
 
 export const containerKindForStorageBlock = (
-  type: ReturnType<typeof blockTypeOfId>,
+  type: BlockType | undefined,
 ): ContainerKind | undefined => {
   switch (type) {
     case 'chest':
@@ -277,14 +288,14 @@ export const makeRedstoneContainerRuntime = (
                         ? 'door'
                   : undefined
             if (kind === undefined) continue
-            const position = { x: chunk.coord.cx * 16 + lx, y, z: chunk.coord.cz * 16 + lz }
+            const position = asBlockPosition({ x: chunk.coord.cx * 16 + lx, y, z: chunk.coord.cz * 16 + lz })
             if (kind === 'lever') {
               const key = leverKeyOf({ dimension: context.dimension, position })
               observedLevers.add(key)
               components.push({ position, kind, active: leverStates.get(key)?.active ?? false })
             } else if (kind === 'piston') {
               const head = Effect.runSync(context.chunkStore.getBlock(
-                asBlockPosition(pistonPositionAt(position, 'north', 1)),
+                pistonPositionAt(position, 'north', pistonHeadOffset),
               ))
               components.push({
                 position,
@@ -297,9 +308,9 @@ export const makeRedstoneContainerRuntime = (
               components.push({
                 position,
                 kind,
-                inputFrom: { x: position.x, y, z: position.z + 1 },
-                outputTo: { x: position.x, y, z: position.z - 1 },
-                delayTicks: 1,
+                inputFrom: asBlockPosition({ x: position.x, y, z: position.z + 1 }),
+                outputTo: asBlockPosition({ x: position.x, y, z: position.z - 1 }),
+                delayTicks: NonNegativeTickCount(1),
               })
             } else if (kind === 'comparator') {
               const container = Effect.runSync(world.inventory.containerSnapshotAt(
@@ -309,17 +320,17 @@ export const makeRedstoneContainerRuntime = (
               components.push({
                 position,
                 kind,
-                inputFrom: { x: position.x, y, z: position.z + 1 },
-                outputTo: { x: position.x, y, z: position.z - 1 },
+                inputFrom: asBlockPosition({ x: position.x, y, z: position.z + 1 }),
+                outputTo: asBlockPosition({ x: position.x, y, z: position.z - 1 }),
                 sideInputs: [
-                  { x: position.x - 1, y, z: position.z },
-                  { x: position.x + 1, y, z: position.z },
+                  asBlockPosition({ x: position.x - 1, y, z: position.z }),
+                  asBlockPosition({ x: position.x + 1, y, z: position.z }),
                 ],
                 mode: comparatorModes.get(leverKeyOf({ dimension: context.dimension, position })) ?? 'compare',
                 ...(container === null ? {} : {
                   containerSlots: container.slots.map((slot) => slot === null
-                    ? { count: 0, maxStack: 64 }
-                    : { count: slot.count, maxStack: maxStackCountForItem(slot.item) }),
+                    ? { count: Schema.decodeUnknownSync(ContainerItemCountSchema)(0), maxStack: Schema.decodeUnknownSync(MaxStackSizeSchema)(64) }
+                    : { count: Schema.decodeUnknownSync(ContainerItemCountSchema)(slot.count), maxStack: Schema.decodeUnknownSync(MaxStackSizeSchema)(maxStackCountForItem(slot.item)) }),
                 }),
               })
             } else if (kind === 'observer') {
@@ -339,8 +350,8 @@ export const makeRedstoneContainerRuntime = (
                 position,
                 kind,
                 active: (observerPulses.get(key) ?? 0) > getSimulationElapsedSecs(),
-                outputTo: { x: position.x, y, z: position.z - 1 },
-                pulseTicks: 2,
+                outputTo: asBlockPosition({ x: position.x, y, z: position.z - 1 }),
+                pulseTicks: NonNegativeTickCount(2),
               })
             } else if (kind === 'pressure-plate') {
               const key = leverKeyOf({ dimension: context.dimension, position })
@@ -367,10 +378,7 @@ export const makeRedstoneContainerRuntime = (
 
     for (const [key, lever] of leverStates) {
       if (lever.dimension !== context.dimension) continue
-      const residentKey = chunkKeyOf({
-        cx: Math.floor(lever.position.x / 16),
-        cz: Math.floor(lever.position.z / 16),
-      })
+      const residentKey = chunkKeyOf(chunkCoord(ChunkAxis(Math.floor(lever.position.x / 16)), ChunkAxis(Math.floor(lever.position.z / 16))))
       if (context.streamLoaded.has(residentKey) && !observedLevers.has(key)) {
         leverStates.delete(key)
         markSessionDirty()
@@ -378,10 +386,7 @@ export const makeRedstoneContainerRuntime = (
     }
     for (const [key, plate] of pressurePlateOccupancy) {
       if (plate.dimension !== context.dimension) continue
-      const residentKey = chunkKeyOf({
-        cx: Math.floor(plate.position.x / 16),
-        cz: Math.floor(plate.position.z / 16),
-      })
+      const residentKey = chunkKeyOf(chunkCoord(ChunkAxis(Math.floor(plate.position.x / 16)), ChunkAxis(Math.floor(plate.position.z / 16))))
       // Unlike leverStates this cache is not persisted — it is a derived read of
       // "who is standing where" recomputed every time the plate is rescanned —
       // so dropping a stale entry is not a session-dirtying change.
@@ -389,7 +394,7 @@ export const makeRedstoneContainerRuntime = (
         pressurePlateOccupancy.delete(key)
       }
     }
-    Effect.runSync(redstoneRuntime.syncSnapshot({ dimension: context.dimension, components }))
+    Effect.runSync(redstoneRuntime.syncSnapshot({ dimension: Schema.decodeUnknownSync(DimensionIdSchema)(context.dimension), components }))
     setRedstoneDirty(false)
   }
 
@@ -403,7 +408,8 @@ export const makeRedstoneContainerRuntime = (
     const reading = Effect.runSync(context.chunkStore.getBlock(asBlockPosition(position)))
     if (reading._tag !== 'Block') return undefined
 
-    const kind = containerKindForStorageBlock(blockTypeOfId(reading.block))
+    // Chunk storage only contains registered block IDs; preserve registry failures.
+    const kind = containerKindForStorageBlock(Result.getOrThrow(blockTypeOfId(reading.block)))
     if (kind === undefined) {
       return undefined
     }
@@ -445,7 +451,7 @@ export const makeRedstoneContainerRuntime = (
     const context = dimensionContexts.get(dimension)
     if (context === undefined) return
     const reading = Effect.runSync(context.chunkStore.getBlock(asBlockPosition(position)))
-    if (reading._tag !== 'Block' || blockTypeOfId(reading.block) !== kind) return
+    if (reading._tag !== 'Block' || Result.getOrThrow(blockTypeOfId(reading.block)) !== kind) return
 
     const containerId = containerIdForStorageBlock(dimension, position)
     if (containerId === undefined) return
@@ -473,11 +479,7 @@ export const makeRedstoneContainerRuntime = (
       spawnDroppedItems(world.entities, [
         {
           ...extracted.stack,
-          at: {
-            x: position.x + 0.5,
-            y: position.y + 0.5,
-            z: position.z - 0.25,
-          },
+          at: worldPosition(PositionAxis(position.x + 0.5), PositionAxis(position.y + 0.5), PositionAxis(position.z - 0.25)),
           ...(metadata.customName === undefined &&
           metadata.enchantedItem === undefined
             ? {}
@@ -512,7 +514,7 @@ export const makeRedstoneContainerRuntime = (
   ): void => applyItemDropperTrigger(dimension, position, 'dropper')
 
   const applyPoweredPistonTransition = (transition: PoweredPistonTransition): void => {
-    const context = dimensionContexts.get(transition.dimension as Dimension)
+    const context = dimensionContexts.get(transition.dimension)
     if (context === undefined) return
     const outcome = planPistonTransition(
       transition,
@@ -530,24 +532,28 @@ export const makeRedstoneContainerRuntime = (
         pistonImmovable: (block) => capabilityOfBlockId(BlockId(Number(block)), 'pistonImmovable'),
       },
     )
-    if (outcome.kind !== 'move') return
+    if (outcome.kind === 'noop' || outcome.kind === 'refused') return
 
-    Effect.runSync(applyPistonPlan(outcome.plan, {
-      commit: (plan: PistonMovementPlan) => Effect.gen(function* () {
-        for (const move of plan.moves) {
-          const source = yield* context.chunkStore.getBlock(asBlockPosition(move.from))
-          if (source._tag !== 'Block' || source.block !== BlockId(Number(move.block))) {
-            return yield* Effect.dieMessage('piston source changed before commit')
+    Effect.runSync(Effect.gen(function* () {
+      // BlockId validates each lookup input; only a broken built-in registry can fail here.
+      if (outcome.kind === 'failed') return yield* Effect.die(outcome.failure)
+      yield* applyPistonPlan(outcome.plan, {
+        commit: (plan: PistonMovementPlan) => Effect.gen(function* () {
+          for (const move of plan.moves) {
+            const source = yield* context.chunkStore.getBlock(asBlockPosition(move.from))
+            if (source._tag !== 'Block' || source.block !== BlockId(Number(move.block))) {
+              return yield* Effect.die(new Error('piston source changed before commit'))
+            }
           }
-        }
-        const head = pistonPositionAt(plan.piston, plan.facing, 1)
-        if (plan.toState === 'retracted') yield* context.chunkStore.setBlock(asBlockPosition(head), blockIdOf('air'))
-        for (const move of plan.moves) {
-          yield* context.chunkStore.setBlock(asBlockPosition(move.to), BlockId(Number(move.block)))
-          yield* context.chunkStore.setBlock(asBlockPosition(move.from), blockIdOf('air'))
-        }
-        if (plan.toState === 'extended') yield* context.chunkStore.setBlock(asBlockPosition(head), blockIdOf('piston_head'))
-      }),
+          const head = pistonPositionAt(plan.piston, plan.facing, pistonHeadOffset)
+          if (plan.toState === 'retracted') yield* context.chunkStore.setBlock(asBlockPosition(head), blockIdOf('air'))
+          for (const move of plan.moves) {
+            yield* context.chunkStore.setBlock(asBlockPosition(move.to), BlockId(Number(move.block)))
+            yield* context.chunkStore.setBlock(asBlockPosition(move.from), blockIdOf('air'))
+          }
+          if (plan.toState === 'extended') yield* context.chunkStore.setBlock(asBlockPosition(head), blockIdOf('piston_head'))
+        }),
+      })
     }))
     markSessionDirty()
     setRedstoneDirty(true)
