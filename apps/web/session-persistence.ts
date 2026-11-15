@@ -1,4 +1,4 @@
-import { Data, Effect, Option, Schema } from 'effect'
+import { Data, Effect, Option, Result, Schema, SchemaTransformation } from 'effect'
 import type { YieldableError } from 'effect/Cause'
 import { isValidWitherRuntimeSnapshot, type WitherRuntimeSnapshot } from '@nerima-games/mc-server/shared'
 
@@ -14,18 +14,18 @@ import {
   type StorageError,
 } from '@nerima-games/mc-save'
 import {
-  advanceFurnace,
   isValidTimeState,
+  isValidVitals,
   isValidWeatherState,
   durabilityForItem,
   maxStackCountForItem,
   validateContainerStorageSnapshot,
+  validateFurnaceSnapshot,
   validatePlayerStorageSnapshot,
   validateCropSnapshot,
   type ContainerStorageSnapshot,
   type CropSnapshot,
   type FurnaceState,
-  type ItemStack,
   type PlayerStorage,
   type TimeState,
   type WeatherState,
@@ -35,15 +35,14 @@ import {
 import {
   CHUNK_FORMAT,
   chunkSnapshotOf,
-  type Chunk,
   type ChunkSource,
   type ChunkStoreApi,
+  type ChunkWithBlockStates,
   type Dimension,
 } from '@nerima-games/mc-worldgen'
 import {
   emptyVillagerTradeState,
   isValidBrewingStandState,
-  isValidPlayerVitals,
   isValidStatusEffectState,
   isValidVillagerTradeState,
   decodeEnchantedItem,
@@ -61,58 +60,35 @@ import {
 export const SESSION_FORMAT_NAME = '@nerima-games/mc-compose/session'
 export const SESSION_FORMAT_VERSION = 17
 
-const filterBoth = <A, I, R>(
-  source: Schema.Schema<A, I, R>,
-  issueFor: (value: A) => string | undefined,
-): Schema.Schema<A, I, R> => {
-  // Effectful filters are decode-only, so the declaration validates before encoding too.
-  const filtered = source.pipe(
-    Schema.filterEffect((value) => Effect.succeed(issueFor(value))),
-  )
-  return Schema.declare([filtered], {
-    decode: (schema) => (input, options) =>
-      Schema.decode(schema)(input as I, options).pipe(
-        Effect.mapError((error) => error.issue),
-      ),
-    encode: (schema) => (value, options) =>
-      Schema.decode(schema)(value as unknown as I, options).pipe(
-        Effect.flatMap((decoded) => Schema.encode(schema)(decoded, options)),
-        Effect.mapError((error) => error.issue),
-      ),
-  })
-}
+// Effect 4 runs a schema's checks on encode as well as decode, so a plain
+// `check` keeps the old "validate before encoding too" guarantee.
+const invariant = <T>(issueFor: (value: T) => string | undefined) =>
+  Schema.makeFilter<T>((value) => issueFor(value))
 
-const makeBoundaryCodec = <A, I>(
-  target: Schema.Schema<A, I>,
+// Swaps happen on the whole field value before the target schema sees it, so
+// the target still validates the restored domain value in both directions.
+const makeBoundaryCodec = <Target extends Schema.Top>(
+  target: Target,
   decodeValue: (input: unknown) => unknown,
-  encodeValue: (input: I) => unknown,
-): Schema.Schema<A, unknown> => Schema.declare([target], {
-  decode: (schema) => (input, options) =>
-    Schema.decode(schema)(decodeValue(input) as I, options).pipe(
-      Effect.mapError((error) => error.issue),
-    ),
-  encode: (schema) => (value, options) =>
-    Schema.encode(schema)(value as A, options).pipe(
-      Effect.map(encodeValue),
-      Effect.mapError((error) => error.issue),
-    ),
-})
+  encodeValue: (input: unknown) => unknown,
+) =>
+  Schema.Unknown.pipe(
+    Schema.decodeTo(Schema.Unknown, SchemaTransformation.transform({ decode: decodeValue, encode: encodeValue })),
+    Schema.decodeTo(target, SchemaTransformation.passthrough({ strict: false })),
+  )
 
-const WitherRuntimeSnapshotSchema = filterBoth(
-  Schema.Unknown,
-  (value) => isValidWitherRuntimeSnapshot(value)
-    ? undefined
-    : 'Wither runtime snapshot violates persistence invariants',
-) as unknown as Schema.Schema<WitherRuntimeSnapshot>
+const WitherRuntimeSnapshotSchema = Schema.declare(isValidWitherRuntimeSnapshot, {
+  expected: 'Wither runtime snapshot that satisfies persistence invariants',
+})
 
 // mx-gameplay's `BrewingStandState.{bottle,ingredient,brewing}` are `X |
 // undefined` (never `null` — see `node_modules/@nerima-games/mx-gameplay/dist/
-// domain/brewing.d.ts`), and mc-save 0.3.0's integrity checksum rejects a bare
+// domain/brewing.d.ts`), and mc-save's integrity checksum rejects a bare
 // `undefined` anywhere in the encoded payload (`integrity-canonical.ts`'s
-// `canonicalize`; see the longer `exact: true` comment further down in this
-// file for the same gap on `Schema.optionalWith` fields). Swapping
-// `undefined` for `null` on encode and back on decode is unambiguous here
-// because these three fields never use `null` for anything else.
+// `canonicalize`; see the longer `optionalKey` comment further down in this
+// file for the same gap on optional fields). Swapping `undefined` for `null`
+// on encode and back on decode is unambiguous here because these three fields
+// never use `null` for anything else.
 const restoreBrewingUndefined = (value: unknown): unknown => {
   if (value === null || typeof value !== 'object') return value
   const record = value as Record<string, unknown>
@@ -144,29 +120,18 @@ const encodeBrewingUndefined = (value: unknown): unknown => {
 }
 
 const BrewingStandStateSchema = makeBoundaryCodec(
-  filterBoth(
-    Schema.Unknown,
-    (value) => isValidBrewingStandState(value)
-      ? undefined
-      : 'Brewing stand state violates gameplay invariants',
-  ) as unknown as Schema.Schema<BrewingStandState>,
+  Schema.declare(isValidBrewingStandState, { expected: 'Brewing stand state that satisfies gameplay invariants' }),
   restoreBrewingUndefined,
   encodeBrewingUndefined,
 )
 
-const StatusEffectStateSchema = filterBoth(
-  Schema.Unknown,
-  (value) => isValidStatusEffectState(value)
-    ? undefined
-    : 'Status effects violate gameplay invariants',
-) as unknown as Schema.Schema<StatusEffectState>
+const StatusEffectStateSchema = Schema.declare(isValidStatusEffectState, {
+  expected: 'Status effects that satisfy gameplay invariants',
+})
 
-const VillagerTradeStateSchema = filterBoth(
-  Schema.Unknown,
-  (value) => isValidVillagerTradeState(value)
-    ? undefined
-    : 'Villager trades violate gameplay invariants',
-) as unknown as Schema.Schema<VillagerTradeState>
+const VillagerTradeStateSchema = Schema.declare(isValidVillagerTradeState, {
+  expected: 'Villager trades that satisfy gameplay invariants',
+})
 
 export type SessionPosition = {
   readonly x: number
@@ -415,18 +380,17 @@ export const EMPTY_END_STATE: PersistedEndState = {
   dragonEggRewarded: false,
 }
 
-const PositionSchema: Schema.Schema<SessionPosition> = Schema.Struct({
+const PositionSchema = Schema.Struct({
   x: Schema.Number,
   y: Schema.Number,
   z: Schema.Number,
 })
 
-const BlockCoordinateSchema = filterBoth(
-  Schema.Number.pipe(Schema.finite()),
-  (value) => Number.isInteger(value) ? undefined : 'Block coordinate must be an integer',
+const BlockCoordinateSchema = Schema.Finite.check(
+  invariant<number>((value) => Number.isInteger(value) ? undefined : 'Block coordinate must be an integer'),
 )
 
-const BlockPositionSchema: Schema.Schema<SessionPosition> = Schema.Struct({
+const BlockPositionSchema = Schema.Struct({
   x: BlockCoordinateSchema,
   y: BlockCoordinateSchema,
   z: BlockCoordinateSchema,
@@ -471,13 +435,13 @@ export type SessionState = {
   readonly mountedVehicleId?: string | null | undefined
 }
 
-const FiniteNumberSchema = Schema.Number.pipe(Schema.finite())
+const FiniteNumberSchema = Schema.Finite
 
 // Same undefined-vs-null gap as `PlayerStorageSchema`/`BrewingStandStateSchema`/
 // `PersistedEntityRostersSchema` above, but on a REQUIRED field rather than an
 // absent one: `PlayerVitals.lastDamageCause: DamageCause | undefined` is
 // always present (there is no death cause yet, not an omitted property), so
-// `Schema.optionalWith(..., { exact: true })` — which is about KEY absence —
+// `Schema.optionalKey` — which is about KEY absence —
 // does not apply here. `Schema.UndefinedOr` lets a present `undefined` VALUE
 // through validation (that is the whole point of the field's type), which is
 // exactly what mc-save's integrity checksum then rejects. The struct/filter
@@ -498,8 +462,14 @@ const encodeVitalsLastDamageCause = (value: unknown): unknown => {
   return { ...record, lastDamageCause: record['lastDamageCause'] ?? null }
 }
 
+// mx-gameplay's `PlayerVitals` is mc-sim's `Vitals`, whose branded fields have
+// exactly `isValidVitals` as their runtime contract (mx-gameplay's
+// `isValidPlayerVitals` delegates to it), so the guard narrows the
+// structurally checked record to that branded type.
+const isPersistablePlayerVitals = (value: unknown): value is PlayerVitals => isValidVitals(value)
+
 const PlayerVitalsSchema = makeBoundaryCodec(
-  filterBoth(Schema.Struct({
+  Schema.Struct({
     healthPoints: FiniteNumberSchema,
     maxHealthPoints: FiniteNumberSchema,
     hungerPoints: FiniteNumberSchema,
@@ -509,28 +479,27 @@ const PlayerVitalsSchema = makeBoundaryCodec(
     foodTimerSecs: FiniteNumberSchema,
     totalExperience: FiniteNumberSchema,
     lastDamageCause: Schema.UndefinedOr(Schema.String),
-  }), (value) => isValidPlayerVitals(value)
-    ? undefined
-    : 'Player vitals violate gameplay invariants'),
+  }).pipe(Schema.refine(isPersistablePlayerVitals, { expected: 'Player vitals that satisfy gameplay invariants' })),
   restoreVitalsLastDamageCause,
   encodeVitalsLastDamageCause,
 )
 
-const TimeStateSchema: Schema.Schema<TimeState> = filterBoth(Schema.Struct({
+const TimeStateSchema = Schema.Struct({
   ticks: FiniteNumberSchema,
   dayLengthTicks: FiniteNumberSchema,
-}), (value) => isValidTimeState(value)
+}).check(invariant<TimeState>((value) => isValidTimeState(value)
   ? undefined
-  : 'Time state violates simulation invariants')
+  : 'Time state violates simulation invariants'))
 
-const WeatherStateSchema: Schema.Schema<WeatherState> = filterBoth(Schema.Struct({
-  weather: Schema.Literal('clear', 'rain', 'thunder'),
+const WeatherStateSchema = Schema.Struct({
+  weather: Schema.Literals(['clear', 'rain', 'thunder']),
   remainingSecs: FiniteNumberSchema,
-}), (value) => isValidWeatherState(value)
-  ? undefined
-  : 'Weather state violates simulation invariants')
+}).pipe(Schema.refine(
+  (value): value is WeatherState => isValidWeatherState(value),
+  { expected: 'Weather state that satisfies simulation invariants' },
+))
 
-const DimensionSchema: Schema.Schema<Dimension> = Schema.Literal('overworld', 'nether', 'end')
+const DimensionSchema = Schema.Literals(['overworld', 'nether', 'end'])
 
 const PersistedEntitySchema = Schema.Struct({
   id: Schema.String,
@@ -640,75 +609,71 @@ const encodePlayerStorageSlots = (value: unknown): unknown => {
   }
 }
 
+const isPersistablePlayerStorage = (value: unknown): value is PlayerStorage =>
+  validatePlayerStorageSnapshot(value)._tag === 'Valid'
+
 const PlayerStorageSchema = makeBoundaryCodec(
-  filterBoth(Schema.Unknown, (value) =>
-    validatePlayerStorageSnapshot(value)._tag === 'Valid'
-      ? undefined
-      : 'Player storage violates persistence invariants') as unknown as Schema.Schema<PlayerStorage>,
+  Schema.declare(isPersistablePlayerStorage, { expected: 'Player storage that satisfies persistence invariants' }),
   restorePlayerStorageSlots,
   encodePlayerStorageSlots,
 )
 
-const ContainerStorageSchema = filterBoth(Schema.Unknown, (value) =>
+const isPersistableContainerStorage = (value: unknown): value is ContainerStorageSnapshot =>
   validateContainerStorageSnapshot(value)._tag === 'Valid'
-    ? undefined
-    : 'Container storage violates persistence invariants') as unknown as Schema.Schema<ContainerStorageSnapshot>
 
-const CropSnapshotSchema = filterBoth(Schema.Unknown, (value) =>
-  validateCropSnapshot(value)._tag === 'Valid'
-    ? undefined
-    : 'Crop snapshot violates persistence invariants') as unknown as Schema.Schema<CropSnapshot>
-
-const FurnaceStackCountSchema = filterBoth(FiniteNumberSchema, (count) => {
-  if (!Number.isInteger(count)) return 'Furnace stack count must be an integer'
-  if (count <= 0) return 'Furnace stack count must be positive'
-  return undefined
+const ContainerStorageSchema = Schema.declare(isPersistableContainerStorage, {
+  expected: 'Container storage that satisfies persistence invariants',
 })
 
-const FurnaceItemStackSchema = filterBoth(Schema.Struct({
-  item: Schema.String,
-  count: FurnaceStackCountSchema,
-}), (stack) => {
-    try {
-      const candidate = stack as ItemStack
-      advanceFurnace({
-        input: candidate,
-        fuel: null,
-        output: null,
-        cookElapsedSecs: 0,
-        burnRemainingSecs: 0,
-      }, Number.MIN_VALUE)
-      return stack.count <= maxStackCountForItem(candidate.item)
-        ? undefined
-        : 'Furnace slot violates item stack invariants'
-    } catch {
-      return 'Furnace slot violates item stack invariants'
-    }
-}) as unknown as Schema.Schema<ItemStack>
+const isPersistableCropSnapshot = (value: unknown): value is CropSnapshot =>
+  validateCropSnapshot(value)._tag === 'Valid'
 
-const FurnaceElapsedSchema = filterBoth(FiniteNumberSchema, (seconds) =>
-  seconds >= 0 ? undefined : 'Furnace elapsed time must be non-negative')
+const CropSnapshotSchema = Schema.declare(isPersistableCropSnapshot, {
+  expected: 'Crop snapshot that satisfies persistence invariants',
+})
 
-const FurnaceStateSchema = filterBoth(Schema.Struct({
-  input: Schema.NullOr(FurnaceItemStackSchema),
-  fuel: Schema.NullOr(FurnaceItemStackSchema),
-  output: Schema.NullOr(FurnaceItemStackSchema),
-  cookElapsedSecs: FurnaceElapsedSchema,
-  burnRemainingSecs: FurnaceElapsedSchema,
-}), (value) => {
-    try {
-      advanceFurnace(value, Number.MIN_VALUE)
-      return undefined
-    } catch {
-      return 'Furnace state violates simulation invariants'
-    }
-}) as unknown as Schema.Schema<FurnaceState>
+const isPersistableFurnaceState = (value: unknown): value is FurnaceState =>
+  validateFurnaceSnapshot(value)._tag === 'Valid'
 
-const PersistedFurnacesSchema = filterBoth(Schema.Array(Schema.Struct({
+// mc-sim's `FurnaceState.{input,fuel,output}` are `ItemStack | undefined`
+// (mc-kernel `smelting-data.d.ts`), so they need the same `undefined`/`null`
+// swap as the player inventory slots below; `null` has no other meaning there.
+const FURNACE_SLOT_FIELDS = ['input', 'fuel', 'output'] as const
+
+const restoreFurnaceSlots = (value: unknown): unknown => {
+  const record = asRecord(value)
+  if (record === undefined) return value
+  const restored = { ...record }
+  for (const field of FURNACE_SLOT_FIELDS) {
+    if (restored[field] === null) restored[field] = undefined
+  }
+  return restored
+}
+
+const encodeFurnaceSlots = (value: unknown): unknown => {
+  const record = asRecord(value)
+  if (record === undefined) return value
+  const encoded = { ...record }
+  for (const field of FURNACE_SLOT_FIELDS) {
+    if (Object.hasOwn(encoded, field)) encoded[field] = encoded[field] ?? null
+  }
+  return encoded
+}
+
+const FurnaceStateSchema = makeBoundaryCodec(
+  Schema.declare(isPersistableFurnaceState, { expected: 'Furnace state that satisfies simulation invariants' }),
+  restoreFurnaceSlots,
+  encodeFurnaceSlots,
+)
+
+const PersistedFurnaceSchema = Schema.Struct({
   dimension: DimensionSchema,
   position: BlockPositionSchema,
   state: FurnaceStateSchema,
-})), (furnaces) => {
+})
+
+const PersistedFurnacesSchema = Schema.Array(PersistedFurnaceSchema).check(
+  invariant<ReadonlyArray<typeof PersistedFurnaceSchema.Type>>((furnaces) => {
     const keys = new Set<string>()
     for (const furnace of furnaces) {
       const key = JSON.stringify([
@@ -721,63 +686,68 @@ const PersistedFurnacesSchema = filterBoth(Schema.Array(Schema.Struct({
       keys.add(key)
     }
     return undefined
-})
+  }),
+)
 
-const PersistedPortalsSchema: Schema.Schema<ReadonlyArray<PersistedPortalState>> = Schema.Array(
+const PersistedPortalsSchema = Schema.Array(
   Schema.Struct({
     dimension: DimensionSchema,
     position: BlockPositionSchema,
   }),
 )
 
-const PersistedVillagerStateSchema: Schema.Schema<PersistedVillagerState> = Schema.Struct({
+const PersistedVillagerStateSchema = Schema.Struct({
   residents: Schema.Array(Schema.Struct({
-    id: Schema.String.pipe(Schema.minLength(1)),
-    profession: Schema.Literal('farmer', 'toolsmith'),
+    id: Schema.String.check(Schema.isMinLength(1)),
+    profession: Schema.Literals(['farmer', 'toolsmith']),
     dimension: DimensionSchema,
     feetPosition: PositionSchema,
   })),
   trades: VillagerTradeStateSchema,
 })
 
-const PersistedEndStateSchema: Schema.Schema<PersistedEndState> = Schema.Struct({
+// mx-gameplay publishes this schema as a decoder only (its encoding services
+// are unknown); its encoded and decoded forms are the same plain record, so
+// the type guard it provides is the whole persistence contract.
+const EnderDragonSnapshotSchema = Schema.declare(Schema.is(EnderDragonEncounterSnapshotSchema), {
+  expected: 'Ender dragon encounter snapshot',
+})
+
+const PersistedEndStateSchema = Schema.Struct({
   frames: Schema.Array(Schema.Struct({
     position: BlockPositionSchema,
-    facing: Schema.Literal('north', 'south', 'east', 'west'),
+    facing: Schema.Literals(['north', 'south', 'east', 'west']),
     eye: Schema.Boolean,
   })),
   portalComplete: Schema.Boolean,
-  dragon: EnderDragonEncounterSnapshotSchema,
+  dragon: EnderDragonSnapshotSchema,
   exitPortalMaterialized: Schema.Boolean,
   dragonEggRewarded: Schema.Boolean,
 })
 
-// `exact: true` on every `Schema.optionalWith` below (in place of the plain
-// `Schema.optional` this file used before): mc-save 0.3.0's integrity
+// Every optional field below uses `Schema.optionalKey`: mc-save's integrity
 // checksum canonicalizes the encoded payload and rejects a bare `undefined`
 // anywhere in it — it is not one of the supported value kinds (see
-// `integrity-canonical.ts`'s `canonicalize`, which throws for anything that
-// is not a string/boolean/finite-or-non-finite number/null/plain
-// object/array/Uint8Array). Plain `Schema.optional` encodes an ABSENT
-// property as an explicit `undefined` key; `exact: true` omits the key
-// instead, which is also what `exactOptionalPropertyTypes` already expects
-// of every `?:` field in `SessionState`.
-const PersistedVehiclesSchema = Schema.optionalWith(
-  filterBoth(Schema.Unknown, (value) => {
-    if (!Array.isArray(value)) return 'Vehicles violate simulation invariants'
-    const highestSerial = value.reduce((highest, vehicle) => {
-      if (typeof vehicle !== 'object' || vehicle === null) return highest
-      const candidate = vehicle as { readonly id?: unknown }
-      if (typeof candidate.id !== 'string') return highest
-      const match = /^v:(\d+)$/.exec(candidate.id)
-      return match === null ? highest : Math.max(highest, Number(match[1]))
-    }, -1)
-    return validateVehicleSnapshot({ vehicles: value, nextSerial: highestSerial + 1 })._tag === 'Valid'
-      ? undefined
-      : 'Vehicles violate simulation invariants'
-  }) as unknown as Schema.Schema<ReadonlyArray<Vehicle>>,
-  { exact: true },
-) as unknown as Schema.Schema<ReadonlyArray<Vehicle> | undefined>
+// `integrity-canonical.ts`'s `canonicalize`, which fails for anything that is
+// not a string/boolean/finite-or-non-finite number/null/plain object/array/
+// Uint8Array). `optionalKey` omits an absent property instead of encoding an
+// explicit `undefined` key, which is also what `exactOptionalPropertyTypes`
+// already expects of every `?:` field in `SessionState`.
+const isPersistableVehicles = (value: unknown): value is ReadonlyArray<Vehicle> => {
+  if (!Array.isArray(value)) return false
+  const highestSerial = value.reduce((highest: number, vehicle: unknown) => {
+    const candidate = asRecord(vehicle)
+    const id = candidate?.['id']
+    if (typeof id !== 'string') return highest
+    const match = /^v:(\d+)$/.exec(id)
+    return match === null ? highest : Math.max(highest, Number(match[1]))
+  }, -1)
+  return validateVehicleSnapshot({ vehicles: value, nextSerial: highestSerial + 1 })._tag === 'Valid'
+}
+
+const PersistedVehiclesSchema = Schema.declare(isPersistableVehicles, {
+  expected: 'Vehicles that satisfy simulation invariants',
+})
 
 const SessionStateSchema = Schema.Struct({
   seed: Schema.Number,
@@ -807,20 +777,20 @@ const SessionStateSchema = Schema.Struct({
   brewing: BrewingStandStateSchema,
   statusEffects: StatusEffectStateSchema,
   end: PersistedEndStateSchema,
-  workstations: Schema.optionalWith(Schema.Struct({
+  workstations: Schema.optionalKey(Schema.Struct({
     enchantmentSeed: Schema.Number,
-    customNames: Schema.Record({ key: Schema.String, value: Schema.String }),
-    enchantedItems: Schema.Record({ key: Schema.String, value: Schema.String }),
-    deathDropDimension: Schema.optionalWith(DimensionSchema, { exact: true }),
+    customNames: Schema.Record(Schema.String, Schema.String),
+    enchantedItems: Schema.Record(Schema.String, Schema.String),
+    deathDropDimension: Schema.optionalKey(DimensionSchema),
     respawn: Schema.NullOr(Schema.Struct({
       dimension: Schema.Literal('overworld'),
       position: PositionSchema,
     })),
-  }), { exact: true }),
-  wither: Schema.optionalWith(WitherRuntimeSnapshotSchema, { exact: true }),
-  vehicles: PersistedVehiclesSchema,
-  mountedVehicleId: Schema.optionalWith(Schema.NullOr(Schema.String), { exact: true }),
-}) as unknown as Schema.Schema<SessionState>
+  })),
+  wither: Schema.optionalKey(WitherRuntimeSnapshotSchema),
+  vehicles: Schema.optionalKey(PersistedVehiclesSchema),
+  mountedVehicleId: Schema.optionalKey(Schema.NullOr(Schema.String)),
+})
 
 /**
  * The on-disk shape of a `SessionState`, exactly as `SessionStateSchema`'s own
@@ -846,7 +816,7 @@ export type SessionChunkManifestEntry = {
 
 export type DimensionChunk = {
   readonly dimension: Dimension
-  readonly chunk: Chunk
+  readonly chunk: ChunkWithBlockStates
 }
 
 export type SessionMode = 'survival' | 'creative'
@@ -873,32 +843,24 @@ export type SessionHead = {
   readonly chunks: ReadonlyArray<SessionChunkManifestEntry>
 }
 
-type SessionHeadEncoded = Omit<SessionHead, 'chunks'> & {
-  readonly chunks: ReadonlyArray<{
-    readonly dimension: Dimension
-    readonly coord: { readonly cx: number; readonly cz: number }
-    readonly key: string
-  }>
-}
-
 const ChunkManifestEntrySchema = Schema.Struct({
   dimension: DimensionSchema,
   coord: Schema.Struct({
-    cx: Schema.Number.pipe(Schema.fromBrand(ChunkAxis)),
-    cz: Schema.Number.pipe(Schema.fromBrand(ChunkAxis)),
+    cx: Schema.Number.pipe(Schema.fromBrand('ChunkAxis', ChunkAxis)),
+    cz: Schema.Number.pipe(Schema.fromBrand('ChunkAxis', ChunkAxis)),
   }),
-  key: Schema.String.pipe(Schema.minLength(1)),
+  key: Schema.String.check(Schema.isMinLength(1)),
 })
 
-const SessionHeadSchema: Schema.Schema<SessionHead, SessionHeadEncoded> = Schema.Struct({
-  sessionId: Schema.String.pipe(Schema.minLength(1)),
-  revision: Schema.String.pipe(Schema.minLength(1)),
+const SessionHeadSchema = Schema.Struct({
+  sessionId: Schema.String.check(Schema.isMinLength(1)),
+  revision: Schema.String.check(Schema.isMinLength(1)),
   metadata: Schema.Struct({
-    name: filterBoth(Schema.String, (name) =>
+    name: Schema.String.check(invariant<string>((name) =>
       normalizeWorldName(name) === name
         ? undefined
-        : `World name must be normalized and at most ${String(MAX_WORLD_NAME_LENGTH)} characters`),
-    mode: Schema.Literal('survival', 'creative'),
+        : `World name must be normalized and at most ${String(MAX_WORLD_NAME_LENGTH)} characters`)),
+    mode: Schema.Literals(['survival', 'creative']),
   }),
   state: SessionStateSchema,
   chunks: Schema.Array(ChunkManifestEntrySchema),
@@ -916,11 +878,13 @@ const asRecord = (value: unknown): Record<string, unknown> | undefined =>
 // coverage below, which replaces the sixteen per-transition migration tests
 // this format used to carry (v1 through v16, one per SESSION_FORMAT_VERSION
 // bump).
-export const SESSION_FORMAT: SaveFormat<SessionHead, SessionHeadEncoded> = defineFormat({
+// `defineFormat` only rejects a malformed name or version; both are the
+// literal constants above, so a failure here is a programming error.
+export const SESSION_FORMAT: SaveFormat<SessionHead, unknown> = Result.getOrThrow(defineFormat({
   name: SESSION_FORMAT_NAME,
   version: SESSION_FORMAT_VERSION,
   schema: SessionHeadSchema,
-})
+}))
 
 type SessionManifestErrorFields = {
   readonly reason: 'duplicate-coordinate' | 'missing-chunk'
@@ -1175,9 +1139,9 @@ export const makeSessionChunkSource = (
 
 export const snapshotResidentChunks = (
   store: Pick<ChunkStoreApi, 'loadedCoords' | 'snapshot'>,
-): Effect.Effect<ReadonlyArray<Chunk>> =>
+): Effect.Effect<ReadonlyArray<ChunkWithBlockStates>> =>
   Effect.gen(function* () {
     const coords = yield* store.loadedCoords
     const snapshots = yield* Effect.forEach(coords, store.snapshot)
-    return snapshots.filter((chunk): chunk is Chunk => chunk !== undefined)
+    return snapshots.filter((chunk): chunk is ChunkWithBlockStates => chunk !== undefined)
   })
