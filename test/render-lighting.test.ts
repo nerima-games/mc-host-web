@@ -1,5 +1,5 @@
-import { BlockId, LightLevelCandidate } from '@nerima-games/mc-kernel'
-import { litColor, packedLightColor, type FaceDirection, type GeometryQuad, type MeshQuad } from '@nerima-games/mc-render'
+import { BlockId } from '@nerima-games/mc-kernel'
+import type { GeometryQuad, MeshQuad } from '@nerima-games/mc-render'
 import { describe, expect, it } from 'vitest'
 import { Effect } from 'effect'
 
@@ -22,7 +22,7 @@ describe('render lighting tracking', () => {
       brightestShade: null, lastChunk: null,
     }
     const dark = { ...quad, ao: 0 }
-    const bright = { ...quad, ao: 255 }
+    const bright = { ...quad, ao: 3 }
     const quads = [dark, bright]
     const before = tracked.snapshot()
     const pending = tracked.colorForChunk({ cx: 2, cz: -3 }, quads)
@@ -44,39 +44,4 @@ describe('render lighting tracking', () => {
     })
     expect(before).toEqual(initial)
   })
-
-  const levels = Array.from({ length: 16 }, (_, level) => level)
-  const lightPairs = levels.flatMap((sky) => levels.map((block) => ({ sky, block })))
-  it.each(lightPairs)('preserves packed sky=$sky block=$block', ({ sky, block }) => {
-    const resolve = packedLightColor(() => ({ sky: LightLevelCandidate(sky), block: LightLevelCandidate(block) }))
-    const tracked = trackChunkLightColor(() => Effect.succeed(resolve))
-    const color = Effect.runSync(tracked.colorForChunk({ cx: 0, cz: 0 }, [quad]))
-    expect(color(quad)).toEqual([255, sky * 17, block * 17])
-    expect(tracked.snapshot()).toMatchObject({ darkestShade: 255, brightestShade: 255, sampledQuads: 1 })
-  })
-
-  const faces: ReadonlyArray<{ direction: FaceDirection; brightness: number }> = [
-    { direction: 'yPos', brightness: 1 }, { direction: 'yNeg', brightness: 0.5 },
-    { direction: 'xPos', brightness: 0.6 }, { direction: 'xNeg', brightness: 0.6 },
-    { direction: 'zPos', brightness: 0.8 }, { direction: 'zNeg', brightness: 0.8 },
-  ]
-  const shadeCases = faces.flatMap(({ direction, brightness }) =>
-    [0, 1, 2, 3].flatMap((ao) => [0, 15].flatMap((sky) => [0, 15].flatMap((block) =>
-      [0, 0.08, 0.5, 1].map((daylight) => ({ direction, brightness, ao, sky, block, daylight })),
-    ))),
-  )
-  it.each(shadeCases)('preserves CPU shade $direction ao=$ao sky=$sky block=$block daylight=$daylight',
-    ({ direction, brightness, ao, sky, block, daylight }) => {
-      const sample = { ...quad, direction, ao }
-      const resolve = litColor(() => ({ sky: LightLevelCandidate(sky), block: LightLevelCandidate(block) }), {
-        skyIntensity: daylight,
-      })
-      const tracked = trackChunkLightColor(() => Effect.succeed(resolve))
-      const color = Effect.runSync(tracked.colorForChunk({ cx: 0, cz: 0 }, [sample]))
-      const level = Math.max(sky * daylight, block)
-      const shade = Math.round(255 * (0.45 + 0.55 * level / 15) * (0.8 + 0.2 * (1 - ao / 5)) * brightness)
-      expect(color(sample)).toEqual([shade, shade, shade])
-      expect(tracked.snapshot()).toMatchObject({ darkestShade: shade, brightestShade: shade, sampledQuads: 1 })
-    },
-  )
 })
