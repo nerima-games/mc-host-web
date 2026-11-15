@@ -1,7 +1,7 @@
 import { describe, expect, it } from '@effect/vitest'
 import { Effect, Option } from 'effect'
 
-import { chunkCoord, CHUNK_SIZE_XZ } from '@nerima-games/mc-kernel'
+import { ChunkAxis, chunkCoord, CHUNK_SIZE_XZ } from '@nerima-games/mc-kernel'
 import { CHUNK_VOLUME, type Chunk, type ChunkSource } from '@nerima-games/mc-worldgen'
 
 import {
@@ -13,8 +13,9 @@ import { createDroppedItemLifetimeTracker } from '../apps/web/dropped-item-lifet
 import { initializeSessionWorld } from '../apps/web/session-world'
 
 const chunk = (cx: number, cz: number, marker: number): Chunk => ({
-  coord: chunkCoord(cx, cz),
-  blocks: new Uint8Array(CHUNK_VOLUME).fill(marker),
+  coord: chunkCoord(ChunkAxis(cx), ChunkAxis(cz)),
+  blocks: new Uint16Array(CHUNK_VOLUME).fill(marker),
+  blockStates: new Uint32Array(CHUNK_VOLUME),
   biomes: Array.from({ length: CHUNK_SIZE_XZ * CHUNK_SIZE_XZ }, () => 'PLAINS'),
 })
 
@@ -32,8 +33,8 @@ describe('session restoration', () => {
       generatedSource,
     )
 
-    const restored = await Effect.runPromise(source(chunkCoord(-1, 2)))
-    const generated = await Effect.runPromise(source(chunkCoord(4, -3)))
+    const restored = await Effect.runPromise(source(chunkCoord(ChunkAxis(-1), ChunkAxis(2))))
+    const generated = await Effect.runPromise(source(chunkCoord(ChunkAxis(4), ChunkAxis(-3))))
 
     expect(restored).toEqual(persisted)
     expect(restored).not.toBe(persisted)
@@ -62,10 +63,10 @@ describe('session restoration', () => {
       droppedItemMetadataFromBehaviour: () => ({}),
     })
 
-    const generated = await Effect.runPromise(initialized.chunkSourceFor('nether')(chunkCoord(2, -1)))
+    const generated = await Effect.runPromise(initialized.chunkSourceFor('nether')(chunkCoord(ChunkAxis(2), ChunkAxis(-1))))
 
     expect(initialized.activeSeed).toBe(42)
-    expect(generated.coord).toEqual(chunkCoord(2, -1))
+    expect(generated.coord).toEqual(chunkCoord(ChunkAxis(2), ChunkAxis(-1)))
     expect(calls).toEqual(['world:42:overworld', 'restore:0', 'restore:0', 'restore:0'])
     expect(initialized.snapshotEntityRosters('nether', { entities: [], nextSerial: 0 })).toEqual({
       overworld: { entities: [], nextSerial: 0 },

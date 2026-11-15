@@ -66,5 +66,9 @@ export const makeSessionChunkSourceFor = (
   )
   return persisted === undefined
     ? generatedSource(coord)
-    : Effect.sync(() => chunkSnapshotOf(persisted))
+    : Effect.sync(() => {
+      // Session chunks come from the save codec, which materializes block states.
+      if (persisted.blockStates === undefined) throw new Error('Persisted chunk has no block states')
+      return chunkSnapshotOf({ ...persisted, blockStates: persisted.blockStates })
+    })
 }

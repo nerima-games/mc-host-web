@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { CHUNK_SIZE_XZ, chunkCoord } from '@nerima-games/mc-kernel'
+import { ChunkAxis, CHUNK_SIZE_XZ, chunkCoord } from '@nerima-games/mc-kernel'
 import {
   CHUNK_VOLUME,
   type Chunk,
@@ -14,8 +14,9 @@ import {
 } from '../apps/web/session-save-coordinator'
 
 const chunk = (cx: number, cz: number, marker: number): Chunk => ({
-  coord: chunkCoord(cx, cz),
-  blocks: new Uint8Array(CHUNK_VOLUME).fill(marker),
+  coord: chunkCoord(ChunkAxis(cx), ChunkAxis(cz)),
+  blocks: new Uint16Array(CHUNK_VOLUME).fill(marker),
+  blockStates: new Uint32Array(CHUNK_VOLUME),
   biomes: Array.from({ length: CHUNK_SIZE_XZ * CHUNK_SIZE_XZ }, () => 'PLAINS'),
 })
 
@@ -50,6 +51,58 @@ const deferred = <T>() => {
 }
 
 describe('session save coordinator', () => {
+  it('retains chunks after an aborted publication and drains the queued save independently', async () => {
+    const publications: Array<SessionSavePublication<number>> = []
+    const firstPublish = deferred<void>()
+    const secondPublish = deferred<void>()
+    const firstStarted = deferred<void>()
+    const secondStarted = deferred<void>()
+    const failures: unknown[] = []
+    const publishedGenerations: number[] = []
+    const coordinator = createSessionSaveCoordinator({
+      initialKnownChunks: [dimensionChunk('overworld', 0, 0, 1)],
+      snapshotResidents: async () => [],
+      currentGeneration: () => 4,
+      snapshotState: () => 1,
+      publish: (publication) => {
+        publications.push(publication)
+        if (publications.length === 1) {
+          firstStarted.resolve()
+          return firstPublish.promise
+        }
+        secondStarted.resolve()
+        return secondPublish.promise
+      },
+      onFailure: (error) => { failures.push(error) },
+      onPublished: (generation) => { publishedGenerations.push(generation) },
+    })
+    coordinator.retainChunk(dimensionChunk('overworld', 3, 2, 8))
+    const first = coordinator.requestSave()
+    await firstStarted.promise
+    let queuedSettled = false
+    const queued = coordinator.requestSave().then(() => { queuedSettled = true })
+    const abort = new DOMException('Publication interrupted', 'AbortError')
+    const rejected = expect(first).rejects.toBe(abort)
+    firstPublish.reject(abort)
+    await rejected
+    await secondStarted.promise
+
+    expect(failures).toEqual([abort])
+    expect(coordinator.knownChunkCount()).toBe(1)
+    expect(coordinator.retainedChunkCount()).toBe(1)
+    expect(queuedSettled).toBe(false)
+    expect(publishedGenerations).toEqual([])
+    expect(publications).toHaveLength(2)
+    expect(markerOf(publications[1]!, 'overworld', 3, 2)).toBe(8)
+
+    secondPublish.resolve()
+    await queued
+    expect(queuedSettled).toBe(true)
+    expect(coordinator.retainedChunkCount()).toBe(0)
+    expect(coordinator.knownChunkCount()).toBe(2)
+    expect(publishedGenerations).toEqual([4])
+  })
+
   it('settles requests made during a save from the following publication batch', async () => {
     const saves = [deferred<void>(), deferred<void>()]
     const publications: Array<SessionSavePublication<number>> = []

@@ -27,10 +27,11 @@ export type SessionSaveCoordinatorOptions<State> = {
 const coordId = ({ dimension, chunk }: DimensionChunk): string =>
   `${dimension}:${String(chunk.coord.cx)},${String(chunk.coord.cz)}`
 
-const dimensionChunkSnapshotOf = ({ dimension, chunk }: DimensionChunk): DimensionChunk => ({
-  dimension,
-  chunk: chunkSnapshotOf(chunk),
-})
+const dimensionChunkSnapshotOf = ({ dimension, chunk }: DimensionChunk): DimensionChunk => {
+  // Both decoded saves and resident snapshots have materialized block states.
+  if (chunk.blockStates === undefined) throw new Error('Session chunk has no block states')
+  return { dimension, chunk: chunkSnapshotOf({ ...chunk, blockStates: chunk.blockStates }) }
+}
 
 export const createSessionSaveCoordinator = <State>(
   options: SessionSaveCoordinatorOptions<State>,

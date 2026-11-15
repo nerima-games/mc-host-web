@@ -2,6 +2,7 @@ import { Option } from 'effect'
 import {
   chunkSnapshotOf,
   generatedChunkSource,
+  NoiseSeed,
   type Chunk,
   type ChunkSource,
   type Dimension,
@@ -62,14 +63,15 @@ export const initializeSessionWorld = async <World>(context: {
   const activeSeed = Option.isSome(context.loadedSession)
     ? context.loadedSession.value.state.seed
     : context.worldSeed
-  const generatedSource = generatedChunkSource(activeSeed)
+  const generatedSource = generatedChunkSource(NoiseSeed(activeSeed))
   const restored = Option.isSome(context.loadedSession)
     ? await context.loadSavedChunks(context.loadedSession.value, context.initialDimension, generatedSource)
     : undefined
-  const initialKnownChunks = (restored?.chunks ?? []).map(({ dimension, chunk }) => ({
-    dimension,
-    chunk: chunkSnapshotOf(chunk),
-  }))
+  const initialKnownChunks = (restored?.chunks ?? []).map(({ dimension, chunk }) => {
+    // loadSavedChunks decodes the save format, including its block-state buffer.
+    if (chunk.blockStates === undefined) throw new Error('Persisted chunk has no block states')
+    return { dimension, chunk: chunkSnapshotOf({ ...chunk, blockStates: chunk.blockStates }) }
+  })
   const persistedChunks = new Map<string, Chunk>(
     (restored?.chunks ?? []).map(({ dimension, chunk }) => [
       `${dimension}:${String(chunk.coord.cx)},${String(chunk.coord.cz)}`,
