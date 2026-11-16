@@ -88,18 +88,21 @@ import {
   BLOCK_PROPERTY_DEFAULTS,
   BlockAxis,
   BlockId,
-  blockIdOf,
   blockPosition,
+  blockPositionKeyOf,
   blockTypeOfId,
   DeltaTimeSecs,
-  chunkCoord,
+  chunkCoordOfBlock,
   isEmpty,
   PositionAxis,
   propertyOfBlockId,
   resolvedBlockOfId,
   StageId,
   WorldIdSchema,
+  WorldWriteBatchSchema,
   type BlockPosition,
+  type BlockPositionKey,
+  type ChunkCoord,
   type MonotonicTimeSecs,
   type Position as Vec3,
 } from '@nerima-games/mc-kernel'
@@ -138,8 +141,8 @@ import {
   RENDER_STAGE_IDS,
   syncWorld,
   wrapHotbarSelection,
-  type ChunkRef,
 } from '@nerima-games/mc-render'
+import { BLOCK } from '@nerima-games/mc-worldgen'
 import { makeBudgetedDirtySource } from './chunk-sync-budget'
 import { makeRedstoneContainerRuntime } from './redstone-container-runtime'
 import {
@@ -1748,38 +1751,62 @@ const bootGame = async (
     markSessionDirty()
     return true
   }
-  const materializePortal = (
-    dimension: Dimension,
-    layout: {
-      readonly frame: ReadonlyArray<PersistedPortalState['position']>
-      readonly interior: ReadonlyArray<PersistedPortalState['position']>
-    },
-  ): Effect.Effect<void> =>
+  type PortalLayout = {
+    readonly frame: ReadonlyArray<PersistedPortalState['position']>
+    readonly interior: ReadonlyArray<PersistedPortalState['position']>
+  }
+  // Keyed by cell so a later edit replaces an earlier one at the same cell,
+  // the outcome of the sequential setBlock calls these batches replaced.
+  type PlannedBlockEdits = Map<BlockPositionKey, { readonly position: BlockPosition; readonly block: BlockId }>
+  const portalCellOf = (position: PersistedPortalState['position']): BlockPosition =>
+    // Portal positions are block cells: integers by BlockCoordinateSchema or kernel BlockPosition.
+    blockPosition(BlockAxis(position.x), BlockAxis(position.y), BlockAxis(position.z))
+  const cellInColumn = (column: BlockPosition, y: number): BlockPosition =>
+    blockPosition(column.x, BlockAxis(y), column.z)
+  const planBlockEdit = (edits: PlannedBlockEdits, position: BlockPosition, block: BlockId): void => {
+    edits.set(blockPositionKeyOf(position), { position, block })
+  }
+  const planPortalEdits = (edits: PlannedBlockEdits, layout: PortalLayout): void => {
+    for (const position of layout.frame) planBlockEdit(edits, portalCellOf(position), OBSIDIAN_BLOCK_ID)
+    for (const position of layout.interior) planBlockEdit(edits, portalCellOf(position), NETHER_PORTAL_BLOCK_ID)
+  }
+  // The port writes only into loaded chunks. A load failure fails the write.
+  const loadChunksFor = (context: DimensionChunkContext, positions: ReadonlyArray<BlockPosition>) =>
     Effect.gen(function* () {
-      const context = getOrCreateDimensionChunkContext(dimension)
-      const chunkRefs = new Map<string, ChunkRef>()
-      for (const position of [...layout.frame, ...layout.interior]) {
-        const chunk = {
-          cx: Math.floor(position.x / 16),
-          cz: Math.floor(position.z / 16),
-        }
-        chunkRefs.set(chunkKeyOf(chunk), chunk)
+      const pending = new Map<string, ChunkCoord>()
+      for (const position of positions) {
+        const chunk = chunkCoordOfBlock(position)
+        const key = chunkKeyOf(chunk)
+        if (!context.streamLoaded.has(key)) pending.set(key, chunk)
       }
-      for (const [key, chunk] of chunkRefs) {
-        if (context.streamLoaded.has(key)) continue
-        yield* context.chunkStore.load(chunkCoord(chunk.cx, chunk.cz)).pipe(Effect.matchEffect({
-          onFailure: () => Effect.void,
-          onSuccess: () => Effect.void,
-        }))
+      for (const [key, chunk] of pending) {
+        yield* context.chunkStore.load(chunk)
         context.streamLoaded.add(key)
         chunksStreamedIn += 1
       }
-      for (const position of layout.frame) {
-        yield* context.chunkStore.setBlock(blockPosition(position.x, position.y, position.z), OBSIDIAN_BLOCK_ID)
-      }
-      for (const position of layout.interior) {
-        yield* context.chunkStore.setBlock(blockPosition(position.x, position.y, position.z), NETHER_PORTAL_BLOCK_ID)
-      }
+    })
+  // One port batch: the ChunkStore prepares every edit before it publishes
+  // any, so a failed commit leaves none of the edits written.
+  const commitPlannedEdits = (dimension: Dimension, edits: PlannedBlockEdits) =>
+    Effect.gen(function* () {
+      const { coordinator, port } = hostWorldWrite
+      const batch = yield* Schema.decodeEffect(WorldWriteBatchSchema)({
+        world: coordinator.worldId,
+        expectedWorldRevision: yield* coordinator.revision,
+        dimension,
+        expectedDimensionRevision: yield* coordinator.dimensionRevision(dimension),
+        edits: [...edits.values()],
+      })
+      yield* port.applyBatch(batch)
+    })
+  const plannedPositions = (edits: PlannedBlockEdits): ReadonlyArray<BlockPosition> =>
+    [...edits.values()].map(({ position }) => position)
+  const materializePortal = (dimension: Dimension, layout: PortalLayout) =>
+    Effect.gen(function* () {
+      const edits: PlannedBlockEdits = new Map()
+      planPortalEdits(edits, layout)
+      yield* loadChunksFor(getOrCreateDimensionChunkContext(dimension), plannedPositions(edits))
+      yield* commitPlannedEdits(dimension, edits)
       markSessionDirty()
     })
   // mc-worldgen's resolveNetherTravel computes `destination` from pure 8:1
@@ -1819,21 +1846,21 @@ const bootGame = async (
   // shape `restoreLookingAt` already proves out for the identical
   // underlying defect.
   const PORTAL_LANDING_SEARCH_BLOCKS = 32
-  const ensureSafePortalLanding = (
-    dimension: Dimension,
-    destination: PersistedPortalState['position'],
-  ): Effect.Effect<void> =>
+  //
+  // The landing is planned against the store as it will read once `edits`
+  // (the destination portal in the same batch) is committed, which is the
+  // state the earlier sequential writes left before this column was read.
+  const planSafePortalLanding = (
+    context: DimensionChunkContext,
+    destination: BlockPosition,
+    edits: PlannedBlockEdits,
+  ) =>
     Effect.gen(function* () {
-      const context = getOrCreateDimensionChunkContext(dimension)
-      const chunk = { cx: Math.floor(destination.x / 16), cz: Math.floor(destination.z / 16) }
-      const key = chunkKeyOf(chunk)
-      if (!context.streamLoaded.has(key)) {
-        yield* context.chunkStore.load(chunkCoord(chunk.cx, chunk.cz)).pipe(Effect.matchEffect({
-          onFailure: () => Effect.void,
-          onSuccess: () => Effect.void,
-        }))
-        context.streamLoaded.add(key)
-        chunksStreamedIn += 1
+      const plannedOrStoredBlock = (position: BlockPosition) => {
+        const planned = edits.get(blockPositionKeyOf(position))
+        return planned === undefined
+          ? Effect.map(context.chunkStore.getBlock(position), (reading) => reading._tag === 'Block' ? reading.block : undefined)
+          : Effect.succeed(planned.block)
       }
 
       // The SAME notion of "does this cell obstruct a body" the real
@@ -1860,67 +1887,65 @@ const bootGame = async (
       // must correct fights that coexistence instead of relying on it, so
       // nether_portal is read as clear here regardless of its shape — the
       // same block-type test stepPortalTravel's own `inPortal` uses.
-      const isObstructed = (y: number): boolean => {
-        const reading = Effect.runSync(context.chunkStore.getBlock(blockPosition(destination.x, y, destination.z)))
-        if (reading._tag !== 'Block') return true
-        if (isEmpty(reading.block)) return false
-        if (blockTypeOfId(reading.block) === 'nether_portal') return false
-        return aabbOfCollisionShape(propertyOfBlockId(reading.block, 'collisionShape')) !== null
-      }
-      const clearAt = (y: number): boolean => !isObstructed(y)
-      const solidAt = (y: number): boolean => isObstructed(y)
+      const isObstructed = (y: number) =>
+        Effect.gen(function* () {
+          const block = yield* plannedOrStoredBlock(cellInColumn(destination, y))
+          if (block === undefined) return true
+          if (isEmpty(block)) return false
+          if ((yield* Effect.fromResult(blockTypeOfId(block))) === 'nether_portal') return false
+          return aabbOfCollisionShape(yield* Effect.fromResult(propertyOfBlockId(block, 'collisionShape'))) !== null
+        })
+      const clearAt = (y: number) => Effect.map(isObstructed(y), (obstructed) => !obstructed)
 
-      if (clearAt(destination.y) && clearAt(destination.y + 1)) return
+      if ((yield* clearAt(destination.y)) && (yield* clearAt(destination.y + 1))) return undefined
 
-      let floorY: number | undefined
-      for (
-        let offset = 0;
-        offset <= PORTAL_LANDING_SEARCH_BLOCKS && floorY === undefined;
-        offset += 1
-      ) {
+      for (let offset = 0; offset <= PORTAL_LANDING_SEARCH_BLOCKS; offset += 1) {
         const candidates =
           offset === 0
             ? [destination.y - 1]
             : [destination.y - 1 + offset, destination.y - 1 - offset]
         for (const candidate of candidates) {
-          if (solidAt(candidate) && clearAt(candidate + 1) && clearAt(candidate + 2)) {
-            floorY = candidate
-            break
+          if ((yield* isObstructed(candidate)) && (yield* clearAt(candidate + 1)) && (yield* clearAt(candidate + 2))) {
+            return { floorY: candidate, carved: false }
           }
         }
       }
-      const carved = floorY === undefined
-      const resolvedFloorY = floorY ?? destination.y - 1
-
-      if (carved) {
-        yield* context.chunkStore.setBlock(blockPosition(destination.x, resolvedFloorY, destination.z), blockIdOf('stone'))
-      }
-      yield* context.chunkStore.setBlock(blockPosition(destination.x, resolvedFloorY + 1, destination.z), blockIdOf('air'))
-      yield* context.chunkStore.setBlock(blockPosition(destination.x, resolvedFloorY + 2, destination.z), blockIdOf('air'))
-      if (carved) markSessionDirty()
-
-      const pose = yield* playerApi.pose
-      yield* playerApi.moveTo({ ...pose.feetPosition, y: PositionAxis(resolvedFloorY + 1) })
+      return { floorY: destination.y - 1, carved: true }
     })
-  const applyPortalTravels = (): Effect.Effect<void> =>
+  // mx-gameplay's portal stage has already committed the player's
+  // destination pose and dimension before this drain. Here the destination
+  // portal and landing edits commit as one batch BEFORE the portal ledger
+  // changes or the landing correction moves the player, so a failed write
+  // leaves both untouched and reaches the caller as a typed failure.
+  const applyPortalTravels = () =>
     Effect.gen(function* () {
       const travels = yield* drainPortalTravels(gameplayState)
       for (const travel of travels) {
-        registerPortal({
-          dimension: travel.sourceDimension,
-          position: travel.sourcePosition,
-        })
-        const destinationAdded = registerPortal({
-          dimension: travel.plan.toDimension,
-          position: travel.plan.destination,
-        })
-        if (destinationAdded && Option.isSome(travel.plan.portalToCreate)) {
-          yield* materializePortal(
-            travel.plan.toDimension,
-            travel.plan.portalToCreate.value,
-          )
+        const { toDimension, destination, portalToCreate } = travel.plan
+        const destinationPortal = { dimension: toDimension, position: destination }
+        const portalLayout = Option.isSome(portalToCreate) && !portalStates.has(portalKeyOf(destinationPortal))
+          ? portalToCreate.value
+          : undefined
+        const context = getOrCreateDimensionChunkContext(toDimension)
+        const destinationCell = portalCellOf(destination)
+        const edits: PlannedBlockEdits = new Map()
+        if (portalLayout !== undefined) planPortalEdits(edits, portalLayout)
+        yield* loadChunksFor(context, [destinationCell, ...plannedPositions(edits)])
+        const landing = yield* planSafePortalLanding(context, destinationCell, edits)
+        if (landing !== undefined) {
+          if (landing.carved) planBlockEdit(edits, cellInColumn(destinationCell, landing.floorY), BLOCK.STONE)
+          planBlockEdit(edits, cellInColumn(destinationCell, landing.floorY + 1), BLOCK.AIR)
+          planBlockEdit(edits, cellInColumn(destinationCell, landing.floorY + 2), BLOCK.AIR)
         }
-        yield* ensureSafePortalLanding(travel.plan.toDimension, travel.plan.destination)
+        if (edits.size > 0) yield* commitPlannedEdits(toDimension, edits)
+
+        registerPortal({ dimension: travel.sourceDimension, position: travel.sourcePosition })
+        registerPortal(destinationPortal)
+        if (portalLayout !== undefined || landing?.carved === true) markSessionDirty()
+        if (landing !== undefined) {
+          const pose = yield* playerApi.pose
+          yield* playerApi.moveTo({ ...pose.feetPosition, y: PositionAxis(landing.floorY + 1) })
+        }
       }
     })
   Effect.runSync(syncPortalCandidateSnapshots())
