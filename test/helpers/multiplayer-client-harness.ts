@@ -62,7 +62,7 @@ class ServerSocketDouble implements BrowserWebSocketLike {
     [K in keyof BrowserWebSocketEventMap]: Set<(event: BrowserWebSocketEventMap[K]) => void>
   } = { open: new Set(), message: new Set(), close: new Set(), error: new Set() }
 
-  send(): void {}
+  readonly send = vi.fn<(data: string) => void>()
 
   close(): void {
     this.readyState = 3

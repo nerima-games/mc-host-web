@@ -1,4 +1,5 @@
 import { assert, describe, expect, it } from '@effect/vitest'
+import { vi } from 'vitest'
 import { Deferred, Effect, Fiber, Option, Result } from 'effect'
 
 import { BlockAxis, blockIdOf, blockPosition, ChunkAxis, chunkCoord, CHUNK_SIZE_XZ, WorldId } from '@nerima-games/mc-kernel'
@@ -469,10 +470,10 @@ describe('chunk render attachment wiring', () => {
   it.effect('meshes a re-entered dimension\'s resident chunks again after the renderer was cleared', () =>
     Effect.gen(function* () {
       class GpuSurface {
-        render = () => {}
-        setSize = () => {}
-        setClearColor = () => {}
-        dispose = () => {}
+        render = vi.fn<() => void>()
+        setSize = vi.fn<() => void>()
+        setClearColor = vi.fn<() => void>()
+        dispose = vi.fn<() => void>()
       }
       const renderer = yield* makeProductionWorldRenderer<
         object, THREE.BufferGeometry<THREE.NormalBufferAttributes>, THREE.MeshBasicMaterial,
