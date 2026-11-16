@@ -1,9 +1,8 @@
 import { expect, test } from '@playwright/test'
 
+import { callQa, callQaWithFrames } from './helpers/qa'
 import { startGameSession } from './helpers/session'
 import { waitForSimulationProgress } from './helpers/simulation-wait'
-
-const QA_GLOBAL_KEY = '__NERIMA_GAMES_QA__'
 
 type LightingSnapshot = {
   readonly resolvedChunks: number
@@ -17,34 +16,11 @@ test('generated world lighting reaches rendered chunk vertex colors', async ({ p
   await startGameSession(page, 'world-lighting')
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
 
-  const snapshotLighting = () =>
-    page.evaluate(
-      async ({ key, command }) => {
-        const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-          | Record<string, () => unknown>
-          | undefined
-        const operation = surface?.[command]
-        if (operation === undefined) throw new Error(`missing QA command: ${command}`)
-        return (await operation()) as LightingSnapshot
-      },
-      { key: QA_GLOBAL_KEY, command: 'render.snapshotLighting' },
-    )
+  const snapshotLighting = (): Promise<LightingSnapshot> =>
+    callQa(page, 'render.snapshotLighting')
 
   const snapshotLightingWithFrames = (): Promise<{ frames: number; value: LightingSnapshot }> =>
-    page.evaluate(
-      async ({ key, command }) => {
-        const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-          | Record<string, () => unknown>
-          | undefined
-        const operation = surface?.[command]
-        if (operation === undefined) throw new Error(`missing QA command: ${command}`)
-        return {
-          frames: Number(document.body.getAttribute('data-frames')),
-          value: (await operation()) as LightingSnapshot,
-        }
-      },
-      { key: QA_GLOBAL_KEY, command: 'render.snapshotLighting' },
-    )
+    callQaWithFrames(page, 'render.snapshotLighting')
 
   // `syncWorld` (mc-render's application/world-sync.ts) drains one dirty batch
   // per call and is driven off the RAF loop, so the spawn chunks it meshes are

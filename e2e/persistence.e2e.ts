@@ -1,9 +1,9 @@
 import { expect, test, type ConsoleMessage, type Page } from '@playwright/test'
 
+import { callQa, callQaWithFrames } from './helpers/qa'
 import { startGameSession } from './helpers/session'
 import { waitForSimulationProgress } from './helpers/simulation-wait'
 
-const QA_GLOBAL_KEY = '__NERIMA_GAMES_QA__'
 const SAVED_MARKER_KEY = '__mcComposeSawSavedPersistence'
 const DATABASE_NAME = 'nerima-games-minecraft'
 const AIR_BLOCK_ID = 0
@@ -100,39 +100,11 @@ const watchForFaults = (page: Page): PageFaults => {
   return { consoleErrors, pageErrors }
 }
 
-const callQa = <A>(
-  page: Page,
-  command: string,
-  ...arguments_: ReadonlyArray<unknown>
-): Promise<A> =>
-  page.evaluate(
-    async ({ key, commandName, commandArguments }) => {
-      const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-        | Record<string, (...arguments_: ReadonlyArray<unknown>) => unknown>
-        | undefined
-      const operation = surface?.[commandName]
-      if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
-      return await operation(...commandArguments)
-    },
-    { key: QA_GLOBAL_KEY, commandName: command, commandArguments: arguments_ },
-  ) as Promise<A>
-
 const snapshot = (page: Page): Promise<GameplaySnapshot> =>
   callQa(page, 'gameplay.snapshot')
 
 const snapshotWithFrames = (page: Page): Promise<{ frames: number; value: GameplaySnapshot }> =>
-  page.evaluate(
-    async ({ key, commandName }) => {
-      const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-        | Record<string, () => unknown>
-        | undefined
-      const operation = surface?.[commandName]
-      if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
-      const value = await operation()
-      return { frames: Number(document.body.getAttribute('data-frames')), value }
-    },
-    { key: QA_GLOBAL_KEY, commandName: 'gameplay.snapshot' },
-  ) as Promise<{ frames: number; value: GameplaySnapshot }>
+  callQaWithFrames(page, 'gameplay.snapshot')
 
 const hotbarText = (page: Page): Promise<ReadonlyArray<string | null>> =>
   page.locator('[data-mx-ui="hotbar"] [data-mx-ui="slot"]').allTextContents()
@@ -291,7 +263,6 @@ test('retains death-drop custom name and enchantments through reload and pickup'
   expect(faults.pageErrors).toEqual([])
   expect(faults.consoleErrors).toEqual([])
 })
-
 
 // mx-gameplay 0.3.x added natural ecosystem spawning (mobSimulation gates all
 // mob logic, and the product wants it on; there is deliberately no

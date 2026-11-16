@@ -23,6 +23,7 @@
  */
 import { expect, test, type ConsoleMessage, type Page } from '@playwright/test'
 
+import { callQa } from './helpers/qa'
 import { startGameSession } from './helpers/session'
 import { waitForSimulationProgress } from './helpers/simulation-wait'
 
@@ -77,17 +78,12 @@ const settleOnSmokeTerrain = async (page: Page): Promise<void> => {
         page.evaluate(
           ([key, command]) =>
             typeof (globalThis as unknown as Record<string, Record<string, unknown>>)[key]?.[command],
-          [QA_GLOBAL_KEY, 'gameplay.seedSmokeGroundingEncounter'] as const,
+          [QA_GLOBAL_KEY, 'dispatch'] as const,
         ),
       { timeout: 15_000 },
     )
     .toBe('function')
-  await page.evaluate(async (key) => {
-    const qa = (globalThis as unknown as Record<string, unknown>)[key] as Record<string, unknown>
-    const operation = qa['gameplay.seedSmokeGroundingEncounter']
-    if (typeof operation !== 'function') throw new Error('smoke grounding QA operation is unavailable')
-    await operation()
-  }, QA_GLOBAL_KEY)
+  await callQa(page, 'gameplay.seedSmokeGroundingEncounter')
   // Settling onto the ground is physics simulated over several frames, not
   // instant on spawn — see waitForSimulationProgress.
   await waitForSimulationProgress(
@@ -319,108 +315,22 @@ test.describe('smoke — the composed frame in a real browser', () => {
       QA_GLOBAL_KEY,
     )
 
-    expect(surface?.sort()).toEqual([
-      'audio.report',
-      'audio.snapshot',
-      'gameplay.boatWaterSnapshot',
-      'gameplay.breakTarget',
-      'gameplay.damage',
-      'gameplay.eat',
-      'gameplay.enterEnd',
-      'gameplay.enterNether',
-      'gameplay.enterOverworld',
-      'gameplay.forceNextEyeOfEnderBreak',
-      'gameplay.forceNextEyeOfEnderDrop',
-      'gameplay.grantNearestVillagerTradeInput',
-      'gameplay.harvestFarmingCrop',
-      'gameplay.heal',
-      'gameplay.leaveSubmergedSwimmingEncounter',
-      'gameplay.mutateObserverInput',
-      'gameplay.preparePotatoEating',
-      'gameplay.pressRedstoneBranchButton',
-      'gameplay.railTrackSnapshot',
-      'gameplay.redstoneFixturesSnapshot',
-      'gameplay.requestMultiplayerBlockBreak',
-      'gameplay.requestMultiplayerBlockPlacement',
-      'gameplay.respawn',
-      'gameplay.returnToCraftingTable',
-      'gameplay.returnToFarmingPlot',
-      'gameplay.seedBedExplosionEncounter',
-      'gameplay.seedBoatWaterEncounter',
-      'gameplay.seedBowProjectileEncounter',
-      'gameplay.seedBrewingEncounter',
-      'gameplay.seedCactusApproach',
-      'gameplay.seedChestTransferMetadata',
-      'gameplay.seedChestTransferMetadataConflict',
-      'gameplay.seedCraftingLog',
-      'gameplay.seedCraftingTableEncounter',
-      'gameplay.seedCreativeBreakEncounter',
-      'gameplay.seedCreativePlacementEncounter',
-      'gameplay.seedDamagingFall',
-      'gameplay.seedDuplicateLavaContact',
-      'gameplay.seedEndDragonFinalHit',
-      'gameplay.seedEndEyeCrafting',
-      'gameplay.seedEndPortalFinalFrame',
-      'gameplay.seedFarmingEncounter',
-      'gameplay.seedFireChargeIgnition',
-      'gameplay.seedFishingEncounter',
-      'gameplay.seedFlintAndSteelIgnition',
-      'gameplay.seedFoodUseEncounter',
-      'gameplay.seedIronArmor',
-      'gameplay.seedItemUpgradeEncounter',
-      'gameplay.seedLethalFall',
-      'gameplay.seedLethalMixedContact',
-      'gameplay.seedLethalZombieEncounter',
-      'gameplay.seedMeleeDropEncounter',
-      'gameplay.seedPortalArrivalIntoSolidGround',
-      'gameplay.seedPortalEncounter',
-      'gameplay.seedPortalIgnitionEncounter',
-      'gameplay.seedRailTrackEncounter',
-      'gameplay.seedRedstoneFixtures',
-      'gameplay.seedRefusedFireChargeIgnition',
-      'gameplay.seedSafeFall',
-      'gameplay.seedSmokeGroundingEncounter',
-      'gameplay.seedStaleCustomNames',
-      'gameplay.seedStickyPistonEncounter',
-      'gameplay.seedSubmergedSwimmingEncounter',
-      'gameplay.seedVillageTradingEncounter',
-      'gameplay.seedWoodenPickaxeProgression',
-      'gameplay.seedZombiePursuitEncounter',
-      'gameplay.setMultiplayerInvalidPose',
-      'gameplay.setPose',
-      'gameplay.setWeather',
-      'gameplay.shoot',
-      'gameplay.snapshot',
-      'gameplay.spawnFullHealthBlaze',
-      'gameplay.spawnFullHealthEnderman',
-      'gameplay.stickyPistonSnapshot',
-      'gameplay.switchItemUpgradeStationToAnvil',
-      'gameplay.targetCompletedEndPortal',
-      'gameplay.targetEndDragon',
-      'gameplay.targetEndExitPortal',
-      'gameplay.targetNearestDroppedItem',
-      'gameplay.targetNearestHostile',
-      'gameplay.targetNearestStrongholdFrame',
-      'lifecycle.stop',
-      'persistence.flush',
-      'render.snapshotLighting',
-    ])
+    expect(surface?.sort()).toEqual(['dispatch'])
   })
 
   test('#4c audio QA exposes the camera-derived listener orientation', async ({ page }) => {
     await startGameSession(page)
     await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
 
-    const snapshots = await page.evaluate(async (key) => {
-      const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-        | Record<string, () => unknown>
-        | undefined
-      const audioSnapshot = surface?.['audio.snapshot']
-      const gameplaySnapshot = surface?.['gameplay.snapshot']
-      if (audioSnapshot === undefined) throw new Error('missing QA command: audio.snapshot')
-      if (gameplaySnapshot === undefined) throw new Error('missing QA command: gameplay.snapshot')
-      return { audio: await audioSnapshot(), gameplay: await gameplaySnapshot() }
-    }, QA_GLOBAL_KEY) as {
+    const snapshots = await page.evaluate(async () => {
+      const transport = window.__NERIMA_GAMES_QA__
+      if (transport === undefined) throw new Error('missing QA transport')
+      const audio = await transport.dispatch('audio', 'snapshot', null)
+      if (audio._tag === 'Failure') throw new Error(`QA audio.snapshot failed: ${JSON.stringify(audio.error)}`)
+      const gameplay = await transport.dispatch('gameplay', 'snapshot', null)
+      if (gameplay._tag === 'Failure') throw new Error(`QA gameplay.snapshot failed: ${JSON.stringify(gameplay.error)}`)
+      return { audio: audio.value, gameplay: gameplay.value }
+    }) as {
       readonly audio: {
         readonly listener: { readonly x: number; readonly y: number; readonly z: number }
         readonly listenerForward: { readonly x: number; readonly y: number; readonly z: number }
@@ -496,12 +406,7 @@ test('published browser lifecycle owns RAF and tears the QA surface down', async
   await startGameSession(page)
   await expect.poll(() => framesDrawn(page)).toBeGreaterThan(1)
 
-  await page.evaluate(async (key) => {
-    const qa = (globalThis as Record<string, unknown>)[key] as {
-      'lifecycle.stop': () => Promise<void>
-    }
-    await qa['lifecycle.stop']()
-  }, QA_GLOBAL_KEY)
+  await callQa(page, 'lifecycle.stop')
 
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'stopped')
   const stoppedAt = await framesDrawn(page)

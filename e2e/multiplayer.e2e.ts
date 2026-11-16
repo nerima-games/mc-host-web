@@ -9,10 +9,10 @@ import { expect, test, type Browser, type BrowserContext, type Page } from '@pla
 import { tsImport } from 'tsx/esm/api'
 import { WebSocket } from 'ws'
 
+import { callQa } from './helpers/qa'
 import { startGameSession } from './helpers/session'
 import { E2E_MULTIPLAYER_URL } from '../playwright.config'
 
-const QA_GLOBAL_KEY = '__NERIMA_GAMES_QA__'
 const LEGACY_SECRETS = {
   'alice-e2e': 'alice-e2e-registration-secret',
   'bob-e2e': 'bob-e2e-registration-secret',
@@ -50,16 +50,6 @@ type GameplaySnapshot = {
     readonly block: number | null
   }
 }
-
-const callQa = <A>(page: Page, command: string): Promise<A> =>
-  page.evaluate(async ({ key, commandName }) => {
-    const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-      | Record<string, () => unknown>
-      | undefined
-    const operation = surface?.[commandName]
-    if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
-    return await operation()
-  }, { key: QA_GLOBAL_KEY, commandName: command }) as Promise<A>
 
 const snapshot = (page: Page): Promise<GameplaySnapshot> =>
   callQa(page, 'gameplay.snapshot')
@@ -959,17 +949,7 @@ test('closing a chest is honored once a facility command already in flight resol
     // test above for the same lesson).
     await startGameSession(page, 'chest-close-race-e2e')
     await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
-    // `callQa` above takes no arguments; `gameplay.setPose` needs the chest
-    // block id, so this calls it directly rather than widening the shared
-    // helper's signature for one call site.
-    await page.evaluate(({ key, targetBlock }) => {
-      const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-        | Record<string, (block: number) => unknown>
-        | undefined
-      const operation = surface?.['gameplay.setPose']
-      if (operation === undefined) throw new Error('missing QA command: gameplay.setPose')
-      return operation(targetBlock)
-    }, { key: QA_GLOBAL_KEY, targetBlock: CHEST_BLOCK_ID })
+    await callQa(page, 'gameplay.setPose', CHEST_BLOCK_ID)
     await page.keyboard.press('Escape')
     await callQa(page, 'persistence.flush')
     await expect(page.locator('body')).toHaveAttribute('data-session-persistence', 'saved')
@@ -1076,14 +1056,7 @@ test('breaking a chest through the authoritative multiplayer server drops its st
     // never completes within the test's timeout.
     await createCreativeWorld(page, 'Chest Break Drop E2E')
     await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
-    await page.evaluate(({ key, targetBlock }) => {
-      const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-        | Record<string, (block: number) => unknown>
-        | undefined
-      const operation = surface?.['gameplay.setPose']
-      if (operation === undefined) throw new Error('missing QA command: gameplay.setPose')
-      return operation(targetBlock)
-    }, { key: QA_GLOBAL_KEY, targetBlock: CHEST_BLOCK_ID })
+    await callQa(page, 'gameplay.setPose', CHEST_BLOCK_ID)
     await page.keyboard.press('Escape')
     await callQa(page, 'persistence.flush')
     await expect(page.locator('body')).toHaveAttribute('data-session-persistence', 'saved')

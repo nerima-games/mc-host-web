@@ -1,9 +1,8 @@
 import { expect, test, type ConsoleMessage, type Locator, type Page } from '@playwright/test'
 
+import { callQa, callQaWithFrames } from './helpers/qa'
 import { startGameSession } from './helpers/session'
 import { waitForSimulationProgress } from './helpers/simulation-wait'
-
-const QA_GLOBAL_KEY = '__NERIMA_GAMES_QA__'
 
 type Position = { readonly x: number; readonly y: number; readonly z: number }
 type Pose = {
@@ -109,35 +108,11 @@ const watchForFaults = (page: Page): PageFaults => {
   return { consoleErrors, pageErrors }
 }
 
-const callQa = <A>(page: Page, command: string, ...arguments_: ReadonlyArray<unknown>): Promise<A> =>
-  page.evaluate(
-    async ({ key, commandName, commandArguments }) => {
-      const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-        | Record<string, (...arguments_: ReadonlyArray<unknown>) => unknown>
-        | undefined
-      const operation = surface?.[commandName]
-      if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
-      return await operation(...commandArguments)
-    },
-    { key: QA_GLOBAL_KEY, commandName: command, commandArguments: arguments_ },
-  ) as Promise<A>
-
 const snapshot = (page: Page): Promise<GameplaySnapshot> =>
   callQa(page, 'gameplay.snapshot')
 
 const snapshotWithFrames = (page: Page): Promise<{ frames: number; value: GameplaySnapshot }> =>
-  page.evaluate(
-    async ({ key, commandName }) => {
-      const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-        | Record<string, () => unknown>
-        | undefined
-      const operation = surface?.[commandName]
-      if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
-      const value = await operation()
-      return { frames: Number(document.body.getAttribute('data-frames')), value }
-    },
-    { key: QA_GLOBAL_KEY, commandName: 'gameplay.snapshot' },
-  ) as Promise<{ frames: number; value: GameplaySnapshot }>
+  callQaWithFrames(page, 'gameplay.snapshot')
 
 const selectedSlotIndex = async (hotbar: Locator): Promise<number> =>
   hotbar.locator('[data-mx-ui="slot"]').evaluateAll((slots) =>
@@ -953,11 +928,8 @@ test('grounds the player within a couple of frames after spawnFullHealthHostile 
   // measurement, which is the only way a bound this tight can mean anything.
   for (const command of ['gameplay.spawnFullHealthBlaze', 'gameplay.spawnFullHealthEnderman'] as const) {
     const framesToGround = await page.evaluate(async (commandName) => {
-      const registry = (globalThis as unknown as Record<string, unknown>)['__NERIMA_GAMES_QA__'] as
-        | Record<string, () => unknown>
-        | undefined
-      const operation = registry?.[commandName]
-      if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
+      const transport = window.__NERIMA_GAMES_QA__
+      if (transport === undefined) throw new Error('missing QA transport')
       const framesNow = (): number => Number(document.body.getAttribute('data-frames'))
       const isGrounded = (): boolean =>
         document.querySelector('#game-canvas')?.getAttribute('data-player-grounded') === 'true'
@@ -965,7 +937,8 @@ test('grounds the player within a couple of frames after spawnFullHealthHostile 
         await new Promise((resolve) => { requestAnimationFrame(() => resolve(undefined)) })
       }
       const start = framesNow()
-      operation()
+      const result = await transport.dispatch('gameplay', commandName.slice('gameplay.'.length), null)
+      if (result._tag === 'Failure') throw new Error(`QA command failed: ${JSON.stringify(result.error)}`)
       for (let frame = 0; frame < 200; frame += 1) {
         if (isGrounded()) return framesNow() - start
         await nextFrame()

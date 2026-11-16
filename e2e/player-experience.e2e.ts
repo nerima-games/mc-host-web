@@ -1,9 +1,8 @@
 import { expect, test, type Locator, type Page } from '@playwright/test'
 
+import { callQa } from './helpers/qa'
 import { startGameSession } from './helpers/session'
 import { waitForSimulationProgress } from './helpers/simulation-wait'
-
-const QA_GLOBAL_KEY = '__NERIMA_GAMES_QA__'
 
 type GameplaySnapshot = {
   readonly inventory: {
@@ -14,19 +13,6 @@ type GameplaySnapshot = {
     readonly block: number | null
   }
 }
-
-const callQa = <A>(page: Page, command: string, ...arguments_: ReadonlyArray<unknown>): Promise<A> =>
-  page.evaluate(
-    async ({ key, commandName, commandArguments }) => {
-      const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-        | Record<string, (...arguments_: ReadonlyArray<unknown>) => unknown>
-        | undefined
-      const operation = surface?.[commandName]
-      if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
-      return await operation(...commandArguments)
-    },
-    { key: QA_GLOBAL_KEY, commandName: command, commandArguments: arguments_ },
-  ) as Promise<A>
 
 const selectedSlotIndex = async (hotbar: Locator): Promise<number> =>
   hotbar.locator('[data-mx-ui="slot"]').evaluateAll((slots) =>

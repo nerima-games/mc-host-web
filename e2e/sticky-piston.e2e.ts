@@ -1,5 +1,6 @@
 import { expect, test, type Page } from '@playwright/test'
 
+import { callQa, callQaWithFrames } from './helpers/qa'
 import { startGameSession } from './helpers/session'
 import { waitForSimulationProgress } from './helpers/simulation-wait'
 
@@ -13,36 +14,14 @@ type PistonSnapshot = {
   far: number | null
 }
 
-const callQa = async <Result>(page: Page, command: string): Promise<Result> =>
-  page.evaluate((commandName) => {
-    const qa = (globalThis as unknown as Record<string, unknown>)['__NERIMA_GAMES_QA__'] as
-      | Record<string, () => unknown>
-      | undefined
-    const operation = qa?.[commandName]
-    if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
-    return operation() as Result
-  }, command)
-
 // Redstone signal propagation from the lever to the piston runs on the
 // simulation's own tick schedule, not on wall-clock time — the same reason
 // waitForSimulationProgress exists for every other multi-tick wait in this
 // suite (see e2e/helpers/simulation-wait.ts). A bare expect.poll here falls
 // back to Playwright's default 5s real-time budget, which is exactly the
 // wall-clock assumption that gets violated under host contention.
-const pistonSnapshotWithFrames = (
-  page: Page,
-): Promise<{ frames: number; value: PistonSnapshot }> =>
-  page.evaluate(() => {
-    const qa = (globalThis as unknown as Record<string, unknown>)['__NERIMA_GAMES_QA__'] as
-      | Record<string, () => unknown>
-      | undefined
-    const operation = qa?.['gameplay.stickyPistonSnapshot']
-    if (operation === undefined) throw new Error('missing QA command: gameplay.stickyPistonSnapshot')
-    return {
-      frames: Number(document.body.getAttribute('data-frames')),
-      value: operation() as PistonSnapshot,
-    }
-  })
+const pistonSnapshotWithFrames = (page: Page): Promise<{ frames: number; value: PistonSnapshot }> =>
+  callQaWithFrames(page, 'gameplay.stickyPistonSnapshot')
 
 const clearDatabase = async (page: Page): Promise<void> => {
   await page.goto('/@vite/client')

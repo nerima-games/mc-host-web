@@ -2,10 +2,9 @@ import { expect, test, type ConsoleMessage, type Page } from '@playwright/test'
 import { overworldToNether } from '@nerima-games/mc-worldgen'
 import { BlockAxis, blockPosition } from '@nerima-games/mc-kernel'
 
+import { callQa, callQaWithFrames } from './helpers/qa'
 import { startGameSession } from './helpers/session'
 import { waitForSimulationProgress } from './helpers/simulation-wait'
-
-const QA_GLOBAL_KEY = '__NERIMA_GAMES_QA__'
 
 // Mirrors qa-fixtures.ts's QA_PORTAL_ANCHOR — the interior cell
 // seedPortalArrivalIntoSolidGround (apps/web/main.ts) restores the player
@@ -35,19 +34,6 @@ const watchForFaults = (page: Page): PageFaults => {
   return { consoleErrors, pageErrors }
 }
 
-const callQa = <A>(page: Page, command: string): Promise<A> =>
-  page.evaluate(
-    async ({ key, commandName }) => {
-      const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-        | Record<string, () => unknown>
-        | undefined
-      const operation = surface?.[commandName]
-      if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
-      return await operation()
-    },
-    { key: QA_GLOBAL_KEY, commandName: command },
-  ) as Promise<A>
-
 const snapshot = (page: Page): Promise<GameplaySnapshot> => callQa(page, 'gameplay.snapshot')
 
 // The frame counter and the snapshot are read in ONE round trip, the same
@@ -55,22 +41,8 @@ const snapshot = (page: Page): Promise<GameplaySnapshot> => callQa(page, 'gamepl
 // two calls they can describe different frames, which would make
 // waitForSimulationProgress's stall detection compare values that never
 // coexisted.
-const readGameplayWithFrames = (
-  page: Page,
-): Promise<{ frames: number; value: GameplaySnapshot }> => page.evaluate(
-  async ({ key, commandName }) => {
-    const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-      | Record<string, () => unknown>
-      | undefined
-    const operation = surface?.[commandName]
-    if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
-    return {
-      frames: Number(document.body.getAttribute('data-frames')),
-      value: await operation(),
-    }
-  },
-  { key: QA_GLOBAL_KEY, commandName: 'gameplay.snapshot' },
-) as Promise<{ frames: number; value: GameplaySnapshot }>
+const readGameplayWithFrames = (page: Page): Promise<{ frames: number; value: GameplaySnapshot }> =>
+  callQaWithFrames(page, 'gameplay.snapshot')
 
 test('grounds the player after a Nether portal arrival lands inside solid ground', async ({ page }) => {
   const faults = watchForFaults(page)
