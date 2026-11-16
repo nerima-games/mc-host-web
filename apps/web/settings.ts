@@ -1,4 +1,5 @@
 import {
+  AudioVolume,
   DEFAULT_VOLUME_SETTINGS,
 } from '@nerima-games/mc-audio'
 import {
@@ -31,17 +32,28 @@ export const PLAYER_BINDING_ACTIONS: ReadonlyArray<Exclude<InputAction, 'escape'
 export type PlayerSettingsV1 = {
   readonly sensitivity: number
   readonly bindings: Bindings
-  readonly masterVolume: number
-  readonly sfxVolume: number
+  readonly masterVolume: AudioVolume
+  readonly sfxVolume: AudioVolume
   readonly audioEnabled: boolean
   readonly captionsEnabled: boolean
 }
+
+// AudioVolume accepts every finite number in [0, 1]. Callers pass only values
+// already inside that range, so a failure means the brand's contract changed;
+// throwing surfaces that (at module load, for FULL_SFX_VOLUME) instead of
+// carrying an unbranded volume into audio.
+const volumeWithinUnitRange = (value: number): AudioVolume => Result.getOrThrowWith(
+  AudioVolume.result(value),
+  (error) => new Error(`player settings volume outside the AudioVolume range: ${error.message}`),
+)
+
+const FULL_SFX_VOLUME = volumeWithinUnitRange(1)
 
 export const DEFAULT_PLAYER_SETTINGS: PlayerSettingsV1 = {
   sensitivity: 1,
   bindings: { ...DEFAULT_BINDINGS },
   masterVolume: DEFAULT_VOLUME_SETTINGS.master,
-  sfxVolume: 1,
+  sfxVolume: FULL_SFX_VOLUME,
   audioEnabled: true,
   captionsEnabled: true,
 }
@@ -69,6 +81,14 @@ const asRecord = (value: unknown): Readonly<Record<string, unknown>> | undefined
 const boundedNumber = (value: unknown, fallback: number, min: number, max: number): number =>
   typeof value === 'number' && Number.isFinite(value)
     ? Math.min(max, Math.max(min, value))
+    : fallback
+
+// Same policy as boundedNumber: clamp a finite value into [0, 1], fall back
+// otherwise. The clamped value is finite and within [0, 1], so the AudioVolume
+// constructor accepts it.
+const boundedVolume = (value: unknown, fallback: AudioVolume): AudioVolume =>
+  typeof value === 'number' && Number.isFinite(value)
+    ? volumeWithinUnitRange(Math.min(1, Math.max(0, value)))
     : fallback
 
 const validBindingCode = (value: unknown): value is string =>
@@ -110,13 +130,8 @@ export const normalizePlayerSettings = (value: unknown): PlayerSettingsV1 => {
   return {
     sensitivity: boundedNumber(record['sensitivity'], 1, 0.1, 3),
     bindings: normalizeBindings(record['bindings']),
-    masterVolume: boundedNumber(
-      record['masterVolume'],
-      DEFAULT_VOLUME_SETTINGS.master,
-      0,
-      1,
-    ),
-    sfxVolume: boundedNumber(record['sfxVolume'], 1, 0, 1),
+    masterVolume: boundedVolume(record['masterVolume'], DEFAULT_VOLUME_SETTINGS.master),
+    sfxVolume: boundedVolume(record['sfxVolume'], FULL_SFX_VOLUME),
     audioEnabled: typeof record['audioEnabled'] === 'boolean' ? record['audioEnabled'] : true,
     captionsEnabled: typeof record['captionsEnabled'] === 'boolean'
       ? record['captionsEnabled']

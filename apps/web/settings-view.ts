@@ -1,4 +1,6 @@
+import { AudioVolume } from '@nerima-games/mc-audio'
 import type { InputAction } from '@nerima-games/mc-render'
+import { Result } from 'effect'
 
 import {
   DEFAULT_PLAYER_SETTINGS,
@@ -42,6 +44,15 @@ const ACTION_LABELS: Readonly<Record<BindableAction, string>> = {
   hotbarSlot8: 'Hotbar 8',
   hotbarSlot9: 'Hotbar 9',
 }
+
+// The volume sliders are range inputs with min 0 and max 100, and the browser
+// sanitizes a range input's value to a number within [min, max]. Dividing by
+// 100 therefore always lands in [0, 1], which AudioVolume accepts; a failure
+// means the slider markup lost those bounds.
+const sliderVolume = (slider: HTMLInputElement): AudioVolume => Result.getOrThrowWith(
+  AudioVolume.result(Number(slider.value) / 100),
+  (error) => new Error(`settings volume slider outside the AudioVolume range: ${error.message}`),
+)
 
 const focusableElements = (root: HTMLElement): ReadonlyArray<HTMLElement> =>
   [...root.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled])')]
@@ -157,8 +168,8 @@ export const createSettingsView = (
   })
 
   sensitivity.addEventListener('input', () => publish({ ...current, sensitivity: Number(sensitivity.value) / 100 }))
-  master.addEventListener('input', () => publish({ ...current, masterVolume: Number(master.value) / 100 }))
-  sfx.addEventListener('input', () => publish({ ...current, sfxVolume: Number(sfx.value) / 100 }))
+  master.addEventListener('input', () => publish({ ...current, masterVolume: sliderVolume(master) }))
+  sfx.addEventListener('input', () => publish({ ...current, sfxVolume: sliderVolume(sfx) }))
   audioEnabled.addEventListener('change', () => publish({ ...current, audioEnabled: audioEnabled.checked }))
   captionsEnabled.addEventListener('change', () => publish({ ...current, captionsEnabled: captionsEnabled.checked }))
   required('[data-reset-bindings]').addEventListener('click', () => {
