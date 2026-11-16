@@ -24,6 +24,7 @@ import {
   HungerPoints,
   TotalExperience,
   advanceFurnace,
+  emptyBrewingState,
   equipFromInventory,
   itemStack,
   storageFromInventory,
@@ -50,7 +51,6 @@ import {
 } from '@nerima-games/mc-worldgen'
 import {
   SPAWN_PLAYER_VITALS,
-  emptyBrewingStandState,
   emptyStatusEffectState,
   isDroppedItemBehaviour,
 } from '@nerima-games/mx-gameplay'
@@ -79,6 +79,11 @@ import {
   type SessionMetadata,
   type SessionState,
 } from '../apps/web/session-persistence'
+
+const fixtureEnvelopeText = (name: string): string =>
+  readFileSync(new URL(`./fixtures/${name}`, import.meta.url), 'utf8')
+
+const parseJson = (text: string): unknown => JSON.parse(text)
 
 const coordOf = (cx: number, cz: number): ChunkCoord => chunkCoord(ChunkAxis(cx), ChunkAxis(cz))
 
@@ -153,7 +158,7 @@ const sessionState = (seed: number): SessionState => ({
   }),
   entities: EMPTY_ENTITY_ROSTERS,
   villagers: EMPTY_VILLAGER_STATE,
-  brewing: emptyBrewingStandState(),
+  brewing: Result.getOrThrow(emptyBrewingState()),
   statusEffects: emptyStatusEffectState(),
   end: EMPTY_END_STATE,
   wither: {
@@ -605,7 +610,9 @@ describe('session persistence', () => {
     const storage = controlledStorage()
     const state = sessionState(42)
     const invalidStates = [
-      storedStateWith(state, { brewing: { fuelUnits: -1, bottle: null, ingredient: null, brewing: null } }),
+      storedStateWith(state, {
+        brewing: { bottles: [null, null, null], ingredient: null, fuel: null, fuelCharges: -1, brewProgressSecs: 0 },
+      }),
       storedStateWith(state, {
         statusEffects: {
           effects: [{ type: 'speed', remainingSecs: -1, pulseClockSecs: 0, amplifier: 0 }],
@@ -1787,10 +1794,8 @@ describe('session persistence', () => {
     // Envelopes captured verbatim from the previous build (Effect 3, mc-save
     // 0.4, mc-sim 0.4) through its own `saveSession`; they are not produced by
     // the code under test.
-    const fixtureEnvelope = (name: string): SaveEnvelope => {
-      const parsed: unknown = JSON.parse(readFileSync(new URL(`./fixtures/${name}`, import.meta.url), 'utf8'))
-      return Schema.decodeUnknownSync(SaveEnvelopeSchema)(parsed)
-    }
+    const fixtureEnvelope = (name: string): SaveEnvelope =>
+      Schema.decodeUnknownSync(SaveEnvelopeSchema)(parseJson(fixtureEnvelopeText(name)))
 
     const seedFixture = (storage: ControlledStorage, sessionId: string, name: string): SaveEnvelope => {
       const envelope = fixtureEnvelope(name)
@@ -1839,7 +1844,7 @@ describe('session persistence', () => {
             { type: 'hunger', remainingSecs: 15, pulseClockSecs: 0, amplifier: 2 },
           ],
         })
-        expect(loaded.state.brewing).toEqual(emptyBrewingStandState())
+        expect(loaded.state.brewing).toEqual(Result.getOrThrow(emptyBrewingState()))
         expect(loaded.state.storage.inventory.slots.every((slot) => slot === undefined)).toBe(true)
         expect(loaded.state.vitals).toMatchObject({ healthPoints: 13, hungerPoints: 17, lastDamageCause: 'fall' })
         expect(loaded.state.mountedVehicleId).toBe('v:7')
@@ -1925,5 +1930,104 @@ describe('session persistence', () => {
         expect(reread.state).toEqual(migrated.state)
       }).pipe(Effect.provide(storage.layer))
     })
+
+    const brewingStack = (item: 'awkward_potion' | 'sugar' | 'blaze_powder', count: number) =>
+      Result.getOrThrow(itemStack(item, count))
+
+    // Old brewing stands, from the old build's own `acceptBrewingFuel`,
+    // `acceptBrewingBottle`, `acceptBrewingIngredient`, and `tickBrewingStand`.
+    it.effect('completes a v17 brew in progress into bottle slot 0 without refunding its fuel', () => {
+      const storage = controlledStorage()
+      const envelope = seedFixture(storage, 'v17-brewing-in-progress', 'session-v17-brewing-in-progress-envelope.json')
+      return Effect.gen(function* () {
+        // 3 fuel units, a water bottle, and nether wart, ticked 5 s into the brew.
+        expect(envelope.payload).toMatchObject({
+          state: {
+            brewing: {
+              fuelUnits: 2,
+              bottle: 'water_bottle',
+              ingredient: null,
+              brewing: { output: 'awkward', remainingSecs: 15 },
+            },
+          },
+        })
+        const loaded = Option.getOrThrow(yield* loadSession('v17-brewing-in-progress'))
+
+        expect(loaded.state.brewing).toEqual({
+          bottles: [brewingStack('awkward_potion', 1), undefined, undefined],
+          ingredient: undefined,
+          fuel: undefined,
+          fuelCharges: 2,
+          brewProgressSecs: 0,
+        })
+      }).pipe(Effect.provide(storage.layer))
+    })
+
+    it.effect('moves a v17 bottle and ingredient into slot 0 and keeps 5 fuel units as 5 charges', () => {
+      const storage = controlledStorage()
+      seedFixture(storage, 'v17-brewing-fuel-5', 'session-v17-brewing-fuel-5-envelope.json')
+      return Effect.gen(function* () {
+        const loaded = Option.getOrThrow(yield* loadSession('v17-brewing-fuel-5'))
+
+        expect(loaded.state.brewing).toEqual({
+          bottles: [brewingStack('awkward_potion', 1), undefined, undefined],
+          ingredient: brewingStack('sugar', 1),
+          fuel: undefined,
+          fuelCharges: 5,
+          brewProgressSecs: 0,
+        })
+      }).pipe(Effect.provide(storage.layer))
+    })
+
+    it.effect('keeps 20 of 45 v17 fuel units as charges and the excess as ceil(25 / 20) blaze powder', () => {
+      const storage = controlledStorage()
+      seedFixture(storage, 'v17-brewing-fuel-45', 'session-v17-brewing-fuel-45-envelope.json')
+      return Effect.gen(function* () {
+        const loaded = Option.getOrThrow(yield* loadSession('v17-brewing-fuel-45'))
+
+        expect(loaded.state.brewing).toEqual({
+          bottles: [undefined, undefined, undefined],
+          ingredient: undefined,
+          fuel: brewingStack('blaze_powder', 2),
+          fuelCharges: 20,
+          brewProgressSecs: 0,
+        })
+      }).pipe(Effect.provide(storage.layer))
+    })
+
+    it.effect('fails the migration when the v17 fuel excess needs more than one stack of blaze powder', () => {
+      const storage = controlledStorage()
+      seedFixture(storage, 'v17-brewing-fuel-overflow', 'session-v17-brewing-fuel-overflow-envelope.json')
+      return Effect.gen(function* () {
+        // 1301 units: 20 charges plus ceil(1281 / 20) = 65 blaze powder, one over a stack of 64.
+        const error = yield* Effect.flip(loadSession('v17-brewing-fuel-overflow'))
+
+        expect(error).toMatchObject({
+          _tag: 'SaveDecodeError',
+          version: 17,
+          reason: 'the payload could not be migrated from v17 to v18',
+          cause: { _tag: 'V17BrewingFuelOverflow', fuelUnits: 1301, fuelItemCount: 65, maxStackCount: 64 },
+        })
+      }).pipe(Effect.provide(storage.layer))
+    })
+  })
+
+  // A save edited by hand can hold `1e999`, which JSON parses to Infinity.
+  // mc-save's envelope validation rejects it before the session schema runs.
+  it.effect('rejects a stored save whose JSON holds 1e999 before decoding the session', () => {
+    const storage = controlledStorage()
+    // The recorded integrity no longer matches; mc-save checks finiteness first.
+    const editedText = fixtureEnvelopeText('session-v17-stackless-envelope.json')
+      .replace('"remainingSecs":123.5', '"remainingSecs":1e999')
+    storage.setEnvelope(
+      sessionHeadKey('v17-stackless-fixture'),
+      Schema.decodeUnknownSync(SaveEnvelopeSchema)(parseJson(editedText)),
+    )
+
+    return Effect.gen(function* () {
+      const error = yield* Effect.flip(loadSession('v17-stackless-fixture'))
+
+      expect(error).toMatchObject({ _tag: 'SaveDecodeError', reason: 'save contains a non-finite number' })
+    }).pipe(Effect.provide(storage.layer))
   })
 })

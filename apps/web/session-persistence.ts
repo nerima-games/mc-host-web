@@ -9,9 +9,10 @@ import {
   saveTo,
   StoragePort,
   defineFormat,
-  defineFormatMigration,
+  SaveFormatVersion,
   type SaveDecodeError,
   type SaveFormat,
+  type SaveFormatMigration,
   type StorageError,
 } from '@nerima-games/mc-save'
 import {
@@ -26,7 +27,14 @@ import {
   validateCropSnapshot,
   type ContainerStorageSnapshot,
   type CropSnapshot,
+  BREWING_FUEL_CHARGES,
+  BREWING_FUEL_ITEM,
+  BREWING_MAX_FUEL_CHARGES,
   LegacyItemStackSchema,
+  itemStack,
+  validateBrewingSnapshot,
+  type BrewingState,
+  type ItemStackFailure,
   type Durability,
   type EquipmentItem,
   type FurnaceState,
@@ -46,6 +54,7 @@ import {
 } from '@nerima-games/mc-worldgen'
 import {
   emptyVillagerTradeState,
+  collectBrewingBottle,
   isValidBrewingStandState,
   isValidStatusEffectState,
   isValidVillagerTradeState,
@@ -85,7 +94,7 @@ const WitherRuntimeSnapshotSchema = Schema.declare(isValidWitherRuntimeSnapshot,
   expected: 'Wither runtime snapshot that satisfies persistence invariants',
 })
 
-// mx-gameplay's `BrewingStandState.{bottle,ingredient,brewing}` are `X |
+// v17 stored mx-gameplay's `BrewingStandState`, whose `{bottle,ingredient,brewing}` are `X |
 // undefined` (never `null` — see `node_modules/@nerima-games/mx-gameplay/dist/
 // domain/brewing.d.ts`), and mc-save's integrity checksum rejects a bare
 // `undefined` anywhere in the encoded payload (`integrity-canonical.ts`'s
@@ -117,7 +126,7 @@ const encodeBrewingUndefined = (value: unknown): unknown => {
   }
 }
 
-const BrewingStandStateSchema = makeBoundaryCodec(
+const V17BrewingStandStateSchema = makeBoundaryCodec(
   Schema.declare(isValidBrewingStandState, { expected: 'Brewing stand state that satisfies gameplay invariants' }),
   restoreBrewingUndefined,
   encodeBrewingUndefined,
@@ -415,7 +424,7 @@ export type SessionState = {
   readonly crops: CropSnapshot
   readonly entities: PersistedEntityRosters
   readonly villagers: PersistedVillagerState
-  readonly brewing: BrewingStandState
+  readonly brewing: BrewingState
   readonly statusEffects: StatusEffectState
   readonly end: PersistedEndState
   readonly workstations?: {
@@ -435,7 +444,7 @@ export type SessionState = {
 
 const FiniteNumberSchema = Schema.Finite
 
-// Same undefined-vs-null gap as `UndefinedSlotSchema`/`BrewingStandStateSchema`/
+// Same undefined-vs-null gap as `UndefinedSlotSchema`/`V17BrewingStandStateSchema`/
 // `PersistedEntityRostersSchema` in this file, but on a REQUIRED field rather than an
 // absent one: `PlayerVitals.lastDamageCause: DamageCause | undefined` is
 // always present (there is no death cause yet, not an omitted property), so
@@ -512,7 +521,7 @@ const PersistedEntityRosterSchema = Schema.Struct({
   nextSerial: Schema.Number,
 })
 
-// Same undefined-vs-null gap as `UndefinedSlotSchema`/`BrewingStandStateSchema`
+// Same undefined-vs-null gap as `UndefinedSlotSchema`/`V17BrewingStandStateSchema`
 // in this file, one level further down: an entity's `behaviour` is `unknown` here
 // (there is no shared schema for the whole `MobBehaviour` union across every
 // mx-gameplay mob kind), so nothing upstream catches a passive mob's
@@ -677,6 +686,19 @@ const FurnaceStateSchema = Schema.Struct({
   expected: 'Furnace state that satisfies simulation invariants',
 }))
 
+const isPersistableBrewingState = (value: unknown): value is BrewingState =>
+  validateBrewingSnapshot(value)._tag === 'Valid'
+
+const BrewingStateSchema = Schema.Struct({
+  bottles: Schema.Tuple([UndefinedSlotSchema, UndefinedSlotSchema, UndefinedSlotSchema]),
+  ingredient: UndefinedSlotSchema,
+  fuel: UndefinedSlotSchema,
+  fuelCharges: Schema.Finite,
+  brewProgressSecs: Schema.Finite,
+}).pipe(Schema.refine(isPersistableBrewingState, {
+  expected: 'Brewing state that satisfies simulation invariants',
+}))
+
 const PersistedFurnaceSchema = Schema.Struct({
   dimension: DimensionSchema,
   position: BlockPositionSchema,
@@ -785,7 +807,7 @@ const SessionStateSchema = Schema.Struct({
   crops: CropSnapshotSchema,
   entities: PersistedEntityRostersSchema,
   villagers: PersistedVillagerStateSchema,
-  brewing: BrewingStandStateSchema,
+  brewing: BrewingStateSchema,
   statusEffects: StatusEffectStateSchema,
   end: PersistedEndStateSchema,
   workstations: Schema.optionalKey(Schema.Struct({
@@ -925,6 +947,7 @@ const V17SessionHeadSchema = Schema.StructWithRest(
           position: Schema.Unknown,
           state: V17FurnaceStateSchema,
         })),
+        brewing: V17BrewingStandStateSchema,
       }),
       [Schema.Record(Schema.String, Schema.Unknown)],
     ),
@@ -962,43 +985,118 @@ const migrateV17FurnaceState = (state: typeof V17FurnaceStateSchema.Type) => ({
   cookProgressSecs: state.cookElapsedSecs,
 })
 
-const migrateV17SessionHead = (head: typeof V17SessionHeadSchema.Type): unknown => ({
-  ...head,
-  state: {
-    ...head.state,
-    storage: {
-      ...head.state.storage,
-      inventory: { ...head.state.storage.inventory, slots: head.state.storage.inventory.slots.map(migrateV17Slot) },
-      equipment: {
-        ...head.state.storage.equipment,
-        slots: Object.fromEntries(
-          Object.entries(head.state.storage.equipment.slots).map(([slot, stack]) => [slot, migrateV17Slot(stack)]),
-        ),
-      },
-    },
-    containerStorage: {
-      ...head.state.containerStorage,
-      version: V18_CONTAINER_STORAGE_VERSION,
-      containers: head.state.containerStorage.containers.map((container) => ({
-        ...container,
-        slots: container.slots.map(migrateV17Slot),
-      })),
-    },
-    furnaces: head.state.furnaces.map((furnace) => ({
-      ...furnace,
-      state: migrateV17FurnaceState(furnace.state),
-    })),
-  },
+type SessionV17MigrationFailure =
+  | {
+    readonly _tag: 'V17BrewingFuelOverflow'
+    readonly fuelUnits: number
+    readonly fuelItemCount: number
+    readonly maxStackCount: number
+  }
+  | { readonly _tag: 'V17BrewingStackRejected'; readonly item: string; readonly error: ItemStackFailure }
+  | { readonly _tag: 'V17BrewingStackUnencodable'; readonly item: string; readonly error: Schema.SchemaError }
+
+const v17BrewingStack = (
+  item: Parameters<typeof itemStack>[0],
+  count: number,
+): Result.Result<unknown, SessionV17MigrationFailure> =>
+  Result.flatMap(
+    Result.mapError(itemStack(item, count), (error) => ({ _tag: 'V17BrewingStackRejected' as const, item, error })),
+    (stack) => Result.mapError(
+      Schema.encodeResult(LegacyItemStackSchema)(stack),
+      (error) => ({ _tag: 'V17BrewingStackUnencodable' as const, item, error }),
+    ),
+  )
+
+// mx-gameplay 0.6's single-slot brewing stand -> mc-sim 0.11's `BrewingState`,
+// in its v18 encoded form:
+// - A brew in progress is completed now: its `output` becomes the bottle,
+//   exactly as the old stand's completion replaced its input bottle. The old
+//   build had already consumed the ingredient and one fuel unit when the brew
+//   started, so both stay consumed and progress restarts at 0. Under
+//   BREWING_DURATION_SECS (20 s) of brewing time is skipped.
+// - The bottle goes to slot 0; slots 1 and 2 stay empty. Its item comes from
+//   mx-gameplay's own `collectBrewingBottle`, so no potion table lives here.
+// - Fuel: one old fuel unit paid for one brew, and one new fuel charge pays
+//   for one brew, so `fuelCharges = min(fuelUnits, BREWING_MAX_FUEL_CHARGES)`.
+//   The excess goes into the fuel slot as ceil(excess / BREWING_FUEL_CHARGES)
+//   blaze powder: truncating would lose brews the player paid for, and
+//   converting every unit to a blaze powder (or every powder to charges)
+//   would multiply them by BREWING_FUEL_CHARGES; rounding up adds at most
+//   BREWING_FUEL_CHARGES - 1 brews. A count over one stack is a typed failure.
+const migrateV17Brewing = (
+  stand: BrewingStandState,
+): Result.Result<unknown, SessionV17MigrationFailure> => Result.gen(function* () {
+  const completed: BrewingStandState = stand.brewing === undefined
+    ? stand
+    : { ...stand, bottle: { potion: stand.brewing.output }, brewing: undefined }
+
+  let bottle: unknown = null
+  if (completed.bottle !== undefined) {
+    const [, collected] = collectBrewingBottle(completed)
+    // A stand with a bottle and no brew in progress is always collectable
+    // (mx-gameplay `collectBrewingBottle` rejects only 'Brewing' and 'Empty').
+    if (collected._tag !== 'Collected') throw new Error(`v17 brewing bottle was not collectable: ${collected.reason}`)
+    bottle = yield* v17BrewingStack(collected.returned.item, collected.returned.count)
+  }
+
+  const ingredient = completed.ingredient === undefined ? null : yield* v17BrewingStack(completed.ingredient, 1)
+
+  const fuelCharges = Math.min(completed.fuelUnits, BREWING_MAX_FUEL_CHARGES)
+  const fuelItemCount = Math.ceil((completed.fuelUnits - fuelCharges) / BREWING_FUEL_CHARGES)
+  const maxStackCount = maxStackCountForItem(BREWING_FUEL_ITEM)
+  if (fuelItemCount > maxStackCount) {
+    return yield* Result.fail({
+      _tag: 'V17BrewingFuelOverflow' as const,
+      fuelUnits: completed.fuelUnits,
+      fuelItemCount,
+      maxStackCount,
+    })
+  }
+  const fuel = fuelItemCount === 0 ? null : yield* v17BrewingStack(BREWING_FUEL_ITEM, fuelItemCount)
+
+  return { bottles: [bottle, null, null], ingredient, fuel, fuelCharges, brewProgressSecs: 0 }
 })
 
-// `defineFormatMigration` only rejects a malformed `fromVersion` or a
-// non-function `migrate`; both are fixed here, so a failure is a programming
-// error.
-const SESSION_V17_MIGRATION = Result.getOrThrow(defineFormatMigration({
-  fromVersion: V17_SESSION_FORMAT_VERSION,
-  schema: V17SessionHeadSchema,
+const migrateV17SessionHead = (
+  payload: unknown,
+): Result.Result<unknown, Schema.SchemaError | SessionV17MigrationFailure> =>
+  Result.flatMap(Schema.decodeUnknownResult(V17SessionHeadSchema)(payload), (head) =>
+    Result.map(migrateV17Brewing(head.state.brewing), (brewing) => ({
+      ...head,
+      state: {
+        ...head.state,
+        storage: {
+          ...head.state.storage,
+          inventory: { ...head.state.storage.inventory, slots: head.state.storage.inventory.slots.map(migrateV17Slot) },
+          equipment: {
+            ...head.state.storage.equipment,
+            slots: Object.fromEntries(
+              Object.entries(head.state.storage.equipment.slots).map(([slot, stack]) => [slot, migrateV17Slot(stack)]),
+            ),
+          },
+        },
+        containerStorage: {
+          ...head.state.containerStorage,
+          version: V18_CONTAINER_STORAGE_VERSION,
+          containers: head.state.containerStorage.containers.map((container) => ({
+            ...container,
+            slots: container.slots.map(migrateV17Slot),
+          })),
+        },
+        furnaces: head.state.furnaces.map((furnace) => ({
+          ...furnace,
+          state: migrateV17FurnaceState(furnace.state),
+        })),
+        brewing,
+      },
+    })))
+
+// Built directly rather than through `defineFormatMigration` so a migration
+// failure stays a typed `Result` failure instead of a thrown value.
+const SESSION_V17_MIGRATION: SaveFormatMigration = {
+  fromVersion: SaveFormatVersion(V17_SESSION_FORMAT_VERSION),
   migrate: migrateV17SessionHead,
-}))
+}
 
 // `defineFormat` only rejects a malformed name, version, or migration chain;
 // all three are the constants above, so a failure here is a programming error.
