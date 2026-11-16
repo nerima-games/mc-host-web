@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { hudViewModel, type DomNode } from '@nerima-games/mx-ui'
 import { Result } from 'effect'
-import { MonotonicTimeSecs, position, PositionAxis } from '@nerima-games/mc-kernel'
+import { EnchantmentLevel, MonotonicTimeSecs, position, PositionAxis } from '@nerima-games/mc-kernel'
 import {
   DamageCause,
   emptyPlayerStorage,
@@ -579,12 +579,12 @@ describe('H4a player UI', () => {
       ['0', {
         item: 'diamond_pickaxe',
         durability: { current: 1500, max: 1561 },
-        enchantments: [{ id: 'fortune', level: 3 }],
+        enchantments: [{ id: 'fortune', level: EnchantmentLevel(3) }],
       }],
       ['equipment:head', {
         item: 'iron_helmet',
         durability: null,
-        enchantments: [{ id: 'protection', level: 2 }],
+        enchantments: [{ id: 'protection', level: EnchantmentLevel(2) }],
       }],
       ['unrelated', { item: 'dirt', durability: null, enchantments: [] }],
     ])

@@ -1,6 +1,6 @@
 import { describe, expect, it } from '@effect/vitest'
 import { Result } from 'effect'
-import { PositionAxis, position, type ItemType } from '@nerima-games/mc-kernel'
+import { EnchantmentLevel, PositionAxis, position, type ItemType } from '@nerima-games/mc-kernel'
 
 import {
   emptyPlayerStorage,
@@ -85,12 +85,12 @@ describe('deathDropsFromPlayerStorage', () => {
         '3': {
           item: 'diamond_pickaxe',
           durability: { current: 1500, max: 1561 },
-          enchantments: [{ id: 'fortune', level: 3 }],
+          enchantments: [{ id: 'fortune', level: EnchantmentLevel(3) }],
         },
         'equipment:head': {
           item: 'iron_helmet',
           durability: { current: 150, max: 165 },
-          enchantments: [{ id: 'protection', level: 4 }],
+          enchantments: [{ id: 'protection', level: EnchantmentLevel(4) }],
         },
       },
     })).toStrictEqual([

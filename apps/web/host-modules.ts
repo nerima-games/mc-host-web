@@ -114,9 +114,9 @@ export type HostModulesDeps = {
 
 /**
  * `gameplayStages`' commit services. The package root does not re-export the
- * type, so it is read from the public function's tenth parameter.
+ * type, so it is read from the public function's ninth parameter.
  */
-export type GameplayCommitServices = NonNullable<Parameters<typeof gameplayStages>[9]>
+export type GameplayCommitServices = NonNullable<Parameters<typeof gameplayStages>[8]>
 
 /** A registered module whose stages were built from `HostServices`. */
 export type HostGameModule = GameModule<
@@ -213,14 +213,16 @@ export const registerHostModules = (deps: HostModulesDeps): Effect.Effect<Readon
         undefined,
         undefined,
         time,
-        vehicles,
         {
-          isActiveDimension,
-          isPoweredRailAt: (dimension, position) => poweredRails.has(leverKeyOf({ dimension, position })),
-          controlsForVehicle: (vehicle) =>
-            String(vehicle.id) === getMountedVehicleId() ? getVehicleControls() : { throttle: 0, steering: 0 },
-          onVehicleExit: (vehicle) => {
-            if (String(vehicle.id) === getMountedVehicleId()) setMountedVehicleId(undefined)
+          service: vehicles,
+          environment: {
+            isActiveDimension,
+            isPoweredRailAt: (dimension, position) => poweredRails.has(leverKeyOf({ dimension, position })),
+            controlsForVehicle: (vehicle) =>
+              String(vehicle.id) === getMountedVehicleId() ? getVehicleControls() : { throttle: 0, steering: 0 },
+            onVehicleExit: (vehicle) => {
+              if (String(vehicle.id) === getMountedVehicleId()) setMountedVehicleId(undefined)
+            },
           },
         },
         {

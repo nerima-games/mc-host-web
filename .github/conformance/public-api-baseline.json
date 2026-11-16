@@ -2295,7 +2295,7 @@
     "count": 1,
     "file": "apps/web/tick/post-frame.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync( requestBlockBreak( gameplayState, target.position, { ...miningLootContextForItem(miningItem), fortuneLevel: enchantedMiningItem === null ? 0 : enchantmentLevel(enchantedMiningItem, 'fortune'), }, ), )"
+    "text": "Effect.runSync( requestBlockBreak( gameplayState, target.position, { ...miningLootContextForItem(miningItem), fortuneLevel: enchantedMiningItem === null ? EnchantmentLevel(0) : enchantmentLevel(enchantedMiningItem, 'fortune'), }, ), )"
   },
   {
     "count": 1,

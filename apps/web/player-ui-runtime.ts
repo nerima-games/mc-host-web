@@ -103,7 +103,7 @@ import type { NetworkMessage } from '@nerima-games/mx-multiplayer'
 import type { MultiplayerInventorySelection, WithoutAuthority } from './multiplayer-client'
 import { applyAnvilOperation, enchantedItemFromAnvilOutput, planAnvilOperation, spendExperienceLevels } from '@nerima-games/mc-server/shared'
 import { announceInventoryTransition } from './audio-runtime'
-import { projectEnchantedItem } from './enchanted-item-state'
+import { enchantedItemWithLevels, projectEnchantedItem } from './enchanted-item-state'
 import {
   resetTouchLook,
   touchControlsPresentation,
@@ -1830,12 +1830,21 @@ export const createPlayerUiRuntime = (
     const outputName = anvilResult.output.customName === null
       ? null
       : String(anvilResult.output.customName)
-    const outputEnchantment = enchantedItemFromAnvilOutput(anvilResult.output)
-    if (anvilResult.output.enchantments.length > 0 && outputEnchantment === undefined) {
+    const rawOutputEnchantment = enchantedItemFromAnvilOutput(anvilResult.output)
+    if (anvilResult.output.enchantments.length > 0 && rawOutputEnchantment === undefined) {
       context.setAnvilStatus('Anvil operation is invalid')
       renderPlayerUi()
       return
     }
+    const decodedOutputEnchantment = rawOutputEnchantment === undefined
+      ? undefined
+      : enchantedItemWithLevels(rawOutputEnchantment)
+    if (decodedOutputEnchantment !== undefined && Result.isFailure(decodedOutputEnchantment)) {
+      context.setAnvilStatus('Anvil operation is invalid')
+      renderPlayerUi()
+      return
+    }
+    const outputEnchantment = decodedOutputEnchantment?.success
     const restored = Effect.runSync(Effect.result(context.worldInventory.restoreStorage(anvilResult.storage)))
     if (Result.isFailure(restored)) {
       context.setAnvilStatus(restored.failure._tag)

@@ -158,7 +158,7 @@ const makeHarness = async (options: HarnessOptions = {}) => {
   }
   const interactions = Option.getOrThrow(Option.fromNullishOr(gameplay.gameplayStages(
     gameplayState, world.chunkStore, world.entities, world.inventory, world.player,
-    time, undefined, undefined, {}, commit,
+    time, undefined, {}, commit,
   ).find((stage) => String(stage.id) === 'gameplay:interactions')))
   const runInteractions = () => Effect.provideService(
     interactions.run(DeltaTimeSecs(0.05)),

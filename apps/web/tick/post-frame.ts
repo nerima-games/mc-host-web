@@ -1125,7 +1125,7 @@ export const runTickPostFrame = (
                   {
                     ...miningLootContextForItem(miningItem),
                     fortuneLevel: enchantedMiningItem === null
-                      ? 0
+                      ? EnchantmentLevel(0)
                       : enchantmentLevel(enchantedMiningItem, 'fortune'),
                   },
                 ),

@@ -65,6 +65,7 @@ import {
   type MobBehaviour,
   type WeatherState,
 } from '@nerima-games/mx-gameplay'
+import { enchantedItemWithLevels } from './enchanted-item-state'
 import type { GameplayCommitServices } from './host-modules'
 import { validateMultiplayerUrl } from './multiplayer-url'
 import type { OwnerBackedWorld } from './owner-backed-services'
@@ -1447,10 +1448,16 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
         || message.revision < multiplayerRevision
         || message.player !== String(clientContext.multiplayer.query.player)
       ) continue
+      const items = Result.all(message.items.map(({ slot, item }) =>
+        Result.map(enchantedItemWithLevels(item), (decoded) => ({ slot, item: decoded }))))
+      if (Result.isFailure(items)) {
+        reportServerStateFailure(invalidServerState('enchantments')(items.failure))
+        continue
+      }
       multiplayerRevision = Math.max(multiplayerRevision, message.revision)
       clientContext.state.enchantmentSeed = message.seed
       for (const key of [...clientContext.state.enchantedItems.keys()]) if (/^\d+$/u.test(key)) clientContext.state.enchantedItems.delete(key)
-      for (const { slot, item } of message.items) clientContext.state.enchantedItems.set(String(slot), item)
+      for (const { slot, item } of items.success) clientContext.state.enchantedItems.set(String(slot), item)
       clientContext.callbacks.renderPlayerUi()
     }
   }

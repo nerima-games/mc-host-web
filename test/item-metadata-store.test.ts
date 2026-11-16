@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { EnchantmentLevel } from '@nerima-games/mc-kernel'
 
 import type { EnchantedItem } from '@nerima-games/mx-gameplay'
 
@@ -7,7 +8,7 @@ import { createItemMetadataStore } from '../apps/web/item-metadata-store'
 const enchantedItem: EnchantedItem = {
   item: 'diamond_sword',
   durability: { current: 1561, max: 1561 },
-  enchantments: [{ id: 'sharpness', level: 5 }],
+  enchantments: [{ id: 'sharpness', level: EnchantmentLevel(5) }],
 }
 
 describe('item metadata store', () => {

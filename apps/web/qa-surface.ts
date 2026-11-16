@@ -39,6 +39,7 @@ import {
   type BlockPosition,
   type ClockService,
   type Position as Vec3,
+  EnchantmentLevel,
 } from '@nerima-games/mc-kernel'
 import {
   biomeFor,
@@ -302,7 +303,7 @@ type QaSurfaceDeps = {
   }
   readonly makeQaBridge: (namespaces: ReadonlyArray<ModuleQaNamespace>) => Result.Result<QaBridgeApi<unknown>, QaBridgeCompositionFailure>
   readonly gameplay: {
-    readonly commit: NonNullable<Parameters<typeof gameplayStages>[9]>
+    readonly commit: NonNullable<Parameters<typeof gameplayStages>[8]>
     readonly targetingEntitiesOwnerId: NonNullable<Parameters<typeof requestTargetedBlockBreak>[2]['entitiesOwnerId']>
     readonly brewingService: BrewingServiceApi
     readonly world: OwnerBackedWorld
@@ -580,7 +581,7 @@ export const makeQaSurface = (
           enchantedItems.set('0', {
             item: 'diamond_pickaxe',
             durability,
-            enchantments: [{ id: 'efficiency', level: 5 }],
+            enchantments: [{ id: 'efficiency', level: EnchantmentLevel(5) }],
           })
           markSessionDirty()
           renderPlayerUi()
@@ -596,7 +597,7 @@ export const makeQaSurface = (
           enchantedItems.set('0', {
             item: 'diamond_pickaxe',
             durability,
-            enchantments: [{ id: 'fortune', level: 3 }],
+            enchantments: [{ id: 'fortune', level: EnchantmentLevel(3) }],
           })
           markSessionDirty()
           renderPlayerUi()

@@ -1,10 +1,11 @@
 import { Result } from 'effect'
 import { describe, expect, it } from 'vitest'
-import type { ItemType } from '@nerima-games/mc-kernel'
+import { EnchantmentLevel, type ItemType } from '@nerima-games/mc-kernel'
 import { itemStack } from '@nerima-games/mc-sim'
 
 import {
   decodeProjectedEnchantedItem,
+  enchantedItemWithLevels,
   projectEnchantedItem,
 } from '../apps/web/enchanted-item-state'
 
@@ -19,7 +20,7 @@ describe('enchanted item state', () => {
       {
         item: 'diamond_pickaxe',
         durability: { current: 1500, max: 1561 },
-        enchantments: [{ id: 'efficiency', level: 3 }],
+        enchantments: [{ id: 'efficiency', level: EnchantmentLevel(3) }],
       },
     )).toEqual({
       item: 'diamond_pickaxe',
@@ -35,7 +36,7 @@ describe('enchanted item state', () => {
       {
         item: 'diamond_pickaxe',
         durability: { current: 1500, max: 1561 },
-        enchantments: [{ id: 'efficiency', level: 3 }],
+        enchantments: [{ id: 'efficiency', level: EnchantmentLevel(3) }],
       },
     )).toEqual({
       item: 'iron_sword',
@@ -53,5 +54,30 @@ describe('enchanted item state', () => {
       durability: { current: 1500, max: 1561 },
       enchantments: [{ id: 'efficiency', level: 2 }],
     }), stack, durability)).toBeNull()
+  })
+
+  it('brands raw enchantment levels from mc-server shared rules', () => {
+    expect(Result.getOrThrow(enchantedItemWithLevels({
+      item: 'diamond_pickaxe',
+      durability: { current: 1500, max: 1561 },
+      enchantments: [{ id: 'efficiency', level: 5 }, { id: 'unbreaking', level: 3 }],
+    }))).toEqual({
+      item: 'diamond_pickaxe',
+      durability: { current: 1500, max: 1561 },
+      enchantments: [
+        { id: 'efficiency', level: EnchantmentLevel(5) },
+        { id: 'unbreaking', level: EnchantmentLevel(3) },
+      ],
+    })
+  })
+
+  it('rejects a raw enchantment level outside the kernel range', () => {
+    for (const level of [256, -1, 1.5]) {
+      expect(Result.isFailure(enchantedItemWithLevels({
+        item: 'diamond_pickaxe',
+        durability: null,
+        enchantments: [{ id: 'efficiency', level: 2 }, { id: 'fortune', level }],
+      }))).toBe(true)
+    }
   })
 })
