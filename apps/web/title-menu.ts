@@ -1,19 +1,25 @@
 import { Array as Arr, Effect, Layer, Result, Scope } from 'effect'
-import { WorldId } from '@nerima-games/mc-kernel'
+import { InputAction, KeyCode, WorldId } from '@nerima-games/mc-kernel'
 import { IndexedDbDatabaseName, indexedDbStorageLayer } from '@nerima-games/mc-save'
 import {
   createMainMenuView,
+  createOnboardingView,
   decodeWorldNameText,
   initialMainMenuState,
   mainMenuViewModel,
+  onboardingViewModel,
   type CreateWorldRequest,
   type MainMenuState,
   type SavedWorld,
+  type DomElement,
+  type DomElementFactory,
+  type QuickControlHint,
 } from '@nerima-games/mx-ui'
 
 import { validateMultiplayerUrl } from './multiplayer-url'
 import {
   DEFAULT_PLAYER_SETTINGS,
+  PLAYER_BINDING_ACTIONS,
   loadPlayerSettings,
   savePlayerSettings,
   type PlayerSettingsV1,
@@ -27,6 +33,77 @@ import {
   makeSettingsWriteQueue,
   type SettingsWriteQueue,
 } from './platform-adapters'
+
+const QUICK_CONTROLS_DISMISSED_KEY = 'mc-host-web/quick-controls-dismissed'
+const QUICK_CONTROL_ACTIONS = new Set(['moveForward', 'moveBackward', 'moveLeft', 'moveRight', 'jump', 'openInventory', 'attack', 'use', 'escape'])
+
+export const playerControlHints = (bindings: PlayerSettingsV1['bindings']): {
+  readonly quickControls: ReadonlyArray<QuickControlHint>
+  readonly allControls: ReadonlyArray<QuickControlHint>
+} => {
+  // The action list is fixed; bound input codes have already passed settings validation.
+  const allControls = PLAYER_BINDING_ACTIONS.flatMap((action): Array<QuickControlHint> => {
+    const keys = bindings[action]
+    return keys === undefined ? [] : [{ action: InputAction(action), keys: KeyCode(keys) }]
+  }).concat({ action: InputAction('escape'), keys: KeyCode('Escape') })
+  return { quickControls: allControls.filter(({ action }) => QUICK_CONTROL_ACTIONS.has(action)), allControls }
+}
+
+export type OnboardingPersistenceFailure = {
+  readonly _tag: 'OnboardingPersistenceFailure'
+  readonly operation: 'read' | 'write'
+  readonly cause: unknown
+}
+
+export const installPlayerOnboarding = (context: {
+  readonly document: DomElementFactory
+  readonly parent: DomElement
+  readonly getStorage: () => Pick<Storage, 'getItem' | 'setItem'>
+  readonly getQuickControls: () => ReadonlyArray<QuickControlHint>
+  readonly getAllControls: () => ReadonlyArray<QuickControlHint>
+  readonly onFailure: (failure: OnboardingPersistenceFailure) => void
+}): Result.Result<{ readonly showControls: () => void; readonly render: () => void }, OnboardingPersistenceFailure> => {
+  const loaded = Result.try({
+    try: () => {
+      const storage = context.getStorage()
+      return { storage, stored: storage.getItem(QUICK_CONTROLS_DISMISSED_KEY) }
+    },
+    catch: (cause): OnboardingPersistenceFailure => ({ _tag: 'OnboardingPersistenceFailure', operation: 'read', cause }),
+  })
+  if (Result.isFailure(loaded)) return Result.fail(loaded.failure)
+  const { storage, stored } = loaded.success
+  if (stored !== null && stored !== 'true') {
+    return Result.fail({ _tag: 'OnboardingPersistenceFailure', operation: 'read', cause: stored })
+  }
+  let dismissed = stored === 'true'
+  let expanded = false
+  const render = (): void => view.render(onboardingViewModel({
+    firstRun: true,
+    quickControlsDismissed: dismissed,
+    quickControls: expanded ? context.getAllControls() : context.getQuickControls(),
+  }))
+  const view = createOnboardingView(context.document, context.parent, {
+    onIntent: (intent) => {
+      if (intent._tag === 'OpenHowToPlay') {
+        expanded = true
+        render()
+        return
+      }
+      const saved = Result.try({
+        try: () => storage.setItem(QUICK_CONTROLS_DISMISSED_KEY, 'true'),
+        catch: (cause): OnboardingPersistenceFailure => ({ _tag: 'OnboardingPersistenceFailure', operation: 'write', cause }),
+      })
+      if (Result.isFailure(saved)) {
+        context.onFailure(saved.failure)
+        return
+      }
+      dismissed = true
+      render()
+    },
+  })
+  render()
+  return Result.succeed({ showControls: () => { dismissed = false; render() }, render })
+}
 
 export type TitleMenuContext = {
   readonly document: Document
@@ -146,9 +223,36 @@ export const bootTitleMenu = async (context: TitleMenuContext): Promise<void> =>
   const existingIds = savedWorlds.map(({ sessionId }) => sessionId)
   let menuState: MainMenuState = initialMainMenuState
   let menuView: ReturnType<typeof createMainMenuView>
+  const onboardingParent = document.createElement('div')
+  titleScreen.appendChild(onboardingParent)
+  const reportOnboardingFailure = (failure: OnboardingPersistenceFailure): void => {
+    titleStatus.textContent = failure.operation === 'read'
+      ? 'Controls preferences could not be loaded.'
+      : 'Controls could not be saved. Please try again.'
+    console.error('[mc-compose] controls persistence failed', failure)
+  }
+  const onboarding = installPlayerOnboarding({
+    document,
+    parent: onboardingParent,
+    getStorage: () => window.localStorage,
+    getQuickControls: () => playerControlHints(playerSettings.bindings).quickControls,
+    getAllControls: () => playerControlHints(playerSettings.bindings).allControls,
+    onFailure: reportOnboardingFailure,
+  })
+  if (Result.isFailure(onboarding)) {
+    reportOnboardingFailure(onboarding.failure)
+  } else {
+    const controlsButton = document.createElement('button')
+    controlsButton.setAttribute('type', 'button')
+    controlsButton.setAttribute('data-title-action', 'show-controls')
+    controlsButton.textContent = 'Controls'
+    controlsButton.addEventListener('click', () => onboarding.success.showControls())
+    titleScreen.appendChild(controlsButton)
+  }
   settingsView = createSettingsView(document, settingsRoot, {
     onChange: (next) => {
       playerSettings = next
+      if (Result.isSuccess(onboarding)) onboarding.success.render()
       persistPlayerSettings(next)
     },
     onClose: () => {
