@@ -151,9 +151,9 @@ test('creates, plays, saves, and resumes a Creative world', async ({ page }) => 
   await page.keyboard.press('Escape')
   await page.getByTestId('save-quit-button').click()
   await page.locator('[data-menu-entry="single-player"]').click()
-  const savedSession = page.locator('[data-mx-ui="menu-world-row"]', {
-    has: page.locator('[data-mx-ui="menu-world-session-id"]', { hasText: sessionId ?? '' }),
-  })
+  const savedSession = page.locator(
+    `[data-mx-ui="menu-world-row"][data-session-id="${sessionId}"]`,
+  )
   await savedSession.click()
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
   expect((await snapshot(page)).mode).toBe('creative')

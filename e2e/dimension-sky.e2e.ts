@@ -103,6 +103,7 @@ test('the rendered sky changes when the player crosses dimensions, and restores 
   await startGameSession(page)
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
 
+  await waitForFrameAdvance(page, await framesNow(page))
   const overworldClear = await readClearColor(page)
   assertClearColor(overworldClear, 'the overworld should already be drawing through a live WebGL2 context')
 

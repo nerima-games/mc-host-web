@@ -44,9 +44,9 @@ test('creates, saves, and reloads a session from the title screen', async ({ pag
   await expect(page.getByTestId('title-screen')).toBeVisible()
   await page.locator('[data-menu-entry="single-player"]').click()
 
-  const savedSession = page.locator('[data-mx-ui="menu-world-row"]', {
-    has: page.locator(`[data-mx-ui="menu-world-session-id"]`, { hasText: sessionId ?? '' }),
-  })
+  const savedSession = page.locator(
+    `[data-mx-ui="menu-world-row"][data-session-id="${sessionId}"]`,
+  )
   await expect(savedSession).toHaveAttribute('data-session-id', sessionId ?? '')
   await expect(savedSession).toContainText('E2E Lifecycle')
 
