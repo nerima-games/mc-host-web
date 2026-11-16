@@ -1,7 +1,8 @@
-import { blockIdOf, blockPosition, blockPositionKeyOf, blockTypeOfId, chunkCoord, DeltaTimeSecs, MonotonicTimeSecs } from '@nerima-games/mc-kernel'
+import { AngleRadians, AttackRangeDistance, BlockAxis, blockIdOf, blockPosition, blockPositionKeyOf, blockTypeOfId, ChunkAxis, chunkCoord, DeltaTimeSecs, EntityHealthPoints, EntityId, FixedDurationSecs, MonotonicTimeSecs, position, PositionAxis, WorldId } from '@nerima-games/mc-kernel'
 import { makeChunkStoreLightColor, makeChunkStoreMesher, type InputAction, type InputSnapshot } from '@nerima-games/mc-render'
 import {
   makeSimFrameState,
+  makeWorldCommitCoordinator,
   makeWeatherService,
   maxStackCountForItem,
   itemStack,
@@ -11,7 +12,6 @@ import {
 import {
   CHUNK_SIZE_XZ,
   CHUNK_VOLUME,
-  FALLBACK_BIOME,
   type ChunkSource,
 } from '@nerima-games/mc-worldgen'
 import {
@@ -19,16 +19,17 @@ import {
   type MobBehaviour,
 } from '@nerima-games/mx-gameplay'
 import * as gameplay from '@nerima-games/mx-gameplay'
-import { Effect, Ref } from 'effect'
-import { describe, expect, it } from 'vitest'
+import { Effect, Option, Ref, Result } from 'effect'
+import { describe, expect, it, vi } from 'vitest'
 
+import { BlocksPerSecond } from '@nerima-games/mc-physics'
 import { makeBudgetedDirtySource } from '../apps/web/chunk-sync-budget'
 import { trackChunkLightColor } from '../apps/web/render-lighting'
 import { isDroppedItemPickupEligible } from '../apps/web/dropped-item-pickup'
 import { droppedItemMetadataFromBehaviour } from '../apps/web/dropped-item-metadata'
 import { IDLE_BOW_USE, advanceBowUse } from '../apps/web/bow-use'
 import { advanceEyeOfEnderRuntime, initialEyeOfEnderRuntimeState } from '../apps/web/eye-of-ender-runtime'
-import { advanceFootstepRuntime, initialFootstepRuntimeState, surfaceForBlockType } from '../apps/web/footstep-runtime'
+import { advanceFootstepRuntime, initialFootstepRuntimeState } from '../apps/web/footstep-runtime'
 import { EMPTY_BLOCK_BREAK_COUNTERS, observeBlockBreakCompletion, recordBlockBreakRequest } from '../apps/web/mining-completion'
 import { projectEnchantedItem } from '../apps/web/enchanted-item-state'
 import {
@@ -42,7 +43,7 @@ import { initialPlayerSwimmingRuntimeState } from '../apps/web/player-swimming-r
 import { type DimensionChunkContext } from '../apps/web/chunk-streaming'
 import { mutableState, type H5aFrameInputResult, type H5aMovementResult } from '../apps/web/tick/h5a-context'
 import { type H5bPostFrameContext } from '../apps/web/tick/h5b-context'
-import { runTickPostFrame } from '../apps/web/tick/post-frame'
+import { runTickPostFrame as runTickPostFrameEffect } from '../apps/web/tick/post-frame'
 import {
   advanceWitherRuntime,
   damageRuntimeWither,
@@ -51,10 +52,12 @@ import {
 
 type LegacyGameplayItemType = Exclude<ItemStack['item'], 'arrow' | 'bow'>
 
+const runTickPostFrame = (...args: Parameters<typeof runTickPostFrameEffect>) => Effect.runSync(runTickPostFrameEffect(...args))
+
 const allAirChunkSource: ChunkSource = (coord) => Effect.succeed({
   coord,
-  blocks: new Uint8Array(CHUNK_VOLUME).fill(blockIdOf('air')),
-  biomes: Array.from({ length: CHUNK_SIZE_XZ * CHUNK_SIZE_XZ }, () => FALLBACK_BIOME),
+  blocks: new Uint16Array(CHUNK_VOLUME).fill(Option.getOrThrow(blockIdOf('air'))),
+  biomes: Array.from({ length: CHUNK_SIZE_XZ * CHUNK_SIZE_XZ }, () => 'PLAINS'),
 })
 
 const cell = <Value,>(initial: Value) => {
@@ -93,6 +96,24 @@ const makeContext = async (primaryAttackConsumed: ReturnType<typeof cell<boolean
     dimension: 'overworld',
     chunkSource: allAirChunkSource,
   }))
+  const owners = await Effect.runPromise(Effect.fromResult(gameplay.gameplayOwnerRegistrations({
+    playerPose: Effect.runSync(world.player.pose),
+    dimension: 'overworld',
+    playerStorage: Effect.runSync(world.inventory.storageSnapshot),
+    vitals: Effect.runSync(world.vitals.snapshot),
+    entities: Effect.runSync(world.entities.snapshot),
+  })))
+  const coordinator = await Effect.runPromise(makeWorldCommitCoordinator({
+    world: WorldId('tick-post-frame-test'),
+    owners,
+    dimensions: ['overworld', 'nether', 'end'],
+    chunkStores: { forDimension: () => world.chunkStore },
+  }))
+  const targeting = {
+    coordinator,
+    playerOwnerId: gameplay.GAMEPLAY_PLAYER_OWNER_ID,
+    entitiesOwnerId: gameplay.GAMEPLAY_ENTITIES_OWNER_ID,
+  }
   const gameplayState = await Effect.runPromise(gameplay.makeGameplayFrameState)
   const simState = await Effect.runPromise(makeSimFrameState)
   const weatherService = await Effect.runPromise(makeWeatherService())
@@ -131,11 +152,12 @@ const makeContext = async (primaryAttackConsumed: ReturnType<typeof cell<boolean
 
   const h5a = {
     world,
+    targeting,
     playerApi,
     simState,
     currentChunkContext: () => currentChunkContext,
     currentChunkStore: world.chunkStore,
-    blockPosition,
+    blockPosition: (x, y, z) => blockPosition(BlockAxis(x), BlockAxis(y), BlockAxis(z)),
     blockTypeOfId,
     gameplayState,
     multiplayer: undefined,
@@ -178,13 +200,13 @@ const makeContext = async (primaryAttackConsumed: ReturnType<typeof cell<boolean
       witherRuntimeState: cell(initialWitherRuntimeState()).state,
       projectileRuntimeState: cell(launchRuntimeProjectile(initialProjectileRuntimeState(), {
         dimension: 'overworld',
-        position: { x: 0, y: 65, z: 0 },
-        yawRadians: 0,
-        pitchRadians: 0,
-        speed: 10,
+        position: position(PositionAxis(0), PositionAxis(65), PositionAxis(0)),
+        yawRadians: AngleRadians(0),
+        pitchRadians: AngleRadians(0),
+        speed: BlocksPerSecond(10),
         damage: 5,
         knockback: 1,
-        shooterId: 'player',
+        shooterId: EntityId('player'),
       })).state,
       eyeOfEnderRuntimeState: cell(initialEyeOfEnderRuntimeState()).state,
       bowUseState: bowUseState.state,
@@ -238,7 +260,7 @@ const makeContext = async (primaryAttackConsumed: ReturnType<typeof cell<boolean
     pressurePlateOccupancy: new Map(),
     environmentalContactsForPose: () => [],
     isGameplayBlockSolid: () => false,
-    applyWorldExplosion: () => undefined,
+    applyWorldExplosion: () => Result.succeed(undefined),
     resetBowUse: () => bowUseState.state.set(IDLE_BOW_USE),
     projectileHud: { textContent: '', hidden: true },
     projectedInventoryEnchantedItem: () => null,
@@ -253,7 +275,6 @@ const makeContext = async (primaryAttackConsumed: ReturnType<typeof cell<boolean
     bowDamage: gameplay.bowDamage,
     bowDamageWithEnchantments: gameplay.bowDamageWithEnchantments,
     advanceFootstepRuntime,
-    surfaceForBlockType,
     audio: { play: () => undefined },
     advanceWitherRuntime,
     damageRuntimeWither,
@@ -275,10 +296,6 @@ const makeContext = async (primaryAttackConsumed: ReturnType<typeof cell<boolean
     requestMeleeAttack: gameplay.requestMeleeAttack,
     requestBlockBreak: gameplay.requestBlockBreak,
     requestPotatoHarvest: gameplay.requestPotatoHarvest,
-    crops: {
-      matureYieldsAt: () => Effect.succeed(null),
-      remove: () => Effect.void,
-    },
     pendingItemUses: new Map(),
     spawnDroppedItems: gameplay.spawnDroppedItems,
   }
@@ -496,11 +513,11 @@ describe('tick post-frame processing', () => {
     const harness = await makeContext(cell(false))
     const world = harness.context.h5a.world
     const startingVitals = Effect.runSync(world.vitals.snapshot)
-    await Effect.runPromise(world.vitals.restore({ ...startingVitals, healthPoints: 5, lastDamageCause: undefined }))
+    await Effect.runPromise(world.vitals.restore({ ...startingVitals, healthPoints: EntityHealthPoints(5), lastDamageCause: undefined }))
     const damageEvent = {
       _tag: 'FireContact' as const,
-      at: { x: 0.5, y: 64, z: 0.5 },
-      damage: { amount: 6, cause: 'fire' as const },
+      at: position(PositionAxis(0.5), PositionAxis(64), PositionAxis(0.5)),
+      damage: { amount: 6, cause: 'in_fire' as const },
     }
     Effect.runSync(Ref.set(harness.context.h5a.gameplayState.playerDamages, [damageEvent]))
 
@@ -512,7 +529,7 @@ describe('tick post-frame processing', () => {
         ...base.h5a,
         playerIsDead: () => Effect.runSync(world.vitals.view).healthPoints === 0,
       },
-      applyPlayerDamage: (damage, minimumHealthPoints = 0) => {
+      applyPlayerDamage: (damage, minimumHealthPoints = EntityHealthPoints(0)) => {
         applied.push({ ...damage, minimumHealthPoints })
         Effect.runSync(world.vitals.damage(damage))
       },
@@ -532,11 +549,62 @@ describe('tick post-frame processing', () => {
       else Object.defineProperty(globalThis, 'document', priorDocument)
     }
 
-    expect(applied).toEqual([{ amount: 6, cause: 'fire', minimumHealthPoints: 0 }])
-    expect(Effect.runSync(world.vitals.snapshot)).toMatchObject({ healthPoints: 0, lastDamageCause: 'fire' })
+    expect(applied).toEqual([{ amount: 6, cause: 'in_fire', minimumHealthPoints: 0 }])
+    expect(Effect.runSync(world.vitals.snapshot)).toMatchObject({ healthPoints: 0, lastDamageCause: 'in_fire' })
     expect(harness.inventoryOpenEvents).toEqual([false])
     expect(harness.sessionDirtyCount()).toBe(1)
     expect(result?.deadAfterFrame).toBe(true)
+  })
+
+  it('reports a wither explosion failure and stops later explosions', async () => {
+    const harness = await makeContext(cell(false))
+    const failure = { _tag: 'ExplosionValidationFailure', path: 'power', reason: 'fixture rejection' } as const
+    const advanced = initialWitherRuntimeState()
+    const explosion = { position: { x: 0, y: 64, z: 0 }, power: 5, destroysResistantBlocks: false }
+    let calls = 0
+    const context: H5bPostFrameContext = {
+      ...inOverworld(harness.context),
+      advanceWitherRuntime: () => ({ state: advanced, meleeDamage: 0, explosions: [explosion, explosion] }),
+      applyWorldExplosion: () => { calls += 1; return Result.fail(failure) },
+    }
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    try {
+      const result = Effect.runSync(Effect.result(runTickPostFrameEffect(context, {
+        frame: harness.input,
+        movement: inOverworldMovement(harness.movement),
+        framesTotal: 5,
+      })))
+
+      expect(Result.isFailure(result)).toBe(true)
+      if (Result.isFailure(result)) expect(result.failure).toBe(failure)
+      expect(warning).toHaveBeenCalledWith('Unable to apply wither explosion', failure)
+      expect(calls).toBe(1)
+      expect(context.state.witherRuntimeState.get()).toBe(advanced)
+    } finally {
+      warning.mockRestore()
+    }
+  })
+
+  it('persists advanced projectile state when targeting fails with a typed error', async () => {
+    const harness = await makeContext(cell(false))
+    const advanced = initialProjectileRuntimeState()
+    const failure = new RangeError('fixture targeting failure')
+    const context: H5bPostFrameContext = {
+      ...inOverworld(harness.context),
+      advanceProjectileRuntime: () => ({ state: advanced, impacts: [] }),
+      resolveTargetedPrimaryAttack: () => Effect.fail(failure),
+    }
+    expect(context.state.projectileRuntimeState.get()).not.toBe(advanced)
+
+    const result = Effect.runSync(Effect.result(runTickPostFrameEffect(context, {
+      frame: { ...harness.input, attackTriggered: true, attackHeld: true },
+      movement: inOverworldMovement(harness.movement),
+      framesTotal: 5,
+    })))
+
+    expect(Result.isFailure(result)).toBe(true)
+    if (Result.isFailure(result)) expect(result.failure).toBe(failure)
+    expect(context.state.projectileRuntimeState.get()).toBe(advanced)
   })
 
   it('preserves the bow reset when the reset callback mutates state and throws', async () => {
@@ -576,7 +644,7 @@ describe('tick post-frame processing', () => {
     expect(harness.environmentalContactDamageState.get()).toEqual({ lastDamageElapsedSecs: undefined })
   })
 
-  it('releases a charged bow into a projectile with fixed damage and consumes one arrow', async () => {
+  it('releases a quarter-second bow charge with five damage and consumes one arrow', async () => {
     const harness = await makeContext(cell(false))
     const { world } = harness.context.h5a
     Effect.runSync(world.inventory.add('bow', 1))
@@ -602,7 +670,7 @@ describe('tick post-frame processing', () => {
     expect(projectile).toMatchObject({
       id: 'arrow-1',
       dimension: 'overworld',
-      damage: 2,
+      damage: 5,
       knockback: 0.5125,
     })
     expect(arrowCount).toBe(0)
@@ -614,14 +682,14 @@ describe('tick post-frame processing', () => {
     Effect.runSync(world.inventory.add('wooden_sword', 1))
     const target = Effect.runSync(world.entities.spawn({
       kind: EntityKind('zombie'),
-      feetPosition: { x: 0.5, y: 64, z: -2 },
-      healthPoints: 10,
+      feetPosition: position(PositionAxis(0.5), PositionAxis(64), PositionAxis(-2)),
+      healthPoints: EntityHealthPoints(10),
       behaviour: gameplay.hostileMobSnapshot(undefined),
     }))
     const request = {
-      origin: { x: 0.5, y: 65.62, z: 0.5 },
-      direction: { x: 0, y: 0, z: -1 },
-      reach: 3,
+      origin: position(PositionAxis(0.5), PositionAxis(65.62), PositionAxis(0.5)),
+      direction: position(PositionAxis(0), PositionAxis(0), PositionAxis(-1)),
+      reach: AttackRangeDistance(3),
       damage: 4,
     }
     const context: H5bPostFrameContext = {
@@ -646,14 +714,81 @@ describe('tick post-frame processing', () => {
     expect(context.state.primaryAttackGestureConsumed.get()).toBe(true)
   })
 
+  it('queues a crop harvest before changing its block', async () => {
+    const harness = await makeContext(cell(false))
+    const world = harness.context.h5a.world
+    const at = blockPosition(BlockAxis(0), BlockAxis(64), BlockAxis(1))
+    Effect.runSync(world.chunkStore.load(chunkCoord(ChunkAxis(0), ChunkAxis(0))))
+    Effect.runSync(world.chunkStore.setBlock(at, Option.getOrThrow(blockIdOf('potato_crop'))))
+    const harvestRequests = new Map<string, Parameters<H5bPostFrameContext['pendingItemUses']['set']>[1]>()
+    const context: H5bPostFrameContext = {
+      ...inOverworld(harness.context),
+      h5a: { ...inOverworld(harness.context).h5a, isCreativeMode: true },
+      resolveTargetedPrimaryAttack: () => Effect.succeed({
+        _tag: 'Block',
+        target: { position: position(PositionAxis(at.x), PositionAxis(at.y), PositionAxis(at.z)), adjacentPosition: position(PositionAxis(at.x), PositionAxis(at.y), PositionAxis(at.z)), distance: 1 },
+      }),
+      pendingItemUses: harvestRequests,
+      requestPotatoHarvest: (state, requestId, position) => gameplay.requestPotatoHarvest(state, requestId, position, 0.25),
+    }
+    harness.canvasAttributes.set('data-breaks-completed', '0')
+
+    runTickPostFrame(context, {
+      frame: { ...harness.input, attackTriggered: true, attackHeld: true },
+      movement: inOverworldMovement(harness.movement),
+      framesTotal: 5,
+    })
+
+    expect(Effect.runSync(world.chunkStore.getBlock(at))).toMatchObject({ _tag: 'Block', block: Option.getOrThrow(blockIdOf('potato_crop')) })
+    expect(harvestRequests.get('item-use-1')).toMatchObject({ kind: 'harvest', dimension: 'overworld', position: at })
+    expect(context.state.blockBreakCounters.get().completed).toBe(0)
+    expect(context.pendingBlockBreakConfirmations).toHaveLength(1)
+    expect(Effect.runSync(Ref.get(context.h5a.gameplayState.pendingItemUses))).toEqual([
+      expect.objectContaining({ action: 'HarvestPotato', requestId: 'item-use-1', positionKey: blockPositionKeyOf(at), roll: 0.25 }),
+    ])
+    expect(harness.canvasAttributes.get('data-breaks-completed')).toBe('0')
+  })
+
+  it('retains a retried harvest confirmation until the committed block is air', async () => {
+    const harness = await makeContext(cell(false))
+    const world = harness.context.h5a.world
+    const at = blockPosition(BlockAxis(0), BlockAxis(64), BlockAxis(1))
+    const crop = Option.getOrThrow(blockIdOf('potato_crop'))
+    Effect.runSync(world.chunkStore.load(chunkCoord(ChunkAxis(0), ChunkAxis(0))))
+    Effect.runSync(world.chunkStore.setBlock(at, crop))
+    const context: H5bPostFrameContext = {
+      ...inOverworld(harness.context),
+      dimensionContexts: new Map([['overworld', harness.context.h5a.currentChunkContext()]]),
+    }
+    context.pendingBlockBreakConfirmations.push({ dimension: 'overworld', position: at, blockId: crop })
+    Effect.runSync(gameplay.requestPotatoHarvest(context.h5a.gameplayState, 'retry-harvest', at, 0.25))
+    const frame = { frame: harness.input, movement: inOverworldMovement(harness.movement), framesTotal: 5 }
+
+    runTickPostFrame(context, frame)
+    runTickPostFrame(context, frame)
+
+    expect(context.pendingBlockBreakConfirmations).toHaveLength(1)
+    expect(context.state.blockBreakCounters.get().completed).toBe(0)
+    expect(Effect.runSync(world.chunkStore.getBlock(at))).toMatchObject({ _tag: 'Block', block: crop })
+    Effect.runSync(Ref.set(context.h5a.gameplayState.pendingItemUses, []))
+    Effect.runSync(world.chunkStore.setBlock(at, Option.getOrThrow(blockIdOf('air'))))
+
+    runTickPostFrame(context, frame)
+    runTickPostFrame(context, frame)
+
+    expect(context.pendingBlockBreakConfirmations).toEqual([])
+    expect(context.state.blockBreakCounters.get().completed).toBe(1)
+    expect(harness.canvasAttributes.get('data-breaks-completed')).toBe('1')
+  })
+
   it('records and completes a fixed creative block-break request', async () => {
     const harness = await makeContext(cell(false))
     const world = harness.context.h5a.world
-    const position = blockPosition(0, 64, 1)
-    await Effect.runPromise(world.worldgenChunkStore.load(chunkCoord(0, 0)))
-    await Effect.runPromise(world.chunkStore.load(chunkCoord(0, 0)))
-    await Effect.runPromise(world.worldgenChunkStore.setBlock(position, blockIdOf('stone')))
-    await Effect.runPromise(world.chunkStore.setBlock(position, blockIdOf('stone')))
+    const position = blockPosition(BlockAxis(0), BlockAxis(64), BlockAxis(1))
+    await Effect.runPromise(world.worldgenChunkStore.load(chunkCoord(ChunkAxis(0), ChunkAxis(0))))
+    await Effect.runPromise(world.chunkStore.load(chunkCoord(ChunkAxis(0), ChunkAxis(0))))
+    await Effect.runPromise(world.worldgenChunkStore.setBlock(position, Option.getOrThrow(blockIdOf('stone'))))
+    await Effect.runPromise(world.chunkStore.setBlock(position, Option.getOrThrow(blockIdOf('stone'))))
     const currentChunkContext = harness.context.h5a.currentChunkContext()
     const context: H5bPostFrameContext = {
       ...inOverworld(harness.context),
@@ -661,7 +796,11 @@ describe('tick post-frame processing', () => {
       dimensionContexts: new Map([['overworld', currentChunkContext] as const]),
       resolveTargetedPrimaryAttack: () => Effect.succeed({
         _tag: 'Block',
-        target: { position, adjacentPosition: position, distance: 1 },
+        target: {
+          position: { x: PositionAxis(position.x), y: PositionAxis(position.y), z: PositionAxis(position.z) },
+          adjacentPosition: { x: PositionAxis(position.x), y: PositionAxis(position.y), z: PositionAxis(position.z) },
+          distance: 1,
+        },
       }),
     }
 
@@ -677,8 +816,8 @@ describe('tick post-frame processing', () => {
     expect(context.pendingBlockBreakConfirmations).toHaveLength(1)
     expect(context.h5a.state.redstoneDirty.get()).toBe(true)
 
-    await Effect.runPromise(world.worldgenChunkStore.setBlock(position, blockIdOf('air')))
-    await Effect.runPromise(world.chunkStore.setBlock(position, blockIdOf('air')))
+    await Effect.runPromise(world.worldgenChunkStore.setBlock(position, Option.getOrThrow(blockIdOf('air'))))
+    await Effect.runPromise(world.chunkStore.setBlock(position, Option.getOrThrow(blockIdOf('air'))))
     runTickPostFrame(context, {
       frame: { ...harness.input, attackTriggered: false, attackHeld: false },
       movement: inOverworldMovement(harness.movement),
@@ -692,8 +831,8 @@ describe('tick post-frame processing', () => {
     const world = harness.context.h5a.world
     const target = Effect.runSync(world.entities.spawn({
       kind: EntityKind('zombie'),
-      feetPosition: { x: 2, y: 64, z: -2 },
-      healthPoints: 10,
+      feetPosition: position(PositionAxis(2), PositionAxis(64), PositionAxis(-2)),
+      healthPoints: EntityHealthPoints(10),
       behaviour: gameplay.hostileMobSnapshot(undefined),
     }))
     harness.context.state.projectileRuntimeState.set(initialProjectileRuntimeState())
@@ -705,10 +844,10 @@ describe('tick post-frame processing', () => {
           projectileId: 'arrow-fixture',
           hit: {
             kind: 'entity',
-            entityId: String(target.id),
-            point: { x: 2, y: 65, z: -2 },
-            normal: { x: 0, y: 0, z: 1 },
-            flightTimeSeconds: 0.05,
+            entityId: target.id,
+            point: position(PositionAxis(2), PositionAxis(65), PositionAxis(-2)),
+            normal: position(PositionAxis(0), PositionAxis(0), PositionAxis(1)),
+            flightTimeSeconds: FixedDurationSecs(0.05),
           },
           damage: 4,
           knockback: 2,

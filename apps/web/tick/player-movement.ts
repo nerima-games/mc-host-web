@@ -1,5 +1,7 @@
+import { position, PositionAxis } from '@nerima-games/mc-kernel'
+import { BlocksPerSecond } from '@nerima-games/mc-physics'
 import { WorldId } from '@nerima-games/mx-multiplayer'
-import { Effect, Exit, Option, Ref } from 'effect'
+import { Effect, Exit, Option, Ref, Result } from 'effect'
 
 import type { InputAction } from '@nerima-games/mc-render'
 import type { H5aMovementContext, H5aMovementFrameInput, H5aMovementResult } from './h5a-context'
@@ -15,7 +17,7 @@ export const movementInput = (
 export const runTickPlayerMovement = (
   context: H5aMovementContext,
   frame: H5aMovementFrameInput,
-): H5aMovementResult | undefined => {
+): Effect.Effect<H5aMovementResult | undefined, Effect.Error<H5aMovementContext['time']['timeOfDay']>> => Effect.gen(function* () {
   const { deltaSecs, dead } = frame
   const poseBeforeFrame = Effect.runSync(context.playerApi.pose)
   const groundedBeforeFrame = Effect.runSync(Ref.get(context.simState.isGrounded))
@@ -37,13 +39,14 @@ export const runTickPlayerMovement = (
     Math.floor(poseBeforeFrame.feetPosition.y + context.eyeLevelOffset),
     Math.floor(poseBeforeFrame.feetPosition.z),
   )))
+  // Chunk-store block IDs belong to the registered block vocabulary.
   const canSwim = mountedVehicle === undefined && !dead
   const feetInWater = canSwim
     && feetReading._tag === 'Block'
-    && context.blockTypeOfId(feetReading.block) === 'water'
+    && Result.getOrThrow(context.blockTypeOfId(feetReading.block)) === 'water'
   const eyesInWater = canSwim
     && eyesReading._tag === 'Block'
-    && context.blockTypeOfId(eyesReading.block) === 'water'
+    && Result.getOrThrow(context.blockTypeOfId(eyesReading.block)) === 'water'
   const sinYaw = Math.sin(poseBeforeFrame.yawRadians)
   const cosYaw = Math.cos(poseBeforeFrame.yawRadians)
   const wasSwimming = context.state.swimmingState.get().active
@@ -82,7 +85,8 @@ export const runTickPlayerMovement = (
             * Effect.runSync(context.getPlayerMovementSpeedMultiplier(context.gameplayState)),
         })),
   )
-  Effect.runSync(Ref.set(context.gameplayState.timeOfDay, Effect.runSync(context.time.timeOfDay)))
+  const timeOfDay = yield* context.time.timeOfDay
+  yield* Ref.set(context.gameplayState.timeOfDay, timeOfDay)
   const weatherBeforeFrame = Effect.runSync(context.weather.snapshot)
   Effect.runSync(Ref.set(context.gameplayState.weather, weatherBeforeFrame))
   Effect.runSync(Ref.set(context.gameplayState.weatherAdvanced, undefined))
@@ -106,7 +110,7 @@ export const runTickPlayerMovement = (
         fishingWater.position.z,
       )))
       const advanced = context.advanceFishing(fishingSession, deltaSecs, {
-        hasWater: water._tag === 'Block' && context.blockTypeOfId(water.block) === 'water',
+        hasWater: water._tag === 'Block' && Result.getOrThrow(context.blockTypeOfId(water.block)) === 'water',
       })
       if (advanced._tag === 'Cancelled') {
         context.state.fishingSession.set(undefined)
@@ -188,16 +192,27 @@ export const runTickPlayerMovement = (
   context.drainPlayerDamageInbound()
   // WIRING, NOT A RULE. mx-gameplay owns vehicle motion and collision; this
   // loop supplies input intent before the frame and mirrors its authoritative state after.
-  const outcome = Effect.runSyncExit(context.runFrame(deltaSecs))
+  const pearlOutcomesBeforeFrame = yield* Ref.get(context.gameplayState.enderPearlOutcomes)
+  const outcome = yield* Effect.exit(context.runFrame(deltaSecs))
+  const pearlOutcomesAfterFrame = yield* Ref.get(context.gameplayState.enderPearlOutcomes)
+  // The stage appends an outcome only after committing the teleport.
+  // Post-frame gameplay drains it later; old outcomes do not suppress movement.
+  const pearlTeleported = pearlOutcomesAfterFrame.length > pearlOutcomesBeforeFrame.length
   if (context.state.swimmingState.get().active && mountedVehicle === undefined) {
-    Effect.runSync(Ref.set(context.simState.velocity, swimmingTick.state.velocity))
-    Effect.runSync(context.playerApi.moveTo({
-      x: poseBeforeFrame.feetPosition.x + swimmingTick.state.velocity.x * deltaSecs,
-      y: poseBeforeFrame.feetPosition.y + swimmingTick.state.velocity.y * deltaSecs,
-      z: poseBeforeFrame.feetPosition.z + swimmingTick.state.velocity.z * deltaSecs,
+    Effect.runSync(Ref.set(context.simState.velocity, {
+      x: BlocksPerSecond(swimmingTick.state.velocity.x),
+      y: BlocksPerSecond(swimmingTick.state.velocity.y),
+      z: BlocksPerSecond(swimmingTick.state.velocity.z),
     }))
+    if (!pearlTeleported) {
+      Effect.runSync(context.playerApi.moveTo(position(
+        PositionAxis(poseBeforeFrame.feetPosition.x + swimmingTick.state.velocity.x * deltaSecs),
+        PositionAxis(poseBeforeFrame.feetPosition.y + swimmingTick.state.velocity.y * deltaSecs),
+        PositionAxis(poseBeforeFrame.feetPosition.z + swimmingTick.state.velocity.z * deltaSecs),
+      )))
+    }
   } else if (wasSwimming) {
-    Effect.runSync(Ref.set(context.simState.velocity, { x: 0, y: 0, z: 0 }))
+    Effect.runSync(Ref.set(context.simState.velocity, { x: BlocksPerSecond(0), y: BlocksPerSecond(0), z: BlocksPerSecond(0) }))
   }
   if (swimmingTick.drowningDamagePoints > 0) {
     context.applyPlayerDamage({ amount: swimmingTick.drowningDamagePoints, cause: 'generic' })
@@ -205,7 +220,7 @@ export const runTickPlayerMovement = (
   }
   if (mountedVehicle !== undefined) {
     const moved = context.vehicleById(String(mountedVehicle.id))
-    if (moved !== undefined) Effect.runSync(context.playerApi.moveTo(moved.position))
+    if (moved !== undefined && !pearlTeleported) Effect.runSync(context.playerApi.moveTo(moved.position))
   }
 
   if (Exit.isFailure(outcome)) {
@@ -243,5 +258,5 @@ export const runTickPlayerMovement = (
     dimensionBeforeFrame,
     weatherBeforeFrame,
     sprinting,
-  }
-}
+  } satisfies H5aMovementResult
+})

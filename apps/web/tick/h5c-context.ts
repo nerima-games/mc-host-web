@@ -1,6 +1,6 @@
 import type { BlockId, BlockPosition, MonotonicTimeSecs } from '@nerima-games/mc-kernel'
 import type { ItemStack, Vehicle } from '@nerima-games/mc-sim'
-import type { Effect } from 'effect'
+import type { Effect, Result } from 'effect'
 import type { GameplayFrameState, ItemUseResult, MobDropEvent } from '@nerima-games/mx-gameplay'
 
 import type {
@@ -24,6 +24,20 @@ type GameplayUseItemType = Exclude<ItemStack['item'], 'iron_helmet' | 'iron_ches
 type GameplayHoeItemType = Parameters<typeof import('@nerima-games/mx-gameplay').requestTargetedSoilTill>[4]
 type GameplayIgnitionItemType = Parameters<typeof import('@nerima-games/mx-gameplay').requestTargetedItemUse>[4]
 type GameplayItemType = Parameters<typeof import('@nerima-games/mx-gameplay').isPlaceableItem>[0]
+type TargetedBlockFailure =
+  | Result.Result.Failure<ReturnType<typeof import('@nerima-games/mc-sim').targetBlockFromPlayerPose>>
+  | import('@nerima-games/mc-kernel').CoordinateConversionFailure
+type FishingEnvironmentFailure =
+  | import('@nerima-games/mc-kernel').CoordinateConversionFailure
+  | import('effect').Brand.BrandError
+  | import('@nerima-games/mc-kernel').BlockRegistryResolutionFailure
+type EndFeatureFailure =
+  | import('effect').Brand.BrandError
+  | TargetedBlockFailure
+  | Effect.Error<ReturnType<import('../chunk-streaming').DimensionChunkContext['chunkStore']['load']>>
+  | Effect.Error<ReturnType<import('@nerima-games/mc-kernel').WorldWritePort['Service']['applyBatch']>>
+  | import('@nerima-games/mc-sim').ItemStackFailure
+  | import('@nerima-games/mc-sim').PlayerStorageFailure
 type H5cInventoryMode = 'player' | 'craftingTable' | 'furnace' | 'chest' | 'anvil' | 'enchanting'
 
 type PendingItemUse =
@@ -68,16 +82,16 @@ export type H5cTickContext = {
     readonly nearestVillagerForTrade: (position: SessionPosition, dimension: Dimension) => PersistedVillager | undefined
     readonly setTradeOpen: (open: boolean, villagerId?: string) => void
     readonly targetedBlock: () => Effect.Effect<{
-      readonly position: SessionPosition
-      readonly adjacentPosition: SessionPosition
+      readonly position: import('@nerima-games/mc-kernel').Position
+      readonly adjacentPosition: import('@nerima-games/mc-kernel').Position
       readonly block: number
-    } | undefined>
-    readonly fishingEnvironmentAt: (position: SessionPosition, isRaining: boolean) => Effect.Effect<{
+    } | undefined, TargetedBlockFailure>
+    readonly fishingEnvironmentAt: (position: import('@nerima-games/mc-kernel').Position, isRaining: boolean) => Effect.Effect<{
       readonly hasWater: boolean
       readonly hasSkyAccess: boolean
       readonly isRaining: boolean
       readonly isOpenWater: boolean
-    }>
+    }, FishingEnvironmentFailure>
     readonly networkFishingPhase: () => 'idle' | 'waiting' | 'bite' | 'escaped'
     readonly playerSettings: () => PlayerSettingsV1
     readonly vehicleService: EffectValue<ReturnType<typeof import('@nerima-games/mc-sim').makeVehicleService>>
@@ -89,7 +103,7 @@ export type H5cTickContext = {
       'sendVitalsCommand' | 'sendPortalUseCommand' | 'sendToggleLeverCommand' | 'sendEntityCommand' | 'sendFacilityCommand' | 'requestBrewing'
     >
     readonly endPortalComplete: () => boolean
-    readonly useEndFeature: () => Effect.Effect<boolean>
+    readonly useEndFeature: () => Effect.Effect<boolean, EndFeatureFailure>
     readonly renderBrewingUi: () => void
     readonly time: EffectValue<ReturnType<typeof import('@nerima-games/mc-sim').makeTimeService>>
     readonly weather: EffectValue<ReturnType<typeof import('@nerima-games/mc-sim').makeWeatherService>>
@@ -97,7 +111,10 @@ export type H5cTickContext = {
     readonly redstoneRuntime: PlatformAdapters['redstoneRuntime']
     readonly leverKeyOf: (lever: Pick<PersistedLeverState, 'dimension' | 'position'>) => string
     readonly asBlockPosition: (position: Readonly<{ readonly x: number; readonly y: number; readonly z: number }>) => BlockPosition
-    readonly streamAround: ReturnType<typeof import('../chunk-streaming').makeChunkStreaming>['streamAround']
+    readonly worldWrite: import('@nerima-games/mc-kernel').WorldWritePort['Service']
+    readonly streamAround: (
+      ...args: Parameters<ReturnType<typeof import('../chunk-streaming').makeChunkStreaming>['streamAround']>
+    ) => Effect.Effect<void, import('@nerima-games/mc-sim').WorldCommitCoordinatorError | import('@nerima-games/mc-worldgen').InvalidNaturalStructureCoordinate>
     readonly presentWeather: (state: import('@nerima-games/mc-sim').WeatherState) => void
     readonly presentWeatherRuntime: (
       state: import('@nerima-games/mc-sim').WeatherState,
@@ -133,7 +150,6 @@ export type H5cTickContext = {
     readonly comparatorModes: Map<string, 'compare' | 'subtract'>
     readonly poweredRails: Set<string>
     readonly redstoneLampTransitionLog: Map<string, Array<{ readonly lit: boolean; readonly writtenBlock: BlockId | null }>>
-    readonly crops: EffectValue<ReturnType<typeof import('@nerima-games/mc-sim').makeCropService>>
     readonly setInventoryOpen: (open: boolean, mode?: H5cInventoryMode) => void
     readonly isGameplayUseItemType: (item: ItemStack['item']) => item is GameplayUseItemType
     readonly isGameplayHoeItem: (item: ItemStack['item']) => item is GameplayHoeItemType

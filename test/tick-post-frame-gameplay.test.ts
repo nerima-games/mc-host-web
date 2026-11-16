@@ -1,10 +1,10 @@
-import { blockIdOf, blockPosition, chunkCoord, DeltaTimeSecs, MonotonicTimeSecs } from '@nerima-games/mc-kernel'
+import { AngleRadians, BlockAxis, BlockId, ClockPort, EpochMillis, fixedClock, blockIdOf, blockTypeOfId, blockPosition as kernelBlockPosition, ChunkAxis, chunkCoord as kernelChunkCoord, DeltaTimeSecs, MonotonicTimeSecs, position, PositionAxis, WorldId, MAX_PORTAL_WIDTH, WorldWriteChunkUnavailableSchema, WorldWriteConflict, WorldWriteInvalidBatch, type WorldWriteBatch, type WorldWritePort } from '@nerima-games/mc-kernel'
 import { type InputSnapshot } from '@nerima-games/mc-render'
-import { makeTimeService, makeWeatherService } from '@nerima-games/mc-sim'
-import { CHUNK_SIZE_XZ, CHUNK_VOLUME, FALLBACK_BIOME, type ChunkSource } from '@nerima-games/mc-worldgen'
+import { CropSnapshotSchema, PlayerServiceSnapshotSchema, PlayerStorageSnapshotSchema, makeTimeService, makeWeatherService, makeWorldCommitCoordinator, HungerPoints, POTATO_MATURITY_SECS, type CropSnapshot } from '@nerima-games/mc-sim'
+import { CHUNK_SIZE_XZ, CHUNK_VOLUME, BIOMES, type ChunkSource } from '@nerima-games/mc-worldgen'
 import { type ItemUseResult, type MobBehaviour } from '@nerima-games/mx-gameplay'
-import { Effect, Ref } from 'effect'
-import { describe, expect, it } from 'vitest'
+import { Effect, Option, Ref, Result, Schema } from 'effect'
+import { describe, expect, it, vi } from 'vitest'
 import * as gameplay from '@nerima-games/mx-gameplay'
 import { makeUiFrameState } from '@nerima-games/mx-ui'
 
@@ -17,13 +17,18 @@ import type { PersistedVillager, SessionPosition } from '../apps/web/session-per
 import { mutableState, type H5aFrameInputResult, type H5aMovementResult, type H5aTickContext } from '../apps/web/tick/h5a-context'
 import type { H5bPostFrameResult } from '../apps/web/tick/h5b-context'
 import type { H5cTickContext } from '../apps/web/tick/h5c-context'
-import { runTickPostFrameGameplay } from '../apps/web/tick/post-frame-gameplay'
+import { runTickPostFrameGameplay as runTickPostFrameGameplayEffect } from '../apps/web/tick/post-frame-gameplay'
 import { type DimensionChunkContext } from '../apps/web/chunk-streaming'
+
+const blockPosition = (x: number, y: number, z: number) => kernelBlockPosition(BlockAxis(x), BlockAxis(y), BlockAxis(z))
+const chunkCoord = (cx: number, cz: number) => kernelChunkCoord(ChunkAxis(cx), ChunkAxis(cz))
+
+const runTickPostFrameGameplay = (...args: Parameters<typeof runTickPostFrameGameplayEffect>) => Effect.runSync(runTickPostFrameGameplayEffect(...args))
 
 const allAirChunkSource: ChunkSource = (coord) => Effect.succeed({
   coord,
-  blocks: new Uint8Array(CHUNK_VOLUME).fill(blockIdOf('air')),
-  biomes: Array.from({ length: CHUNK_SIZE_XZ * CHUNK_SIZE_XZ }, () => FALLBACK_BIOME),
+  blocks: new Uint16Array(CHUNK_VOLUME).fill(Option.getOrThrow(blockIdOf('air'))),
+  biomes: Array.from({ length: CHUNK_SIZE_XZ * CHUNK_SIZE_XZ }, () => BIOMES[0]),
 })
 
 const cell = <Value,>(initial: Value) => {
@@ -62,16 +67,15 @@ const makeDocument = (attributes: Map<string, string>): Document => ({
 
 type HarnessOptions = Readonly<{
   useTriggered?: boolean
-  selectedItem?: 'eye_of_ender' | 'fishing_rod' | 'stone' | 'flint_and_steel'
+  selectedItem?: 'eye_of_ender' | 'ender_pearl' | 'fishing_rod' | 'stone' | 'flint_and_steel' | 'wooden_hoe' | 'potato'
   nearbyVillager?: PersistedVillager
   endFeatureResult?: boolean
   deadAfterFrame?: boolean
-  targetedBlock?: {
-    readonly position: SessionPosition
-    readonly adjacentPosition: SessionPosition
-    readonly block: number
-  }
+  targetedBlock?: Effect.Success<ReturnType<H5cTickContext['services']['targetedBlock']>>
   fishingHasWater?: boolean
+  fullInventory?: boolean
+  hungry?: boolean
+  crops?: CropSnapshot
   lampTransitions?: ReadonlyArray<{
     readonly dimension: string
     readonly position: SessionPosition
@@ -85,19 +89,92 @@ const makeHarness = async (options: HarnessOptions = {}) => {
     dimension: options.dimension ?? 'overworld',
     chunkSource: allAirChunkSource,
   }))
+  if (options.fullInventory) {
+    const slots = Effect.runSync(world.inventory.snapshot).slots.length
+    expect(Effect.runSync(world.inventory.add('stone', slots * 64))).toBe(0)
+  }
   if (options.selectedItem !== undefined) {
     Effect.runSync(world.inventory.add(options.selectedItem, 1))
+  }
+  if (options.hungry) Effect.runSync(world.vitals.restore({
+    ...Effect.runSync(world.vitals.snapshot), hungerPoints: HungerPoints(10),
+  }))
+  const owners = await Effect.runPromise(Effect.fromResult(gameplay.gameplayOwnerRegistrations({
+    playerPose: Effect.runSync(world.player.pose),
+    dimension: options.dimension ?? 'overworld',
+    playerStorage: Effect.runSync(world.inventory.storageSnapshot),
+    vitals: Effect.runSync(world.vitals.snapshot),
+    entities: Effect.runSync(world.entities.snapshot),
+    crops: options.crops ?? { crops: [] },
+  })))
+  const coordinator = await Effect.runPromise(makeWorldCommitCoordinator({
+    world: WorldId('tick-post-frame-gameplay-test'),
+    owners,
+    dimensions: ['overworld', 'nether', 'end'],
+    chunkStores: { forDimension: () => world.chunkStore },
+  }))
+  const worldWriteBatches: Array<WorldWriteBatch> = []
+  const worldWrite: WorldWritePort['Service'] = {
+    applyBatch: (batch) => Effect.sync(() => {
+      worldWriteBatches.push(batch)
+      // This harness exercises the actual coordinator publication; adapter failure mapping is covered separately.
+      const committed = Effect.runSync(coordinator.commit({
+        expectedRevision: batch.expectedWorldRevision,
+        expectedDimensions: [{ dimension: batch.dimension, expectedRevision: batch.expectedDimensionRevision }],
+        changes: [],
+        blockWrite: batch,
+      }))
+      return { worldRevision: committed.revision, dimensionRevision: Effect.runSync(coordinator.dimensionRevision(batch.dimension)) }
+    }),
+  }
+  const targeting = {
+    coordinator,
+    playerOwnerId: gameplay.GAMEPLAY_PLAYER_OWNER_ID,
+    entitiesOwnerId: gameplay.GAMEPLAY_ENTITIES_OWNER_ID,
   }
   const gameplayState = await Effect.runPromise(gameplay.makeGameplayFrameState)
   const time = await Effect.runPromise(makeTimeService())
   const weather = await Effect.runPromise(makeWeatherService())
   const weatherBeforeFrame = Effect.runSync(weather.snapshot)
+  const commit = {
+    coordinator,
+    playerOwnerId: gameplay.GAMEPLAY_PLAYER_OWNER_ID,
+    playerStorageOwnerId: gameplay.GAMEPLAY_PLAYER_STORAGE_OWNER_ID,
+    cropOwnerId: gameplay.GAMEPLAY_CROPS_OWNER_ID,
+    droppedItemsOwnerId: gameplay.GAMEPLAY_DROPPED_ITEMS_OWNER_ID,
+    vitalsOwnerId: gameplay.GAMEPLAY_VITALS_OWNER_ID,
+    entitiesOwnerId: gameplay.GAMEPLAY_ENTITIES_OWNER_ID,
+  }
+  const interactions = Option.getOrThrow(Option.fromNullishOr(gameplay.gameplayStages(
+    gameplayState, world.chunkStore, world.entities, world.inventory, world.player,
+    time, undefined, undefined, {}, commit,
+  ).find((stage) => String(stage.id) === 'gameplay:interactions')))
+  const runInteractions = () => Effect.provideService(
+    interactions.run(DeltaTimeSecs(0.05)),
+    ClockPort,
+    fixedClock({ monotonicSecs: MonotonicTimeSecs(2), wallClockEpochMillis: EpochMillis(2000) }),
+  )
+  const syncPlayerOwner = () => Effect.gen(function* () {
+    const registrations = yield* Effect.fromResult(gameplay.gameplayOwnerRegistrations({
+      playerPose: yield* world.player.pose,
+      dimension: yield* world.player.dimension,
+    }))
+    const player = Option.getOrThrow(Option.fromNullishOr(registrations.find(
+      (entry) => entry.ownerId === gameplay.GAMEPLAY_PLAYER_OWNER_ID,
+    )))
+    yield* coordinator.commit({
+      expectedRevision: yield* coordinator.revision,
+      expectedDimensions: [],
+      changes: [{ ownerId: player.ownerId, state: player.initialState }],
+    })
+  })
   const uiFrameState = Effect.runSync(makeUiFrameState)
   const attributes = new Map<string, string>()
   const canvasAttributes = new Map<string, string>()
   const tradeOpenCalls: Array<{ readonly open: boolean; readonly villagerId?: string }> = []
   const fishingResults: string[] = []
   const streamCalls: Array<{ readonly dimension: string; readonly x: number; readonly z: number }> = []
+  const damageCalls: Array<unknown> = []
   const endAudioCalls: Array<{ readonly cue: string; readonly position: SessionPosition }> = []
   const endFeatureCalls = cell(0)
   const playerUiCalls = cell(0)
@@ -108,9 +185,9 @@ const makeHarness = async (options: HarnessOptions = {}) => {
     chunkStore: world.chunkStore,
   } as DimensionChunkContext
   const pose = {
-    feetPosition: { x: 12.346, y: 64.234, z: -7.891 },
-    yawRadians: 0.25,
-    pitchRadians: -0.1,
+    feetPosition: position(PositionAxis(12.346), PositionAxis(64.234), PositionAxis(-7.891)),
+    yawRadians: AngleRadians(0.25),
+    pitchRadians: AngleRadians(-0.1),
   }
   const frame: H5aFrameInputResult = {
     nowSecs: MonotonicTimeSecs(2),
@@ -155,10 +232,12 @@ const makeHarness = async (options: HarnessOptions = {}) => {
   }
   const h5a = {
     world,
+    targeting,
     playerApi: world.player,
+    eyeLevelOffset: 1.62,
     currentChunkStore: world.chunkStore,
     blockPosition,
-    blockTypeOfId: (id: number) => id === blockIdOf('air') ? 'air' : undefined,
+    blockTypeOfId,
     gameplayState,
     multiplayer: undefined,
     isCreativeMode: false,
@@ -183,11 +262,11 @@ const makeHarness = async (options: HarnessOptions = {}) => {
     state: {
       activeChestId: cell<string | undefined>(undefined).state,
       activeFurnaceKey: cell<string | undefined>(undefined).state,
-      witherRuntimeState: cell(gameplay.initialWitherRuntimeState()).state,
+      witherRuntimeState: cell((await import('@nerima-games/mc-server/shared')).initialWitherRuntimeState()).state,
     },
     inventoryMode: () => 'player',
-    applyPlayerDamage: () => undefined,
-    applyWorldExplosion: () => undefined,
+    applyPlayerDamage: (damage: unknown) => { damageCalls.push(damage) },
+    applyWorldExplosion: () => Result.succeed(undefined),
     endDragonPosition: () => ({ x: 0, y: 64, z: 0 }),
     spawnDroppedItems: gameplay.spawnDroppedItems,
     spawnMobDrops: () => Effect.void,
@@ -251,6 +330,7 @@ const makeHarness = async (options: HarnessOptions = {}) => {
     },
     leverKeyOf: () => '',
     asBlockPosition: (position: SessionPosition) => blockPosition(position.x, position.y, position.z),
+    worldWrite,
     streamAround: (context: DimensionChunkContext, x: number, z: number) => {
       streamCalls.push({ dimension: context.dimension, x, z })
       return Effect.void
@@ -274,7 +354,6 @@ const makeHarness = async (options: HarnessOptions = {}) => {
     comparatorModes: new Map(),
     poweredRails: new Set(),
     redstoneLampTransitionLog: new Map(),
-    crops: {},
     isGameplayUseItemType: (item: string) => item === 'flint_and_steel',
     isGameplayHoeItem: () => false,
     isGameplayIgnitionItem: (item: string) => item === 'flint_and_steel',
@@ -318,6 +397,11 @@ const makeHarness = async (options: HarnessOptions = {}) => {
 
   return {
     context,
+    coordinator,
+    worldWriteBatches,
+    runInteractions,
+    syncPlayerOwner,
+    damageCalls,
     frame,
     movement,
     postFrame,
@@ -349,6 +433,137 @@ const withHarness = async (
 }
 
 describe('tick post-frame gameplay processing', () => {
+  it.each([false, true])('settles mature harvest once with full inventory %s', async (fullInventory) => {
+    const cropPosition = blockPosition(0, 64, 1)
+    await withHarness({
+      fullInventory,
+      crops: { crops: [{ dimension: 'overworld', position: cropPosition, crop: 'potato_crop', growthSecs: POTATO_MATURITY_SECS }] },
+    }, (harness) => {
+      Effect.runSync(harness.world.chunkStore.load(chunkCoord(0, 0)))
+      Effect.runSync(harness.world.chunkStore.setBlock(cropPosition, Option.getOrThrow(blockIdOf('potato_crop'))))
+      const revision = Effect.runSync(harness.coordinator.revision)
+      Effect.runSync(gameplay.requestPotatoHarvest(harness.context.h5a.gameplayState, 'harvest-1', cropPosition, 0.25))
+      harness.context.services.pendingItemUses.set('harvest-1', { kind: 'harvest', dimension: 'overworld', position: cropPosition })
+      expect(Effect.runSync(harness.world.chunkStore.getBlock(cropPosition))).toMatchObject({
+        _tag: 'Block', block: Option.getOrThrow(blockIdOf('potato_crop')),
+      })
+      expect(Effect.runSync(harness.coordinator.revision)).toBe(revision)
+
+      Effect.runSync(harness.runInteractions())
+
+      const storage = Effect.runSync(harness.coordinator.snapshot(gameplay.GAMEPLAY_PLAYER_STORAGE_OWNER_ID, PlayerStorageSnapshotSchema))
+      const crops = Effect.runSync(harness.coordinator.snapshot(gameplay.GAMEPLAY_CROPS_OWNER_ID, CropSnapshotSchema))
+      const dropped = Effect.runSync(harness.coordinator.snapshot(gameplay.GAMEPLAY_DROPPED_ITEMS_OWNER_ID, gameplay.DroppedItemOwnerSnapshotSchema))
+      expect(crops.state.crops).toEqual([])
+      expect(Effect.runSync(harness.world.chunkStore.getBlock(cropPosition))).toMatchObject({
+        _tag: 'Block', block: Option.getOrThrow(blockIdOf('air')),
+      })
+      expect(storage.state.inventory.slots.filter((stack) => stack?.item === 'potato').reduce((total, stack) => total + (stack?.count ?? 0), 0)).toBe(fullInventory ? 0 : 3)
+      expect(dropped.state.items).toHaveLength(fullInventory ? 1 : 0)
+      if (fullInventory) expect(dropped.state.items[0]?.behaviour).toMatchObject({ item: 'potato', count: 3 })
+      expect(Effect.runSync(gameplay.drainGameplayEntityStageFaults(harness.context.h5a.gameplayState))).toEqual([])
+      const committedRevision = Effect.runSync(harness.coordinator.revision)
+      const liveStorage = Effect.runSync(harness.world.inventory.storageSnapshot)
+      const liveEntities = Effect.runSync(harness.world.entities.snapshot)
+
+      runTickPostFrameGameplay(harness.context, { frame: harness.frame, movement: harness.movement, postFrame: harness.postFrame, nowSecs: MonotonicTimeSecs(2) })
+      Effect.runSync(harness.runInteractions())
+      runTickPostFrameGameplay(harness.context, { frame: harness.frame, movement: harness.movement, postFrame: harness.postFrame, nowSecs: MonotonicTimeSecs(2) })
+
+      expect(Effect.runSync(harness.coordinator.revision)).toBe(committedRevision)
+      expect(Effect.runSync(harness.world.inventory.storageSnapshot)).toEqual(liveStorage)
+      expect(Effect.runSync(harness.world.entities.snapshot)).toEqual(liveEntities)
+      expect(harness.context.services.pendingItemUses.size).toBe(0)
+    })
+  })
+
+  it.each(['till', 'plant', 'eat', 'ignite'])('does not repeat committed %s item-use effects', async (action) => {
+    const selectedItem = action === 'till' ? 'wooden_hoe' : action === 'ignite' ? 'flint_and_steel' : 'potato'
+    await withHarness({ selectedItem, hungry: action === 'eat' }, (harness) => {
+      const ground = blockPosition(0, 64, 1)
+      const above = blockPosition(0, 65, 1)
+      Effect.runSync(harness.world.chunkStore.load(chunkCoord(0, 0)))
+      Effect.runSync(harness.world.chunkStore.setBlock(ground, Option.getOrThrow(blockIdOf(action === 'plant' ? 'farmland' : 'dirt'))))
+      const state = harness.context.h5a.gameplayState
+      if (action === 'till') {
+        Effect.runSync(gameplay.requestSoilTill(state, 'item-1', ground, 'wooden_hoe'))
+        harness.context.services.pendingItemUses.set('item-1', { kind: 'till', slotIndex: 0, heldItem: 'wooden_hoe' })
+      } else if (action === 'plant') {
+        Effect.runSync(gameplay.requestPotatoPlanting(state, 'item-1', ground))
+        harness.context.services.pendingItemUses.set('item-1', { kind: 'plant', slotIndex: 0, dimension: 'overworld' })
+      } else if (action === 'eat') {
+        Effect.runSync(gameplay.requestPotatoFoodUse(state, 'item-1', Effect.runSync(harness.world.vitals.snapshot)))
+        harness.context.services.pendingItemUses.set('item-1', { kind: 'eat', slotIndex: 0 })
+      } else {
+        for (const chunk of gameplay.chunkCoordsAround(above, MAX_PORTAL_WIDTH + 1)) {
+          Effect.runSync(harness.world.chunkStore.load(chunk))
+        }
+        Effect.runSync(gameplay.requestItemUse(state, 'item-1', above, 'flint_and_steel'))
+        harness.context.services.pendingItemUses.set('item-1', { kind: 'ignition', slotIndex: 0, heldItem: 'flint_and_steel', dimension: 'overworld' })
+      }
+      const revision = Effect.runSync(harness.coordinator.revision)
+
+      Effect.runSync(harness.runInteractions())
+
+      expect(Effect.runSync(Ref.get(state.itemUseResults))).toEqual([
+        expect.objectContaining({ requestId: 'item-1', success: true }),
+      ])
+      expect(Effect.runSync(harness.coordinator.revision)).toBeGreaterThan(revision)
+      expect(Effect.runSync(gameplay.drainGameplayEntityStageFaults(state))).toEqual([])
+      const committedStorage = Effect.runSync(harness.coordinator.snapshot(gameplay.GAMEPLAY_PLAYER_STORAGE_OWNER_ID, PlayerStorageSnapshotSchema))
+      const committedCrops = Effect.runSync(harness.coordinator.snapshot(gameplay.GAMEPLAY_CROPS_OWNER_ID, CropSnapshotSchema))
+      const committedVitals = Effect.runSync(harness.coordinator.snapshot(gameplay.GAMEPLAY_VITALS_OWNER_ID, gameplay.ExperienceOrbVitalsOwnerSnapshotSchema))
+      const liveStorage = Effect.runSync(harness.world.inventory.storageSnapshot)
+      const liveVitals = Effect.runSync(harness.world.vitals.snapshot)
+      const committedRevision = Effect.runSync(harness.coordinator.revision)
+
+      runTickPostFrameGameplay(harness.context, { frame: harness.frame, movement: harness.movement, postFrame: harness.postFrame, nowSecs: MonotonicTimeSecs(2) })
+      runTickPostFrameGameplay(harness.context, { frame: harness.frame, movement: harness.movement, postFrame: harness.postFrame, nowSecs: MonotonicTimeSecs(2) })
+
+      expect(Effect.runSync(harness.coordinator.revision)).toBe(committedRevision)
+      expect(Effect.runSync(harness.coordinator.snapshot(gameplay.GAMEPLAY_PLAYER_STORAGE_OWNER_ID, PlayerStorageSnapshotSchema))).toEqual(committedStorage)
+      expect(Effect.runSync(harness.coordinator.snapshot(gameplay.GAMEPLAY_CROPS_OWNER_ID, CropSnapshotSchema))).toEqual(committedCrops)
+      expect(Effect.runSync(harness.coordinator.snapshot(gameplay.GAMEPLAY_VITALS_OWNER_ID, gameplay.ExperienceOrbVitalsOwnerSnapshotSchema))).toEqual(committedVitals)
+      expect(Effect.runSync(harness.world.inventory.storageSnapshot)).toEqual(liveStorage)
+      expect(Effect.runSync(harness.world.vitals.snapshot)).toEqual(liveVitals)
+      expect(harness.context.state.lastObservedItemUse.get()).toMatchObject({ requestId: 'item-1', success: true })
+      expect(harness.context.services.pendingItemUses.size).toBe(0)
+    })
+  })
+
+  it('settles a pearl consumption, displacement, and damage once', async () => {
+    await withHarness({ useTriggered: true, selectedItem: 'ender_pearl' }, (harness) => {
+      const playerBefore = Effect.runSync(harness.coordinator.snapshot(gameplay.GAMEPLAY_PLAYER_OWNER_ID, PlayerServiceSnapshotSchema))
+      const vitalsBefore = Effect.runSync(harness.coordinator.snapshot(gameplay.GAMEPLAY_VITALS_OWNER_ID, gameplay.ExperienceOrbVitalsOwnerSnapshotSchema))
+      const revision = Effect.runSync(harness.coordinator.revision)
+      runTickPostFrameGameplay(harness.context, { frame: harness.frame, movement: harness.movement, postFrame: harness.postFrame, nowSecs: MonotonicTimeSecs(2) })
+      expect(Effect.runSync(harness.coordinator.revision)).toBe(revision)
+      expect(Effect.runSync(harness.coordinator.snapshot(gameplay.GAMEPLAY_PLAYER_STORAGE_OWNER_ID, PlayerStorageSnapshotSchema)).state.inventory.slots[0]?.count).toBe(1)
+
+      Effect.runSync(harness.runInteractions())
+
+      const playerAfter = Effect.runSync(harness.coordinator.snapshot(gameplay.GAMEPLAY_PLAYER_OWNER_ID, PlayerServiceSnapshotSchema))
+      const vitalsAfter = Effect.runSync(harness.coordinator.snapshot(gameplay.GAMEPLAY_VITALS_OWNER_ID, gameplay.ExperienceOrbVitalsOwnerSnapshotSchema))
+      expect(Effect.runSync(harness.coordinator.snapshot(gameplay.GAMEPLAY_PLAYER_STORAGE_OWNER_ID, PlayerStorageSnapshotSchema)).state.inventory.slots[0]).toBeUndefined()
+      expect(playerAfter.state.pose.feetPosition).not.toEqual(playerBefore.state.pose.feetPosition)
+      expect(vitalsAfter.state.vitals.healthPoints).toBe(vitalsBefore.state.vitals.healthPoints - gameplay.ENDER_PEARL_DAMAGE)
+      expect(Effect.runSync(gameplay.drainGameplayEntityStageFaults(harness.context.h5a.gameplayState))).toEqual([])
+      const committedRevision = Effect.runSync(harness.coordinator.revision)
+      const livePose = Effect.runSync(harness.world.player.pose)
+      const liveStorage = Effect.runSync(harness.world.inventory.storageSnapshot)
+      const frame = { ...harness.frame, useTriggered: false }
+
+      runTickPostFrameGameplay(harness.context, { frame, movement: harness.movement, postFrame: harness.postFrame, nowSecs: MonotonicTimeSecs(2) })
+      Effect.runSync(harness.runInteractions())
+      runTickPostFrameGameplay(harness.context, { frame, movement: harness.movement, postFrame: harness.postFrame, nowSecs: MonotonicTimeSecs(2) })
+
+      expect(Effect.runSync(harness.coordinator.revision)).toBe(committedRevision)
+      expect(Effect.runSync(harness.world.player.pose)).toEqual(livePose)
+      expect(Effect.runSync(harness.world.inventory.storageSnapshot)).toEqual(liveStorage)
+      expect(harness.damageCalls).toEqual([])
+    })
+  })
+
   it('publishes fixed player pose, grounded state, and frame count', async () => {
     await withHarness({}, (harness) => {
       runTickPostFrameGameplay(harness.context, {
@@ -390,7 +605,7 @@ describe('tick post-frame gameplay processing', () => {
       id: 'villager-7',
       profession: 'farmer',
       dimension: 'overworld',
-      feetPosition: { x: 12.346, y: 64.234, z: -7.891 },
+      feetPosition: position(PositionAxis(12.346), PositionAxis(64.234), PositionAxis(-7.891)),
     }
 
     await withHarness({
@@ -412,9 +627,9 @@ describe('tick post-frame gameplay processing', () => {
 
   it('casts a local fishing rod into water and records the fishing session', async () => {
     const target = {
-      position: { x: 2, y: 64, z: -3 },
-      adjacentPosition: { x: 2, y: 65, z: -3 },
-      block: blockIdOf('water'),
+      position: position(PositionAxis(2), PositionAxis(64), PositionAxis(-3)),
+      adjacentPosition: position(PositionAxis(2), PositionAxis(65), PositionAxis(-3)),
+      block: Option.getOrThrow(blockIdOf('water')),
     }
     await withHarness({
       useTriggered: true,
@@ -445,16 +660,17 @@ describe('tick post-frame gameplay processing', () => {
       const supportPosition = blockPosition(0, 65, -2)
       Effect.runSync(harness.world.worldgenChunkStore.load(chunkCoord(0, -1)))
       Effect.runSync(harness.world.player.restore({
-        feetPosition: { x: 0.5, y: 64, z: 0.5 },
-        yawRadians: 0,
-        pitchRadians: 0,
+        feetPosition: position(PositionAxis(0.5), PositionAxis(64), PositionAxis(0.5)),
+        yawRadians: AngleRadians(0),
+        pitchRadians: AngleRadians(0),
       }, 'overworld'))
-      Effect.runSync(harness.world.chunkStore.setBlock(supportPosition, blockIdOf('stone')))
+      Effect.runSync(harness.syncPlayerOwner())
+      Effect.runSync(harness.world.chunkStore.setBlock(supportPosition, Option.getOrThrow(blockIdOf('stone'))))
       expect(harness.frame.useTriggered).toBe(true)
       expect(Effect.runSync(harness.world.inventory.snapshot).slots[0]?.item).toBe('stone')
       expect(Effect.runSync(harness.world.chunkStore.getBlock(supportPosition))).toMatchObject({
         _tag: 'Block',
-        block: blockIdOf('stone'),
+        block: Option.getOrThrow(blockIdOf('stone')),
       })
 
       runTickPostFrameGameplay(harness.context, {
@@ -478,11 +694,12 @@ describe('tick post-frame gameplay processing', () => {
       const supportPosition = blockPosition(0, 65, -2)
       Effect.runSync(harness.world.worldgenChunkStore.load(chunkCoord(0, -1)))
       Effect.runSync(harness.world.player.restore({
-        feetPosition: { x: 0.5, y: 64, z: 0.5 },
-        yawRadians: 0,
-        pitchRadians: 0,
+        feetPosition: position(PositionAxis(0.5), PositionAxis(64), PositionAxis(0.5)),
+        yawRadians: AngleRadians(0),
+        pitchRadians: AngleRadians(0),
       }, 'overworld'))
-      Effect.runSync(harness.world.chunkStore.setBlock(supportPosition, blockIdOf('stone')))
+      Effect.runSync(harness.syncPlayerOwner())
+      Effect.runSync(harness.world.chunkStore.setBlock(supportPosition, Option.getOrThrow(blockIdOf('stone'))))
       expect(harness.frame.useTriggered).toBe(true)
       expect(Effect.runSync(harness.world.inventory.snapshot).slots[0]?.item).toBe('flint_and_steel')
 
@@ -513,6 +730,8 @@ describe('tick post-frame gameplay processing', () => {
       lampTransitions: [{ dimension: 'overworld', position, lit: true }],
     }, (harness) => {
       Effect.runSync(harness.world.worldgenChunkStore.load(chunkCoord(0, -1)))
+      const initialRevision = Effect.runSync(harness.coordinator.revision)
+      const initialDimensionRevision = Effect.runSync(harness.coordinator.dimensionRevision('overworld'))
       runTickPostFrameGameplay(harness.context, {
         frame: harness.frame,
         movement: harness.movement,
@@ -520,10 +739,199 @@ describe('tick post-frame gameplay processing', () => {
         nowSecs: MonotonicTimeSecs(2),
       })
 
+      expect(harness.worldWriteBatches).toEqual([{
+        world: harness.coordinator.worldId,
+        expectedWorldRevision: initialRevision,
+        dimension: 'overworld',
+        expectedDimensionRevision: initialDimensionRevision,
+        edits: [{ position: blockPosition(position.x, position.y, position.z), block: Option.getOrThrow(blockIdOf('redstone_lamp_lit')) }],
+      }])
+      expect(Effect.runSync(harness.coordinator.revision)).toBe(initialRevision + 1)
       expect(Effect.runSync(harness.world.chunkStore.getBlock(blockPosition(position.x, position.y, position.z)))).toMatchObject({
         _tag: 'Block',
-        block: blockIdOf('redstone_lamp_lit'),
+        block: Option.getOrThrow(blockIdOf('redstone_lamp_lit')),
       })
+    })
+  })
+
+  it.each(['target', 'environment'])('propagates a fishing %s failure before casting', async (stage) => {
+    await withHarness({
+      useTriggered: true,
+      selectedItem: 'fishing_rod',
+      targetedBlock: {
+        position: position(PositionAxis(2), PositionAxis(64), PositionAxis(-3)),
+        adjacentPosition: position(PositionAxis(2), PositionAxis(65), PositionAxis(-3)),
+        block: Option.getOrThrow(blockIdOf('water')),
+      },
+    }, (harness) => {
+      const failure = {
+        _tag: 'CoordinateConversionFailure', reason: 'block-axis-out-of-range', axis: 'x', kind: 'RangeError',
+      } as const
+      const context: H5cTickContext = {
+        ...harness.context,
+        services: {
+          ...harness.context.services,
+          ...(stage === 'target'
+            ? { targetedBlock: () => Effect.fail(failure) }
+            : { fishingEnvironmentAt: () => Effect.fail(failure) }),
+        },
+      }
+      const result = Effect.runSync(Effect.result(runTickPostFrameGameplayEffect(context, {
+        frame: harness.frame,
+        movement: harness.movement,
+        postFrame: harness.postFrame,
+        nowSecs: MonotonicTimeSecs(2),
+      })))
+
+      expect(Result.isFailure(result)).toBe(true)
+      if (Result.isFailure(result)) expect(result.failure).toBe(failure)
+      expect(harness.fishingResults).toEqual([])
+      expect(context.h5a.state.fishingSession.get()).toBeUndefined()
+      expect(harness.streamCalls).toEqual([])
+    })
+  })
+
+  it('reports an End feature failure and stops later use routing', async () => {
+    await withHarness({ useTriggered: true, selectedItem: 'eye_of_ender' }, (harness) => {
+      const failure = new RangeError('fixture End feature rejection')
+      const context: H5cTickContext = {
+        ...harness.context,
+        services: { ...harness.context.services, useEndFeature: () => Effect.fail(failure) },
+      }
+      const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+      try {
+        const result = Effect.runSync(Effect.result(runTickPostFrameGameplayEffect(context, {
+          frame: harness.frame,
+          movement: harness.movement,
+          postFrame: harness.postFrame,
+          nowSecs: MonotonicTimeSecs(2),
+        })))
+
+        expect(Result.isFailure(result)).toBe(true)
+        if (Result.isFailure(result)) expect(result.failure).toBe(failure)
+        expect(warning).toHaveBeenCalledWith('Unable to use End feature', failure)
+        expect(harness.playerUiCalls.get()).toBe(0)
+        expect(harness.streamCalls).toEqual([])
+      } finally {
+        warning.mockRestore()
+      }
+    })
+  })
+
+  it('reports a bed explosion failure before announcing its completion', async () => {
+    await withHarness({ useTriggered: true, dimension: 'end' }, (harness) => {
+      Effect.runSync(harness.world.chunkStore.load(chunkCoord(0, -1)))
+      const failure = { _tag: 'ExplosionValidationFailure', path: 'power', reason: 'fixture rejection' } as const
+      const context: H5cTickContext = {
+        ...harness.context,
+        h5a: {
+          ...harness.context.h5a,
+          currentChunkStore: {
+            ...harness.world.chunkStore,
+            getBlock: () => Effect.succeed({ _tag: 'Block', block: Option.getOrThrow(blockIdOf('bed')) }),
+          },
+        },
+        h5b: { ...harness.context.h5b, applyWorldExplosion: () => Result.fail(failure) },
+      }
+      const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+      try {
+        const result = Effect.runSync(Effect.result(runTickPostFrameGameplayEffect(context, {
+          frame: harness.frame,
+          movement: harness.movement,
+          postFrame: harness.postFrame,
+          nowSecs: MonotonicTimeSecs(2),
+        })))
+
+        expect(Result.isFailure(result)).toBe(true)
+        if (Result.isFailure(result)) expect(result.failure).toBe(failure)
+        expect(warning).toHaveBeenCalledWith('Unable to apply bed explosion', failure)
+        expect(harness.worldWriteBatches).toHaveLength(1)
+        expect(harness.attributes.has('data-bed-explosion-request')).toBe(false)
+        expect(harness.attributes.has('data-sleep-result')).toBe(false)
+        expect(harness.streamCalls).toEqual([])
+      } finally {
+        warning.mockRestore()
+      }
+    })
+  })
+
+  it('returns an invalid targeted block registry entry as a typed failure', async () => {
+    await withHarness({ useTriggered: true }, (harness) => {
+      const context: H5cTickContext = {
+        ...harness.context,
+        h5a: {
+          ...harness.context.h5a,
+          currentChunkStore: {
+            ...harness.world.chunkStore,
+            getBlock: () => Effect.succeed({ _tag: 'Block', block: BlockId(65535) }),
+          },
+        },
+      }
+      const result = Effect.runSync(Effect.result(runTickPostFrameGameplayEffect(context, {
+        frame: harness.frame,
+        movement: harness.movement,
+        postFrame: harness.postFrame,
+        nowSecs: MonotonicTimeSecs(2),
+      })))
+
+      expect(result).toMatchObject({ _tag: 'Failure', failure: { _tag: 'UnknownTargetBlockId', blockId: 65535 } })
+      expect(harness.streamCalls).toEqual([])
+    })
+  })
+
+  it.each(['conflict', 'invalid', 'unavailable'])('propagates a %s port failure before confirming a lamp', async (kind) => {
+    const at = blockPosition(4, 70, -2)
+    await withHarness({ lampTransitions: [{ dimension: 'overworld', position: at, lit: true }] }, (harness) => {
+      Effect.runSync(harness.world.worldgenChunkStore.load(chunkCoord(0, -1)))
+      const worldRevision = Effect.runSync(harness.coordinator.revision)
+      const dimensionRevision = Effect.runSync(harness.coordinator.dimensionRevision('overworld'))
+      const failure = kind === 'conflict'
+        ? new WorldWriteConflict({
+          expectedWorldRevision: worldRevision, currentWorldRevision: worldRevision,
+          expectedDimensionRevision: dimensionRevision, currentDimensionRevision: dimensionRevision,
+        })
+        : kind === 'invalid'
+          ? Schema.decodeUnknownSync(WorldWriteInvalidBatch)({ _tag: 'WorldWriteInvalidBatch', reason: 'empty' })
+          : Schema.decodeUnknownSync(WorldWriteChunkUnavailableSchema)({
+            _tag: 'WorldWriteChunkUnavailable', dimension: 'overworld', chunk: '0,-1',
+          })
+      const context: H5cTickContext = {
+        ...harness.context,
+        services: { ...harness.context.services, worldWrite: { applyBatch: () => Effect.fail(failure) } },
+      }
+      const result = Effect.runSync(Effect.result(runTickPostFrameGameplayEffect(context, {
+        frame: harness.frame,
+        movement: harness.movement,
+        postFrame: harness.postFrame,
+        nowSecs: MonotonicTimeSecs(2),
+      })))
+
+      expect(result).toMatchObject({ _tag: 'Failure', failure })
+      expect(Effect.runSync(harness.world.chunkStore.getBlock(at))).toMatchObject({
+        _tag: 'Block', block: Option.getOrThrow(blockIdOf('air')),
+      })
+      expect(Effect.runSync(harness.coordinator.revision)).toBe(worldRevision)
+      expect(context.services.redstoneLampTransitionLog.size).toBe(0)
+      expect(harness.streamCalls).toEqual([])
+    })
+  })
+
+  it('propagates streaming owner failures before presenting the frame', async () => {
+    await withHarness({}, (harness) => {
+      const failure = { _tag: 'WorldCommitCoordinatorInvalidOptions', value: 'stream failure' } as const
+      const context: H5cTickContext = {
+        ...harness.context,
+        services: { ...harness.context.services, streamAround: () => Effect.fail(failure) },
+      }
+      const result = Effect.runSync(Effect.result(runTickPostFrameGameplayEffect(context, {
+        frame: harness.frame,
+        movement: harness.movement,
+        postFrame: harness.postFrame,
+        nowSecs: MonotonicTimeSecs(2),
+      })))
+
+      expect(result).toMatchObject({ _tag: 'Failure', failure })
+      expect(harness.canvasAttributes.has('data-player-feet')).toBe(false)
     })
   })
 
@@ -565,7 +973,9 @@ describe('tick post-frame gameplay processing', () => {
 
   it('applies the dragon defeat events to the portal and reward state', async () => {
     await withHarness({ dimension: 'end' }, (harness) => {
-      Effect.runSync(harness.world.worldgenChunkStore.load(chunkCoord(0, 0)))
+      for (const cx of [-1, 0]) {
+        for (const cz of [-1, 0]) Effect.runSync(harness.world.worldgenChunkStore.load(chunkCoord(cx, cz)))
+      }
       const damage = Effect.runSync(harness.context.h5a.gameplayState.enderDragonEncounter.damageByPlayer(200))
       expect(damage).toMatchObject({ _tag: 'Applied', state: { phase: 'dead', health: 0 } })
 
@@ -578,10 +988,19 @@ describe('tick post-frame gameplay processing', () => {
 
       expect(harness.context.state.dragonEggRewarded.get()).toBe(true)
       expect(harness.context.state.exitPortalMaterialized.get()).toBe(true)
+      expect(harness.worldWriteBatches).toHaveLength(1)
+      expect(harness.worldWriteBatches[0]?.edits).toHaveLength(9)
+      for (let x = -1; x <= 1; x += 1) {
+        for (let z = -1; z <= 1; z += 1) {
+          expect(Effect.runSync(harness.world.chunkStore.getBlock(blockPosition(x, 64, z)))).toMatchObject({
+            _tag: 'Block', block: Option.getOrThrow(blockIdOf('end_portal')),
+          })
+        }
+      }
       expect(harness.canvasAttributes.get('data-end-dragon-phase')).toBe('dead')
       expect(Effect.runSync(harness.world.chunkStore.getBlock(blockPosition(0, 64, 0)))).toMatchObject({
         _tag: 'Block',
-        block: blockIdOf('end_portal'),
+        block: Option.getOrThrow(blockIdOf('end_portal')),
       })
       expect(harness.endAudioCalls.map(({ cue }) => cue)).toEqual(['dragonHurt', 'dragonReward', 'exitPortal'])
     })

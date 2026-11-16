@@ -1,7 +1,7 @@
 import { describe, expect, it } from '@effect/vitest'
-import { Effect } from 'effect'
+import { Effect, Result } from 'effect'
 
-import { DeltaTimeSecs, MonotonicTimeSecs } from '@nerima-games/mc-kernel'
+import { DeltaTimeSecs, MonotonicTimeSecs, position, PositionAxis } from '@nerima-games/mc-kernel'
 import { ESCAPE_KEY_CODE, wrapHotbarSelection, type InputAction, type InputSnapshot } from '@nerima-games/mc-render'
 
 import { runTickFrameInput, readFrameTiming } from '../apps/web/tick/frame-input'
@@ -63,7 +63,7 @@ const makeFrameInputFixture = (options: FrameInputFixtureOptions = {}) => {
   const triggeredActions = new Set(options.triggeredActions ?? [])
   const activeActions = new Set(options.activeActions ?? [])
   const playerPose = {
-    feetPosition: { x: 0, y: 64, z: 0 },
+    feetPosition: position(PositionAxis(0), PositionAxis(64), PositionAxis(0)),
     yawRadians: 0,
     pitchRadians: 0,
   }
@@ -193,7 +193,7 @@ describe('tick frame timing', () => {
     const calls: Array<string> = []
     let previousSecs: ReturnType<typeof MonotonicTimeSecs> | undefined = MonotonicTimeSecs(1)
     const playerPose = {
-      feetPosition: { x: 0, y: 64, z: 0 },
+      feetPosition: position(PositionAxis(0), PositionAxis(64), PositionAxis(0)),
       yawRadians: 0,
       pitchRadians: 0,
     }
@@ -399,7 +399,7 @@ describe('tick frame input branches', () => {
       ...fixture.context,
       wrapHotbarSelection: (current, steps, size) => {
         fixture.calls.push(`wrap:${current}:${steps}:${size}`)
-        return 6
+        return Result.succeed(6)
       },
     }
 

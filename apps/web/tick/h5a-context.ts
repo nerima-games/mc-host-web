@@ -150,7 +150,8 @@ export type H5aTickContext = {
   readonly sprintSpeedMPerSec: number
   readonly getPlayerMovementSpeedMultiplier: (state: GameplayFrameState) => Effect.Effect<number>
   readonly gameplayState: GameplayFrameState
-  readonly time: { readonly timeOfDay: Effect.Effect<number> }
+  readonly time: Pick<import('@nerima-games/mc-sim').TimeServiceApi, 'timeOfDay'>
+  readonly targeting: import('@nerima-games/mx-gameplay').GameplayTargetingSnapshotContext
   readonly weather: { readonly snapshot: Effect.Effect<WeatherState> }
   readonly syncPortalCandidateSnapshots: () => Effect.Effect<void>
   readonly setFishingResult: (result: string) => void
