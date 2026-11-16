@@ -174,13 +174,16 @@ test('settings write failures block navigation until a later save succeeds', asy
   await expect(page.locator('[data-pause-error]')).toHaveAttribute('role', 'alert')
 
   await page.getByTestId('options-button').click()
-  await page.locator('[data-audio-enabled]').check()
+  await expect(page.locator('[data-audio-enabled]')).toBeChecked()
+  await page.locator('[data-audio-enabled]').uncheck()
   await expect(page.locator('body')).toHaveAttribute('data-player-settings-persistence', 'saved')
   await page.locator('[data-settings-close]').click()
   await page.getByTestId('save-quit-button').click()
   await expect(page).toHaveURL('/')
 
   await page.locator('[data-menu-entry="settings"]').click()
+  await page.locator('[data-audio-enabled]').check()
+  await expect(page.locator('body')).toHaveAttribute('data-player-settings-persistence', 'saved')
   await failNextSettingsWrite(page)
   await page.locator('[data-audio-enabled]').uncheck()
   await expect(page.locator('[data-settings-error]')).toHaveText('Settings could not be saved.')
@@ -194,10 +197,67 @@ test('settings write failures block navigation until a later save succeeds', asy
 
   await page.locator('[data-menu-action="back"]').click()
   await page.locator('[data-menu-entry="settings"]').click()
-  await page.locator('[data-audio-enabled]').check()
+  await expect(page.locator('[data-audio-enabled]')).toBeChecked()
+  await page.locator('[data-audio-enabled]').uncheck()
   await expect(page.locator('body')).toHaveAttribute('data-player-settings-persistence', 'saved')
   await page.locator('[data-settings-close]').click()
   await page.locator('[data-menu-entry="load-world"]').click()
   await page.locator('[data-mx-ui="menu-world-row"][data-session-id="settings-write-failure"]').click()
   await expect(page).toHaveURL('/?session=settings-write-failure')
+})
+
+test('corrupt saved settings warn until a valid change replaces the record', async ({ page }) => {
+  await page.goto('/')
+  const settings = page.locator('[data-menu-entry="settings"]')
+  const error = page.locator('[data-settings-error]')
+  const sensitivity = page.locator('[data-sensitivity]')
+  await settings.click()
+  await sensitivity.fill('175')
+  await expect(page.locator('body')).toHaveAttribute('data-player-settings-persistence', 'saved')
+
+  await page.evaluate(async () => {
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open('nerima-games-minecraft')
+      request.addEventListener('success', () => resolve(request.result), { once: true })
+      request.addEventListener('error', () => reject(request.error), { once: true })
+    })
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const transaction = database.transaction('saves', 'readwrite')
+        const store = transaction.objectStore('saves')
+        const request: IDBRequest<unknown> = store.get('mc-compose/player-settings')
+        request.addEventListener('success', () => {
+          const record = request.result
+          if (typeof record !== 'object' || record === null) {
+            transaction.abort()
+            reject(new Error('saved settings record missing before corruption'))
+            return
+          }
+          store.put({ ...record, envelope: null })
+        }, { once: true })
+        transaction.addEventListener('complete', () => resolve(), { once: true })
+        transaction.addEventListener('error', () => reject(transaction.error), { once: true })
+        transaction.addEventListener('abort', () => reject(transaction.error), { once: true })
+      })
+    } finally {
+      database.close()
+    }
+  })
+
+  await page.reload()
+  await settings.click()
+  await expect(error).toBeVisible()
+  await expect(error).toHaveAttribute('role', 'alert')
+  await expect(error).toHaveText('Saved settings could not be read. Changing a setting will replace them.')
+  await page.locator('[data-settings-close]').click()
+  await settings.click()
+  await expect(error).toHaveText('Saved settings could not be read. Changing a setting will replace them.')
+
+  await sensitivity.fill('176')
+  await expect(page.locator('body')).toHaveAttribute('data-player-settings-persistence', 'saved')
+  await expect(error).toBeEmpty()
+  await page.reload()
+  await settings.click()
+  await expect(sensitivity).toHaveValue('176')
+  await expect(error).toBeEmpty()
 })
