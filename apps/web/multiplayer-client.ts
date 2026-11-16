@@ -240,12 +240,12 @@ export type MultiplayerConnectionContext = {
 export type MultiplayerClientContext = {
   readonly multiplayer: MultiplayerRuntime | undefined
   readonly ui: {
-    readonly canvas: HTMLCanvasElement
-    readonly multiplayerStatus: HTMLOutputElement
-    readonly multiplayerChat: HTMLElement
-    readonly multiplayerChatLog: HTMLOListElement
-    readonly multiplayerChatForm: HTMLFormElement
-    readonly multiplayerChatInput: HTMLInputElement
+    readonly canvas: Pick<HTMLCanvasElement, 'setAttribute'>
+    readonly multiplayerStatus: Pick<HTMLOutputElement, 'hidden' | 'textContent'>
+    readonly multiplayerChat: Pick<HTMLElement, 'hidden'>
+    readonly multiplayerChatLog: Pick<HTMLOListElement, 'append' | 'childElementCount' | 'firstElementChild'>
+    readonly multiplayerChatForm: Pick<HTMLFormElement, 'addEventListener'>
+    readonly multiplayerChatInput: Pick<HTMLInputElement, 'value' | 'addEventListener'>
   }
   readonly state: {
     inventoryOpen: boolean
