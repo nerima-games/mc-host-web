@@ -249,8 +249,9 @@ const startWitherServer = async (): Promise<{
     'const nativeSetInterval = globalThis.setInterval',
     'let multiplayerTicks = 0',
     "globalThis.setInterval = (handler, timeout, ...args) => nativeSetInterval(() => { if (timeout !== 4000 || multiplayerTicks++ < 3) handler(...args) }, timeout)",
+    'const { Result } = await import("effect")',
     `const { startMultiplayerServer } = await import(${JSON.stringify(serverEntryPoint)})`,
-    `const runtime = await startMultiplayerServer({ host: '127.0.0.1', port: 0, worldId: 'overworld', seed: 0, allowedBlocks: new Set(['soul_sand', 'wither_skeleton_skull']), installSignalHandlers: true, stateFile: ${JSON.stringify(stateFile)}, legacyPlayerClaimsFile: ${JSON.stringify(claimsFile)}, maxMoveDistance: 1000 })`,
+    `const runtime = Result.getOrThrow(await startMultiplayerServer({ host: '127.0.0.1', port: 0, worldId: 'overworld', seed: 0, allowedBlocks: new Set(['soul_sand', 'wither_skeleton_skull']), installSignalHandlers: true, stateFile: ${JSON.stringify(stateFile)}, legacyPlayerClaimsFile: ${JSON.stringify(claimsFile)}, maxMoveDistance: 1000 }))`,
     "process.stdout.write('READY:' + runtime.port + '\\n')",
   ].join(';')
   const child = spawn(process.execPath, [
