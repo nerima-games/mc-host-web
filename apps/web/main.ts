@@ -82,7 +82,7 @@
  * block edits and mc-render meshing all observe the same mc-worldgen store;
  * dirty chunk notifications are the only render synchronization path.
  */
-import { Cause, Context, Effect, Exit, Option, Ref, Result } from 'effect'
+import { Cause, Context, Effect, Exit, Option, Ref, Result, Schema } from 'effect'
 import {
   AngleRadians,
   BLOCK_PROPERTY_DEFAULTS,
@@ -98,6 +98,7 @@ import {
   propertyOfBlockId,
   resolvedBlockOfId,
   StageId,
+  WorldIdSchema,
   type BlockPosition,
   type MonotonicTimeSecs,
   type Position as Vec3,
@@ -361,6 +362,7 @@ import {
   type SettingsWriteQueue,
 } from './platform-adapters'
 import { makeHostServiceContext, registerHostModules } from './host-modules'
+import { makeHostWorldWrite } from './world-write-port'
 import { bootTitleMenu } from './title-menu'
 import {
   handleLocalPlayerDeath as handleLocalPlayerDeathUi,
@@ -903,6 +905,26 @@ const bootGame = async (
   const time = await Effect.runPromise(makeTimeService())
   const weather = await Effect.runPromise(makeWeatherService())
   const crops = await Effect.runPromise(makeCropService())
+  const hostWorldWriteExit = await Effect.runPromiseExit(
+    Effect.flatMap(
+      Schema.decodeEffect(WorldIdSchema)(sessionId),
+      (worldId) => makeHostWorldWrite({
+        world: worldId,
+        owners: [],
+        chunkStores: {
+          // `getOrCreateDimensionChunkContext` is declared further down. This
+          // is safe because mc-sim calls `forDimension` only on observe and
+          // commit, never while building the coordinator.
+          forDimension: (dimension) => getOrCreateDimensionChunkContext(dimension).chunkStore,
+        },
+      }),
+    ),
+  )
+  if (Exit.isFailure(hostWorldWriteExit)) {
+    failBoot('world commit coordinator creation failed', Cause.squash(hostWorldWriteExit.cause))
+    return
+  }
+  const hostWorldWrite = hostWorldWriteExit.value
   const gameplayState = await Effect.runPromise(makeGameplayFrameState)
   const villagerResidents = new Map<string, PersistedVillager>(
     (Option.isSome(loadedSession) ? loadedSession.value.state.villagers.residents : [])
@@ -2189,6 +2211,7 @@ const bootGame = async (
     vehicles: vehicleService,
     entities: world.entities,
     chunkStore: currentChunkStore,
+    worldWrite: hostWorldWrite.port,
     inputContext: adapters.inputContext,
     redstoneContext: adapters.redstoneContext,
   })

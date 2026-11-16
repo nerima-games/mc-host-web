@@ -1,5 +1,5 @@
 import { Context, Effect } from 'effect'
-import { type QaNamespace, type SaveSliceRegistration } from '@nerima-games/mc-kernel'
+import { WorldWritePort, type QaNamespace, type SaveSliceRegistration } from '@nerima-games/mc-kernel'
 import { renderModule, InputService, type DrawPort, type GraphicsQuality } from '@nerima-games/mc-render'
 import {
   CropService,
@@ -49,6 +49,7 @@ export type HostServices =
   | VehicleService
   | EntityManager
   | ChunkStore
+  | WorldWritePort
   | InputService
   | RedstoneWorldRuntime
 
@@ -67,6 +68,7 @@ export type HostServiceInstances = {
   readonly vehicles: VehicleServiceApi
   readonly entities: EntityManagerApi<MobBehaviour>
   readonly chunkStore: ChunkStoreApi
+  readonly worldWrite: WorldWritePort['Service']
   readonly inputContext: Context.Context<InputService>
   readonly redstoneContext: Context.Context<RedstoneWorldRuntime>
 }
@@ -82,6 +84,7 @@ export const makeHostServiceContext = (instances: HostServiceInstances): Context
     Context.make(VehicleService, instances.vehicles),
     Context.make(MobEntityManager, instances.entities),
     Context.make(ChunkStore, instances.chunkStore),
+    Context.make(WorldWritePort, instances.worldWrite),
   )
 
 /**

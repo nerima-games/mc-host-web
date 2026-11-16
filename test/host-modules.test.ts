@@ -1,11 +1,13 @@
 import { assert, describe, expect, it } from '@effect/vitest'
-import { Context, Effect, Layer } from 'effect'
+import { Context, Effect, Layer, Schema } from 'effect'
 import {
   DeltaTimeSecs,
   EpochMillis,
   FixedClockLayer,
   MonotonicTimeSecs,
   StageId,
+  WorldIdSchema,
+  WorldWritePort,
 } from '@nerima-games/mc-kernel'
 import { composeGame, type StageRegistration } from '@nerima-games/mc-compose'
 import {
@@ -41,6 +43,7 @@ import {
   type HostModulesDeps,
   type HostServiceInstances,
 } from '../apps/web/host-modules'
+import { makeHostWorldWrite } from '../apps/web/world-write-port'
 
 // The browser twin of this list is e2e/smoke.e2e.ts #3b; both must change together.
 const SMOKE_STAGE_ORDER = [
@@ -68,6 +71,12 @@ const SMOKE_STAGE_ORDER = [
 // InputService and RedstoneWorldRuntime are built once into a Context, as
 // platform-adapters.ts does, so the scope of the test owns them.
 const makeInstances = Effect.gen(function* () {
+  const chunkStore = yield* makeChunkStore(generatedChunkSource(NoiseSeed(1)), ChunkCapacity(16))
+  const hostWorldWrite = yield* makeHostWorldWrite({
+    world: yield* Schema.decodeEffect(WorldIdSchema)('host-modules-test'),
+    owners: [],
+    chunkStores: { forDimension: () => chunkStore },
+  })
   const instances: HostServiceInstances = {
     time: yield* makeTimeService(),
     player: yield* makePlayerService(),
@@ -75,7 +84,8 @@ const makeInstances = Effect.gen(function* () {
     inventory: yield* makeInventoryService(),
     vehicles: yield* makeVehicleService(),
     entities: yield* makeEntityManager<MobBehaviour>(),
-    chunkStore: yield* makeChunkStore(generatedChunkSource(NoiseSeed(1)), ChunkCapacity(16)),
+    chunkStore,
+    worldWrite: hostWorldWrite.port,
     inputContext: yield* Layer.build(InputServiceLayer()),
     redstoneContext: yield* Layer.build(RedstoneWorldRuntimeLayer),
   }
@@ -134,6 +144,7 @@ describe('host modules', () => {
       expect(Context.get(services, VehicleService)).toBe(instances.vehicles)
       expect(Context.get(services, MobEntityManager)).toBe(instances.entities)
       expect(Context.get(services, ChunkStore)).toBe(instances.chunkStore)
+      expect(Context.get(services, WorldWritePort)).toBe(instances.worldWrite)
       expect(Context.get(services, InputService)).toBe(Context.get(instances.inputContext, InputService))
       expect(Context.get(services, RedstoneWorldRuntime)).toBe(
         Context.get(instances.redstoneContext, RedstoneWorldRuntime),
