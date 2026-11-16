@@ -1,4 +1,4 @@
-import { AngleRadians, BlockId, BlockPositionKey, blockOfPlaceableItem, DimensionIdSchema, InterpolationFraction, blockIdOf, encodeBlockState, MonotonicTimeSecs as KernelMonotonicTimeSecs, position, PositionAxis, VehicleVelocityComponent, type BlockEdit } from '@nerima-games/mc-kernel'
+import { AngleRadians, BlockId, BlockPositionKey, blockOfPlaceableItem, DimensionIdSchema, InterpolationFraction, blockIdOf, encodeBlockState, MonotonicTimeSecs as KernelMonotonicTimeSecs, position, PositionAxis, VehicleVelocityComponent, type WorldWriteBatch } from '@nerima-games/mc-kernel'
 import { addExperience as addVitalsExperience, ExperienceDelta, changed, emptyFurnaceState, UNCHANGED, type WeatherState } from '@nerima-games/mc-sim'
 import { Effect, Option, Ref, Result, Schema } from 'effect'
 import {
@@ -91,7 +91,7 @@ export const runTickPostFrameGameplay = (
   } = postFrame
   const { h5a, h5b, services, state } = context
   const targeting = h5a.targeting
-  const writeBlocks = (dimension: Dimension, edits: ReadonlyArray<BlockEdit>) => Effect.gen(function* () {
+  const writeBlocks = (dimension: Dimension, edits: WorldWriteBatch['edits']) => Effect.gen(function* () {
     const dimensionId = yield* Schema.decodeEffect(DimensionIdSchema)(dimension)
     const coordinator = targeting.coordinator
     yield* services.worldWrite.applyBatch({
@@ -1145,7 +1145,7 @@ export const runTickPostFrameGameplay = (
       case 'ExitPortalMaterializationRequested':
         if (!state.exitPortalMaterialized.get()) {
           const portalY = 64
-          const edits: Array<BlockEdit> = []
+          const edits: Array<WorldWriteBatch['edits'][number]> = []
           for (let x = -1; x <= 1; x += 1) {
             for (let z = -1; z <= 1; z += 1) {
               edits.push({ position: blockPosition(x, portalY, z), block: END_PORTAL_BLOCK.PORTAL })
