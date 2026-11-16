@@ -88,10 +88,17 @@ const openBrewingStand = async (page: Page): Promise<void> => {
   await expect(page.locator('#brewing-root')).toBeVisible()
 }
 
-const selectAndInsert = async (page: Page, digit: string): Promise<void> => {
-  const brewing = page.locator('#brewing-root')
+const selectHotbar = async (page: Page, digit: 'Digit1' | 'Digit2' | 'Digit3' | 'Digit4'): Promise<void> => {
+  const slotIndex = { Digit1: 0, Digit2: 1, Digit3: 2, Digit4: 3 }[digit]
   await page.keyboard.press(digit)
-  await page.waitForTimeout(100)
+  await expect.poll(() => page.locator('#hud-root [data-mx-ui="hotbar"] [data-mx-ui="slot"]').evaluateAll(
+    (slots) => slots.findIndex((slot) => slot.hasAttribute('data-selected')),
+  )).toBe(slotIndex)
+}
+
+const selectAndInsert = async (page: Page, digit: 'Digit1' | 'Digit2' | 'Digit3' | 'Digit4'): Promise<void> => {
+  const brewing = page.locator('#brewing-root')
+  await selectHotbar(page, digit)
   if (!(await brewing.isVisible())) await openBrewingStand(page)
   await brewing.locator('[data-brewing-action="insert"]').click()
 }
@@ -162,7 +169,7 @@ test.describe('brewing, effects, and experience', () => {
     const brewing = page.locator('#brewing-root')
     await brewing.locator('[data-brewing-action="collect"]').click()
     await expect.poll(async () => (await snapshot(page)).inventory.slots[1]?.item).toBe('potion_of_poison')
-    await page.keyboard.press('Digit2')
+    await selectHotbar(page, 'Digit2')
     await brewing.locator('[data-brewing-action="drink"]').click()
 
     await expect(page.locator('[data-testid="status-effects"]')).toContainText('poison:')

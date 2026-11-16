@@ -1,4 +1,4 @@
-import { AngleRadians, BlockAxis, BlockId, ClockPort, EpochMillis, fixedClock, blockIdOf, blockTypeOfId, blockPosition as kernelBlockPosition, ChunkAxis, chunkCoord as kernelChunkCoord, DeltaTimeSecs, itemStack, MonotonicTimeSecs, position, PositionAxis, StackCount, WorldId, MAX_PORTAL_WIDTH, WorldWriteChunkUnavailableSchema, WorldWriteConflict, WorldWriteInvalidBatch, type WorldWriteBatch, type WorldWritePort } from '@nerima-games/mc-kernel'
+import { AngleRadians, BlockAddressSchema, BlockAxis, BlockId, ClockPort, EntityIdSchema, EpochMillis, fixedClock, blockIdOf, blockTypeOfId, blockPosition as kernelBlockPosition, ChunkAxis, chunkCoord as kernelChunkCoord, DeltaTimeSecs, itemStack, MonotonicTimeSecs, position, PositionAxis, SimulationTickSchema, StackCount, WorldId, MAX_PORTAL_WIDTH, WorldWriteChunkUnavailableSchema, WorldWriteConflict, WorldWriteInvalidBatch, type WorldWriteBatch, type WorldWritePort } from '@nerima-games/mc-kernel'
 import { type InputSnapshot } from '@nerima-games/mc-render'
 import { CropSnapshotSchema, PlayerServiceSnapshotSchema, PlayerStorageSnapshotSchema, WorldCommitCoordinator, makeBrewingService, makeTimeService, makeWeatherService, makeWorldCommitCoordinator, HungerPoints, POTATO_MATURITY_SECS, type CropSnapshot } from '@nerima-games/mc-sim'
 import { CHUNK_SIZE_XZ, CHUNK_VOLUME, BIOMES, type ChunkSource } from '@nerima-games/mc-worldgen'
@@ -434,6 +434,45 @@ const withHarness = async (
 }
 
 describe('tick post-frame gameplay processing', () => {
+  it('collects a queued brewing bottle through the stage and presents the result', async () => {
+    await withHarness({}, (harness) => {
+      const state = harness.context.h5a.gameplayState
+      const stand = blockPosition(0, 64, 1)
+      Effect.runSync(harness.world.chunkStore.load(chunkCoord(0, 0)))
+      Effect.runSync(harness.world.chunkStore.setBlock(stand, Option.getOrThrow(blockIdOf('brewing_stand'))))
+      Effect.runSync(harness.context.services.brewingService.setBottle(
+        0, Result.getOrThrow(itemStack('potion_of_poison', StackCount(1))),
+      ).pipe(Effect.provideService(WorldCommitCoordinator, harness.coordinator)))
+      Effect.runSync(gameplay.collectBrewingPotion(state, {
+        requestId: 'brewing-collect-1',
+        actor: Schema.decodeUnknownSync(EntityIdSchema)('mx-gameplay:player-avatar'),
+        tick: Schema.decodeUnknownSync(SimulationTickSchema)(Effect.runSync(Ref.get(state.tickCount))),
+        address: Schema.decodeUnknownSync(BlockAddressSchema)({ dimension: 'overworld', position: stand }),
+        bottleIndex: 0,
+      }))
+      harness.context.services.pendingItemUses.set('brewing-collect-1', { kind: 'brewing', action: 'collect' })
+
+      Effect.runSync(harness.runInteractions())
+
+      expect({
+        results: Effect.runSync(Ref.get(state.itemUseResults)),
+        faults: Effect.runSync(gameplay.drainGameplayEntityStageFaults(state)),
+        unsupported: Effect.runSync(Ref.get(state.unsupportedOperations)),
+      }).toEqual({
+        results: [{ action: 'CollectBrewingBottle', requestId: 'brewing-collect-1', success: true, outcome: { _tag: 'Collected', item: 'potion_of_poison', count: 1, remainingCount: 0 } }],
+        faults: [],
+        unsupported: [],
+      })
+      expect(Effect.runSync(harness.coordinator.snapshot(gameplay.GAMEPLAY_PLAYER_STORAGE_OWNER_ID, PlayerStorageSnapshotSchema)).state.inventory.slots[0]?.item).toBe('potion_of_poison')
+      expect(Effect.runSync(harness.context.services.brewingService.snapshot.pipe(Effect.provideService(WorldCommitCoordinator, harness.coordinator))).bottles[0]).toBeUndefined()
+
+      runTickPostFrameGameplay(harness.context, { frame: harness.frame, movement: harness.movement, postFrame: harness.postFrame, nowSecs: MonotonicTimeSecs(2) })
+
+      expect(harness.context.state.brewingStatus.get()).toBe('Collected potion_of_poison')
+      expect(harness.context.services.pendingItemUses.has('brewing-collect-1')).toBe(false)
+    })
+  })
+
   it('advances an active brew by one frame delta', async () => {
     await withHarness({}, (harness) => {
       const service = harness.context.services.brewingService
