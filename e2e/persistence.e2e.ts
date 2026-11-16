@@ -1,5 +1,5 @@
 import { expect, test, type ConsoleMessage, type Page } from '@playwright/test'
-import { isDroppedItemBehaviour } from '@nerima-games/mx-gameplay'
+import { DROPPED_ITEM_PICKUP_RADIUS, isDroppedItemBehaviour } from '@nerima-games/mx-gameplay'
 
 import type { SessionHead } from '../apps/web/session-persistence'
 import { callQa, callQaWithFrames } from './helpers/qa'
@@ -357,23 +357,30 @@ test('isolates and restores entity rosters across dimensions and reload', async 
 
   await callQa(page, 'gameplay.enterOverworld')
   await expect.poll(async () => (await snapshot(page)).activeChunkDimension).toBe('overworld')
-  await callQa(page, 'gameplay.respawn')
-  await expect.poll(async () => (await snapshot(page)).dead).toBe(false)
-  await callQa(page, 'gameplay.seedFoodUseEncounter')
-  // Queue travel and grounding together so the live player never stands on the first nether drop.
+  // Respawn and prepare both fixtures at one boundary so no intermediate frame can collect the retained drop.
   await page.evaluate(async () => {
     const transport = window.__NERIMA_GAMES_QA__
     if (transport === undefined) throw new Error('missing QA transport')
     const results = await Promise.all([
-      transport.dispatch('gameplay', 'enterNether', null),
+      transport.dispatch('gameplay', 'respawn', null),
+      transport.dispatch('gameplay', 'seedFoodUseEncounter', null),
       transport.dispatch('gameplay', 'seedSmokeGroundingEncounter', null),
     ])
     for (const result of results) {
       if (result._tag === 'Failure') throw new Error(`QA command failed: ${JSON.stringify(result.error)}`)
     }
   })
+  await expect.poll(async () => (await snapshot(page)).dead).toBe(false)
+  await callQa(page, 'gameplay.enterNether')
   await expect.poll(async () => (await snapshot(page)).activeChunkDimension).toBe('nether')
-  await expect(page.locator('#game-canvas')).toHaveAttribute('data-player-grounded', 'true')
+  const retainedNetherDrop = seededNether[0]
+  if (retainedNetherDrop === undefined) throw new Error('missing first nether death drop')
+  const secondNether = await snapshot(page)
+  // Horizontal separation remains outside pickup range even while the second fixture falls.
+  expect(Math.hypot(
+    secondNether.pose.feetPosition.x - retainedNetherDrop.feetPosition.x,
+    secondNether.pose.feetPosition.z - retainedNetherDrop.feetPosition.z,
+  )).toBeGreaterThan(DROPPED_ITEM_PICKUP_RADIUS)
   const expandedNether = await damageUntilNewDrop(seededNether.map(({ id }) => id))
   const seededExpandedNether = droppedEntities(expandedNether)
   expect(seededExpandedNether).toHaveLength(2)

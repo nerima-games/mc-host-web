@@ -150,11 +150,11 @@ test.describe('player inventory experience', () => {
     await expect(destination).toHaveAttribute('aria-label', /, Stone, 2$/)
     const snapshot = await callQa<GameplaySnapshot>(page, 'gameplay.snapshot')
     expect(snapshot.inventory.slots[0]).toBeNull()
-      expect(snapshot.inventory.slots[9]).toEqual({
-        item: 'stone',
-        count: 2,
-        components: Result.getOrThrow(itemComponents('stone')),
-      })
+    expect(snapshot.inventory.slots[9]).toEqual({
+      item: 'stone',
+      count: 2,
+      components: Result.getOrThrow(itemComponents('stone')),
+    })
     })
 
     test('places an inventory stack into the crafting grid by dragging', async ({ page }) => {
@@ -240,7 +240,7 @@ test.describe('player inventory experience', () => {
     const heldTableSlot = page.locator(
       `#hud-root [data-mx-ui="hotbar"] [data-slot-index="${craftingTableSlotIndex}"]`,
     )
-    await expect(heldTableSlot).toContainText('crafting_table')
+    await expect(heldTableSlot).toContainText('Crafting Table')
 
     await grantPointerLock(page)
     await canvas.click({ button: 'right' })
