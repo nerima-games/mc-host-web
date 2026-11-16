@@ -1,14 +1,15 @@
-import { Data, Effect, Option, Result, Schema, SchemaTransformation } from 'effect'
+import { Data, Effect, Option, Result, Schema, SchemaIssue, SchemaTransformation } from 'effect'
 import type { YieldableError } from 'effect/Cause'
 import { isValidWitherRuntimeSnapshot, type WitherRuntimeSnapshot } from '@nerima-games/mc-server/shared'
 
-import { ChunkAxis, isItemType, type ChunkCoord } from '@nerima-games/mc-kernel'
+import { ChunkAxis, isItemStack, isItemType, type ChunkCoord } from '@nerima-games/mc-kernel'
 import {
   loadFrom,
   SaveKey,
   saveTo,
   StoragePort,
   defineFormat,
+  defineFormatMigration,
   type SaveDecodeError,
   type SaveFormat,
   type StorageError,
@@ -25,6 +26,9 @@ import {
   validateCropSnapshot,
   type ContainerStorageSnapshot,
   type CropSnapshot,
+  LegacyItemStackSchema,
+  type Durability,
+  type EquipmentItem,
   type FurnaceState,
   type PlayerStorage,
   type TimeState,
@@ -58,7 +62,7 @@ import {
 } from '@nerima-games/mx-gameplay'
 
 export const SESSION_FORMAT_NAME = '@nerima-games/mc-compose/session'
-export const SESSION_FORMAT_VERSION = 17
+export const SESSION_FORMAT_VERSION = 18
 
 // Effect 4 runs a schema's checks on encode as well as decode, so a plain
 // `check` keeps the old "validate before encoding too" guarantee.
@@ -100,14 +104,8 @@ const restoreBrewingUndefined = (value: unknown): unknown => {
   }
 }
 
-// Untyped rather than `(state: BrewingStandState) => unknown`: this also runs,
-// via `toStoredSessionState`, over the deliberately-malformed fixtures the
-// test suite's decode-rejection tests seed directly into `StoragePort`
-// (bypassing `saveSession`/this schema's own encode). A malformed fixture is
-// exactly a `BrewingStandState`-shaped value with an invalid VALUE at one of
-// its fields, never a differently-SHAPED value, so a defensive property read
-// here is enough — it mirrors `restoreBrewingUndefined`'s decode-side
-// looseness rather than trusting the nominal type.
+// Untyped because `makeBoundaryCodec` swaps on the raw field value before the
+// target schema has validated it.
 const encodeBrewingUndefined = (value: unknown): unknown => {
   if (value === null || typeof value !== 'object') return value
   const record = value as Record<string, unknown>
@@ -437,8 +435,8 @@ export type SessionState = {
 
 const FiniteNumberSchema = Schema.Finite
 
-// Same undefined-vs-null gap as `PlayerStorageSchema`/`BrewingStandStateSchema`/
-// `PersistedEntityRostersSchema` above, but on a REQUIRED field rather than an
+// Same undefined-vs-null gap as `UndefinedSlotSchema`/`BrewingStandStateSchema`/
+// `PersistedEntityRostersSchema` in this file, but on a REQUIRED field rather than an
 // absent one: `PlayerVitals.lastDamageCause: DamageCause | undefined` is
 // always present (there is no death cause yet, not an omitted property), so
 // `Schema.optionalKey` — which is about KEY absence —
@@ -514,8 +512,8 @@ const PersistedEntityRosterSchema = Schema.Struct({
   nextSerial: Schema.Number,
 })
 
-// Same undefined-vs-null gap as `PlayerStorageSchema`/`BrewingStandStateSchema`
-// above, one level further down: an entity's `behaviour` is `unknown` here
+// Same undefined-vs-null gap as `UndefinedSlotSchema`/`BrewingStandStateSchema`
+// in this file, one level further down: an entity's `behaviour` is `unknown` here
 // (there is no shared schema for the whole `MobBehaviour` union across every
 // mx-gameplay mob kind), so nothing upstream catches a passive mob's
 // `behaviour: undefined` — "a pig keeps its `undefined`" — before mc-save's
@@ -567,63 +565,95 @@ const PersistedEntityRostersSchema = makeBoundaryCodec(
   encodePersistedEntityRosters,
 )
 
-// Same undefined-vs-null gap as `BrewingStandStateSchema` above: mc-sim's
-// `Inventory.slots: ReadonlyArray<Slot>` models an empty slot as `undefined`
-// (`Slot = ItemStack | undefined`), never `null`, so the swap is unambiguous
-// for this one field.
-const restorePlayerStorageSlots = (value: unknown): unknown => {
-  if (value === null || typeof value !== 'object') return value
-  const record = value as Record<string, unknown>
-  const inventory = record['inventory']
-  if (inventory === null || typeof inventory !== 'object') return value
-  const inventoryRecord = inventory as Record<string, unknown>
-  const slots = inventoryRecord['slots']
-  if (!Array.isArray(slots)) return value
-  return {
-    ...record,
-    inventory: {
-      ...inventoryRecord,
-      slots: slots.map((slot) => (slot === null ? undefined : slot)),
-    },
-  }
+// Every item stack is persisted in mc-sim's `LegacyItemStackSchema` form
+// (`components: null` for the item's default components, otherwise the
+// components with `undefined` written as `null`); the host adds no stack codec
+// of its own.
+//
+// mc-sim models an empty player inventory or furnace slot as `undefined`
+// (`Slot = ItemStack | undefined`), which mc-save's checksum cannot store, so
+// this is the one place such a slot is written as `null` and read back.
+// Container and equipment slots already use `null` and need no swap.
+const UndefinedSlotSchema = Schema.NullOr(LegacyItemStackSchema).pipe(Schema.decodeTo(
+  Schema.UndefinedOr(Schema.toType(LegacyItemStackSchema)),
+  SchemaTransformation.transform({
+    decode: (slot) => slot ?? undefined,
+    encode: (slot) => slot ?? null,
+  }),
+))
+
+const isDurability = (value: unknown): value is Durability => {
+  const record = asRecord(value)
+  return typeof record?.['current'] === 'number' && typeof record['max'] === 'number'
 }
 
-// Untyped for the same reason as `encodeBrewingUndefined` above: it also runs
-// over the test suite's deliberately-malformed `PlayerStorage`-shaped
-// fixtures via `toStoredSessionState`, which never differ in SHAPE from a
-// real `PlayerStorage`, only in the values a real one would reject.
-const encodePlayerStorageSlots = (value: unknown): unknown => {
-  if (value === null || typeof value !== 'object') return value
-  const record = value as Record<string, unknown>
-  const inventory = record['inventory']
-  if (inventory === null || typeof inventory !== 'object') return value
-  const inventoryRecord = inventory as Record<string, unknown>
-  const slots = inventoryRecord['slots']
-  if (!Array.isArray(slots)) return value
-  return {
-    ...record,
-    inventory: {
-      ...inventoryRecord,
-      slots: slots.map((slot: unknown) => slot ?? null),
-    },
-  }
+const isStoredStack = (value: unknown): value is EquipmentItem => {
+  const record = asRecord(value)
+  return record !== undefined
+    && isItemStack({ item: record['item'], count: record['count'], components: record['components'] })
+    && (record['durability'] === null || isDurability(record['durability']))
 }
+
+// Equipment and container stacks carry a `durability` next to the stack
+// fields; the stack part goes through `LegacyItemStackSchema` and the
+// durability is copied as recorded. The full storage validators below check
+// the durability values.
+const StoredStackSchema = Schema.Unknown.pipe(Schema.decodeTo(
+  Schema.declare(isStoredStack, { expected: 'Item stack with its durability' }),
+  SchemaTransformation.transformEffect({
+    decode: (wire: unknown) => {
+      const durability = asRecord(wire)?.['durability']
+      return Schema.decodeUnknownEffect(LegacyItemStackSchema)(wire).pipe(
+        Effect.mapError((error) => error.issue),
+        Effect.flatMap((stack) =>
+          durability === null || isDurability(durability)
+            ? Effect.succeed({ ...stack, durability })
+            : Effect.fail(new SchemaIssue.InvalidValue(
+              { message: 'Stored stack durability must be null or { current, max }' },
+              durability,
+            ))),
+      )
+    },
+    encode: ({ durability, ...stack }: EquipmentItem) =>
+      Schema.encodeEffect(LegacyItemStackSchema)(stack).pipe(
+        Effect.mapError((error) => error.issue),
+        Effect.map((encoded): unknown => ({ ...asRecord(encoded), durability })),
+      ),
+  }),
+))
+
+const StoredSlotSchema = Schema.NullOr(StoredStackSchema)
 
 const isPersistablePlayerStorage = (value: unknown): value is PlayerStorage =>
   validatePlayerStorageSnapshot(value)._tag === 'Valid'
 
-const PlayerStorageSchema = makeBoundaryCodec(
-  Schema.declare(isPersistablePlayerStorage, { expected: 'Player storage that satisfies persistence invariants' }),
-  restorePlayerStorageSlots,
-  encodePlayerStorageSlots,
-)
+const PlayerStorageSchema = Schema.Struct({
+  inventory: Schema.Struct({ slots: Schema.Array(UndefinedSlotSchema) }),
+  equipment: Schema.Struct({
+    slots: Schema.Struct({
+      head: StoredSlotSchema,
+      chest: StoredSlotSchema,
+      legs: StoredSlotSchema,
+      feet: StoredSlotSchema,
+      offhand: StoredSlotSchema,
+    }),
+  }),
+  inventoryDurability: Schema.Array(Schema.Unknown),
+}).pipe(Schema.refine(isPersistablePlayerStorage, { expected: 'Player storage that satisfies persistence invariants' }))
 
 const isPersistableContainerStorage = (value: unknown): value is ContainerStorageSnapshot =>
   validateContainerStorageSnapshot(value)._tag === 'Valid'
 
-const ContainerStorageSchema = Schema.declare(isPersistableContainerStorage, {
+const ContainerStorageSchema = Schema.Struct({
+  version: Schema.Literal(3),
+  containers: Schema.Array(Schema.Struct({
+    id: Schema.String,
+    kind: Schema.String,
+    slots: Schema.Array(StoredSlotSchema),
+  })),
+}).pipe(Schema.refine(isPersistableContainerStorage, {
   expected: 'Container storage that satisfies persistence invariants',
-})
+}))
 
 const isPersistableCropSnapshot = (value: unknown): value is CropSnapshot =>
   validateCropSnapshot(value)._tag === 'Valid'
@@ -635,36 +665,17 @@ const CropSnapshotSchema = Schema.declare(isPersistableCropSnapshot, {
 const isPersistableFurnaceState = (value: unknown): value is FurnaceState =>
   validateFurnaceSnapshot(value)._tag === 'Valid'
 
-// mc-sim's `FurnaceState.{input,fuel,output}` are `ItemStack | undefined`
-// (mc-kernel `smelting-data.d.ts`), so they need the same `undefined`/`null`
-// swap as the player inventory slots below; `null` has no other meaning there.
-const FURNACE_SLOT_FIELDS = ['input', 'fuel', 'output'] as const
-
-const restoreFurnaceSlots = (value: unknown): unknown => {
-  const record = asRecord(value)
-  if (record === undefined) return value
-  const restored = { ...record }
-  for (const field of FURNACE_SLOT_FIELDS) {
-    if (restored[field] === null) restored[field] = undefined
-  }
-  return restored
-}
-
-const encodeFurnaceSlots = (value: unknown): unknown => {
-  const record = asRecord(value)
-  if (record === undefined) return value
-  const encoded = { ...record }
-  for (const field of FURNACE_SLOT_FIELDS) {
-    if (Object.hasOwn(encoded, field)) encoded[field] = encoded[field] ?? null
-  }
-  return encoded
-}
-
-const FurnaceStateSchema = makeBoundaryCodec(
-  Schema.declare(isPersistableFurnaceState, { expected: 'Furnace state that satisfies simulation invariants' }),
-  restoreFurnaceSlots,
-  encodeFurnaceSlots,
-)
+const FurnaceStateSchema = Schema.Struct({
+  station: Schema.String,
+  input: UndefinedSlotSchema,
+  fuel: UndefinedSlotSchema,
+  output: UndefinedSlotSchema,
+  fuelTimeRemainingSecs: Schema.Finite,
+  fuelTimeTotalSecs: Schema.Finite,
+  cookProgressSecs: Schema.Finite,
+}).pipe(Schema.refine(isPersistableFurnaceState, {
+  expected: 'Furnace state that satisfies simulation invariants',
+}))
 
 const PersistedFurnaceSchema = Schema.Struct({
   dimension: DimensionSchema,
@@ -793,20 +804,14 @@ const SessionStateSchema = Schema.Struct({
 })
 
 /**
- * The on-disk shape of a `SessionState`, exactly as `SessionStateSchema`'s own
- * encode step produces it (`storage.inventory.slots` and `brewing`'s three
- * optional fields have `undefined` swapped for `null` — see the comments on
- * `PlayerStorageSchema`/`BrewingStandStateSchema` above). Tests that seed a
- * `StoragePort` directly with a hand-built envelope (bypassing `saveSession`,
- * to exercise `loadSession`'s rejection paths in isolation) need this rather
- * than a bare `SessionState`, since `sealSaveEnvelope`'s own integrity
- * checksum rejects raw `undefined` exactly as `saveSession` would have.
+ * The on-disk shape of a `SessionState`, produced by `SessionStateSchema`'s
+ * own encode step. Tests that seed a `StoragePort` directly with a hand-built
+ * envelope (bypassing `saveSession`, to exercise `loadSession`'s rejection
+ * paths in isolation) start from this and override single fields with
+ * malformed encoded values.
  */
-export const toStoredSessionState = (state: SessionState): unknown => ({
-  ...state,
-  storage: encodePlayerStorageSlots(state.storage),
-  brewing: encodeBrewingUndefined(state.brewing),
-})
+export const toStoredSessionState = (state: SessionState): Result.Result<unknown, Schema.SchemaError> =>
+  Schema.encodeUnknownResult(SessionStateSchema)(state)
 
 export type SessionChunkManifestEntry = {
   readonly dimension: Dimension
@@ -871,19 +876,137 @@ const asRecord = (value: unknown): Record<string, unknown> | undefined =>
     ? value as Record<string, unknown>
     : undefined
 
-// mc-save 0.3.0 removed format migrations (org decision, Wave 0: consumers
-// require the current format version; no migration shims). A session saved by
-// an older build now fails `loadSession` with `SaveDecodeError` instead of
-// being transformed forward — see the "rejects a legacy session version"
-// coverage below, which replaces the sixteen per-transition migration tests
-// this format used to carry (v1 through v16, one per SESSION_FORMAT_VERSION
-// bump).
-// `defineFormat` only rejects a malformed name or version; both are the
-// literal constants above, so a failure here is a programming error.
+// v17 is the last format written against mc-sim 0.4 (Effect 3). Only the
+// fields whose shape changed are described here; every other key is carried
+// to the v18 schema untouched, which then validates the whole payload. Older
+// versions (v1-v16) have no migration and stay unreadable.
+const V17_SESSION_FORMAT_VERSION = 17
+
+// mc-sim 0.4's `FurnaceState`. Slots are `ItemStack | null`.
+const V17FurnaceStateSchema = Schema.Struct({
+  input: Schema.Unknown,
+  fuel: Schema.Unknown,
+  output: Schema.Unknown,
+  cookElapsedSecs: Schema.Finite,
+  burnRemainingSecs: Schema.Finite,
+})
+
+const V17Rest = [Schema.Record(Schema.String, Schema.Unknown)] as const
+
+// v17 stack slots (`null` or `{ item, count }`, plus `durability` for
+// equipment and container stacks) are carried as recorded and only gain
+// `components` below.
+const V17SessionHeadSchema = Schema.StructWithRest(
+  Schema.Struct({
+    state: Schema.StructWithRest(
+      Schema.Struct({
+        storage: Schema.StructWithRest(
+          Schema.Struct({
+            inventory: Schema.StructWithRest(Schema.Struct({ slots: Schema.Array(Schema.Unknown) }), V17Rest),
+            equipment: Schema.StructWithRest(
+              Schema.Struct({ slots: Schema.Record(Schema.String, Schema.Unknown) }),
+              V17Rest,
+            ),
+          }),
+          V17Rest,
+        ),
+        containerStorage: Schema.StructWithRest(
+          Schema.Struct({
+            version: Schema.Literal(2),
+            containers: Schema.Array(Schema.StructWithRest(
+              Schema.Struct({ slots: Schema.Array(Schema.Unknown) }),
+              V17Rest,
+            )),
+          }),
+          V17Rest,
+        ),
+        furnaces: Schema.Array(Schema.Struct({
+          dimension: Schema.Unknown,
+          position: Schema.Unknown,
+          state: V17FurnaceStateSchema,
+        })),
+      }),
+      [Schema.Record(Schema.String, Schema.Unknown)],
+    ),
+  }),
+  [Schema.Record(Schema.String, Schema.Unknown)],
+)
+
+// v17 had no item component concept, so every recorded stack has the item's
+// default components. `components: null` is how mc-sim's
+// `LegacyItemStackSchema` records exactly that; empty slots stay as recorded.
+const migrateV17Slot = (slot: unknown): unknown => {
+  const stack = asRecord(slot)
+  return stack === undefined ? slot : { ...stack, components: null }
+}
+
+// The container snapshot version that v18 records. mc-sim 0.11's v3 differs
+// from v2 only in each stored stack's `components`.
+const V18_CONTAINER_STORAGE_VERSION = 3
+
+// Unrecorded v18 furnace fields, built only from the v17 record:
+// - station: 'furnace'. mc-sim 0.4 furnaces had no station; only normal
+//   furnaces existed.
+// - cookProgressSecs: cookElapsedSecs.
+// - fuelTimeRemainingSecs: burnRemainingSecs.
+// - fuelTimeTotalSecs: burnRemainingSecs. v17 never recorded the burning
+//   fuel's total, so the remainder stands in for it. Only the flame-fraction
+//   display changes; the time until the fuel runs out does not.
+const migrateV17FurnaceState = (state: typeof V17FurnaceStateSchema.Type) => ({
+  station: 'furnace',
+  input: migrateV17Slot(state.input),
+  fuel: migrateV17Slot(state.fuel),
+  output: migrateV17Slot(state.output),
+  fuelTimeRemainingSecs: state.burnRemainingSecs,
+  fuelTimeTotalSecs: state.burnRemainingSecs,
+  cookProgressSecs: state.cookElapsedSecs,
+})
+
+const migrateV17SessionHead = (head: typeof V17SessionHeadSchema.Type): unknown => ({
+  ...head,
+  state: {
+    ...head.state,
+    storage: {
+      ...head.state.storage,
+      inventory: { ...head.state.storage.inventory, slots: head.state.storage.inventory.slots.map(migrateV17Slot) },
+      equipment: {
+        ...head.state.storage.equipment,
+        slots: Object.fromEntries(
+          Object.entries(head.state.storage.equipment.slots).map(([slot, stack]) => [slot, migrateV17Slot(stack)]),
+        ),
+      },
+    },
+    containerStorage: {
+      ...head.state.containerStorage,
+      version: V18_CONTAINER_STORAGE_VERSION,
+      containers: head.state.containerStorage.containers.map((container) => ({
+        ...container,
+        slots: container.slots.map(migrateV17Slot),
+      })),
+    },
+    furnaces: head.state.furnaces.map((furnace) => ({
+      ...furnace,
+      state: migrateV17FurnaceState(furnace.state),
+    })),
+  },
+})
+
+// `defineFormatMigration` only rejects a malformed `fromVersion` or a
+// non-function `migrate`; both are fixed here, so a failure is a programming
+// error.
+const SESSION_V17_MIGRATION = Result.getOrThrow(defineFormatMigration({
+  fromVersion: V17_SESSION_FORMAT_VERSION,
+  schema: V17SessionHeadSchema,
+  migrate: migrateV17SessionHead,
+}))
+
+// `defineFormat` only rejects a malformed name, version, or migration chain;
+// all three are the constants above, so a failure here is a programming error.
 export const SESSION_FORMAT: SaveFormat<SessionHead, unknown> = Result.getOrThrow(defineFormat({
   name: SESSION_FORMAT_NAME,
   version: SESSION_FORMAT_VERSION,
   schema: SessionHeadSchema,
+  migrations: [SESSION_V17_MIGRATION],
 }))
 
 type SessionManifestErrorFields = {
