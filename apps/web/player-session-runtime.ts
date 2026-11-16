@@ -1,14 +1,17 @@
-import { Effect } from 'effect'
-import type { Position, MonotonicTimeSecs } from '@nerima-games/mc-kernel'
+import { Effect, Schema } from 'effect'
+import { PositionAxis, position as worldPosition, type Position, type MonotonicTimeSecs } from '@nerima-games/mc-kernel'
 import type { Vehicle } from '@nerima-games/mc-sim'
 import type { Dimension } from '@nerima-games/mc-worldgen'
-import type { RenderEntity } from '@nerima-games/mc-render'
+import { EntityRenderIdentifierSchema, type RenderEntity } from '@nerima-games/mc-render'
 import type { AuthoritativeEntityState } from '@nerima-games/mx-multiplayer'
 import type { RemotePlayer } from './multiplayer-client'
 import type { PersistedVillager, SessionPosition } from './session-persistence'
 import { makeQaSurface } from './qa-surface'
 import { describeQaApiError } from '@nerima-games/mc-compose'
 import type { TouchLookResetReason } from './touch-input'
+
+// Projected entities originate from the session's registered entities and require stable, non-empty IDs.
+const renderEntityId = Schema.decodeUnknownSync(EntityRenderIdentifierSchema)
 
 type LocalEntityProjection = Readonly<{
   id: string
@@ -33,7 +36,7 @@ export type PlayerSessionRuntimeContext = {
 }
 
 export type PlayerLifecycleContext = {
-  readonly document: Document
+  readonly document: Pick<Document, 'addEventListener' | 'visibilityState'>
   readonly window: Pick<Window, 'setInterval' | 'addEventListener'>
   readonly autosaveIntervalMs: number
   readonly requestBackgroundFlush: () => void
@@ -46,6 +49,7 @@ export type PlayerLifecycleContext = {
   readonly weatherAudio: { readonly dispose: () => void }
   readonly clearPendingThunder: () => void
   readonly removeNativeMouseDown: () => void
+  readonly disposeQaSurface: () => void
   readonly disposeWorldRenderer: () => void
   readonly disposeAtlasTexture: () => void
   readonly closeAudio: () => void
@@ -71,13 +75,13 @@ export const createPlayerSessionRuntime = (
 ): PlayerSessionRuntime => {
   const entityRenderProjection = (): ReadonlyArray<RenderEntity> => [
     ...context.getLocalEntities().map((entity) => ({
-      id: entity.id,
+      id: renderEntityId(entity.id),
       kind: entity.kind,
       feetPosition: entity.feetPosition,
       category: entity.kind === 'dropped_item' ? 'item' : 'hostile',
     } satisfies RenderEntity)),
     ...context.getAuthoritativeEntities().map(([, entity]) => ({
-      id: `authoritative:${String(entity.entityId)}`,
+      id: renderEntityId(`authoritative:${String(entity.entityId)}`),
       kind: entity._tag === 'living'
         ? entity.entityType
         : entity._tag === 'vehicle'
@@ -96,21 +100,25 @@ export const createPlayerSessionRuntime = (
     ...context.getRemotePlayers()
       .filter(([, player]) => player.world === context.getCurrentDimension())
       .map(([playerId, player]) => ({
-        id: `multiplayer:${String(playerId)}`,
+        id: renderEntityId(`multiplayer:${String(playerId)}`),
         kind: 'remote_player',
         feetPosition: player.at,
       } satisfies RenderEntity)),
     ...context.getVillagerResidents()
       .filter((villager) => villager.dimension === context.getCurrentDimension())
-      .filter((villager) => context.isCurrentChunkLoaded(villager.feetPosition))
+      .filter((villager) => context.isCurrentChunkLoaded(worldPosition(
+        PositionAxis(villager.feetPosition.x),
+        PositionAxis(villager.feetPosition.y),
+        PositionAxis(villager.feetPosition.z),
+      )))
       .map((villager) => ({
-        id: villager.id,
+        id: renderEntityId(villager.id),
         kind: 'villager',
         feetPosition: villager.feetPosition,
       } satisfies RenderEntity)),
     ...(context.getCurrentDimension() === 'end' && context.getEndDragonPhase() !== 'dead'
       ? [{
-          id: 'ender-dragon',
+          id: renderEntityId('ender-dragon'),
           kind: 'ender_dragon',
           category: 'hostile' as const,
           feetPosition: context.getEndDragonPosition(),
@@ -119,7 +127,7 @@ export const createPlayerSessionRuntime = (
     ...context.getVehicles()
       .filter((vehicle) => vehicle.dimension === context.getCurrentDimension())
       .map((vehicle) => ({
-        id: String(vehicle.id),
+        id: renderEntityId(String(vehicle.id)),
         kind: vehicle.type,
         feetPosition: vehicle.position,
         facingRadians: vehicle.yawRadians,
@@ -158,11 +166,13 @@ export const installPlayerQaSurface = (
   failBoot: (title: string, reason: string) => void,
 ): boolean => {
   const result = makeQaSurface(context)
-  if (result._tag === 'Left') {
-    failBoot('QA registry rejected', describeQaApiError(result.left))
+  if (result._tag === 'Failure') {
+    failBoot('QA registry rejected', result.failure._tag === 'DuplicateModuleContract'
+      ? JSON.stringify(result.failure)
+      : describeQaApiError(result.failure))
     return false
   }
-  result.right.install()
+  result.success.install()
   return true
 }
 
@@ -178,6 +188,7 @@ export const installPlayerLifecycle = (context: PlayerLifecycleContext): PlayerL
   const disposeRuntime = (): void => {
     if (runtimeDisposed) return
     runtimeDisposed = true
+    context.disposeQaSurface()
     context.settingsView.dispose()
     context.endAudio.dispose()
     context.weatherAudio.dispose()
