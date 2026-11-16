@@ -1,4 +1,4 @@
-import { AngleRadians, BlockAddressSchema, BlockAxis, BlockId, ClockPort, EntityIdSchema, EpochMillis, fixedClock, blockIdOf, blockTypeOfId, blockPosition as kernelBlockPosition, ChunkAxis, chunkCoord as kernelChunkCoord, DeltaTimeSecs, itemStack, MonotonicTimeSecs, position, PositionAxis, SimulationTickSchema, StackCount, WorldId, MAX_PORTAL_WIDTH, WorldWriteChunkUnavailableSchema, WorldWriteConflict, WorldWriteInvalidBatch, type WorldWriteBatch, type WorldWritePort } from '@nerima-games/mc-kernel'
+import { AngleRadians, BlockAddressSchema, InterpolationFraction, SimulationTick, BlockAxis, BlockId, ClockPort, EntityId, EntityIdSchema, EpochMillis, fixedClock, blockIdOf, blockTypeOfId, blockPosition as kernelBlockPosition, ChunkAxis, chunkCoord as kernelChunkCoord, DeltaTimeSecs, itemStack, MonotonicTimeSecs, position, PositionAxis, SimulationTickSchema, StackCount, WorldId, MAX_PORTAL_WIDTH, WorldWriteChunkUnavailableSchema, WorldWriteConflict, WorldWriteInvalidBatch, type WorldWriteBatch, type WorldWritePort } from '@nerima-games/mc-kernel'
 import { type InputSnapshot } from '@nerima-games/mc-render'
 import { CropSnapshotSchema, DomainEventBus, DomainEventBusLayer, EventSubscriberCapacitySchema, PlayerServiceSnapshotSchema, PlayerStorageSnapshotSchema, WorldCommitCoordinator, makeBrewingService, makeTimeService, makeWeatherService, makeWorldCommitCoordinator, HungerPoints, POTATO_MATURITY_SECS, type CropSnapshot } from '@nerima-games/mc-sim'
 import { CHUNK_SIZE_XZ, CHUNK_VOLUME, BIOMES, type ChunkSource } from '@nerima-games/mc-worldgen'
@@ -16,7 +16,9 @@ import type { PersistedVillager, SessionPosition } from '../apps/web/session-per
 import { mutableState, type H5aFrameInputResult, type H5aMovementResult, type H5aTickContext } from '../apps/web/tick/h5a-context'
 import type { H5bPostFrameResult } from '../apps/web/tick/h5b-context'
 import type { H5cTickContext } from '../apps/web/tick/h5c-context'
-import { runTickPostFrameGameplay as runTickPostFrameGameplayEffect } from '../apps/web/tick/post-frame-gameplay'
+import { runFramePresentation, runTickPostFrameGameplay as runTickPostFrameGameplayEffect } from '../apps/web/tick/post-frame-gameplay'
+import { initialProjectileRuntimeState, launchRuntimeProjectile } from '../apps/web/projectile-runtime'
+import { BlocksPerSecond } from '@nerima-games/mc-physics'
 import { type ChunkStreamingFailure, type DimensionChunkContext } from '../apps/web/chunk-streaming'
 
 const blockPosition = (x: number, y: number, z: number) => kernelBlockPosition(BlockAxis(x), BlockAxis(y), BlockAxis(z))
@@ -189,6 +191,25 @@ const makeHarness = async (options: HarnessOptions = {}) => {
   const endAudioCalls: Array<{ readonly cue: string; readonly position: SessionPosition }> = []
   const endFeatureCalls = cell(0)
   const playerUiCalls = cell(0)
+  const crosshairCalls: Array<MonotonicTimeSecs> = []
+  const syncRenderedEntitiesCalls = cell(0)
+  const weatherPresentations: Array<{ readonly weather: string; readonly nowSecs: MonotonicTimeSecs }> = []
+  const captionRenders = cell(0)
+  const debugOverlayUpdates: Array<number | undefined> = []
+  const fpsValue = { textContent: '' }
+  const projectileHud = { textContent: '', hidden: true }
+  const launchArrow = (state: ReturnType<typeof initialProjectileRuntimeState>, dimension: 'overworld' | 'nether') =>
+    launchRuntimeProjectile(state, {
+      dimension,
+      position: position(PositionAxis(0), PositionAxis(65), PositionAxis(0)),
+      yawRadians: AngleRadians(0),
+      pitchRadians: AngleRadians(0),
+      speed: BlocksPerSecond(10),
+      damage: 5,
+      knockback: 1,
+      shooterId: EntityId('player'),
+    })
+  const projectileRuntimeState = cell(launchArrow(launchArrow(initialProjectileRuntimeState(), 'overworld'), 'nether'))
   const previousDocument = Object.getOwnPropertyDescriptor(globalThis, 'document')
 
   const currentChunkContext = {
@@ -259,7 +280,7 @@ const makeHarness = async (options: HarnessOptions = {}) => {
     setFishingResult: (result: string) => fishingResults.push(result),
     markSessionDirty: () => undefined,
     sendVitalsCommand: () => undefined,
-    renderCrosshair: () => undefined,
+    renderCrosshair: (nowSecs: MonotonicTimeSecs) => { crosshairCalls.push(nowSecs) },
     playerSettings: { ...DEFAULT_PLAYER_SETTINGS, captionsEnabled: false },
     currentChunkContext: () => currentChunkContext,
     canvas: {
@@ -272,7 +293,9 @@ const makeHarness = async (options: HarnessOptions = {}) => {
       activeChestId: cell<string | undefined>(undefined).state,
       activeFurnaceKey: cell<string | undefined>(undefined).state,
       witherRuntimeState: cell((await import('@nerima-games/mc-server/shared')).initialWitherRuntimeState()).state,
+      projectileRuntimeState: projectileRuntimeState.state,
     },
+    projectileHud,
     inventoryMode: () => 'player',
     applyPlayerDamage: (damage: unknown) => { damageCalls.push(damage) },
     applyWorldExplosion: () => Result.succeed(undefined),
@@ -346,16 +369,18 @@ const makeHarness = async (options: HarnessOptions = {}) => {
       return Effect.void
     },
     presentWeather: () => undefined,
-    presentWeatherRuntime: () => Effect.void,
-    syncRenderedEntities: () => Effect.void,
+    presentWeatherRuntime: (state: { readonly weather: string }, _pose: unknown, nowSecs: MonotonicTimeSecs) => Effect.sync(() => {
+      weatherPresentations.push({ weather: state.weather, nowSecs })
+    }),
+    syncRenderedEntities: () => Effect.sync(() => syncRenderedEntitiesCalls.state.set(syncRenderedEntitiesCalls.get() + 1)),
     registerPortal: () => false,
     requiredSleepRatio: 1,
     sleepHud: { textContent: '', hidden: true },
     endDragonSnapshot: () => Effect.runSync(gameplayState.enderDragonEncounter.snapshot),
     adapters,
     uiFrameState,
-    fpsValue: { textContent: '' },
-    captionsParent: { replaceChildren: () => undefined },
+    fpsValue,
+    captionsParent: { replaceChildren: () => captionRenders.state.set(captionRenders.get() + 1) },
     pendingItemUses: new Map(),
     pendingBlockUses: new Map(),
     pendingBlockPlacements: new Map(),
@@ -391,6 +416,10 @@ const makeHarness = async (options: HarnessOptions = {}) => {
     lastObservedItemUse: cell<ItemUseResult | undefined>(undefined).state,
   }
   const context = { h5a, h5b, services, state } as H5cTickContext
+  const presentationContext = {
+    ...context,
+    updateDebugOverlay: (rawDeltaSecs: number | undefined) => Effect.sync(() => { debugOverlayUpdates.push(rawDeltaSecs) }),
+  }
 
   Object.defineProperty(globalThis, 'document', {
     configurable: true,
@@ -425,6 +454,15 @@ const makeHarness = async (options: HarnessOptions = {}) => {
     endAudioCalls,
     endFeatureCalls,
     playerUiCalls,
+    crosshairCalls,
+    syncRenderedEntitiesCalls,
+    weatherPresentations,
+    captionRenders,
+    debugOverlayUpdates,
+    fpsValue,
+    projectileHud,
+    projectileRuntimeState,
+    presentationContext,
     restoreDocument,
   }
 }
@@ -441,6 +479,13 @@ const withHarness = async (
   } finally {
     harness.restoreDocument()
   }
+}
+
+const presentationFrame = {
+  partialTick: InterpolationFraction(0),
+  simulationTick: SimulationTick(0),
+  frameDeltaSecs: DeltaTimeSecs(0.016),
+  nowSecs: MonotonicTimeSecs(2),
 }
 
 describe('tick post-frame gameplay processing', () => {
@@ -604,13 +649,13 @@ describe('tick post-frame gameplay processing', () => {
       expect(harness.context.state.brewingStatus.get()).toBe('Inserted blaze_powder')
       expect(harness.context.services.pendingItemUses.has('brewing-fuel-1')).toBe(false)
       expect(Effect.runSync(Ref.get(state.itemUseResults))).toEqual([])
-      expect(harness.playerUiCalls.get()).toBe(2)
+      expect(harness.playerUiCalls.get()).toBe(1)
       const committedStorage = Effect.runSync(harness.coordinator.snapshot(gameplay.GAMEPLAY_PLAYER_STORAGE_OWNER_ID, PlayerStorageSnapshotSchema)).state
 
       runTickPostFrameGameplay(harness.context, { frame: harness.frame, movement: harness.movement, postFrame: harness.postFrame, nowSecs: MonotonicTimeSecs(2) })
 
       expect(harness.context.state.brewingStatus.get()).toBe('Inserted blaze_powder')
-      expect(harness.playerUiCalls.get()).toBe(3)
+      expect(harness.playerUiCalls.get()).toBe(1)
       expect(Effect.runSync(harness.coordinator.snapshot(gameplay.GAMEPLAY_PLAYER_STORAGE_OWNER_ID, PlayerStorageSnapshotSchema)).state).toEqual(committedStorage)
     })
   })
@@ -819,7 +864,7 @@ describe('tick post-frame gameplay processing', () => {
     })
   })
 
-  it('publishes fixed player pose, grounded state, and frame count', async () => {
+  it('publishes fixed player pose and grounded state', async () => {
     await withHarness({}, (harness) => {
       runTickPostFrameGameplay(harness.context, {
         frame: harness.frame,
@@ -830,7 +875,6 @@ describe('tick post-frame gameplay processing', () => {
 
       expect(harness.canvasAttributes.get('data-player-feet')).toBe('12.35,64.23,-7.89')
       expect(harness.canvasAttributes.get('data-player-grounded')).toBe('true')
-      expect(harness.attributes.get('data-frames')).toBe('42')
     })
   })
 
@@ -851,7 +895,7 @@ describe('tick post-frame gameplay processing', () => {
       })
 
       expect(harness.endFeatureCalls.get()).toBe(1)
-      expect(harness.playerUiCalls.get()).toBe(2)
+      expect(harness.playerUiCalls.get()).toBe(1)
     })
   })
 
@@ -1239,17 +1283,12 @@ describe('tick post-frame gameplay processing', () => {
     await withHarness({}, (harness) => {
       const rejected = PositionAxis.result(Number.NaN)
       if (Result.isSuccess(rejected)) throw new Error('PositionAxis accepted NaN')
-      const context: H5cTickContext = {
-        ...harness.context,
-        services: { ...harness.context.services, presentWeatherRuntime: () => Effect.fail(rejected.failure) },
+      const context = {
+        ...harness.presentationContext,
+        services: { ...harness.presentationContext.services, presentWeatherRuntime: () => Effect.fail(rejected.failure) },
       }
 
-      const result = Effect.runSync(Effect.result(runTickPostFrameGameplayEffect(context, {
-        frame: harness.frame,
-        movement: harness.movement,
-        postFrame: harness.postFrame,
-        nowSecs: MonotonicTimeSecs(2),
-      })))
+      const result = Effect.runSync(Effect.result(runFramePresentation(context, presentationFrame)))
 
       expect(Result.isFailure(result)).toBe(true)
       if (Result.isFailure(result)) expect(result.failure).toBe(rejected.failure)
@@ -1311,6 +1350,90 @@ describe('tick post-frame gameplay processing', () => {
         block: Option.getOrThrow(blockIdOf('end_portal')),
       })
       expect(harness.endAudioCalls.map(({ cue }) => cue)).toEqual(['dragonHurt', 'dragonReward', 'exitPortal'])
+    })
+  })
+})
+
+describe('frame presentation split from the tick', () => {
+  const runTick = (harness: Harness) => runTickPostFrameGameplay(harness.context, {
+    frame: harness.frame,
+    movement: harness.movement,
+    postFrame: harness.postFrame,
+    nowSecs: MonotonicTimeSecs(2),
+  })
+  const simulationSnapshot = (harness: Harness) => ({
+    revision: Effect.runSync(harness.coordinator.revision),
+    playerOwner: Effect.runSync(harness.coordinator.snapshot(gameplay.GAMEPLAY_PLAYER_OWNER_ID, PlayerServiceSnapshotSchema)),
+    storageOwner: Effect.runSync(harness.coordinator.snapshot(gameplay.GAMEPLAY_PLAYER_STORAGE_OWNER_ID, PlayerStorageSnapshotSchema)),
+    vitalsOwner: Effect.runSync(harness.coordinator.snapshot(gameplay.GAMEPLAY_VITALS_OWNER_ID, gameplay.ExperienceOrbVitalsOwnerSnapshotSchema)),
+    cropsOwner: Effect.runSync(harness.coordinator.snapshot(gameplay.GAMEPLAY_CROPS_OWNER_ID, CropSnapshotSchema)),
+    pose: Effect.runSync(harness.world.player.pose),
+    dimension: Effect.runSync(harness.world.player.dimension),
+    storage: Effect.runSync(harness.world.inventory.storageSnapshot),
+    vitals: Effect.runSync(harness.world.vitals.snapshot),
+    entities: Effect.runSync(harness.world.entities.snapshot),
+    time: Effect.runSync(harness.context.services.time.snapshot),
+    weather: Effect.runSync(harness.context.services.weather.snapshot),
+    projectiles: harness.projectileRuntimeState.get(),
+    sleep: harness.context.state.sleepRuntimeState.get(),
+  })
+
+  it('leaves entity sync, the final player UI, crosshair, captions, weather display and the frame count out of the tick', async () => {
+    await withHarness({}, (harness) => {
+      runTick(harness)
+
+      expect(harness.syncRenderedEntitiesCalls.get()).toBe(0)
+      expect(harness.playerUiCalls.get()).toBe(0)
+      expect(harness.crosshairCalls).toEqual([])
+      expect(harness.captionRenders.get()).toBe(0)
+      expect(harness.weatherPresentations).toEqual([])
+      expect(harness.context.state.framesTotal.get()).toBe(41)
+      expect(harness.attributes.has('data-frames')).toBe(false)
+      expect(harness.fpsValue.textContent).toBe('')
+      expect(harness.projectileHud).toEqual({ textContent: '', hidden: true })
+      expect(harness.debugOverlayUpdates).toEqual([])
+    })
+  })
+
+  it('presents each per-frame output exactly once', async () => {
+    await withHarness({}, (harness) => {
+      Effect.runSync(runFramePresentation(harness.presentationContext, presentationFrame))
+
+      expect(harness.syncRenderedEntitiesCalls.get()).toBe(1)
+      expect(harness.playerUiCalls.get()).toBe(1)
+      expect(harness.crosshairCalls).toEqual([MonotonicTimeSecs(2)])
+      expect(harness.captionRenders.get()).toBe(1)
+      expect(harness.weatherPresentations).toEqual([{
+        weather: Effect.runSync(harness.context.services.weather.snapshot).weather,
+        nowSecs: MonotonicTimeSecs(2),
+      }])
+      expect(harness.context.state.framesTotal.get()).toBe(42)
+      expect(harness.attributes.get('data-frames')).toBe('42')
+      expect(harness.fpsValue.textContent).toMatch(/^\d+$/)
+      // One arrow is in the player's dimension; the nether one is not counted.
+      expect(harness.projectileHud).toEqual({ textContent: 'Arrows 1', hidden: false })
+      expect(harness.debugOverlayUpdates).toEqual([0.016])
+    })
+  })
+
+  it('gives the debug overlay no timing on the first counted frame', async () => {
+    await withHarness({}, (harness) => {
+      harness.context.state.framesTotal.set(0)
+
+      Effect.runSync(runFramePresentation(harness.presentationContext, presentationFrame))
+
+      expect(harness.debugOverlayUpdates).toEqual([undefined])
+    })
+  })
+
+  it('does not change simulation state', async () => {
+    await withHarness({}, (harness) => {
+      runTick(harness)
+      const before = simulationSnapshot(harness)
+
+      Effect.runSync(runFramePresentation(harness.presentationContext, presentationFrame))
+
+      expect(simulationSnapshot(harness)).toEqual(before)
     })
   })
 })

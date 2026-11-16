@@ -441,7 +441,7 @@ describe('tick post-frame processing', () => {
     expect(harness.environmentalContactDamageState.get()).toEqual({ lastDamageElapsedSecs: undefined })
   })
 
-  it('clears projectile output when a frame ends with the player dead', async () => {
+  it('clears projectile state but leaves the projectile HUD to the frame presentation when a frame ends with the player dead', async () => {
     const harness = await makeContext(cell(false))
     const context: H5bPostFrameContext = {
       ...harness.context,
@@ -465,8 +465,8 @@ describe('tick post-frame processing', () => {
 
     expect(result.dimensionChanged).toBe(false)
     expect(result.deadAfterFrame).toBe(true)
-    expect(context.projectileHud.textContent).toBe('Arrows 0')
-    expect(context.projectileHud.hidden).toBe(true)
+    expect(context.state.projectileRuntimeState.get().projectiles).toEqual([])
+    expect(context.projectileHud).toEqual({ textContent: 'Arrows 1', hidden: false })
   })
 
   it('picks up a nearby local drop and transfers its metadata to the inventory slot', async () => {

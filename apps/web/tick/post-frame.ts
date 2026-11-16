@@ -64,7 +64,6 @@ export const runTickPostFrame = (
     isGameplayBlockSolid,
     applyWorldExplosion,
     resetBowUse: resetBowUseAction,
-    projectileHud,
     projectedInventoryEnchantedItem,
     durabilityWearWithEnchantments,
     endDragonPosition,
@@ -784,12 +783,6 @@ export const runTickPostFrame = (
         markSessionDirty()
       }
     }
-    const activeProjectileCount = projectileRuntimeState.projectiles
-      .filter(({ dimension }) => dimension === dimensionAfterFrame)
-      .length
-    projectileHud.textContent = `Arrows ${String(activeProjectileCount)}`
-    projectileHud.hidden = activeProjectileCount === 0
-
     const bowInventory = Effect.runSync(world.inventory.snapshot)
     const selectedBowItem = bowInventory.slots[h5aState.selectedHotbarIndex.get()]?.item ?? null
     // `raw`, NOT `deltaSecs` — bow charge is how long a player held a button,
