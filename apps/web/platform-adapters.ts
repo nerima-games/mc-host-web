@@ -139,6 +139,7 @@ export type PlatformAdapters = {
   readonly softwareRenderer: boolean
   readonly renderQuality: GraphicsQuality | undefined
   readonly worldRenderer: WorldRenderer
+  readonly bindDebugOverlayToggle: (toggle: () => void) => () => void
 }
 
 export const makePlatformAdapters = async (deps: {
@@ -326,6 +327,16 @@ export const makePlatformAdapters = async (deps: {
   canvas.addEventListener('keydown', (event) => {
     if (event.isTrusted) audio.unlock()
   })
+  // F3 uses the canvas keyboard target that F2 uses and leaves pointer lock as it is.
+  const bindDebugOverlayToggle = (toggle: () => void): (() => void) => {
+    const handleKey = (event: KeyboardEvent): void => {
+      if (event.code !== 'F3' || event.repeat || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return
+      event.preventDefault()
+      toggle()
+    }
+    canvas.addEventListener('keydown', handleKey)
+    return () => canvas.removeEventListener('keydown', handleKey)
+  }
 
   // Built ONCE, into a Context, and then provided as a Context rather than as a
   // Layer. `mx-multiplayer/stages/registration.ts` records why this matters:
@@ -461,5 +472,6 @@ export const makePlatformAdapters = async (deps: {
     softwareRenderer,
     renderQuality,
     worldRenderer,
+    bindDebugOverlayToggle,
   }
 }

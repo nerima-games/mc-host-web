@@ -325,6 +325,7 @@ import {
   EMPTY_MODULE_LAYER,
 } from '@nerima-games/mc-compose'
 import { BrowserClockLayer, browserClock } from './clock'
+import { createDebugOverlayRuntime } from './debug-overlay-runtime'
 import {
   connectMultiplayer,
   createMultiplayerClient,
@@ -446,6 +447,7 @@ import type { H5bPostFrameContext } from './tick/h5b-context'
 import { runTickPostFrame } from './tick/post-frame'
 import type { H5cTickContext } from './tick/h5c-context'
 import { runTickPostFrameGameplay } from './tick/post-frame-gameplay'
+import { runTickDebugOverlayFrame } from './tick/debug-overlay-frame'
 
 /**
  * plan.md §3.4's measured clamp, applied by the DELTA'S PRODUCER.
@@ -1121,6 +1123,22 @@ const bootGame = async (
     worldgenChunkStore: generatedWorld.worldgenChunkStore,
     ...ownerBacked.views,
   }
+  const debugMount = document.createElement('div')
+  gameShell.appendChild(debugMount)
+  const debugOverlay = createDebugOverlayRuntime(document, debugMount, Effect.gen(function* () {
+    return {
+      cameraPose: yield* world.player.cameraPose.pipe(Effect.provide(BrowserClockLayer)),
+      dimension: (yield* world.player.snapshot).state.pose.feetPosition.dimension,
+      worldTime: yield* time.snapshot,
+      loadedChunkCount: (yield* worldRenderer.chunkKeys).length,
+      gpuTimingSupported: undefined,
+      latestGpuTimeMs: undefined,
+      qualityPreset: undefined,
+      biome: undefined,
+      faultCount: undefined,
+    }
+  }))
+  const unbindDebugOverlayKey = adapters.bindDebugOverlayToggle(() => { debugOverlay.toggle() })
   // Containers are not owner state, so they are still restored locally.
   await restoreInitialWorld(loadedSessionState, isCreativeMode, {
     restoreContainerStorage: (state) =>
@@ -3926,6 +3944,7 @@ const bootGame = async (
         if (movement === undefined) return
         const postFrame = yield* runTickPostFrame(h5bTickContext, { frame, movement, framesTotal })
         yield* runTickPostFrameGameplay(h5cTickContext, { frame, movement, postFrame, nowSecs })
+        yield* runTickDebugOverlayFrame(debugOverlay.update, { framesTotal, raw: frame.raw })
         yield* music.update({
           nowSecs,
           scene: {
@@ -3983,6 +4002,9 @@ const bootGame = async (
         Effect.runSync(Scope.close(gameplayScope, Exit.void))
         window.clearInterval(hiddenNetworkPump)
         canvas.removeEventListener('keydown', handleScreenshotKey)
+        unbindDebugOverlayKey()
+        debugOverlay.dispose()
+        debugMount.remove()
         disposeQaSurface()
         document.body.setAttribute('data-mc-compose-boot', 'stopped')
       })
