@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Effect } from 'effect'
-import type { StackCount } from '@nerima-games/mc-kernel'
+import { position, PositionAxis } from '@nerima-games/mc-kernel'
 import { emptyPlayerStorage, SPAWN_VITALS, type InventoryServiceApi, type PlayerStorage } from '@nerima-games/mc-sim'
 import type { ChestStorageSlotTarget } from '@nerima-games/mx-ui'
-import type { InventoryInteractionService } from '../apps/web/inventory-interaction'
+import type { InventoryInteractionInventory } from '../apps/web/inventory-interaction'
 import { initialPlayerSwimmingRuntimeState } from '../apps/web/player-swimming-runtime'
 import { TOUCH_LOOK_CONTROLLER_IDLE } from '../apps/web/touch-input'
 import {
@@ -83,14 +83,19 @@ describe('player inventory runtime', () => {
     const setAnvilStatus = vi.fn()
     const setEnchantingStatus = vi.fn()
     const makeView = () => ({ root: { style: { setProperty: vi.fn() } }, render: vi.fn() })
-    const inventoryView = makeView() as unknown as PlayerUiRuntimeContext<never, never>['inventoryView']
-    const furnaceView = makeView() as unknown as PlayerUiRuntimeContext<never, never>['furnaceView']
-    const chestView = makeView() as unknown as PlayerUiRuntimeContext<never, never>['chestView']
-    const anvilView = makeView() as unknown as PlayerUiRuntimeContext<never, never>['anvilView']
-    const enchantingView = makeView() as unknown as PlayerUiRuntimeContext<never, never>['enchantingView']
+    const inventoryView = makeView() as unknown as PlayerUiRuntimeContext['inventoryView']
+    const furnaceView = makeView() as unknown as PlayerUiRuntimeContext['furnaceView']
+    const chestView = makeView() as unknown as PlayerUiRuntimeContext['chestView']
+    const anvilView = makeView() as unknown as PlayerUiRuntimeContext['anvilView']
+    const enchantingView = makeView() as unknown as PlayerUiRuntimeContext['enchantingView']
     const renderHud = vi.fn()
-    const inventoryService = {} as InventoryInteractionService<never, never, StackCount>
-    const context: PlayerUiRuntimeContext<never, never> = {
+    const inventoryService: InventoryInteractionInventory = {
+      click: () => Effect.succeed({ _tag: 'NoChange', carried: undefined }),
+      snapshot: Effect.sync(() => emptyPlayerStorage().inventory),
+      previewCraft: () => Effect.succeed({ _tag: 'NoMatch' }),
+      craft: () => Effect.succeed({ _tag: 'NoMatch' }),
+    }
+    const context: PlayerUiRuntimeContext = {
       document: document as unknown as Document,
       window,
       canvas,
@@ -117,16 +122,16 @@ describe('player inventory runtime', () => {
       inventoryStorageSnapshot: Effect.succeed(emptyPlayerStorage() satisfies PlayerStorage),
       getPlayerDimension: () => Effect.succeed('overworld'),
       restorePlayerForDimension: () => Effect.succeed(undefined),
-      getOrCreateDimensionChunkContext: (() => ({})) as unknown as PlayerUiRuntimeContext<never, never>['getOrCreateDimensionChunkContext'],
+      getOrCreateDimensionChunkContext: (() => ({})) as unknown as PlayerUiRuntimeContext['getOrCreateDimensionChunkContext'],
       getPlayerPose: () => Effect.succeed({
-        feetPosition: { x: 0, y: 64, z: 0 },
+        feetPosition: position(PositionAxis(0), PositionAxis(64), PositionAxis(0)),
         yawRadians: 0,
         pitchRadians: 0,
       }),
       readBlockAt: () => Effect.succeed({ _tag: 'Unavailable' }),
       getEntitiesForExplosion: () => [],
-      setBlockAt: vi.fn(),
       setBlockEffect: () => Effect.succeed(undefined),
+      writeBlocks: () => Effect.succeed(undefined),
       resolveExplosionEffects: vi.fn(),
       getActiveSeed: () => 0,
       endPortalFrames: new Map(),

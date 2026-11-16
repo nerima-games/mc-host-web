@@ -1,3 +1,4 @@
+import { Brand } from 'effect'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { bootTitleMenu } from '../apps/web/title-menu'
@@ -177,6 +178,8 @@ const makeTitleMenuContext = () => {
 
 describe('title menu boot', () => {
   afterEach(() => {
+    mocks.sessions.splice(1)
+    vi.restoreAllMocks()
     vi.clearAllMocks()
   })
 
@@ -212,5 +215,23 @@ describe('title menu boot', () => {
     )
     expect(state.menuParent.attributes.get('aria-busy')).toBe('true')
     expect(state.dispose).toHaveBeenCalledOnce()
+  })
+
+  it('leaves a stored session with a blank id out of the saved worlds and reports it', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    mocks.sessions.push({ sessionId: '   ', metadata: { name: 'Blank Id World' } })
+    const state = makeTitleMenuContext()
+
+    await bootTitleMenu(state.context)
+
+    expect(state.multiplayerWorld.children).toHaveLength(1)
+    expect(state.multiplayerWorld.children[0]).toMatchObject({
+      value: 'saved-world',
+      textContent: 'Saved World',
+    })
+    expect(consoleError).toHaveBeenCalledExactlyOnceWith(
+      '[mc-compose] saved session has an invalid world id',
+      expect.any(Brand.BrandError),
+    )
   })
 })
