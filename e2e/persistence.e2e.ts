@@ -494,6 +494,7 @@ test('debounces dirty gameplay into a durable save without an explicit flush', a
       if (record === undefined) return undefined
       return {
         sequence: record.seq,
+        pose: record.envelope.payload.state.player,
         roster: record.envelope.payload.state.entities.overworld.entities.map(({ id, kind, healthPoints }) => ({
           id, kind, healthPoints,
         })),
@@ -516,9 +517,10 @@ test('debounces dirty gameplay into a durable save without an explicit flush', a
     const head = await readPublishedHead()
     return {
       newer: head !== undefined && (beforeMining === undefined || head.sequence > beforeMining.sequence),
+      pose: head?.pose,
       roster: head?.roster,
     }
-  }).toEqual({ newer: true, roster: durableEntityRoster(published) })
+  }).toEqual({ newer: true, pose: published.pose, roster: durableEntityRoster(published) })
   await expect(page.locator('body')).toHaveAttribute('data-session-persistence', 'saved')
 
   await page.reload()
