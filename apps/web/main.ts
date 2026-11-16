@@ -209,7 +209,7 @@ import {
   insertBrewingFuel,
   insertBrewingIngredient,
   INITIAL_ENVIRONMENTAL_CONTACT_DAMAGE_STATE,
-  makeGameplayFrameState,
+  makeGameplayFrameStateForOwner,
   makeGeneratedWorld,
   isDroppedItemBehaviour,
   isHoeItem,
@@ -928,6 +928,13 @@ const bootGame = async (
   // `gameplayOwnerRegistrations(undefined)` is a typed failure, so a fresh
   // session passes an object without those fields.
   const gameplayOwners = gameplayOwnerRegistrations({
+    // The gameplay stages read and commit the player, storage and vitals
+    // through these owners, so they start from the state just restored into
+    // the host services (or the fresh-world state).
+    playerPose: await Effect.runPromise(world.player.pose),
+    dimension: await Effect.runPromise(world.player.dimension),
+    playerStorage: await Effect.runPromise(world.inventory.storageSnapshot),
+    vitals: await Effect.runPromise(world.vitals.snapshot),
     ...(loadedSessionState === undefined ? {} : {
       villagerTrades: loadedSessionState.villagers.trades,
       brewing: loadedSessionState.brewing,
@@ -976,7 +983,10 @@ const bootGame = async (
     .pipe(Effect.map(({ state }) => state))
   const snapshotGameplayBrewing = gameplayBrewingService.snapshot
     .pipe(Effect.provideService(WorldCommitCoordinator, gameplayCommit.coordinator))
-  const gameplayState = await Effect.runPromise(makeGameplayFrameState)
+  const gameplayState = await Effect.runPromise(makeGameplayFrameStateForOwner({
+    coordinator: hostWorldWrite.coordinator,
+    vitalsOwnerId: GAMEPLAY_VITALS_OWNER_ID,
+  }))
   const villagerResidents = new Map<string, PersistedVillager>(
     (Option.isSome(loadedSession) ? loadedSession.value.state.villagers.residents : [])
       .map((villager) => [villager.id, villager]),
@@ -2305,6 +2315,7 @@ const bootGame = async (
         uiFrameState,
         simState,
         gameplayState,
+        gameplayCommit,
         isActiveDimension: (dimension) => dimension === currentChunkContext.dimension,
         poweredRails,
         leverKeyOf,

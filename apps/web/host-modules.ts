@@ -101,6 +101,7 @@ export type HostModulesDeps = {
   readonly uiFrameState: UiFrameState
   readonly simState: SimFrameState
   readonly gameplayState: GameplayFrameState
+  readonly gameplayCommit: GameplayCommitServices
   readonly isActiveDimension: (dimension: Dimension) => boolean
   readonly poweredRails: ReadonlySet<string>
   readonly leverKeyOf: (lever: Pick<PersistedLeverState, 'dimension' | 'position'>) => string
@@ -135,6 +136,7 @@ export const registerHostModules = (deps: HostModulesDeps): Effect.Effect<Readon
     uiFrameState,
     simState,
     gameplayState,
+    gameplayCommit,
     isActiveDimension,
     poweredRails,
     leverKeyOf,
@@ -228,6 +230,7 @@ export const registerHostModules = (deps: HostModulesDeps): Effect.Effect<Readon
           droppedItemPickup: false,
           mobSimulation: multiplayer === undefined,
         },
+        gameplayCommit,
       )
     }),
   })
