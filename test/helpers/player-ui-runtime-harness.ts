@@ -185,7 +185,7 @@ export class FakeElement {
   }
 }
 
-export const createPlayerUiRuntimeHarness = (): PlayerUiRuntimeHarness => {
+export const createPlayerUiRuntimeHarness = (overrides: Partial<HarnessContext> = {}): PlayerUiRuntimeHarness => {
   const state = {
     inventoryOpen: false,
     inventoryMode: 'player' as InventoryMode,
@@ -358,7 +358,7 @@ export const createPlayerUiRuntimeHarness = (): PlayerUiRuntimeHarness => {
     setEnchantmentSeed: vi.fn(),
     getVitalsSnapshot: () => ({ totalExperience: 0 }),
     getInventorySnapshot: () => Effect.sync(() => state.storage.inventory),
-    restoreVitalsAtExperience: vi.fn(),
+    restoreVitalsAtExperience: vi.fn(() => Result.succeed(undefined)),
     setAnvilName: vi.fn(),
     setAnvilStatus: vi.fn(),
     setEnchantingStatus: vi.fn(),
@@ -409,6 +409,7 @@ export const createPlayerUiRuntimeHarness = (): PlayerUiRuntimeHarness => {
     saveSession: async () => {},
     saveDebounceMs: 1,
     renderCrosshair: vi.fn(),
+    ...overrides,
   }
 
   vi.stubGlobal('Element', FakeElement)

@@ -119,6 +119,7 @@ import {
 import {
   addExperience as addVitalsExperience,
   containerIdAt,
+  ExperienceDelta,
   emptyPlayerStorage,
   itemStack,
   makeBrewingService,
@@ -2909,10 +2910,10 @@ const bootGame = async (
     getInventorySnapshot: () => world.inventory.snapshot,
     restoreVitalsAtExperience: (totalExperience) => {
       const vitals = Effect.runSync(world.vitals.snapshot)
-      Effect.runSync(world.vitals.restore(addVitalsExperience(
-        vitals,
-        totalExperience - vitals.totalExperience,
-      )))
+      return Result.map(
+        ExperienceDelta.result(totalExperience - vitals.totalExperience),
+        (delta) => Effect.runSync(world.vitals.restore(addVitalsExperience(vitals, delta))),
+      )
     },
     setAnvilName: (name) => { anvilName = name },
     setAnvilStatus: (status) => { anvilStatus = status },

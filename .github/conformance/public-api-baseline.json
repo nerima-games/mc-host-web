@@ -579,7 +579,7 @@
     "count": 1,
     "file": "apps/web/player-ui-runtime.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(context.addInventoryItem(output.item, output.count))"
+    "text": "Effect.runSync(Effect.result(context.addInventoryItem(output.item, output.count)))"
   },
   {
     "count": 4,
@@ -615,7 +615,7 @@
     "count": 1,
     "file": "apps/web/player-ui-runtime.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(context.removeInventoryAt(context.getSelectedHotbarIndex(), selected.item, 1))"
+    "text": "Effect.runSync(Effect.result( context.removeInventoryAt(context.getSelectedHotbarIndex(), selected.item, 1), ))"
   },
   {
     "count": 1,

@@ -38,6 +38,7 @@ type EndFeatureFailure =
   | Effect.Error<ReturnType<import('@nerima-games/mc-kernel').WorldWritePort['Service']['applyBatch']>>
   | import('@nerima-games/mc-sim').ItemStackFailure
   | import('@nerima-games/mc-sim').PlayerStorageFailure
+  | import('@nerima-games/mc-sim').PlayerServiceInputError
 type H5cInventoryMode = 'player' | 'craftingTable' | 'furnace' | 'chest' | 'anvil' | 'enchanting'
 
 type PendingItemUse =

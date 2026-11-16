@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { Option, Result, Schema } from 'effect'
-import { blockIdOf, WorldWriteConflict } from '@nerima-games/mc-kernel'
-import { emptyFurnaceState, itemStack } from '@nerima-games/mc-sim'
+import { Effect, Option, Result, Schema } from 'effect'
+import { blockIdOf, PositionAxis, WorldWriteConflict } from '@nerima-games/mc-kernel'
+import { emptyFurnaceState, itemStack, type InventoryServiceApi } from '@nerima-games/mc-sim'
 import {
   createPlayerUiRuntimeHarness,
+  FakeElement,
 } from './helpers/player-ui-runtime-harness'
 
 afterEach(() => vi.unstubAllGlobals())
@@ -171,6 +172,70 @@ describe('H4b player UI runtime input paths', () => {
     ])
     expect(harness.state.inventoryMode).toBe('furnace')
     expect(harness.elements.body.getAttribute('data-inventory-open')).toBe('true')
+  })
+
+  it('reports a failed furnace output transfer and keeps the furnace output', () => {
+    const rejected = Result.getFailure(PositionAxis.result(Number.NaN))
+    if (Option.isNone(rejected)) throw new Error('PositionAxis accepted NaN')
+    const harness = createPlayerUiRuntimeHarness({ addInventoryItem: () => Effect.fail(rejected.value) })
+    harness.state.multiplayer = false
+    harness.state.activeFurnaceKey = 'furnace-42'
+    const furnace = {
+      ...Result.getOrThrow(emptyFurnaceState()),
+      output: Result.getOrThrow(itemStack('iron_ingot', 2)),
+    }
+    harness.state.furnaceState = furnace
+    harness.runtime.installInventoryListeners()
+    harness.runtime.setInventoryOpen(true, 'furnace')
+
+    harness.elements.inventoryParent.dispatch('click', harness.makeFurnaceSlot('output'))
+
+    expect(harness.state.furnaceStatus).toBe('BrandError')
+    expect(harness.state.furnaceState).toBe(furnace)
+  })
+
+  it('reports a failed furnace input removal and keeps the furnace input empty', () => {
+    const rejected = Result.getFailure(PositionAxis.result(Number.NaN))
+    if (Option.isNone(rejected)) throw new Error('PositionAxis accepted NaN')
+    const harness = createPlayerUiRuntimeHarness({ removeInventoryAt: () => Effect.fail(rejected.value) })
+    harness.state.multiplayer = false
+    harness.state.activeFurnaceKey = 'furnace-42'
+    const furnace = Result.getOrThrow(emptyFurnaceState())
+    harness.state.furnaceState = furnace
+    harness.addPlayerStack(0, 'raw_iron', 2)
+    harness.runtime.installInventoryListeners()
+    harness.runtime.setInventoryOpen(true, 'furnace')
+
+    harness.elements.inventoryParent.dispatch('click', harness.makeFurnaceSlot('input'))
+
+    expect(harness.state.furnaceStatus).toBe('BrandError')
+    expect(harness.state.furnaceState).toBe(furnace)
+  })
+
+  it('reports a failed anvil experience spend and leaves the item name unchanged', () => {
+    const rejected = Result.getFailure(PositionAxis.result(Number.NaN))
+    if (Option.isNone(rejected)) throw new Error('PositionAxis accepted NaN')
+    const restoreStorage = vi.fn(() => Effect.void)
+    const harness = createPlayerUiRuntimeHarness({
+      worldInventory: { restoreStorage } as unknown as InventoryServiceApi,
+      getVitalsSnapshot: () => ({ totalExperience: 1000 }),
+      getAnvilName: () => 'Fixture Sword',
+      restoreVitalsAtExperience: () => Result.fail(rejected.value),
+    })
+    harness.state.multiplayer = false
+    harness.addPlayerStack(0, 'iron_sword', 1)
+    harness.runtime.installInventoryListeners()
+    harness.runtime.setInventoryOpen(true, 'anvil')
+    const output = new FakeElement()
+    output.setAttribute('data-operation-target', 'output')
+    harness.elements.inventoryParent.append(output)
+
+    harness.elements.inventoryParent.dispatch('click', output)
+
+    expect(restoreStorage).toHaveBeenCalledTimes(1)
+    expect(harness.context.setAnvilStatus).toHaveBeenLastCalledWith('BrandError')
+    expect(harness.context.customNames.has('0')).toBe(false)
+    expect(harness.context.markSessionDirty).not.toHaveBeenCalled()
   })
 
   it('opens the crafting table and routes output activation to the crafting request', () => {

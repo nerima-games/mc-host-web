@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { Effect } from 'effect'
+import { Effect, Result } from 'effect'
 import { position, PositionAxis } from '@nerima-games/mc-kernel'
 import { emptyPlayerStorage, SPAWN_VITALS, type InventoryServiceApi, type PlayerStorage } from '@nerima-games/mc-sim'
 import type { ChestStorageSlotTarget } from '@nerima-games/mx-ui'
@@ -196,7 +196,7 @@ describe('player inventory runtime', () => {
       setEnchantmentSeed: vi.fn(),
       getVitalsSnapshot: () => ({ totalExperience: 0 }),
       getInventorySnapshot: () => Effect.succeed({ slots: [] }),
-      restoreVitalsAtExperience: vi.fn(),
+      restoreVitalsAtExperience: vi.fn(() => Result.succeed(undefined)),
       renderHud,
       getTotalExperience: () => 0,
       getExperienceLevel: () => 0,

@@ -50,6 +50,7 @@ import {
   type PlayerStorage,
   type InventoryServiceApi,
   type ItemStackFailure,
+  type PlayerServiceInputError,
   type PlayerStorageFailure,
   type Slot,
   type Vitals as PlayerVitals,
@@ -130,7 +131,7 @@ type FailureOf<R> = R extends Result.Result<unknown, infer E> ? E : never
 type BlockTargetFailure = FailureOf<ReturnType<typeof targetBlockFromPlayerPose>>
 type ChunkLoadFailure = Effect.Error<ReturnType<DimensionChunkContext['chunkStore']['load']>>
 type WorldWriteFailure = Effect.Error<ReturnType<WorldWritePort['Service']['applyBatch']>>
-type EndArrivalFailure = ChunkLoadFailure | WorldWriteFailure
+type EndArrivalFailure = ChunkLoadFailure | WorldWriteFailure | PlayerServiceInputError
 type BlockReadingFailure = Brand.BrandError | BlockRegistryResolutionFailure
 type TargetedBlockFailure = BlockTargetFailure | CoordinateConversionFailure
 type FishingEnvironmentFailure = CoordinateConversionFailure | BlockReadingFailure
@@ -215,6 +216,8 @@ type FishingEnvironment = {
 }
 
 type InventoryRemoval = { readonly _tag: 'Removed'; readonly removed: number } | { readonly _tag: 'Unavailable' }
+type InventoryRemoveFailure = Effect.Error<ReturnType<InventoryServiceApi['removeAt']>>
+type InventoryAddFailure = Effect.Error<ReturnType<InventoryServiceApi['add']>>
 
 export type PlayerUiRuntimeContext = {
   readonly document: Document
@@ -239,7 +242,7 @@ export type PlayerUiRuntimeContext = {
   readonly restorePlayerForDimension: (
     pose: Parameters<typeof targetBlockFromPlayerPose>[0],
     dimension: Dimension,
-  ) => Effect.Effect<void>
+  ) => Effect.Effect<void, PlayerServiceInputError>
   readonly getOrCreateDimensionChunkContext: (dimension: Dimension) => DimensionChunkContext
   readonly readBlockAt: (position: BlockPosition) => Effect.Effect<BlockReading>
   readonly getEntitiesForExplosion: () => Parameters<typeof planExplosion>[0]['entities']
@@ -322,7 +325,7 @@ export type PlayerUiRuntimeContext = {
   readonly setEnchantmentSeed: (seed: number) => void
   readonly getVitalsSnapshot: () => { readonly totalExperience: number }
   readonly getInventorySnapshot: () => Effect.Effect<{ readonly slots: ReadonlyArray<ItemStack | undefined> }>
-  readonly restoreVitalsAtExperience: (totalExperience: number) => void
+  readonly restoreVitalsAtExperience: (totalExperience: number) => Result.Result<void, Brand.BrandError>
   readonly renderHud: (storage: PlayerStorage, durabilityBySlot: ReadonlyMap<number, number>) => void
   readonly getTotalExperience: () => number
   readonly getExperienceLevel: () => number
@@ -344,8 +347,12 @@ export type PlayerUiRuntimeContext = {
   readonly deleteItemMetadata: (key: string) => void
   readonly getActiveFurnaceState: () => FurnaceState | undefined
   readonly getActiveFurnaceKey: () => string | undefined
-  readonly removeInventoryAt: (slot: number, item: ItemStack['item'], count: number) => Effect.Effect<InventoryRemoval>
-  readonly addInventoryItem: (item: ItemStack['item'], count: number) => Effect.Effect<number>
+  readonly removeInventoryAt: (
+    slot: number,
+    item: ItemStack['item'],
+    count: number,
+  ) => Effect.Effect<InventoryRemoval, InventoryRemoveFailure>
+  readonly addInventoryItem: (item: ItemStack['item'], count: number) => Effect.Effect<number, InventoryAddFailure>
   readonly updateActiveFurnaceState: (state: FurnaceState) => boolean
   readonly sendFacilityCommand: (
     command: WithoutAuthority<Extract<NetworkMessage, { readonly _tag: 'ContainerCommand' | 'FurnaceCommand' }>>,
@@ -1187,8 +1194,13 @@ export const createPlayerUiRuntime = (
     if (slot === 'output') {
       const output = furnace.output
       if (output !== undefined) {
-        const leftover = Effect.runSync(context.addInventoryItem(output.item, output.count))
-        const accepted = output.count - leftover
+        const added = Effect.runSync(Effect.result(context.addInventoryItem(output.item, output.count)))
+        if (Result.isFailure(added)) {
+          context.setFurnaceStatus(added.failure._tag)
+          renderPlayerUi()
+          return
+        }
+        const accepted = output.count - added.success
         const remainder: Result.Result<Slot, ItemStackFailure> = accepted === output.count
           ? Result.succeed(undefined)
           : itemStack(output.item, output.count - accepted)
@@ -1224,8 +1236,15 @@ export const createPlayerUiRuntime = (
       renderPlayerUi()
       return
     }
-    const removal = Effect.runSync(context.removeInventoryAt(context.getSelectedHotbarIndex(), selected.item, 1))
-    if (removal._tag === 'Removed' && removal.removed > 0) {
+    const removal = Effect.runSync(Effect.result(
+      context.removeInventoryAt(context.getSelectedHotbarIndex(), selected.item, 1),
+    ))
+    if (Result.isFailure(removal)) {
+      context.setFurnaceStatus(removal.failure._tag)
+      renderPlayerUi()
+      return
+    }
+    if (removal.success._tag === 'Removed' && removal.success.removed > 0) {
       updateActiveFurnace({
         ...furnace,
         [slot]: nextSlot.success,
@@ -1785,7 +1804,12 @@ export const createPlayerUiRuntime = (
       renderPlayerUi()
       return
     }
-    context.restoreVitalsAtExperience(remainingExperience)
+    const experienceRestored = context.restoreVitalsAtExperience(remainingExperience)
+    if (Result.isFailure(experienceRestored)) {
+      context.setAnvilStatus(experienceRestored.failure._tag)
+      renderPlayerUi()
+      return
+    }
     if (outputEnchantment === undefined) context.enchantedItems.delete(itemKey)
     else context.enchantedItems.set(itemKey, outputEnchantment)
     if (outputName === null) context.customNames.delete(itemKey)
@@ -1853,7 +1877,12 @@ export const createPlayerUiRuntime = (
     }
     context.enchantedItems.set(key, result.state.item)
     context.setEnchantmentSeed(result.state.seed)
-    context.restoreVitalsAtExperience(totalExperienceAtLevel(nextLevel.success))
+    const experienceRestored = context.restoreVitalsAtExperience(totalExperienceAtLevel(nextLevel.success))
+    if (Result.isFailure(experienceRestored)) {
+      context.setEnchantingStatus(experienceRestored.failure._tag)
+      renderPlayerUi()
+      return
+    }
     const status = `Applied ${result.state.item.enchantments.at(-1)?.id ?? 'enchantment'}`
     context.setEnchantingStatus(status)
     context.documentBody.setAttribute('data-enchanting-result', status)
