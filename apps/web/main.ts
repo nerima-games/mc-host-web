@@ -2343,6 +2343,7 @@ const bootGame = async (
       deferToFrameBoundary,
       world,
       gameplayState,
+      gameplayCommit,
       playerApi,
       time,
       weather,

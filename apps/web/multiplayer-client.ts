@@ -1,18 +1,32 @@
-import { Effect, Queue } from 'effect'
+import { Data, Effect, Option, Queue, Result, type Brand } from 'effect'
+import type { YieldableError } from 'effect/Cause'
 import {
+  BlockAxis,
   blockIdOf,
   blockPosition,
-  StackCount,
+  EntityHealthPoints,
+  InterpolationFraction,
+  isBlockType,
+  isItemType,
+  itemStackFromUnknown,
+  position,
+  PositionAxis,
+  type ItemStackFailure,
+  type ItemType,
   type Position as Vec3,
 } from '@nerima-games/mc-kernel'
 import {
   durabilityForItem,
   equipmentItem,
   EQUIPMENT_SLOTS,
-  itemStack,
+  furnaceState,
+  HungerPoints,
   makeTimeService,
   makeVehicleService,
   makeWeatherService,
+  TotalExperience,
+  type EquipmentItemFailure,
+  type FurnaceStateValidationFailure,
   type ItemStack,
   type Vehicle,
 } from '@nerima-games/mc-sim'
@@ -29,16 +43,17 @@ import {
   type NetworkMessage,
 } from '@nerima-games/mx-multiplayer'
 import {
+  GAMEPLAY_VILLAGER_TRADES_OWNER_ID,
+  GameplayVillagerTradeSnapshotSchema,
   type GeneratedWorld,
   restoreBrewingStand,
   restoreStatusEffects,
-  restoreVillagerTrades,
-  snapshotVillagerTrades,
   type EnchantedItem,
   type GameplayFrameState,
   type MobBehaviour,
   type WeatherState,
 } from '@nerima-games/mx-gameplay'
+import type { GameplayCommitServices } from './host-modules'
 import { validateMultiplayerUrl } from './multiplayer-url'
 import type { OwnerBackedWorld } from './owner-backed-services'
 import {
@@ -289,6 +304,8 @@ export type MultiplayerClientContext = {
     readonly deferToFrameBoundary: (work: () => void) => void
     readonly world: Pick<OwnerBackedWorld, 'inventory' | 'vitals'>
     readonly gameplayState: GameplayFrameState
+    /** The gameplay owners' commit services; server deltas for owner state are committed through them. */
+    readonly gameplayCommit: GameplayCommitServices
     readonly playerApi: OwnerBackedWorld['player']
     readonly time: TimeService
     readonly weather: WeatherService
@@ -323,6 +340,38 @@ export type MultiplayerClientContext = {
 }
 
 type MultiplayerPosition = Readonly<{ x: number; y: number; z: number }>
+
+type UnknownNetworkNameFields = {
+  readonly kind: 'block' | 'item'
+  readonly name: string
+}
+
+/** A server message named a block or item this client does not know. */
+type UnknownNetworkName = YieldableError &
+  UnknownNetworkNameFields & { readonly _tag: 'UnknownNetworkName' }
+
+const UnknownNetworkName: new (fields: UnknownNetworkNameFields) => UnknownNetworkName =
+  Data.TaggedError('UnknownNetworkName')
+
+/** Why a server message's state could not be applied to the local world. */
+type InvalidServerStateFailure =
+  | Brand.BrandError
+  | UnknownNetworkName
+  | ItemStackFailure
+  | EquipmentItemFailure
+  | FurnaceStateValidationFailure
+
+const networkPosition = (at: MultiplayerPosition): Result.Result<Vec3, Brand.BrandError> =>
+  Result.gen(function* () {
+    return position(
+      yield* PositionAxis.result(at.x),
+      yield* PositionAxis.result(at.y),
+      yield* PositionAxis.result(at.z),
+    )
+  })
+
+const networkItemType = (name: string): Result.Result<ItemType, UnknownNetworkName> =>
+  isItemType(name) ? Result.succeed(name) : Result.fail(new UnknownNetworkName({ kind: 'item', name }))
 
 export type MultiplayerClientApi = Readonly<{
   enqueueMultiplayerPlayerMove: (nowSecs: number) => void
@@ -550,7 +599,7 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
 
   const drainMultiplayerInbound = (): void => {
     if (clientContext.multiplayer === undefined) return
-    for (const message of Effect.runSync(Queue.takeAll(clientContext.multiplayer.transport.sleepInbound))) {
+    for (const message of Effect.runSync(Queue.clear(clientContext.multiplayer.transport.sleepInbound))) {
       if (message._tag === 'SleepSnapshot') clientContext.state.networkSleepState = sleepClientFromSnapshot(message.snapshot)
       else if (message._tag === 'SleepCommandResult') clientContext.state.networkSleepState = applySleepCommandResult(clientContext.state.networkSleepState, message.result)
       else if (message._tag === 'SleepEvents') clientContext.state.networkSleepState = applySleepEvents(clientContext.state.networkSleepState, message.revision, message.events)
@@ -563,13 +612,13 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
         })
       }
     }
-    for (const message of Effect.runSync(Queue.takeAll(clientContext.multiplayer.transport.witherInbound))) {
+    for (const message of Effect.runSync(Queue.clear(clientContext.multiplayer.transport.witherInbound))) {
       if (message._tag === 'WitherSnapshot') {
         clientContext.state.witherRevision = message.revision
         clientContext.state.witherRuntimeState = restoreWitherRuntime(message.snapshot)
       }
     }
-    for (const message of Effect.runSync(Queue.takeAll(clientContext.multiplayer.transport.enderDragonInbound))) {
+    for (const message of Effect.runSync(Queue.clear(clientContext.multiplayer.transport.enderDragonInbound))) {
       if (message._tag === 'EnderDragonSnapshot' && message.revision >= clientContext.state.enderDragonRevision) {
         clientContext.state.enderDragonRevision = message.revision
         clientContext.state.authoritativeEnderDragonSnapshot = message.snapshot
@@ -587,6 +636,15 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
   clientContext.ui.canvas.setAttribute('data-multiplayer-revision', '0')
   clientContext.ui.canvas.setAttribute('data-multiplayer-rejection', '')
 
+  // A server value the local world cannot represent is not applied; the
+  // rejection is shown on the multiplayer status line like a rejected mutation.
+  const reportInvalidServerState = (what: string, failure: InvalidServerStateFailure): void => {
+    console.error(`[mc-compose] multiplayer ${what} from the server could not be applied`, failure)
+    clientContext.state.multiplayerRejection = `invalid ${what}`
+    clientContext.ui.multiplayerStatus.textContent = `Invalid ${what} from the multiplayer server was not applied.`
+    clientContext.ui.multiplayerStatus.hidden = false
+  }
+
   const dimensionFromWorld = (worldId: WorldId): Dimension | undefined =>
     worldId === 'overworld' || worldId === 'nether' || worldId === 'end'
       ? (worldId as Dimension)
@@ -598,8 +656,23 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
   ): void => {
     const dimension = dimensionFromWorld(worldId)
     if (dimension === undefined) return
+    const blockName = block ?? 'air'
+    const edit = Result.gen(function* () {
+      const cell = blockPosition(
+        yield* BlockAxis.result(at.x),
+        yield* BlockAxis.result(at.y),
+        yield* BlockAxis.result(at.z),
+      )
+      const id = isBlockType(blockName) ? blockIdOf(blockName) : Option.none()
+      if (Option.isNone(id)) return yield* Result.fail(new UnknownNetworkName({ kind: 'block', name: blockName }))
+      return { cell, id: id.value }
+    })
+    if (Result.isFailure(edit)) {
+      reportInvalidServerState('block', edit.failure)
+      return
+    }
     const context = clientContext.services.getOrCreateDimensionChunkContext(dimension)
-    Effect.runSync(context.chunkStore.setBlock(blockPosition(at.x, at.y, at.z), block === null ? blockIdOf('air') : blockIdOf(block as Parameters<typeof blockIdOf>[0])))
+    Effect.runSync(context.chunkStore.setBlock(edit.success.cell, edit.success.id))
     if (dimension === clientContext.services.currentChunkContext().dimension) clientContext.state.redstoneDirty = true
   }
 
@@ -886,7 +959,7 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
 
   const drainPlayerDamageInbound = (): void => {
     if (clientContext.multiplayer === undefined) return
-    for (const message of Effect.runSync(Queue.takeAll(clientContext.multiplayer.transport.playerDamageInbound))) {
+    for (const message of Effect.runSync(Queue.clear(clientContext.multiplayer.transport.playerDamageInbound))) {
       if (message._tag === 'PlayerDamageCommandResult') applyPlayerDamageResult(message)
     }
   }
@@ -972,7 +1045,7 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
 
   const drainCraftingInbound = (): void => {
     if (clientContext.multiplayer === undefined) return
-    for (const message of Effect.runSync(Queue.takeAll(clientContext.multiplayer.transport.craftingInbound))) {
+    for (const message of Effect.runSync(Queue.clear(clientContext.multiplayer.transport.craftingInbound))) {
       if (message._tag === 'CraftingCommandResult') applyCraftingResult(message)
     }
   }
@@ -1027,7 +1100,7 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
   const drainBrewingInbound = (): void => {
     if (clientContext.multiplayer === undefined) return
     const currentWorld = String(WorldId.make(Effect.runSync(clientContext.services.playerApi.dimension)))
-    for (const message of Effect.runSync(Queue.takeAll(clientContext.multiplayer.transport.brewingInbound))) {
+    for (const message of Effect.runSync(Queue.clear(clientContext.multiplayer.transport.brewingInbound))) {
       if (message._tag === 'BrewingCommandResult') {
         applyBrewingResult(message)
         continue
@@ -1043,7 +1116,7 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
         continue
       }
       if (message.player === String(clientContext.multiplayer.query.player)) {
-        Effect.runSync(restoreStatusEffects(clientContext.services.gameplayState, message.state))
+        Effect.runSync(restoreStatusEffects(clientContext.services.gameplayState, message.state, clientContext.services.gameplayCommit))
       }
     }
   }
@@ -1106,7 +1179,7 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
   const drainAnvilInbound = (): void => {
     if (clientContext.multiplayer === undefined) return
     const currentWorld = String(WorldId.make(Effect.runSync(clientContext.services.playerApi.dimension)))
-    for (const message of Effect.runSync(Queue.takeAll(clientContext.multiplayer.transport.anvilInbound))) {
+    for (const message of Effect.runSync(Queue.clear(clientContext.multiplayer.transport.anvilInbound))) {
       if (message._tag === 'AnvilCommandResult') {
         applyAnvilResult(message)
         continue
@@ -1137,7 +1210,7 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
   const drainEnchantingInbound = (): void => {
     if (clientContext.multiplayer === undefined) return
     const currentWorld = String(WorldId.make(Effect.runSync(clientContext.services.playerApi.dimension)))
-    for (const message of Effect.runSync(Queue.takeAll(clientContext.multiplayer.transport.enchantingInbound))) {
+    for (const message of Effect.runSync(Queue.clear(clientContext.multiplayer.transport.enchantingInbound))) {
       if (message._tag === 'EnchantingCommandResult') {
         applyEnchantingResult(message)
         continue
@@ -1162,7 +1235,7 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
     const entityId = EntityId.make(detail.entityId)
     // A command names the player's dimension, which is read from the world.
     clientContext.services.deferToFrameBoundary(() => {
-      if (detail.action === 'attack') sendEntityCommand({ _tag: 'EntityAttackCommand', entityId })
+      if (detail.action === 'attack') sendEntityCommand({ _tag: 'EntityAttackCommand', entityId, heldSlot: clientContext.state.selectedHotbarIndex })
       else if (detail.action === 'pickup') sendEntityCommand({ _tag: 'EntityPickupCommand', entityId })
       else if (detail.action !== 'move') sendEntityCommand({
         _tag: 'VehicleCommand',
@@ -1174,33 +1247,48 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
   })
 
   const applyNetworkVitals = (state: { readonly health: number; readonly hunger: number; readonly experience: number }): void => {
+    const vitals = Result.gen(function* () {
+      return {
+        healthPoints: yield* EntityHealthPoints.result(state.health),
+        hungerPoints: yield* HungerPoints.result(state.hunger),
+        totalExperience: yield* TotalExperience.result(state.experience),
+      }
+    })
+    if (Result.isFailure(vitals)) {
+      reportInvalidServerState('vitals', vitals.failure)
+      return
+    }
     const current = Effect.runSync(clientContext.services.world.vitals.snapshot)
-    Effect.runSync(clientContext.services.world.vitals.restore({
-      ...current,
-      healthPoints: state.health,
-      hungerPoints: state.hunger,
-      totalExperience: state.experience,
-    }))
+    Effect.runSync(clientContext.services.world.vitals.restore({ ...current, ...vitals.success }))
     clientContext.callbacks.renderPlayerUi()
   }
 
   const applyNetworkInventory = (state: Extract<NetworkMessage, { readonly _tag: 'PlayerInventoryDelta' }>['state']): void => {
     const storage = Effect.runSync(clientContext.services.world.inventory.storageSnapshot)
-    const slots = state.slots.map((stack) => stack === null
-      ? undefined
-      : { item: stack.item as ItemStack['item'], count: StackCount(stack.count) })
-    const equipmentSlots = { ...storage.equipment.slots }
-    if (state.equipment !== undefined) {
-      for (const slot of EQUIPMENT_SLOTS) {
-        const stack = state.equipment[slot]
-        equipmentSlots[slot] = stack === null
-          ? null
-          : equipmentItem(
-              { item: stack.item as ItemStack['item'], count: StackCount(stack.count) },
-              stack.durability ?? durabilityForItem(stack.item as ItemStack['item']),
-            )
+    const decoded = Result.gen(function* () {
+      const slots: Array<ItemStack | undefined> = []
+      for (const stack of state.slots) {
+        slots.push(stack === null ? undefined : yield* itemStackFromUnknown(stack.item, stack.count))
       }
+      const equipmentSlots = { ...storage.equipment.slots }
+      if (state.equipment !== undefined) {
+        for (const slot of EQUIPMENT_SLOTS) {
+          const stack = state.equipment[slot]
+          if (stack === null) {
+            equipmentSlots[slot] = null
+            continue
+          }
+          const equipped = yield* itemStackFromUnknown(stack.item, stack.count)
+          equipmentSlots[slot] = yield* equipmentItem(equipped, stack.durability ?? durabilityForItem(equipped.item))
+        }
+      }
+      return { slots, equipmentSlots }
+    })
+    if (Result.isFailure(decoded)) {
+      reportInvalidServerState('inventory', decoded.failure)
+      return
     }
+    const { slots, equipmentSlots } = decoded.success
     Effect.runSync(clientContext.services.world.inventory.restoreStorage({
       ...storage,
       inventory: { slots },
@@ -1220,32 +1308,62 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
   type NetworkVillagerTradeState = Extract<NetworkMessage, { readonly _tag: 'VillagerTradeDelta' }>['state']
 
   const applyNetworkVillagerTrade = (state: NetworkVillagerTradeState): void => {
-    const current = Effect.runSync(snapshotVillagerTrades(clientContext.services.gameplayState))
-    const villagers = current.villagers.map((villager) => {
-      if (villager.id !== state.villagerId) return villager
-      return {
-        ...villager,
-        offers: villager.offers.map((offer) => {
-          const networkOffer = state.offers.find((candidate) => candidate.offerId === offer.id)
-          const input = networkOffer?.input[0]
-          if (networkOffer === undefined || input === undefined) return offer
-          return {
-            ...offer,
-            input: { item: input.item as typeof offer.input.item, count: input.count },
-            output: { item: networkOffer.output.item as typeof offer.output.item, count: networkOffer.output.count },
-            uses: networkOffer.uses,
-            maxUses: networkOffer.maxUses,
-          }
-        }),
+    const decodedOffers = Result.gen(function* () {
+      const offers = new Map<string, Readonly<{
+        input: Readonly<{ item: ItemType; count: number }>
+        output: Readonly<{ item: ItemType; count: number }>
+        uses: number
+        maxUses: number
+      }>>()
+      for (const offer of state.offers) {
+        const input = offer.input[0]
+        if (input === undefined) continue
+        offers.set(offer.offerId, {
+          input: { item: yield* networkItemType(input.item), count: input.count },
+          output: { item: yield* networkItemType(offer.output.item), count: offer.output.count },
+          uses: offer.uses,
+          maxUses: offer.maxUses,
+        })
       }
+      return offers
     })
-    Effect.runSync(restoreVillagerTrades(clientContext.services.gameplayState, { ...current, villagers }))
+    if (Result.isFailure(decodedOffers)) {
+      reportInvalidServerState('villager trade', decodedOffers.failure)
+      return
+    }
+    // The villager-trade owner is the store, so the server's offers are
+    // committed to it on top of whatever the owner holds at commit time.
+    Effect.runSync(clientContext.services.gameplayCommit.coordinator.commitFromSnapshot(
+      GAMEPLAY_VILLAGER_TRADES_OWNER_ID,
+      GameplayVillagerTradeSnapshotSchema,
+      (snapshot) => Effect.sync(() => ({
+        expectedRevision: snapshot.revision,
+        expectedDimensions: [],
+        changes: [{
+          ownerId: GAMEPLAY_VILLAGER_TRADES_OWNER_ID,
+          state: {
+            ...snapshot.state,
+            villagers: snapshot.state.villagers.map((villager) => villager.id !== state.villagerId
+              ? villager
+              : {
+                  ...villager,
+                  offers: villager.offers.map((offer) => {
+                    const networkOffer = decodedOffers.success.get(offer.id)
+                    return networkOffer === undefined ? offer : { ...offer, ...networkOffer }
+                  }),
+                }),
+          },
+        }],
+      })),
+    ))
   }
 
   const applyNetworkTimeWeather = (
     state: Extract<NetworkMessage, { readonly _tag: 'WorldTimeWeatherDelta' }>['state'],
   ): void => {
-    Effect.runSync(clientContext.services.time.setTimeOfDay(state.timeOfDay / 24_000))
+    const timeOfDay = InterpolationFraction.result(state.timeOfDay / 24_000)
+    if (Result.isFailure(timeOfDay)) reportInvalidServerState('time of day', timeOfDay.failure)
+    else Effect.runSync(clientContext.services.time.setTimeOfDay(timeOfDay.success))
     const nextWeather: WeatherState = { weather: state.weather, remainingSecs: 300 }
     Effect.runSync(clientContext.services.weather.applyTransition(nextWeather))
     clientContext.services.presentWeather(nextWeather)
@@ -1313,19 +1431,27 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
       }
     }
     if (location === undefined) return
-    const networkStack = (stack: NetworkFurnaceState['input']): ItemStack | null => stack === null
-      ? null
-      : itemStack(stack.item as ItemStack['item'], stack.count)
-    clientContext.state.furnaceStates.set(state.furnaceId, {
-      ...location,
-      state: {
-        input: networkStack(state.input),
-        fuel: networkStack(state.fuel),
-        output: networkStack(state.output),
-        burnRemainingSecs: state.burnTicksRemaining / 20,
-        cookElapsedSecs: state.cookTicks / 20,
-      },
+    const networkStack = (stack: NetworkFurnaceState['input']): Result.Result<ItemStack | undefined, ItemStackFailure> =>
+      stack === null ? Result.succeed(undefined) : itemStackFromUnknown(stack.item, stack.count)
+    // The wire carries the pre-station furnace record, so the fields it lacks
+    // are filled as the v17 session migration fills them: the furnace station,
+    // and the remaining burn time standing in for the burning fuel's total.
+    const decoded = Result.gen(function* () {
+      return yield* furnaceState({
+        station: 'furnace',
+        input: yield* networkStack(state.input),
+        fuel: yield* networkStack(state.fuel),
+        output: yield* networkStack(state.output),
+        fuelTimeRemainingSecs: state.burnTicksRemaining / 20,
+        fuelTimeTotalSecs: state.burnTicksRemaining / 20,
+        cookProgressSecs: state.cookTicks / 20,
+      })
     })
+    if (Result.isFailure(decoded)) {
+      reportInvalidServerState('furnace', decoded.failure)
+      return
+    }
+    clientContext.state.furnaceStates.set(state.furnaceId, { ...location, state: decoded.success })
   }
 
   const applyNetworkMessage = (message: NetworkMessage): void => {
@@ -1419,12 +1545,17 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
         if (message.player !== clientContext.multiplayer.query.player) break
         const dimension = dimensionFromWorld(message.destinationWorld)
         if (dimension === undefined) break
+        const feet = networkPosition(message.at)
+        if (Result.isFailure(feet)) {
+          reportInvalidServerState('realm transfer position', feet.failure)
+          break
+        }
         // Each realm maintains its own revision sequence.
         multiplayerRevision = -1
         applyNetworkMessage(message.worldSnapshot)
         applyNetworkMessage(message.authoritativeSnapshot)
         Effect.runSync(clientContext.services.playerApi.restore({
-          feetPosition: message.at,
+          feetPosition: feet.success,
           yawRadians: message.facing.yawRadians,
           pitchRadians: message.facing.pitchRadians,
         }, dimension))
@@ -1441,6 +1572,11 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
         multiplayerRevision = message.revision
         const dimension = dimensionFromWorld(message.world)
         if (dimension === undefined || dimension !== clientContext.services.currentChunkContext().dimension) break
+        const origin = networkPosition(message.origin)
+        if (Result.isFailure(origin)) {
+          reportInvalidServerState('eye of ender position', origin.failure)
+          break
+        }
         const dx = message.target.x - message.origin.x
         const dz = message.target.z - message.origin.z
         clientContext.ui.canvas.setAttribute('data-stronghold-direction', String(Math.atan2(dx, -dz)))
@@ -1451,7 +1587,7 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
           target: message.target,
           breaks: message.breaks,
         })
-        clientContext.services.queueEndAudio('eyeThrow', message.origin)
+        clientContext.services.queueEndAudio('eyeThrow', origin.success)
         break
       }
       case 'EntitySpawnDelta':
@@ -1520,15 +1656,21 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
         multiplayerRevision = message.revision
         applyNetworkTimeWeather(message.state)
         break
-      case 'LightningStrikeDelta':
+      case 'LightningStrikeDelta': {
         if (message.revision < multiplayerRevision) return
         multiplayerRevision = message.revision
+        const strike = networkPosition(message.at)
+        if (Result.isFailure(strike)) {
+          reportInvalidServerState('lightning position', strike.failure)
+          break
+        }
         clientContext.state.authoritativeLightning = {
           sequence: message.revision,
-          at: { ...message.at },
+          at: strike.success,
           expiresAtSecs: performance.now() / 1_000 + 0.35,
         }
         break
+      }
       case 'ContainerDelta':
         if (message.revision < multiplayerRevision) return
         multiplayerRevision = message.revision
@@ -1627,8 +1769,13 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
           const worldId = message.world ?? WorldId.make(Effect.runSync(clientContext.services.playerApi.dimension))
           const dimension = dimensionFromWorld(worldId)
           if (dimension !== undefined) {
+            const feet = networkPosition(message.at)
+            if (Result.isFailure(feet)) {
+              reportInvalidServerState('movement correction', feet.failure)
+              break
+            }
             Effect.runSync(clientContext.services.playerApi.restore({
-              feetPosition: message.at,
+              feetPosition: feet.success,
               yawRadians: message.facing.yawRadians,
               pitchRadians: message.facing.pitchRadians,
             }, dimension))

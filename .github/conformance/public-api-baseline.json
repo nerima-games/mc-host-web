@@ -159,49 +159,49 @@
     "count": 1,
     "file": "apps/web/multiplayer-client.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(Queue.takeAll(clientContext.multiplayer.transport.anvilInbound))"
+    "text": "Effect.runSync(Queue.clear(clientContext.multiplayer.transport.anvilInbound))"
   },
   {
     "count": 1,
     "file": "apps/web/multiplayer-client.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(Queue.takeAll(clientContext.multiplayer.transport.brewingInbound))"
+    "text": "Effect.runSync(Queue.clear(clientContext.multiplayer.transport.brewingInbound))"
   },
   {
     "count": 1,
     "file": "apps/web/multiplayer-client.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(Queue.takeAll(clientContext.multiplayer.transport.craftingInbound))"
+    "text": "Effect.runSync(Queue.clear(clientContext.multiplayer.transport.craftingInbound))"
   },
   {
     "count": 1,
     "file": "apps/web/multiplayer-client.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(Queue.takeAll(clientContext.multiplayer.transport.enchantingInbound))"
+    "text": "Effect.runSync(Queue.clear(clientContext.multiplayer.transport.enchantingInbound))"
   },
   {
     "count": 1,
     "file": "apps/web/multiplayer-client.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(Queue.takeAll(clientContext.multiplayer.transport.enderDragonInbound))"
+    "text": "Effect.runSync(Queue.clear(clientContext.multiplayer.transport.enderDragonInbound))"
   },
   {
     "count": 1,
     "file": "apps/web/multiplayer-client.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(Queue.takeAll(clientContext.multiplayer.transport.playerDamageInbound))"
+    "text": "Effect.runSync(Queue.clear(clientContext.multiplayer.transport.playerDamageInbound))"
   },
   {
     "count": 1,
     "file": "apps/web/multiplayer-client.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(Queue.takeAll(clientContext.multiplayer.transport.sleepInbound))"
+    "text": "Effect.runSync(Queue.clear(clientContext.multiplayer.transport.sleepInbound))"
   },
   {
     "count": 1,
     "file": "apps/web/multiplayer-client.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(Queue.takeAll(clientContext.multiplayer.transport.witherInbound))"
+    "text": "Effect.runSync(Queue.clear(clientContext.multiplayer.transport.witherInbound))"
   },
   {
     "count": 2,
@@ -327,13 +327,13 @@
     "count": 2,
     "file": "apps/web/multiplayer-client.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(clientContext.services.playerApi.restore({ feetPosition: message.at, yawRadians: message.facing.yawRadians, pitchRadians: message.facing.pitchRadians, }, dimension))"
+    "text": "Effect.runSync(clientContext.services.playerApi.restore({ feetPosition: feet.success, yawRadians: message.facing.yawRadians, pitchRadians: message.facing.pitchRadians, }, dimension))"
   },
   {
     "count": 1,
     "file": "apps/web/multiplayer-client.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(clientContext.services.time.setTimeOfDay(state.timeOfDay / 24_000))"
+    "text": "Effect.runSync(clientContext.services.time.setTimeOfDay(timeOfDay.success))"
   },
   {
     "count": 1,
@@ -375,7 +375,7 @@
     "count": 1,
     "file": "apps/web/multiplayer-client.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(clientContext.services.world.vitals.restore({ ...current, healthPoints: state.health, hungerPoints: state.hunger, totalExperience: state.experience, }))"
+    "text": "Effect.runSync(clientContext.services.world.vitals.restore({ ...current, ...vitals.success }))"
   },
   {
     "count": 1,
@@ -387,7 +387,7 @@
     "count": 1,
     "file": "apps/web/multiplayer-client.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(context.chunkStore.setBlock(blockPosition(at.x, at.y, at.z), block === null ? blockIdOf('air') : blockIdOf(block as Parameters<typeof blockIdOf>[0])))"
+    "text": "Effect.runSync(context.chunkStore.setBlock(edit.success.cell, edit.success.id))"
   },
   {
     "count": 1,
@@ -405,19 +405,13 @@
     "count": 1,
     "file": "apps/web/multiplayer-client.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(restoreStatusEffects(clientContext.services.gameplayState, message.state))"
+    "text": "Effect.runSync(restoreStatusEffects(clientContext.services.gameplayState, message.state, clientContext.services.gameplayCommit))"
   },
   {
     "count": 1,
     "file": "apps/web/multiplayer-client.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(restoreVillagerTrades(clientContext.services.gameplayState, { ...current, villagers }))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/multiplayer-client.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(snapshotVillagerTrades(clientContext.services.gameplayState))"
+    "text": "Effect.runSync(clientContext.services.gameplayCommit.coordinator.commitFromSnapshot( GAMEPLAY_VILLAGER_TRADES_OWNER_ID, GameplayVillagerTradeSnapshotSchema, (snapshot) => Effect.sync(() => ({ expectedRevision: snapshot.revision, expectedDimensions: [], changes: [{ ownerId: GAMEPLAY_VILLAGER_TRADES_OWNER_ID, state: { ...snapshot.state, villagers: snapshot.state.villagers.map((villager) => villager.id !== state.villagerId ? villager : { ...villager, offers: villager.offers.map((offer) => { const networkOffer = decodedOffers.success.get(offer.id) return networkOffer === undefined ? offer : { ...offer, ...networkOffer } }), }), }, }], })), ))"
   },
   {
     "count": 2,
