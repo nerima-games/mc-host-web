@@ -1,6 +1,12 @@
 import { assert, describe, expect, it } from '@effect/vitest'
 import { Context, Effect, Layer, Option, Ref, Schema } from 'effect'
+import { vi } from 'vitest'
 import {
+  BlockAxis,
+  blockIdOf,
+  blockPosition,
+  ChunkAxis,
+  chunkCoord,
   DeltaTimeSecs,
   EpochMillis,
   FixedClockLayer,
@@ -8,6 +14,7 @@ import {
   position,
   PositionAxis,
   WorldIdSchema,
+  WorldWriteBatchSchema,
   WorldWritePort,
 } from '@nerima-games/mc-kernel'
 import { composeGame } from '@nerima-games/mc-compose'
@@ -15,6 +22,7 @@ import {
   CropService,
   InventoryService,
   makeCropService,
+  makeBrewingService,
   makeSimFrameState,
   makeTimeService,
   makeVehicleService,
@@ -29,15 +37,23 @@ import { RedstoneWorldRuntime, RedstoneWorldRuntimeLayer } from '@nerima-games/m
 import { makeUiFrameState } from '@nerima-games/mx-ui'
 import {
   ExperienceOrbVitalsOwnerSnapshotSchema,
+  GAMEPLAY_BREWING_OWNER_ID,
+  GAMEPLAY_CROPS_OWNER_ID,
+  GAMEPLAY_DROPPED_ITEMS_OWNER_ID,
   GAMEPLAY_ENTITIES_OWNER_ID,
   GAMEPLAY_PLAYER_OWNER_ID,
   GAMEPLAY_PLAYER_STORAGE_OWNER_ID,
   GAMEPLAY_STAGE_IDS,
+  GAMEPLAY_STATUS_EFFECTS_OWNER_ID,
+  GAMEPLAY_VILLAGER_TRADES_OWNER_ID,
   GAMEPLAY_VITALS_OWNER_ID,
   gameplayOwnerRegistrations,
+  gameplayStages,
   makeGameplayFrameState,
   makeGameplayFrameStateForOwner,
   makeGeneratedWorld,
+  requestStatusEffect,
+  snapshotStatusEffects,
   type MobBehaviour,
 } from '@nerima-games/mx-gameplay'
 import { disconnectedTransport, makeMultiplayerHost, TransportPort } from '@nerima-games/mx-multiplayer'
@@ -55,9 +71,15 @@ import {
   type HostGameModule,
   type HostModulesDeps,
   type HostServiceInstances,
+  type GameplayCommitServices,
 } from '../apps/web/host-modules'
 import { makeOwnerBackedHost } from '../apps/web/owner-backed-services'
 import { makeHostWorldWrite } from '../apps/web/world-write-port'
+
+vi.mock('@nerima-games/mx-gameplay', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@nerima-games/mx-gameplay')>()
+  return { ...actual, gameplayStages: vi.fn(actual.gameplayStages) }
+})
 
 // The browser twin of this list is e2e/smoke.e2e.ts #3b; both must change together.
 const SMOKE_STAGE_ORDER = [
@@ -114,7 +136,7 @@ const makeHost = Effect.gen(function* () {
     inputContext: yield* Layer.build(InputServiceLayer()),
     redstoneContext: yield* Layer.build(RedstoneWorldRuntimeLayer),
   }
-  return { instances, owned, generated, coordinator: hostWorldWrite.coordinator }
+  return { instances, owned, generated, hostWorldWrite, coordinator: hostWorldWrite.coordinator }
 })
 
 const makeInstances = Effect.map(makeHost, ({ instances }) => instances)
@@ -180,6 +202,61 @@ const runRegisteredHungerStage = (mode: 'single-player survival' | 'creative' | 
   })
 
 describe('host modules', () => {
+  it.effect('passes the shared commit object to gameplayStages and commits through the Context port coordinator', () =>
+    Effect.gen(function* () {
+      const { instances, hostWorldWrite } = yield* makeHost
+      const coordinator = hostWorldWrite.coordinator
+      const gameplayCommit: GameplayCommitServices = {
+        coordinator,
+        playerOwnerId: GAMEPLAY_PLAYER_OWNER_ID,
+        playerStorageOwnerId: GAMEPLAY_PLAYER_STORAGE_OWNER_ID,
+        cropOwnerId: GAMEPLAY_CROPS_OWNER_ID,
+        droppedItemsOwnerId: GAMEPLAY_DROPPED_ITEMS_OWNER_ID,
+        entitiesOwnerId: GAMEPLAY_ENTITIES_OWNER_ID,
+        vitalsOwnerId: GAMEPLAY_VITALS_OWNER_ID,
+        statusEffectsOwnerId: GAMEPLAY_STATUS_EFFECTS_OWNER_ID,
+        villagerTradesOwnerId: GAMEPLAY_VILLAGER_TRADES_OWNER_ID,
+        brewingOwnerId: GAMEPLAY_BREWING_OWNER_ID,
+        brewingService: yield* makeBrewingService(GAMEPLAY_BREWING_OWNER_ID),
+      }
+      const deps = { ...(yield* makeDeps(instances)), gameplayCommit }
+      vi.mocked(gameplayStages).mockClear()
+      const modules = yield* registerHostModules(deps)
+      expect(vi.mocked(gameplayStages).mock.calls).toHaveLength(1)
+      expect(vi.mocked(gameplayStages).mock.calls[0]?.[9]).toBe(gameplayCommit)
+      expect(gameplayCommit.coordinator).toBe(hostWorldWrite.coordinator)
+      const port = Context.get(deps.services, WorldWritePort)
+      expect(port).toBe(hostWorldWrite.port)
+
+      const interactions = modules.find((module) => module.name === '@nerima-games/mx-gameplay')
+        ?.frameStages.find((stage) => stage.id === GAMEPLAY_STAGE_IDS.interactions)
+      assert.isDefined(interactions)
+      yield* requestStatusEffect(deps.gameplayState, { type: 'speed', durationSecs: 30 })
+      const before = yield* coordinator.revision
+      yield* Effect.provide(
+        interactions.run(DeltaTimeSecs(0.05)),
+        FixedClockLayer({ monotonicSecs: MonotonicTimeSecs(0), wallClockEpochMillis: EpochMillis(0) }),
+      )
+      const afterStage = yield* coordinator.revision
+      expect(afterStage).toBeGreaterThan(before)
+      expect((yield* snapshotStatusEffects(deps.gameplayState, gameplayCommit)).effects)
+        .toContainEqual({ type: 'speed', remainingSecs: 29.95, pulseClockSecs: 0, amplifier: 0 })
+
+      yield* instances.chunkStore.load(chunkCoord(ChunkAxis(0), ChunkAxis(0)))
+      const at = blockPosition(BlockAxis(1), BlockAxis(100), BlockAxis(1))
+      const stone = Option.getOrThrow(blockIdOf('stone'))
+      const batch = yield* Schema.decodeUnknownEffect(WorldWriteBatchSchema)({
+        world: coordinator.worldId,
+        expectedWorldRevision: afterStage,
+        dimension: 'overworld',
+        expectedDimensionRevision: yield* coordinator.dimensionRevision('overworld'),
+        edits: [{ position: at, block: stone }],
+      })
+      yield* port.applyBatch(batch)
+      expect(yield* coordinator.revision).toBe(afterStage + 1)
+      expect(yield* instances.chunkStore.getBlock(at)).toEqual({ _tag: 'Block', block: stone })
+    }))
+
   it.effect('composes the stage order the browser smoke test asserts', () =>
     Effect.gen(function* () {
       const deps = yield* makeDeps(yield* makeInstances)

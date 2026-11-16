@@ -31,7 +31,7 @@ export type GeneratedOwnerState = Readonly<{
  * schema rather than asserted to be a `PlayerPose`.
  */
 export const gameplayOwnerInitialState = (
-  loaded: Pick<SessionState, 'dimension' | 'player' | 'storage' | 'vitals' | 'villagers' | 'brewing'> | undefined,
+  loaded: Pick<SessionState, 'dimension' | 'player' | 'storage' | 'vitals' | 'villagers' | 'brewing' | 'statusEffects'> | undefined,
   generated: GeneratedOwnerState,
   entities: MobRoster,
 ): Result.Result<GameplayOwnerInitialState, Schema.SchemaError> => {
@@ -42,6 +42,7 @@ export const gameplayOwnerInitialState = (
       playerStorage: generated.storage,
       vitals: generated.vitals,
       entities,
+      droppedItems: { items: [] },
     })
   }
   return Result.map(
@@ -58,8 +59,10 @@ export const gameplayOwnerInitialState = (
       playerStorage: loaded.storage,
       vitals: loaded.vitals,
       entities,
+      droppedItems: { items: [] },
       villagerTrades: loaded.villagers.trades,
       brewing: loaded.brewing,
+      statusEffects: loaded.statusEffects,
     }),
   )
 }

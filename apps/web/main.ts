@@ -200,6 +200,8 @@ import {
   EYE_LEVEL_OFFSET,
   fishingPhase,
   GAMEPLAY_BREWING_OWNER_ID,
+  GAMEPLAY_CROPS_OWNER_ID,
+  GAMEPLAY_DROPPED_ITEMS_OWNER_ID,
   GAMEPLAY_ENTITIES_OWNER_ID,
   GAMEPLAY_PLAYER_OWNER_ID,
   GAMEPLAY_PLAYER_STORAGE_OWNER_ID,
@@ -968,7 +970,6 @@ const bootGame = async (
   const loadedSessionState = Option.isSome(loadedSession) ? loadedSession.value.state : undefined
   const time = await Effect.runPromise(makeTimeService())
   const weather = await Effect.runPromise(makeWeatherService())
-  const crops = await Effect.runPromise(makeCropService())
   // The owners are the only store of the player, its storage, vitals,
   // entities, villager trades and the brewing stand, so the loaded session (or
   // the generated world) seeds them here and nothing restores them later.
@@ -1011,6 +1012,7 @@ const bootGame = async (
     return
   }
   const hostWorldWrite = hostWorldWriteExit.value
+  const crops = await Effect.runPromise(makeCropService())
   const ownerIds: OwnerBackedOwnerIds = {
     player: GAMEPLAY_PLAYER_OWNER_ID,
     playerStorage: GAMEPLAY_PLAYER_STORAGE_OWNER_ID,
@@ -1072,12 +1074,13 @@ const bootGame = async (
     })
   const gameplayBrewingService = await Effect.runPromise(makeBrewingService(GAMEPLAY_BREWING_OWNER_ID))
   // The one set of commit services every reader of the gameplay owners shares.
-  // Owners the host still simulates in its own services (crops, entities,
-  // dropped items) stay unset, as before this wiring.
   const gameplayCommit: GameplayCommitServices = {
     coordinator: hostWorldWrite.coordinator,
     playerOwnerId: GAMEPLAY_PLAYER_OWNER_ID,
     playerStorageOwnerId: GAMEPLAY_PLAYER_STORAGE_OWNER_ID,
+    cropOwnerId: GAMEPLAY_CROPS_OWNER_ID,
+    droppedItemsOwnerId: GAMEPLAY_DROPPED_ITEMS_OWNER_ID,
+    entitiesOwnerId: GAMEPLAY_ENTITIES_OWNER_ID,
     vitalsOwnerId: GAMEPLAY_VITALS_OWNER_ID,
     statusEffectsOwnerId: GAMEPLAY_STATUS_EFFECTS_OWNER_ID,
     villagerTradesOwnerId: GAMEPLAY_VILLAGER_TRADES_OWNER_ID,
@@ -2433,6 +2436,7 @@ const bootGame = async (
         uiFrameState,
         simState,
         gameplayState,
+        gameplayCommit,
         isActiveDimension: (dimension) => dimension === currentChunkContext.dimension,
         poweredRails,
         leverKeyOf,

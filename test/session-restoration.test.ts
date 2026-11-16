@@ -36,14 +36,18 @@ import {
   GAMEPLAY_ENTITIES_OWNER_ID,
   GAMEPLAY_PLAYER_OWNER_ID,
   GAMEPLAY_PLAYER_STORAGE_OWNER_ID,
+  GAMEPLAY_STATUS_EFFECTS_OWNER_ID,
   GAMEPLAY_VILLAGER_TRADES_OWNER_ID,
   GAMEPLAY_VITALS_OWNER_ID,
   GameplayEntityRosterSchema,
   GameplayVillagerTradeSnapshotSchema,
   gameplayOwnerRegistrations,
   emptyVillagerTradeState,
+  emptyStatusEffectState,
   hostileMobSnapshot,
   mintEntityId,
+  makeGameplayFrameState,
+  snapshotStatusEffects,
   SPAWN_PLAYER_VITALS,
   type DroppedItemBehaviour,
   type GameplayOwnerInitialState,
@@ -239,7 +243,7 @@ const zombie = (serial: number): MobEntity => ({
 describe('owner initial state', () => {
   it.effect('seeds every owner with the loaded session, including the player pose and dimension', () =>
     Effect.gen(function* () {
-      const loaded: Pick<SessionState, 'dimension' | 'player' | 'storage' | 'vitals' | 'villagers' | 'brewing'> = {
+      const loaded: Pick<SessionState, 'dimension' | 'player' | 'storage' | 'vitals' | 'villagers' | 'brewing' | 'statusEffects'> = {
         dimension: 'nether',
         player: { feetPosition: { x: 3.5, y: 70, z: -4.5 }, yawRadians: 0.5, pitchRadians: -0.25 },
         storage: storageFromInventory({
@@ -249,6 +253,7 @@ describe('owner initial state', () => {
         vitals: { ...SPAWN_PLAYER_VITALS, healthPoints: EntityHealthPoints(7) },
         villagers: { residents: [], trades: emptyVillagerTradeState() },
         brewing: Result.getOrThrow(emptyBrewingState()),
+        statusEffects: { effects: [{ type: 'speed', remainingSecs: 30, pulseClockSecs: 0, amplifier: 0 }] },
       }
       const entities: MobRoster = {
         entities: [{ ...zombie(0), dimension: 'nether' }],
@@ -275,6 +280,13 @@ describe('owner initial state', () => {
       expect((yield* coordinator.snapshot(GAMEPLAY_VILLAGER_TRADES_OWNER_ID, GameplayVillagerTradeSnapshotSchema)).state)
         .toEqual(loaded.villagers.trades)
       expect((yield* coordinator.snapshot(GAMEPLAY_BREWING_OWNER_ID, BrewingStateSchema)).state).toEqual(loaded.brewing)
+      expect(yield* snapshotStatusEffects(yield* makeGameplayFrameState, {
+        coordinator,
+        playerOwnerId: GAMEPLAY_PLAYER_OWNER_ID,
+        playerStorageOwnerId: GAMEPLAY_PLAYER_STORAGE_OWNER_ID,
+        statusEffectsOwnerId: GAMEPLAY_STATUS_EFFECTS_OWNER_ID,
+      })).toEqual(loaded.statusEffects)
+      expect(initial.droppedItems).toEqual({ items: [] })
     }))
 
   it.effect('seeds a new session with the generated spawn rather than the registrations\' origin', () =>
@@ -301,6 +313,7 @@ describe('owner initial state', () => {
         vitals: SPAWN_PLAYER_VITALS,
         villagers: { residents: [], trades: emptyVillagerTradeState() },
         brewing: Result.getOrThrow(emptyBrewingState()),
+        statusEffects: emptyStatusEffectState(),
       },
       generatedOwnerState,
       { entities: [], nextSerial: EntitySerial(0) },
