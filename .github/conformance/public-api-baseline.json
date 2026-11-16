@@ -2043,12 +2043,6 @@
     "count": 1,
     "file": "apps/web/tick/player-movement.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(Ref.set(context.gameplayState.timeOfDay, Effect.runSync(context.time.timeOfDay)))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/player-movement.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(Ref.set(context.gameplayState.weather, weatherBeforeFrame))"
   },
   {
@@ -2133,12 +2127,6 @@
     "count": 1,
     "file": "apps/web/tick/player-movement.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(context.time.timeOfDay)"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/player-movement.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(context.weather.snapshot)"
   },
   {
@@ -2184,12 +2172,6 @@
     "text": "Effect.runSync(multiplayer.host.transitionConnection({ _tag: 'PeerClosed' }))"
   },
   {
-    "count": 1,
-    "file": "apps/web/tick/player-movement.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSyncExit(context.runFrame(deltaSecs))"
-  },
-  {
     "count": 2,
     "file": "apps/web/tick/post-frame-gameplay.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
@@ -2200,54 +2182,6 @@
     "file": "apps/web/tick/post-frame-gameplay.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync( requestPotatoFoodUse( gameplayState, requestId, Effect.runSync(world.vitals.snapshot), ), )"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/post-frame-gameplay.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync( requestTargetedBlockPlacement( gameplayState, currentChunkStore, playerApi, heldItem, ), )"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/post-frame-gameplay.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync( requestTargetedBlockUse( gameplayState, currentChunkStore, playerApi, requestId, heldItem, ), )"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/post-frame-gameplay.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync( requestTargetedItemUse( gameplayState, currentChunkStore, playerApi, requestId, selected.item, ), )"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/post-frame-gameplay.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync( requestTargetedPotatoPlanting( gameplayState, currentChunkStore, playerApi, requestId, ), )"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/post-frame-gameplay.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync( requestTargetedSoilTill( gameplayState, currentChunkStore, playerApi, requestId, selected.item, ), )"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/post-frame-gameplay.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync( streamAround( currentChunkContext(), postFramePose.feetPosition.x, postFramePose.feetPosition.z, ), )"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/post-frame-gameplay.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync( world.inventory.damageAt( { _tag: 'Inventory', slotIndex: pending.slotIndex }, result.durabilityDamage, ), )"
-  },
-  {
-    "count": 2,
-    "file": "apps/web/tick/post-frame-gameplay.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync( world.inventory.removeAt(pending.slotIndex, 'potato', result.consumedCount), )"
   },
   {
     "count": 1,
@@ -2268,22 +2202,10 @@
     "text": "Effect.runSync(Ref.getAndSet(gameplayState.consumedItems, []))"
   },
   {
-    "count": 1,
-    "file": "apps/web/tick/post-frame-gameplay.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(Ref.getAndSet(gameplayState.enderPearlOutcomes, []))"
-  },
-  {
     "count": 2,
     "file": "apps/web/tick/post-frame-gameplay.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(Ref.set(gameplayState.pendingPlacements, []))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/post-frame-gameplay.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(Ref.update(gameplayState.pendingPearlThrows, (requests) => [ ...requests, { origin, inventory: { mode: isCreativeMode ? 'creative' as const : 'survival' as const, slotIndex: h5aState.selectedHotbarIndex.get(), }, dirX: -Math.sin(pose.yawRadians) * horizontal, dirY: Math.sin(pose.pitchRadians), dirZ: -Math.cos(pose.yawRadians) * horizontal, ...(hitDistance === undefined ? {} : { hitDistance }), }, ]))"
   },
   {
     "count": 1,
@@ -2307,30 +2229,6 @@
     "count": 1,
     "file": "apps/web/tick/post-frame-gameplay.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(context.chunkStore.setBlock(asBlockPosition(transition.position), transition.powered ? blockIdOf('door_open') : blockIdOf('door')))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/post-frame-gameplay.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(context.chunkStore.setBlock(blockPosition(position.x, position.y, position.z), blockIdOf('air')))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/post-frame-gameplay.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(context.chunkStore.setBlock(lampPosition, transition.lit ? blockIdOf('redstone_lamp_lit') : blockIdOf('redstone_lamp')))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/post-frame-gameplay.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(crops.plant({ dimension: pending.dimension, position: result.outcome.at as CropLocation['position'], }))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/post-frame-gameplay.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(currentChunkStore.getBlock(blockPosition(blockTarget.value.position.x, blockTarget.value.position.y, blockTarget.value.position.z)))"
   },
   {
@@ -2338,18 +2236,6 @@
     "file": "apps/web/tick/post-frame-gameplay.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(currentChunkStore.getBlock(blockPosition(target.value.position.x, target.value.position.y, target.value.position.z)))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/post-frame-gameplay.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(currentChunkStore.setBlock(bedPosition, blockIdOf('air')))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/post-frame-gameplay.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(currentChunkStore.setBlock(blockPosition(x, portalY, z), END_PORTAL_BLOCK.PORTAL))"
   },
   {
     "count": 1,
@@ -2391,12 +2277,6 @@
     "count": 1,
     "file": "apps/web/tick/post-frame-gameplay.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(fishingEnvironmentAt( target.position, weatherBeforeFrame.weather === 'rain' || weatherBeforeFrame.weather === 'thunder', ))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/post-frame-gameplay.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(gameplayState.enderDragonEncounter.drainEvents)"
   },
   {
@@ -2412,13 +2292,7 @@
     "text": "Effect.runSync(playerApi.dimension)"
   },
   {
-    "count": 1,
-    "file": "apps/web/tick/post-frame-gameplay.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(playerApi.moveTo({ x: pose.feetPosition.x + outcome.displacement.x, y: pose.feetPosition.y + outcome.displacement.y, z: pose.feetPosition.z + outcome.displacement.z, }))"
-  },
-  {
-    "count": 4,
+    "count": 3,
     "file": "apps/web/tick/post-frame-gameplay.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(playerApi.pose)"
@@ -2469,19 +2343,7 @@
     "count": 1,
     "file": "apps/web/tick/post-frame-gameplay.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(resolveTargetedBlock(currentChunkStore, playerApi))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/post-frame-gameplay.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(spawnDroppedItems(world.entities, [{ item: event.item, count: event.count, at: endDragonWorldPosition(), }]))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/post-frame-gameplay.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(spawnDroppedItems(world.entities, leftovers.map((stack) => ({ ...stack, at }))))"
   },
   {
     "count": 1,
@@ -2490,40 +2352,10 @@
     "text": "Effect.runSync(spawnMobDrops(world.entities, mobDrops))"
   },
   {
-    "count": 6,
-    "file": "apps/web/tick/post-frame-gameplay.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(targetedBlock())"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/post-frame-gameplay.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(targetedRightClickRoute(currentChunkStore, playerApi, DEFAULT_BLOCK_REACH))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/post-frame-gameplay.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(time.setTimeOfDay(0.25))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/post-frame-gameplay.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(time.timeOfDay)"
-  },
-  {
     "count": 1,
     "file": "apps/web/tick/post-frame-gameplay.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(useBucket( currentChunkStore, world.inventory, gameplayState.fluidFrontier, { activeDimension: dimension, targetDimension: dimension, position: (specialSelected.item === 'bucket' ? blockPosition(target.position.x, target.position.y, target.position.z) : blockPosition(target.adjacentPosition.x, target.adjacentPosition.y, target.adjacentPosition.z)), heldItem: specialSelected.item, }, ))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/post-frame-gameplay.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(useEndFeature())"
   },
   {
     "count": 1,
@@ -2577,12 +2409,6 @@
     "count": 1,
     "file": "apps/web/tick/post-frame-gameplay.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(world.inventory.add(drop.item, drop.count))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/post-frame-gameplay.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(world.inventory.add(item, 1))"
   },
   {
@@ -2604,31 +2430,13 @@
     "text": "Effect.runSync(world.inventory.damageAt( { _tag: 'Inventory', slotIndex: h5aState.selectedHotbarIndex.get() }, 1, ))"
   },
   {
-    "count": 1,
-    "file": "apps/web/tick/post-frame-gameplay.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(world.inventory.damageAt({ _tag: 'Inventory', slotIndex: pending.slotIndex }, 1))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/post-frame-gameplay.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(world.inventory.removeAt(h5aState.selectedHotbarIndex.get(), 'ender_pearl', 1))"
-  },
-  {
     "count": 2,
     "file": "apps/web/tick/post-frame-gameplay.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(world.inventory.removeAt(h5aState.selectedHotbarIndex.get(), item, 1))"
   },
   {
-    "count": 1,
-    "file": "apps/web/tick/post-frame-gameplay.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(world.inventory.removeAt(pending.slotIndex, pending.heldItem, 1))"
-  },
-  {
-    "count": 5,
+    "count": 3,
     "file": "apps/web/tick/post-frame-gameplay.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(world.inventory.snapshot)"
@@ -2685,12 +2493,6 @@
     "count": 1,
     "file": "apps/web/tick/post-frame.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync( resolveTargetedPrimaryAttack( currentChunkStore, world.entities, playerApi, { meleeDamage: inventoryMeleeDamage(selectedSlotIndex), }, ), )"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/post-frame.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync( world.inventory.damageAt( { _tag: 'Inventory', slotIndex: pending.slotIndex }, appliedWear, ), )"
   },
   {
@@ -2712,28 +2514,10 @@
     "text": "Effect.runSync(Ref.set(gameplayState.targetPosition, postFramePose.feetPosition))"
   },
   {
-    "count": 1,
-    "file": "apps/web/tick/post-frame.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(applyPortalTravels())"
-  },
-  {
     "count": 2,
     "file": "apps/web/tick/post-frame.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(context.chunkStore.getBlock(blockPosition(pending.position.x, pending.position.y, pending.position.z)))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/post-frame.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(crops.matureYieldsAt(location))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/post-frame.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(crops.remove(location))"
   },
   {
     "count": 1,
@@ -2752,12 +2536,6 @@
     "file": "apps/web/tick/post-frame.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(currentChunkStore.getBlock(blockPosition(resolution.target.position.x, resolution.target.position.y, resolution.target.position.z)))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/post-frame.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(currentChunkStore.setBlock(target.position, blockIdOf('air')))"
   },
   {
     "count": 1,
