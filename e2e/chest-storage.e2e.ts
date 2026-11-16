@@ -139,9 +139,7 @@ test('moves, persists, and spills chest contents', async ({ page }) => {
 
   await openTargetedChest(page)
   await expect(
-    page.locator(
-      '[data-region="chest"] [data-interaction-slot="0"][aria-label*="oak_log"]',
-    ),
+    chest.getByRole('button', { name: 'Chest slot 1, Oak Log, 1', exact: true }),
   ).toBeVisible()
   snapshot = await callQa<GameplaySnapshot>(page, 'gameplay.snapshot')
   expect(snapshot.containerStorage.containers[0]?.slots[0]).toEqual({

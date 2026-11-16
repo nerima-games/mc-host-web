@@ -4,8 +4,10 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { blockIdOf, defaultBlockState, encodeBlockState } from '@nerima-games/mc-kernel'
 import type { NetworkMessage } from '@nerima-games/mx-multiplayer'
 import { expect, test, type Browser, type BrowserContext, type Page } from '@playwright/test'
+import { Option, Result } from 'effect'
 import { tsImport } from 'tsx/esm/api'
 import { WebSocket } from 'ws'
 
@@ -256,11 +258,17 @@ const expectOutOfBoundsPlacementRejection = async (
     } as NetworkMessage))
     expect(await reader.next()).toMatchObject({ _tag: 'WorldSnapshot', revision })
 
+    const stone = Option.getOrThrow(blockIdOf('stone'))
+    const state = Result.getOrThrow(Result.flatMap(
+      defaultBlockState(stone),
+      (values) => encodeBlockState(stone, values),
+    ))
     socket.send(encode({
       _tag: 'BlockPlace',
       player: 'invalid-mutation-e2e',
       at: { x: 30_000_001, y: 64, z: 0 },
       block: 'stone',
+      state,
     } as NetworkMessage))
     expect(await receiveMessageWithTag(reader, 'BlockMutationRejected')).toMatchObject({
       _tag: 'BlockMutationRejected',
@@ -874,7 +882,7 @@ test('a connected multiplayer player can craft (regression for the empty-grid de
 
     await page.keyboard.press('KeyE')
     await expect(inventory).toBeVisible()
-    await expect(hotbarSlot).toHaveAttribute('aria-label', /oak_planks/)
+    await expect(hotbarSlot).toHaveAttribute('aria-label', 'Hotbar slot 1, Oak Planks, 4')
 
     // One click selects the whole plank stack as the multiplayer move-source
     // (the same selection `activateInventoryTarget` already uses for
@@ -890,7 +898,7 @@ test('a connected multiplayer player can craft (regression for the empty-grid de
     // against the grid's actual contents, never by network-pending status.
     await expect(outcome).toHaveAttribute('data-crafting-state', 'match')
     await expect(output).toHaveAttribute('aria-disabled', 'false')
-    await expect(output).toHaveAttribute('aria-label', /stick, 4/)
+    await expect(output).toHaveAttribute('aria-label', 'Crafting output, Stick, 4')
 
     // The real gate this defect broke: a genuine click on a genuinely
     // enabled button reaching the server.

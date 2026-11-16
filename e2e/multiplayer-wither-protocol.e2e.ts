@@ -5,8 +5,10 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
+import { blockIdOf, defaultBlockState, encodeBlockState, type BlockType } from '@nerima-games/mc-kernel'
 import type { NetworkMessage } from '@nerima-games/mx-multiplayer'
 import { expect, test } from '@playwright/test'
+import { Option, Result } from 'effect'
 import { tsImport } from 'tsx/esm/api'
 import { WebSocket } from 'ws'
 
@@ -300,7 +302,7 @@ test('serializes competing Wither damage and restores the canonical state on rej
       { at: { x: -1, y: 90, z: 0 }, block: 'wither_skeleton_skull' },
       { at: { x: 0, y: 90, z: 0 }, block: 'wither_skeleton_skull' },
       { at: { x: 1, y: 90, z: 0 }, block: 'wither_skeleton_skull' },
-    ]
+    ] satisfies ReadonlyArray<{ readonly at: Position; readonly block: BlockType }>
     for (const [index, placement] of structure.entries()) {
       if (index === 4) {
         alice.socket.send(encodeProtocol({
@@ -314,8 +316,13 @@ test('serializes competing Wither damage and restores the canonical state on rej
         await alice.inbox.next('AuthoritativeCommandAccepted', (message) =>
           message.commandId === 'select-wither-skulls')
       }
+      const blockId = Option.getOrThrow(blockIdOf(placement.block))
+      const state = Result.getOrThrow(Result.flatMap(
+        defaultBlockState(blockId),
+        (values) => encodeBlockState(blockId, values),
+      ))
       alice.socket.send(encodeProtocol({
-        _tag: 'BlockPlace', player: 'wither-alice', world: 'overworld', ...placement,
+        _tag: 'BlockPlace', player: 'wither-alice', world: 'overworld', ...placement, state,
       } as NetworkMessage))
       await alice.inbox.next('BlockPlace', (_message) => alice.inbox.messages('BlockPlace').length > index)
     }
