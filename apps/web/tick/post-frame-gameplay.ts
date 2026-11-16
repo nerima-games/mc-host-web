@@ -486,7 +486,7 @@ export const runTickPostFrameGameplay = (
       setBrewingOpen(true)
       if (brewingTarget !== undefined) state.activeBrewingStandAt.set({ ...brewingTarget.position })
       if (multiplayer !== undefined && brewingTarget !== undefined) {
-        if (!requestBrewing({ _tag: 'open' })) state.brewingStatus.set('Brewing stand is unavailable')
+        requestBrewing({ _tag: 'open' })
         renderBrewingUi()
       }
     } else if (routeResult !== undefined && '_tag' in routeResult) {

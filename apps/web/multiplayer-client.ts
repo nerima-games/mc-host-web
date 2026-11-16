@@ -59,7 +59,6 @@ import {
   GAMEPLAY_VILLAGER_TRADES_OWNER_ID,
   GameplayVillagerTradeSnapshotSchema,
   type GeneratedWorld,
-  restoreBrewingStand,
   restoreStatusEffects,
   type EnchantedItem,
   type GameplayFrameState,
@@ -79,8 +78,6 @@ import {
   applySleepEvents,
   type AnvilCommand,
   type AnvilCommandResult,
-  type BrewingCommand,
-  type BrewingCommandResult,
   type CraftingCommand,
   type CraftingCommandResult,
   type EnchantingCommand,
@@ -296,7 +293,6 @@ export type MultiplayerClientContext = {
     multiplayerInventorySelection: MultiplayerInventorySelection | null
     queuedPlayerDamages: QueuedPlayerDamage[]
     pendingCrafting: { readonly commandId: string; readonly acceptedRevision: number | null } | null
-    pendingBrewingCommand: { readonly commandId: string } | null
     activeBrewingStandAt: { readonly x: number; readonly y: number; readonly z: number } | undefined
     closeChestOnFacilityIdle: boolean
     networkSleepState: SleepClientState
@@ -439,6 +435,15 @@ const appliedAs = <A>(
   effect: Effect.Effect<A, ServerStateApplyFailure>,
 ): Effect.Effect<A, ServerStateNotApplied> =>
   Effect.mapError(effect, (failure) => new ServerStateNotApplied({ what, failure }))
+
+type BrewingProtocolFailure = Readonly<{
+  readonly _tag: 'ServerProtocolUnsupported'
+  readonly feature: 'BrewingStand'
+  readonly reason: 'LegacySingleBottleState'
+}>
+
+export const MULTIPLAYER_BREWING_UNSUPPORTED_MESSAGE =
+  'Multiplayer brewing is unsupported until the server protocol is updated.'
 
 const networkPosition = (at: MultiplayerPosition): Result.Result<Vec3, Brand.BrandError> =>
   Result.gen(function* () {
@@ -676,7 +681,8 @@ export type MultiplayerClientApi = Readonly<{
   drainPlayerDamageInbound: () => void
   requestCrafting: () => void
   drainCraftingInbound: () => void
-  requestBrewing: (action: BrewingCommand['action']) => boolean
+  requestBrewing: () => boolean
+  brewingProtocolFailure: BrewingProtocolFailure | undefined
   drainBrewingInbound: () => void
   requestAnvil: () => boolean
   drainAnvilInbound: () => void
@@ -797,7 +803,7 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
   let nextInventoryCommand = 0
   let nextPlayerDamageCommand = 0
   let nextCraftingCommand = 0
-  let nextBrewingCommand = 0
+  let brewingProtocolFailure: BrewingProtocolFailure | undefined
   let nextAnvilCommand = 0
   let nextEnchantingCommand = 0
   let nextVillagerTradeCommand = 0
@@ -1302,69 +1308,37 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
     }
   }
 
-  const requestBrewing = (action: BrewingCommand['action']): boolean => {
-    if (
-      clientContext.multiplayer === undefined
-      || !clientContext.state.multiplayerHandshakeComplete
-      || clientContext.state.pendingBrewingCommand !== null
-      || clientContext.state.activeBrewingStandAt === undefined
-    ) return false
-    nextBrewingCommand += 1
-    const commandId = requestIdFor('brewing', nextBrewingCommand)
-    clientContext.state.pendingBrewingCommand = { commandId }
-    const command: BrewingCommand = {
-      _tag: 'BrewingCommand',
-      commandId,
-      player: String(clientContext.multiplayer.query.player),
-      world: String(WorldId.make(Effect.runSync(clientContext.services.playerApi.dimension))),
-      expectedRevision: multiplayerRevision,
-      at: clientContext.state.activeBrewingStandAt,
-      action,
+  const reportUnsupportedBrewingProtocol = (): void => {
+    if (brewingProtocolFailure === undefined) {
+      brewingProtocolFailure = {
+        _tag: 'ServerProtocolUnsupported', feature: 'BrewingStand', reason: 'LegacySingleBottleState',
+      }
+      console.error('[mc-compose] multiplayer brewing state cannot be represented locally', brewingProtocolFailure)
     }
-    Effect.runSync(clientContext.multiplayer.transport.sendBrewing(command))
-    return true
-  }
-
-  const resyncBrewing = (): void => {
-    if (clientContext.multiplayer === undefined) return
-    Effect.runSync(clientContext.multiplayer.host.enqueueOutbound({
-      _tag: 'AuthoritativeResyncRequest',
-      world: WorldId.make(Effect.runSync(clientContext.services.playerApi.dimension)),
-      lastKnownRevision: multiplayerRevision,
-    }))
-  }
-
-  const applyBrewingResult = (message: BrewingCommandResult): void => {
-    if (clientContext.multiplayer === undefined || clientContext.state.pendingBrewingCommand?.commandId !== message.commandId) return
-    multiplayerRevision = Math.max(multiplayerRevision, message.revision)
-    clientContext.state.pendingBrewingCommand = null
-    if (message.accepted) return
-    clientContext.state.brewingStatus = `Cannot brew: ${message.reason ?? 'rejected'}`
-    resyncBrewing()
+    clientContext.state.brewingStatus = MULTIPLAYER_BREWING_UNSUPPORTED_MESSAGE
     clientContext.callbacks.renderBrewingUi()
   }
 
-  const sameBrewingPosition = (
-    left: { readonly x: number; readonly y: number; readonly z: number },
-    right: { readonly x: number; readonly y: number; readonly z: number },
-  ): boolean => left.x === right.x && left.y === right.y && left.z === right.z
+  const requestBrewing = (): boolean => {
+    if (clientContext.multiplayer !== undefined) reportUnsupportedBrewingProtocol()
+    return false
+  }
 
   const drainBrewingInbound = (): void => {
     if (clientContext.multiplayer === undefined) return
     const currentWorld = String(WorldId.make(Effect.runSync(clientContext.services.playerApi.dimension)))
     for (const message of Effect.runSync(Queue.clear(clientContext.multiplayer.transport.brewingInbound))) {
       if (message._tag === 'BrewingCommandResult') {
-        applyBrewingResult(message)
+        reportUnsupportedBrewingProtocol()
         continue
       }
       if (message._tag !== 'BrewingStandDelta' && message._tag !== 'PlayerStatusEffectsDelta') continue
       if (message.world !== currentWorld || message.revision < multiplayerRevision) continue
       multiplayerRevision = Math.max(multiplayerRevision, message.revision)
       if (message._tag === 'BrewingStandDelta') {
-        if (clientContext.state.activeBrewingStandAt !== undefined && sameBrewingPosition(clientContext.state.activeBrewingStandAt, message.at)) {
-          Effect.runSync(restoreBrewingStand(clientContext.services.gameplayState, message.state))
-          if (clientContext.state.brewingOpen) clientContext.callbacks.renderBrewingUi()
-        }
+        // The single-bottle wire state lacks the three slots, fuel stack and
+        // progress needed by the live owner. Save migration would finish brews.
+        reportUnsupportedBrewingProtocol()
         continue
       }
       if (message.player === String(clientContext.multiplayer.query.player)) {
@@ -2036,6 +2010,7 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
     requestCrafting,
     drainCraftingInbound,
     requestBrewing,
+    get brewingProtocolFailure() { return brewingProtocolFailure },
     drainBrewingInbound,
     requestAnvil,
     drainAnvilInbound,

@@ -1,10 +1,13 @@
-import { Effect, Result } from 'effect'
-import { CHEST_CONTAINER_CAPACITY, furnaceState, INVENTORY_SLOT_COUNT } from '@nerima-games/mc-sim'
+import { Effect, Option, Queue, Result } from 'effect'
+import type { BrewingWireMessage } from '@nerima-games/mc-server/shared'
+import { BrewingServiceStateSchema, CHEST_CONTAINER_CAPACITY, furnaceState, INVENTORY_SLOT_COUNT } from '@nerima-games/mc-sim'
+import { GAMEPLAY_BREWING_OWNER_ID } from '@nerima-games/mx-gameplay'
 import { CommandId, EntityId, PlayerId, WorldId, type NetworkMessage } from '@nerima-games/mx-multiplayer'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   connectMultiplayer,
+  createMultiplayerClient,
   makeMultiplayerChatCommand,
   makeMultiplayerCommandIds,
 } from '../apps/web/multiplayer-client'
@@ -12,6 +15,72 @@ import type { PersistedFurnaceState } from '../apps/web/session-persistence'
 import { makeMultiplayerClientHarness } from './helpers/multiplayer-client-harness'
 
 describe('multiplayer client', () => {
+  it('records unsupported brewing without replacing other rejections and keeps the server revision', async () => {
+    const harness = await makeMultiplayerClientHarness()
+    const multiplayer = Option.getOrThrow(Option.fromNullishOr(harness.context.multiplayer))
+    const brewingInbound = Effect.runSync(Queue.unbounded<BrewingWireMessage>())
+    const client = createMultiplayerClient({
+      ...harness.context,
+      multiplayer: { ...multiplayer, transport: { ...multiplayer.transport, brewingInbound } },
+    })
+    const coordinator = harness.context.services.gameplayCommit.coordinator
+    const sendBrewing = vi.spyOn(multiplayer.transport, 'sendBrewing')
+    const enqueueOutbound = vi.spyOn(multiplayer.host, 'enqueueOutbound')
+    const renderBrewingUi = vi.spyOn(harness.context.callbacks, 'renderBrewingUi')
+    harness.context.state.brewingOpen = true
+    harness.context.state.activeBrewingStandAt = { x: 0, y: 64, z: 0 }
+    harness.context.state.multiplayerRejection = 'inventory command rejected'
+    harness.context.ui.multiplayerStatus.textContent = 'The inventory command was rejected.'
+    harness.context.ui.multiplayerStatus.hidden = false
+    harness.context.ui.canvas.setAttribute('data-multiplayer-rejection', 'inventory command rejected')
+    const reported = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    try {
+      const before = Effect.runSync(coordinator.snapshot(GAMEPLAY_BREWING_OWNER_ID, BrewingServiceStateSchema))
+      expect(client.brewingProtocolFailure).toBeUndefined()
+      expect(client.requestBrewing()).toBe(false)
+      expect(client.brewingProtocolFailure).toMatchObject({
+        _tag: 'ServerProtocolUnsupported', feature: 'BrewingStand', reason: 'LegacySingleBottleState',
+      })
+      expect(sendBrewing).not.toHaveBeenCalled()
+      expect(harness.context.state.brewingStatus).toBe('Multiplayer brewing is unsupported until the server protocol is updated.')
+      expect(harness.context.state.multiplayerRejection).toBe('inventory command rejected')
+      expect(harness.multiplayerStatus.textContent).toBe('The inventory command was rejected.')
+      expect(harness.multiplayerStatus.hidden).toBe(false)
+      expect(harness.canvasAttributes.get('data-multiplayer-rejection')).toBe('inventory command rejected')
+      expect(renderBrewingUi).toHaveBeenCalledOnce()
+
+      Effect.runSync(Queue.offer(brewingInbound, {
+        _tag: 'BrewingStandDelta', world: 'overworld', at: { x: 0, y: 64, z: 0 }, revision: 1,
+        state: { fuelUnits: 2, bottle: 'water_bottle', ingredient: undefined, brewing: { output: 'awkward', remainingSecs: 10 } },
+      }))
+      client.drainBrewingInbound()
+
+      expect(Effect.runSync(coordinator.snapshot(GAMEPLAY_BREWING_OWNER_ID, BrewingServiceStateSchema))).toEqual(before)
+      expect(Effect.runSync(coordinator.revision)).toBe(before.revision)
+      expect(sendBrewing).not.toHaveBeenCalled()
+      expect(harness.context.state.multiplayerRejection).toBe('inventory command rejected')
+      expect(harness.multiplayerStatus.textContent).toBe('The inventory command was rejected.')
+      expect(harness.multiplayerStatus.hidden).toBe(false)
+      expect(harness.canvasAttributes.get('data-multiplayer-rejection')).toBe('inventory command rejected')
+      expect(renderBrewingUi).toHaveBeenCalledTimes(2)
+      expect(reported).toHaveBeenCalledOnce()
+      expect(reported.mock.calls[0]?.[1]).toMatchObject({ _tag: 'ServerProtocolUnsupported', feature: 'BrewingStand' })
+      expect(client.sendInventorySelection(2)).toBe(true)
+      expect(enqueueOutbound).toHaveBeenLastCalledWith(expect.objectContaining({
+        _tag: 'PlayerInventoryCommand', expectedRevision: 1,
+      }))
+    } finally {
+      reported.mockRestore()
+      sendBrewing.mockRestore()
+      enqueueOutbound.mockRestore()
+      renderBrewingUi.mockRestore()
+      Effect.runSync(multiplayer.transport.close)
+      Effect.runSync(Queue.shutdown(brewingInbound))
+      vi.unstubAllGlobals()
+      vi.restoreAllMocks()
+    }
+  })
+
   it('keeps singleplayer connection setup inert', async () => {
     const storageEvents: Array<string> = []
     const bootErrors: Array<string> = []

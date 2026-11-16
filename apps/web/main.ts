@@ -325,6 +325,7 @@ import { BrowserClockLayer, browserClock } from './clock'
 import {
   connectMultiplayer,
   createMultiplayerClient,
+  MULTIPLAYER_BREWING_UNSUPPORTED_MESSAGE,
   multiplayerRegistrationTokenKey,
   type DecodedVehicle,
   type MultiplayerClientContext,
@@ -2705,7 +2706,6 @@ const bootGame = async (
       brewingParent.replaceChildren()
       return
     }
-    const state = Effect.runSync(snapshotGameplayBrewing)
     let summary = brewingParent.querySelector<HTMLElement>('[data-testid="brewing-state"]')
     let progress = brewingParent.querySelector<HTMLElement>('[data-testid="brewing-progress"]')
     let status = brewingParent.querySelector<HTMLElement>('.brewing-status')
@@ -2720,14 +2720,17 @@ const bootGame = async (
       insert.type = 'button'
       insert.dataset['brewingAction'] = 'insert'
       insert.textContent = 'Insert selected item'
+      insert.disabled = multiplayer !== undefined
       const collect = document.createElement('button')
       collect.type = 'button'
       collect.dataset['brewingAction'] = 'collect'
       collect.textContent = 'Collect bottle'
+      collect.disabled = multiplayer !== undefined
       const drink = document.createElement('button')
       drink.type = 'button'
       drink.dataset['brewingAction'] = 'drink'
       drink.textContent = 'Drink potion'
+      drink.disabled = multiplayer !== undefined
       const close = document.createElement('button')
       close.type = 'button'
       close.dataset['brewingAction'] = 'close'
@@ -2737,6 +2740,13 @@ const bootGame = async (
       status.setAttribute('role', 'status')
       brewingParent.replaceChildren(title, summary, progress, insert, collect, drink, close, status)
     }
+    if (multiplayer !== undefined) {
+      summary.textContent = MULTIPLAYER_BREWING_UNSUPPORTED_MESSAGE
+      progress.textContent = ''
+      status.textContent = MULTIPLAYER_BREWING_UNSUPPORTED_MESSAGE
+      return
+    }
+    const state = Effect.runSync(snapshotGameplayBrewing)
     summary.textContent = `Fuel: ${brewingSlotLabel(state.fuel)} (${String(state.fuelCharges)} charges) | Bottles: ${state.bottles.map(brewingSlotLabel).join(', ')} | Ingredient: ${brewingSlotLabel(state.ingredient)}`
     progress.textContent = state.brewProgressSecs === 0
       ? 'Idle'
@@ -2777,19 +2787,15 @@ const bootGame = async (
         setBrewingOpen(false)
         return
       }
+      if (multiplayer !== undefined) {
+        requestBrewing({ _tag: 'open' })
+        renderBrewingUi()
+        return
+      }
       if (action === 'insert') {
         const selected = Effect.runSync(world.inventory.snapshot).slots[selectedHotbarIndex]
         if (selected === undefined) {
           brewingStatus = 'Select brewing fuel, a bottle, or an ingredient'
-          renderBrewingUi()
-          return
-        }
-        if (multiplayer !== undefined) {
-          if (requestBrewing({ _tag: 'insert', slot: selectedHotbarIndex })) {
-            brewingStatus = `Submitting ${selected.item}...`
-          } else {
-            brewingStatus = 'Brewing action is unavailable'
-          }
           renderBrewingUi()
           return
         }
@@ -2825,15 +2831,6 @@ const bootGame = async (
         return
       }
       if (action === 'collect') {
-        if (multiplayer !== undefined) {
-          if (requestBrewing({ _tag: 'collect' })) {
-            brewingStatus = 'Collecting bottle...'
-          } else {
-            brewingStatus = 'Brewing action is unavailable'
-          }
-          renderBrewingUi()
-          return
-        }
         const bottleIndex = Effect.runSync(snapshotGameplayBrewing).bottles.findIndex((slot) => slot !== undefined)
         if (bottleIndex === -1) {
           brewingStatus = 'Cannot collect bottle: Empty'
@@ -2863,15 +2860,6 @@ const bootGame = async (
         return
       }
       if (action === 'drink') {
-        if (multiplayer !== undefined) {
-          if (requestBrewing({ _tag: 'drink' })) {
-            brewingStatus = 'Drinking potion...'
-          } else {
-            brewingStatus = 'Brewing action is unavailable'
-          }
-          renderBrewingUi()
-          return
-        }
         nextItemUseRequestId += 1
         const requestId = `brewing-${String(nextItemUseRequestId)}`
         Effect.runSync(useBrewingPotion(gameplayState, {
