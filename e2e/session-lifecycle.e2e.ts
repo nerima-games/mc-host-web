@@ -18,7 +18,8 @@ test('creates, saves, and reloads a session from the title screen', async ({ pag
   await expect(page.getByTestId('title-screen')).toBeVisible()
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-route', 'title')
 
-  await page.locator('[data-menu-entry="new-world"]').click()
+  await page.locator('[data-menu-entry="single-player"]').click()
+  await page.locator('[data-menu-action="new-world"]').click()
   await page.locator('[data-mx-ui="menu-world-name"]').fill('E2E Lifecycle')
   await page.locator('[data-menu-action="confirm"]').click()
 
@@ -41,7 +42,7 @@ test('creates, saves, and reloads a session from the title screen', async ({ pag
 
   await expect(page).toHaveURL('/')
   await expect(page.getByTestId('title-screen')).toBeVisible()
-  await page.locator('[data-menu-entry="load-world"]').click()
+  await page.locator('[data-menu-entry="single-player"]').click()
 
   const savedSession = page.locator('[data-mx-ui="menu-world-row"]', {
     has: page.locator(`[data-mx-ui="menu-world-session-id"]`, { hasText: sessionId ?? '' }),
@@ -61,7 +62,7 @@ test('creates, saves, and reloads a session from the title screen', async ({ pag
   await page.keyboard.press('Escape')
   await expect(page.getByTestId('pause-overlay')).toBeVisible()
   await page.getByTestId('save-quit-button').click()
-  await page.locator('[data-menu-entry="load-world"]').click()
+  await page.locator('[data-menu-entry="single-player"]').click()
   await expect(savedSession).toContainText('E2E Lifecycle')
   await expect(savedSession).not.toContainText('Replacement Name')
   await savedSession.click()

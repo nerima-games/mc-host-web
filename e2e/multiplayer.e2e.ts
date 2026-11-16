@@ -83,7 +83,8 @@ const useTargetedBlock = async (page: Page): Promise<void> => {
 
 const createCreativeWorld = async (page: Page, name: string): Promise<string> => {
   await page.goto('/')
-  await page.locator('[data-menu-entry="new-world"]').click()
+  await page.locator('[data-menu-entry="single-player"]').click()
+  await page.locator('[data-menu-action="new-world"]').click()
   await page.locator('input[data-mx-ui="menu-world-name"]').fill(name)
   await page.locator('[data-mx-ui="menu-game-mode"]').click()
   await expect(page.locator('[data-mx-ui="menu-game-mode"]')).toHaveAttribute(
@@ -98,7 +99,8 @@ const createCreativeWorld = async (page: Page, name: string): Promise<string> =>
 
 const createSurvivalWorld = async (page: Page, name: string): Promise<string> => {
   await page.goto('/')
-  await page.locator('[data-menu-entry="new-world"]').click()
+  await page.locator('[data-menu-entry="single-player"]').click()
+  await page.locator('[data-menu-action="new-world"]').click()
   await page.locator('input[data-mx-ui="menu-world-name"]').fill(name)
   await expect(page.locator('[data-mx-ui="menu-game-mode"]')).toHaveAttribute(
     'aria-label',

@@ -87,7 +87,8 @@ const grantPointerLock = async (page: Page): Promise<void> => {
 
 test('creates, plays, saves, and resumes a Creative world', async ({ page }) => {
   await page.goto('/')
-  await page.locator('[data-menu-entry="new-world"]').click()
+  await page.locator('[data-menu-entry="single-player"]').click()
+  await page.locator('[data-menu-action="new-world"]').click()
   await page.locator('[data-mx-ui="menu-world-name"]').fill('Creative E2E')
   await page.locator('[data-mx-ui="menu-game-mode"]').click()
   await expect(page.locator('[data-mx-ui="menu-game-mode"]')).toHaveAttribute(
@@ -96,8 +97,8 @@ test('creates, plays, saves, and resumes a Creative world', async ({ page }) => 
   )
   await page.locator('[data-menu-action="confirm"]').click()
 
-  await expect(page).toHaveURL(/mode=creative$/u)
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
+  await expect(page).toHaveURL(/\?session=creative-e2e-[^&]+$/u)
   const sessionId = new URL(page.url()).searchParams.get('session')
   expect(sessionId).not.toBeNull()
   expect((await snapshot(page)).mode).toBe('creative')
@@ -149,7 +150,7 @@ test('creates, plays, saves, and resumes a Creative world', async ({ page }) => 
 
   await page.keyboard.press('Escape')
   await page.getByTestId('save-quit-button').click()
-  await page.locator('[data-menu-entry="load-world"]').click()
+  await page.locator('[data-menu-entry="single-player"]').click()
   const savedSession = page.locator('[data-mx-ui="menu-world-row"]', {
     has: page.locator('[data-mx-ui="menu-world-session-id"]', { hasText: sessionId ?? '' }),
   })

@@ -54,11 +54,12 @@ test('unlocks Web Audio and schedules a player-hurt node from a game event', asy
       }
       return result.value
     }
-    await run('gameplay', 'damage')
-    return {
-      report: await run('audio', 'report'),
-      snapshot: await run('audio', 'snapshot'),
-    }
+    const [, report, snapshot] = await Promise.all([
+      run('gameplay', 'damage'),
+      run('audio', 'report'),
+      run('audio', 'snapshot'),
+    ])
+    return { report, snapshot }
   }) as { readonly report: AudioReport; readonly snapshot: AudioSnapshot }
 
   expect(result.report.activeTones).toBeGreaterThan(0)

@@ -325,9 +325,11 @@ test.describe('smoke — the composed frame in a real browser', () => {
     const snapshots = await page.evaluate(async () => {
       const transport = window.__NERIMA_GAMES_QA__
       if (transport === undefined) throw new Error('missing QA transport')
-      const audio = await transport.dispatch('audio', 'snapshot', null)
+      const [audio, gameplay] = await Promise.all([
+        transport.dispatch('audio', 'snapshot', null),
+        transport.dispatch('gameplay', 'snapshot', null),
+      ])
       if (audio._tag === 'Failure') throw new Error(`QA audio.snapshot failed: ${JSON.stringify(audio.error)}`)
-      const gameplay = await transport.dispatch('gameplay', 'snapshot', null)
       if (gameplay._tag === 'Failure') throw new Error(`QA gameplay.snapshot failed: ${JSON.stringify(gameplay.error)}`)
       return { audio: audio.value, gameplay: gameplay.value }
     }) as {

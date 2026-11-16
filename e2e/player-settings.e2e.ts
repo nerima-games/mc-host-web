@@ -134,7 +134,10 @@ test('rapid setting changes finish saving before title navigation', async ({ pag
     }
     close.click()
 
-    const newWorld = document.querySelector<HTMLButtonElement>('[data-menu-entry="new-world"]')
+    const singlePlayer = document.querySelector<HTMLButtonElement>('[data-menu-entry="single-player"]')
+    if (singlePlayer === null) throw new Error('single player control missing')
+    singlePlayer.click()
+    const newWorld = document.querySelector<HTMLButtonElement>('[data-menu-action="new-world"]')
     if (newWorld === null) throw new Error('new world control missing')
     newWorld.click()
 
@@ -146,8 +149,8 @@ test('rapid setting changes finish saving before title navigation', async ({ pag
     confirm.click()
   })
 
-  await expect(page).toHaveURL(/\?session=rapid-settings-[^&]+&create=1/u)
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
+  await expect(page).toHaveURL(/\?session=rapid-settings-[^&]+$/u)
   await page.keyboard.press('Escape')
   await page.getByTestId('options-button').click()
   await expect(page.locator('[data-sensitivity]')).toHaveValue('245')
@@ -188,7 +191,7 @@ test('settings write failures block navigation until a later save succeeds', asy
   await page.locator('[data-audio-enabled]').uncheck()
   await expect(page.locator('[data-settings-error]')).toHaveText('Settings could not be saved.')
   await page.locator('[data-settings-close]').click()
-  await page.locator('[data-menu-entry="load-world"]').click()
+  await page.locator('[data-menu-entry="single-player"]').click()
   await page.locator('[data-mx-ui="menu-world-row"][data-session-id="settings-write-failure"]').click()
   await expect(page).toHaveURL('/')
   await expect(page.locator('#title-status')).toHaveText(
@@ -201,7 +204,7 @@ test('settings write failures block navigation until a later save succeeds', asy
   await page.locator('[data-audio-enabled]').uncheck()
   await expect(page.locator('body')).toHaveAttribute('data-player-settings-persistence', 'saved')
   await page.locator('[data-settings-close]').click()
-  await page.locator('[data-menu-entry="load-world"]').click()
+  await page.locator('[data-menu-entry="single-player"]').click()
   await page.locator('[data-mx-ui="menu-world-row"][data-session-id="settings-write-failure"]').click()
   await expect(page).toHaveURL('/?session=settings-write-failure')
 })
@@ -253,11 +256,11 @@ test('corrupt saved settings warn until a valid change replaces the record', asy
   await settings.click()
   await expect(error).toHaveText('Saved settings could not be read. Changing a setting will replace them.')
 
-  await sensitivity.fill('176')
+  await sensitivity.fill('180')
   await expect(page.locator('body')).toHaveAttribute('data-player-settings-persistence', 'saved')
   await expect(error).toBeEmpty()
   await page.reload()
   await settings.click()
-  await expect(sensitivity).toHaveValue('176')
+  await expect(sensitivity).toHaveValue('180')
   await expect(error).toBeEmpty()
 })
