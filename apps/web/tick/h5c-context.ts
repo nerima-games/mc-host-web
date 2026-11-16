@@ -27,6 +27,7 @@ type GameplayItemType = Parameters<typeof import('@nerima-games/mx-gameplay').is
 type TargetedBlockFailure =
   | Result.Result.Failure<ReturnType<typeof import('@nerima-games/mc-sim').targetBlockFromPlayerPose>>
   | import('@nerima-games/mc-kernel').CoordinateConversionFailure
+  | import('../owner-backed-services').OwnerBackedPlayerSyncError
 type FishingEnvironmentFailure =
   | import('@nerima-games/mc-kernel').CoordinateConversionFailure
   | import('effect').Brand.BrandError
@@ -38,7 +39,8 @@ type EndFeatureFailure =
   | Effect.Error<ReturnType<import('@nerima-games/mc-kernel').WorldWritePort['Service']['applyBatch']>>
   | import('@nerima-games/mc-sim').ItemStackFailure
   | import('@nerima-games/mc-sim').PlayerStorageFailure
-  | import('@nerima-games/mc-sim').PlayerServiceInputError
+  | import('../owner-backed-services').OwnerBackedPlayerWriteError
+  | import('../owner-backed-services').OwnerBackedInventoryWriteError
 type H5cInventoryMode = 'player' | 'craftingTable' | 'furnace' | 'chest' | 'anvil' | 'enchanting'
 
 type PendingItemUse =

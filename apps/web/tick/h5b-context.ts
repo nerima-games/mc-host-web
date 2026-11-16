@@ -12,6 +12,7 @@ type WorldExplosionFailure =
   | Result.Result.Failure<ReturnType<typeof import('@nerima-games/mc-sim').planExplosion>>
   | import('@nerima-games/mc-kernel').BlockRegistryResolutionFailure
   | Effect.Error<ReturnType<import('@nerima-games/mc-kernel').WorldWritePort['Service']['applyBatch']>>
+  | import('../owner-backed-services').OwnerBackedPlayerSyncError
 
 export type H5bPostFrameInput = Readonly<{
   readonly frame: H5aFrameInputResult
@@ -33,6 +34,7 @@ export type H5bPostFrameContext = {
   readonly h5a: Omit<Pick<
     H5aTickContext,
     | 'world'
+    | 'entityManager'
     | 'playerApi'
     | 'simState'
     | 'currentChunkContext'
@@ -128,6 +130,7 @@ export type H5bPostFrameContext = {
   readonly sendEntityCommand: import('../multiplayer-client').MultiplayerClientApi['sendEntityCommand']
   readonly applyPortalTravels: () => Effect.Effect<void,
     | import('@nerima-games/mc-sim').PlayerServiceInputError
+    | import('../owner-backed-services').OwnerBackedPlayerWriteError
     | import('effect').Schema.SchemaError
     | import('@nerima-games/mc-kernel').WorldWriteChunkUnavailable
     | import('@nerima-games/mc-kernel').WorldWriteConflict

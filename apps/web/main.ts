@@ -213,7 +213,7 @@ import {
   insertBrewingFuel,
   insertBrewingIngredient,
   INITIAL_ENVIRONMENTAL_CONTACT_DAMAGE_STATE,
-  makeGameplayFrameState,
+  makeGameplayFrameStateForOwner,
   makeGeneratedWorld,
   isDroppedItemBehaviour,
   isHoeItem,
@@ -327,8 +327,7 @@ import {
 } from './native-input-queue'
 import { selectedHotbarAfterInput } from './player-experience'
 import { createDroppedItemLifetimeTracker } from './dropped-item-lifetime'
-import { createSessionSaveCoordinator } from './session-save-coordinator'
-import { makeSurvivalHungerCoordinator } from './survival-hunger-runtime'
+import { createSessionSaveCoordinator, snapshotOwnedSessionState } from './session-save-coordinator'
 import {
   advanceFootstepRuntime,
   initialFootstepRuntimeState,
@@ -357,7 +356,6 @@ import {
 import {
   makeSessionChunkSource,
   saveSession,
-  EMPTY_ENTITY_ROSTER,
   snapshotResidentChunks,
   type DimensionChunk,
   type PersistedFurnaceState,
@@ -369,10 +367,13 @@ import {
   type SessionState,
 } from './session-persistence'
 import {
+  gameplayOwnerInitialState,
   restoreInitialWorld,
   restoreLoadedSessionServices,
 } from './session-restoration'
 import { initializeSessionWorld } from './session-world'
+import { makeOwnerBackedHost, type OwnerBackedOwnerIds } from './owner-backed-services'
+import { makeFrameBoundary } from './frame-boundary-queue'
 import {
   readSessionRoute,
   type SessionRoute,
@@ -927,7 +928,7 @@ const bootGame = async (
     return
   }
   respawnLocation = restoredRespawnLocation.success
-  const sessionWorld = await initializeSessionWorld({
+  const sessionWorldResult = await initializeSessionWorld({
     loadedSession,
     initialDimension,
     worldSeed: WORLD_SEED,
@@ -946,75 +947,46 @@ const bootGame = async (
     droppedItemMetadataKey,
     droppedItemMetadataFromBehaviour,
   })
+  if (Result.isFailure(sessionWorldResult)) {
+    failBoot('saved entity rosters could not be merged', sessionWorldResult.failure)
+    return
+  }
   const {
     activeSeed,
     initialKnownChunks,
     restored,
-    world,
+    world: generatedWorld,
     chunkSourceFor,
-    entityRosters,
-    rosterWithDroppedItemLifetimes,
-    snapshotEntityRosters: snapshotEntityRostersFor,
-  } = sessionWorld
+    entities: initialEntities,
+    snapshotEntityRosters,
+  } = sessionWorldResult.success
   enchantmentSeed = restoredWorkstations?.enchantmentSeed ?? activeSeed
-  const snapshotEntityRosters = (): SessionState['entities'] =>
-    snapshotEntityRostersFor(
-      currentChunkContext.dimension,
-      Effect.runSync(world.entities.snapshot),
-    )
-  const survivalHunger = makeSurvivalHungerCoordinator(world.vitals)
-  const initialSpawnPose = await Effect.runPromise(world.player.pose)
-  const initialSpawnDimension = await Effect.runPromise(world.player.dimension)
+  // Read before the owners exist: the generated spawn seeds a new session's
+  // player owner and stays the respawn fallback.
+  const initialSpawnPose = await Effect.runPromise(generatedWorld.player.pose)
+  const initialSpawnDimension = await Effect.runPromise(generatedWorld.player.dimension)
   const loadedSessionState = Option.isSome(loadedSession) ? loadedSession.value.state : undefined
-  await restoreInitialWorld(loadedSessionState, isCreativeMode, {
-    restoreEntities: () => Effect.runPromise(
-      world.entities.restore(
-        (entityRosters.get(initialDimension) ?? EMPTY_ENTITY_ROSTER) as Parameters<
-          typeof world.entities.restore
-        >[0],
-      ),
-    ),
-    restoreStorage: (state) => Effect.runPromise(world.inventory.restoreStorage(state.storage)),
-    restoreContainerStorage: (state) =>
-      Effect.runPromise(world.inventory.restoreContainerStorage(state.containerStorage)),
-    // The session stores plain coordinates; PlayerPose needs finite PositionAxis
-    // values. A failed check rejects like a failed restore and reaches failBoot.
-    restorePlayer: (state) =>
-      Effect.runPromise(Effect.flatMap(
-        Effect.fromResult(Result.gen(function* () {
-          return {
-            ...state.player,
-            feetPosition: worldPosition(
-              yield* PositionAxis.result(state.player.feetPosition.x),
-              yield* PositionAxis.result(state.player.feetPosition.y),
-              yield* PositionAxis.result(state.player.feetPosition.z),
-            ),
-          }
-        })),
-        (pose) => world.player.restore(pose, state.dimension),
-      )),
-    restoreVitals: (state) => Effect.runPromise(world.vitals.restore(state.vitals)),
-    addCreativeStartingItems: async () => {
-      await Effect.runPromise(world.inventory.add('redstone_dust', 16))
-      await Effect.runPromise(world.inventory.add('lever', 4))
-      await Effect.runPromise(world.inventory.add('redstone_lamp', 8))
-      await Effect.runPromise(world.inventory.add('piston', 4))
-    },
-  })
   const time = await Effect.runPromise(makeTimeService())
   const weather = await Effect.runPromise(makeWeatherService())
   const crops = await Effect.runPromise(makeCropService())
-  // Villager trades and the brewing stand exist only as owners, so the loaded
-  // session seeds them here and nothing restores them later; chunk streaming
-  // updates the trades through the coordinator.
-  // `gameplayOwnerRegistrations(undefined)` is a typed failure, so a fresh
-  // session passes an object without those fields.
-  const gameplayOwners = gameplayOwnerRegistrations({
-    ...(loadedSessionState === undefined ? {} : {
-      villagerTrades: loadedSessionState.villagers.trades,
-      brewing: loadedSessionState.brewing,
-    }),
-  })
+  // The owners are the only store of the player, its storage, vitals,
+  // entities, villager trades and the brewing stand, so the loaded session (or
+  // the generated world) seeds them here and nothing restores them later.
+  const ownerInitialState = gameplayOwnerInitialState(
+    loadedSessionState,
+    {
+      pose: initialSpawnPose,
+      dimension: initialSpawnDimension,
+      storage: await Effect.runPromise(generatedWorld.inventory.storageSnapshot),
+      vitals: await Effect.runPromise(generatedWorld.vitals.snapshot),
+    },
+    initialEntities,
+  )
+  if (Result.isFailure(ownerInitialState)) {
+    failBoot('saved player pose decoding failed', ownerInitialState.failure)
+    return
+  }
+  const gameplayOwners = gameplayOwnerRegistrations(ownerInitialState.success)
   if (Result.isFailure(gameplayOwners)) {
     failBoot('gameplay owner registration failed', gameplayOwners.failure)
     return
@@ -1039,6 +1011,36 @@ const bootGame = async (
     return
   }
   const hostWorldWrite = hostWorldWriteExit.value
+  const ownerIds: OwnerBackedOwnerIds = {
+    player: GAMEPLAY_PLAYER_OWNER_ID,
+    playerStorage: GAMEPLAY_PLAYER_STORAGE_OWNER_ID,
+    vitals: GAMEPLAY_VITALS_OWNER_ID,
+    entities: GAMEPLAY_ENTITIES_OWNER_ID,
+  }
+  // From here on the generated world's player, inventory, vitals and entities
+  // are reached only through these (I1): the views for host code, the stage
+  // adapters for the registration Context.
+  const ownerBacked = await Effect.runPromise(makeOwnerBackedHost({
+    coordinator: hostWorldWrite.coordinator,
+    world: generatedWorld,
+    ownerIds,
+  }))
+  const world = {
+    chunkStore: generatedWorld.chunkStore,
+    worldgenChunkStore: generatedWorld.worldgenChunkStore,
+    ...ownerBacked.views,
+  }
+  // Containers are not owner state, so they are still restored locally.
+  await restoreInitialWorld(loadedSessionState, isCreativeMode, {
+    restoreContainerStorage: (state) =>
+      Effect.runPromise(world.inventory.restoreContainerStorage(state.containerStorage)),
+    addCreativeStartingItems: async () => {
+      await Effect.runPromise(world.inventory.add('redstone_dust', 16))
+      await Effect.runPromise(world.inventory.add('lever', 4))
+      await Effect.runPromise(world.inventory.add('redstone_lamp', 8))
+      await Effect.runPromise(world.inventory.add('piston', 4))
+    },
+  })
   // A WorldWriteBatch names its dimension by the branded DimensionId. Every
   // host Dimension is a DimensionIdSchema input, so the three ids are decoded
   // once here and a decode failure stops the boot like any other.
@@ -1087,7 +1089,12 @@ const bootGame = async (
     .pipe(Effect.map(({ state }) => state))
   const snapshotGameplayBrewing = gameplayBrewingService.snapshot
     .pipe(Effect.provideService(WorldCommitCoordinator, gameplayCommit.coordinator))
-  const gameplayState = await Effect.runPromise(makeGameplayFrameState)
+  // The survival-hunger stage ticks the vitals owner itself (I4); host code
+  // reaches the same runtime through `gameplayState.survivalHunger`.
+  const gameplayState = await Effect.runPromise(makeGameplayFrameStateForOwner({
+    coordinator: hostWorldWrite.coordinator,
+    vitalsOwnerId: GAMEPLAY_VITALS_OWNER_ID,
+  }))
   const villagerResidents = new Map<string, PersistedVillager>(
     (Option.isSome(loadedSession) ? loadedSession.value.state.villagers.residents : [])
       .map((villager) => [villager.id, villager]),
@@ -1207,7 +1214,7 @@ const bootGame = async (
   // holds each context once, so no store is attached twice.
   const makeDimensionChunkContext = (
     dimension: Dimension,
-    dimensionWorld: typeof world,
+    dimensionWorld: Pick<typeof generatedWorld, 'chunkStore' | 'worldgenChunkStore'>,
   ) => {
     const lighting = trackChunkLightColor((chunk, quads) =>
       makeChunkStoreLightColor(dimensionWorld.worldgenChunkStore, chunk, quads),
@@ -1377,6 +1384,15 @@ const bootGame = async (
   let savedGeneration = 0
   let debounceTimer: number | undefined
 
+  // Every world read or write from outside the frame fiber goes through this:
+  // DOM handlers and QA operations are queued for the next frame boundary, and
+  // work that cannot wait for a frame (saves, the hidden-tab pump) runs under
+  // the frame lock. Queued writes have no typed failure; a throw in one is a
+  // defect that stops the loop like any other frame defect.
+  const frameBoundary = Effect.runSync(makeFrameBoundary<never>())
+  const deferToFrameBoundary = (work: () => void): void => {
+    frameBoundary.enqueue(Effect.sync(work))
+  }
   const reportPersistenceFailure = (error: unknown): void => {
     document.body.setAttribute('data-session-persistence', 'failed')
     console.error('[mc-compose] session persistence failed', error)
@@ -1394,74 +1410,73 @@ const bootGame = async (
       return residents.flat()
     },
     currentGeneration: () => dirtyGeneration,
-    snapshotState: () => ({
-      seed: activeSeed,
-      dimension: Effect.runSync(world.player.dimension),
-      player: Effect.runSync(world.player.pose),
-      storage: Effect.runSync(world.inventory.storageSnapshot),
-      containerStorage: Effect.runSync(world.inventory.containerStorageSnapshot),
-      vitals: Effect.runSync(world.vitals.snapshot),
-      time: Effect.runSync(time.snapshot),
-      weather: Effect.runSync(weather.snapshot),
-      redstone: { levers: [...leverStates.values()] },
-      furnaces: [...furnaceStates.values()],
-      portals: [...portalStates.values()],
-      crops: Effect.runSync(crops.snapshot),
-      entities: snapshotEntityRosters(),
-      villagers: {
-        residents: [...villagerResidents.values()],
-        trades: Effect.runSync(snapshotGameplayVillagerTrades),
-      },
-      brewing: Effect.runSync(snapshotGameplayBrewing),
-      statusEffects: Effect.runSync(snapshotStatusEffects(gameplayState, gameplayCommit)),
-      wither: snapshotWitherRuntime(witherRuntimeState),
-      fishing: {
-        result: fishingResult,
-        phase: multiplayer === undefined ? (fishingSession === undefined ? 'idle' : fishingPhase(fishingSession)) : networkFishingState.phase,
-        water: fishingWater ?? null,
-      },
-      // An unoccupied vehicle's `occupant` is `undefined` (see
-      // vehicleById/boardVehicle call sites in this file), not an absent
-      // key — object literals in this codebase set it explicitly rather
-      // than omitting it. session-persistence.ts's PersistedVehiclesSchema
-      // validates this array as Schema.Unknown, so nothing schema-side ever
-      // strips that key the way this file's own exact:true optional fields
-      // do; an explicit `undefined` reaching mc-save's integrity
-      // canonicalizer is a hard encode failure there (see that file's
-      // comment on PersistedVehiclesSchema for the same failure mode on a
-      // different field). Stripped here, at the one place a Vehicle enters
-      // the persisted snapshot, the same way vehicle-motion.ts's own
-      // withoutOccupant already represents "no occupant" everywhere else.
-      vehicles: vehicleList().map((vehicle) => {
-        if (vehicle.occupant !== undefined) return vehicle
-        const { occupant: _occupant, ...withoutOccupant } = vehicle
-        return withoutOccupant
-      }),
-      mountedVehicleId: mountedVehicleId ?? null,
-      end: {
-        frames: [...endPortalFrames.values()],
-        portalComplete: endPortalComplete,
-        dragon: endDragonSnapshot(),
-        exitPortalMaterialized,
-        dragonEggRewarded,
-      },
-      workstations: {
-        enchantmentSeed,
-        customNames: Object.fromEntries(customNames),
-        enchantedItems: Object.fromEntries(
-          [...enchantedItems].map(([slot, item]) => [slot, JSON.stringify(item)]),
-        ),
-        // `SessionStateSchema`'s `deathDropDimension` is `optionalWith(...,
-        // { exact: true })`: it requires the key to be OMITTED, not merely
-        // `undefined`-valued, or mc-save's integrity checksum rejects the
-        // encoded save (a present `undefined` key is not one of canonicalize's
-        // supported value kinds). `deathDropDimension` here is `undefined`
-        // whenever no death is pending, which is most saves, so this must be
-        // conditional rather than a bare shorthand property.
-        ...(deathDropDimension === undefined ? {} : { deathDropDimension }),
-        respawn: respawnLocation,
-      },
-    }),
+    // Taken under the frame lock, so it never reads the owners mid-frame.
+    snapshotState: () => Effect.runPromise(frameBoundary.outsideFrame(Effect.gen(function* () {
+      return {
+        seed: activeSeed,
+        ...yield* snapshotOwnedSessionState(hostWorldWrite.coordinator, ownerIds, snapshotEntityRosters),
+        containerStorage: yield* world.inventory.containerStorageSnapshot,
+        time: yield* time.snapshot,
+        weather: yield* weather.snapshot,
+        redstone: { levers: [...leverStates.values()] },
+        furnaces: [...furnaceStates.values()],
+        portals: [...portalStates.values()],
+        crops: yield* crops.snapshot,
+        villagers: {
+          residents: [...villagerResidents.values()],
+          trades: yield* snapshotGameplayVillagerTrades,
+        },
+        brewing: yield* snapshotGameplayBrewing,
+        statusEffects: yield* snapshotStatusEffects(gameplayState, gameplayCommit),
+        wither: snapshotWitherRuntime(witherRuntimeState),
+        fishing: {
+          result: fishingResult,
+          phase: multiplayer === undefined ? (fishingSession === undefined ? 'idle' : fishingPhase(fishingSession)) : networkFishingState.phase,
+          water: fishingWater ?? null,
+        },
+        // An unoccupied vehicle's `occupant` is `undefined` (see
+        // vehicleById/boardVehicle call sites in this file), not an absent
+        // key — object literals in this codebase set it explicitly rather
+        // than omitting it. session-persistence.ts's PersistedVehiclesSchema
+        // validates this array as Schema.Unknown, so nothing schema-side ever
+        // strips that key the way this file's own exact:true optional fields
+        // do; an explicit `undefined` reaching mc-save's integrity
+        // canonicalizer is a hard encode failure there (see that file's
+        // comment on PersistedVehiclesSchema for the same failure mode on a
+        // different field). Stripped here, at the one place a Vehicle enters
+        // the persisted snapshot, the same way vehicle-motion.ts's own
+        // withoutOccupant already represents "no occupant" everywhere else.
+        vehicles: vehicleList().map((vehicle) => {
+          if (vehicle.occupant !== undefined) return vehicle
+          const { occupant: _occupant, ...withoutOccupant } = vehicle
+          return withoutOccupant
+        }),
+        mountedVehicleId: mountedVehicleId ?? null,
+        end: {
+          frames: [...endPortalFrames.values()],
+          portalComplete: endPortalComplete,
+          dragon: endDragonSnapshot(),
+          exitPortalMaterialized,
+          dragonEggRewarded,
+        },
+        workstations: {
+          enchantmentSeed,
+          customNames: Object.fromEntries(customNames),
+          enchantedItems: Object.fromEntries(
+            [...enchantedItems].map(([slot, item]) => [slot, JSON.stringify(item)]),
+          ),
+          // `SessionStateSchema`'s `deathDropDimension` is `optionalWith(...,
+          // { exact: true })`: it requires the key to be OMITTED, not merely
+          // `undefined`-valued, or mc-save's integrity checksum rejects the
+          // encoded save (a present `undefined` key is not one of canonicalize's
+          // supported value kinds). `deathDropDimension` here is `undefined`
+          // whenever no death is pending, which is most saves, so this must be
+          // conditional rather than a bare shorthand property.
+          ...(deathDropDimension === undefined ? {} : { deathDropDimension }),
+          respawn: respawnLocation,
+        },
+      }
+    }))),
     publish: ({ state, chunks }) =>
       runStorage(
         Effect.provide(
@@ -1533,7 +1548,7 @@ const bootGame = async (
 
   const redstoneContainerRuntime = makeRedstoneContainerRuntime({
     dimensionContexts,
-    world,
+    world: { inventory: world.inventory, entities: ownerBacked.entityManager },
     writeBlocks: writeBlocksThroughPort,
     leverStates,
     comparatorModes,
@@ -1829,21 +1844,8 @@ const bootGame = async (
   const alignActiveDimension = (dimension: Dimension): boolean => {
     if (currentChunkContext.dimension === dimension) return false
     Effect.runSync(retainDimensionResidents(currentChunkContext))
-    entityRosters.set(
-      currentChunkContext.dimension,
-      rosterWithDroppedItemLifetimes(
-        currentChunkContext.dimension,
-        Effect.runSync(world.entities.snapshot),
-      ),
-    )
-    Effect.runSync(
-      world.entities.restore(
-        (entityRosters.get(dimension) ?? EMPTY_ENTITY_ROSTER) as Parameters<
-          typeof world.entities.restore
-        >[0],
-      ),
-    )
-    entityRosters.set(dimension, Effect.runSync(world.entities.snapshot))
+    // The entities owner holds every dimension and the entities view shows the
+    // player's current one, so no roster is swapped here.
     currentChunkContext = getOrCreateDimensionChunkContext(dimension)
     Effect.runSync(clearRenderedChunks(worldRenderer))
     redstoneDirty = true
@@ -2334,6 +2336,7 @@ const bootGame = async (
       set lastPlayerMoveSent(value) { lastPlayerMoveSent = value },
     },
     services: {
+      deferToFrameBoundary,
       world,
       gameplayState,
       playerApi,
@@ -2386,11 +2389,10 @@ const bootGame = async (
 
   const services = makeHostServiceContext({
     time,
-    player: playerApi,
+    player: ownerBacked.stagePlayer,
     crops,
-    inventory: world.inventory,
     vehicles: vehicleService,
-    entities: world.entities,
+    entities: ownerBacked.entityManager,
     chunkStore: currentChunkStore,
     worldWrite: hostWorldWrite.port,
     inputContext: adapters.inputContext,
@@ -2435,6 +2437,7 @@ const bootGame = async (
         },
         getVehicleControls: () => vehicleControls,
         multiplayer,
+        isCreativeMode,
       }),
       (modules) => composeGame(modules),
     ),
@@ -2567,30 +2570,35 @@ const bootGame = async (
     if (open && document.pointerLockElement === canvas) document.exitPointerLock()
   }
 
+  // The trade screen renders from the trades owner, so the click is handled at
+  // the frame boundary.
   tradeParent.addEventListener('click', (event) => {
     if (!(event.target instanceof Element)) return
     if (event.target.closest('[data-trade-close]') !== null) {
-      setTradeOpen(false)
+      deferToFrameBoundary(() => setTradeOpen(false))
       return
     }
     const button = event.target.closest<HTMLElement>('[data-trade-offer-id]')
     const offerId = button?.dataset['tradeOfferId']
-    if (activeVillagerId === undefined || offerId === undefined) return
-    if (multiplayer !== undefined && multiplayerHandshakeComplete) {
-      if (sendVillagerTradeCommand(activeVillagerId, offerId)) {
-        tradeStatus = 'Trading...'
-        renderTradeUi()
+    if (offerId === undefined) return
+    deferToFrameBoundary(() => {
+      if (activeVillagerId === undefined) return
+      if (multiplayer !== undefined && multiplayerHandshakeComplete) {
+        if (sendVillagerTradeCommand(activeVillagerId, offerId)) {
+          tradeStatus = 'Trading...'
+          renderTradeUi()
+        }
+        return
       }
-      return
-    }
-    nextVillagerTradeRequestId += 1
-    Effect.runSync(requestVillagerTrade(gameplayState, {
-      requestId: `villager-trade-${String(nextVillagerTradeRequestId)}`,
-      villagerId: activeVillagerId,
-      offerId,
-    }))
-    tradeStatus = 'Trading...'
-    renderTradeUi()
+      nextVillagerTradeRequestId += 1
+      Effect.runSync(requestVillagerTrade(gameplayState, {
+        requestId: `villager-trade-${String(nextVillagerTradeRequestId)}`,
+        villagerId: activeVillagerId,
+        offerId,
+      }))
+      tradeStatus = 'Trading...'
+      renderTradeUi()
+    })
   })
 
   const brewingBottleFromItem = (item: string): BrewingBottle | undefined => {
@@ -2668,113 +2676,119 @@ const bootGame = async (
     if (open && document.pointerLockElement === canvas) document.exitPointerLock()
   }
 
+  // The brewing actions read and write the inventory and brewing owners and act
+  // on the results, so the whole action runs at the frame boundary.
   brewingParent.addEventListener('click', (event) => {
     if (!(event.target instanceof Element)) return
     const action = event.target.closest<HTMLElement>('[data-brewing-action]')
       ?.dataset['brewingAction']
     if (action === undefined) return
-    if (action === 'close') {
-      setBrewingOpen(false)
-      return
-    }
-    if (action === 'insert') {
-      const selected = Effect.runSync(world.inventory.snapshot).slots[selectedHotbarIndex]
-      if (selected === undefined) {
-        brewingStatus = 'Select brewing fuel, a bottle, or an ingredient'
-        renderBrewingUi()
+    deferToFrameBoundary(() => {
+      // The frame can close the stand before this runs.
+      if (!brewingOpen) return
+      if (action === 'close') {
+        setBrewingOpen(false)
         return
       }
-      if (multiplayer !== undefined) {
-        if (requestBrewing({ _tag: 'insert', slot: selectedHotbarIndex })) {
-          brewingStatus = `Submitting ${selected.item}...`
-        } else {
-          brewingStatus = 'Brewing action is unavailable'
+      if (action === 'insert') {
+        const selected = Effect.runSync(world.inventory.snapshot).slots[selectedHotbarIndex]
+        if (selected === undefined) {
+          brewingStatus = 'Select brewing fuel, a bottle, or an ingredient'
+          renderBrewingUi()
+          return
         }
-        renderBrewingUi()
-        return
-      }
-      const bottle = brewingBottleFromItem(selected.item)
-      const ingredients: ReadonlySet<string> = new Set([
-        'nether_wart', 'sugar', 'spider_eye', 'ghast_tear',
-      ])
-      if (selected.item !== 'blaze_powder' && bottle === undefined && !ingredients.has(selected.item)) {
-        brewingStatus = 'That item cannot be used for brewing'
-        renderBrewingUi()
-        return
-      }
-      const removal = Effect.runSync(
-        world.inventory.removeAt(selectedHotbarIndex, selected.item, 1),
-      )
-      if (removal._tag !== 'Removed' || removal.removed !== 1) {
-        brewingStatus = 'The selected item is no longer available'
-        renderBrewingUi()
-        return
-      }
-      const result = selected.item === 'blaze_powder'
-        ? Effect.runSync(insertBrewingFuel(gameplayState))
-        : bottle !== undefined
-          ? Effect.runSync(insertBrewingBottle(gameplayState, bottle))
-          : Effect.runSync(insertBrewingIngredient(gameplayState, selected.item as BrewingIngredient))
-      if (result._tag === 'Rejected') {
-        const leftover = Effect.runSync(world.inventory.add(selected.item, 1))
-        if (leftover !== 0) throw new Error('Failed to restore rejected brewing item')
-        brewingStatus = `Cannot insert item: ${result.reason}`
-      } else {
-        brewingStatus = `Inserted ${selected.item}`
-        markSessionDirty()
-      }
-      renderBrewingUi()
-      renderPlayerUi()
-      return
-    }
-    if (action === 'collect') {
-      if (multiplayer !== undefined) {
-        if (requestBrewing({ _tag: 'collect' })) {
-          brewingStatus = 'Collecting bottle...'
-        } else {
-          brewingStatus = 'Brewing action is unavailable'
+        if (multiplayer !== undefined) {
+          if (requestBrewing({ _tag: 'insert', slot: selectedHotbarIndex })) {
+            brewingStatus = `Submitting ${selected.item}...`
+          } else {
+            brewingStatus = 'Brewing action is unavailable'
+          }
+          renderBrewingUi()
+          return
         }
-        renderBrewingUi()
-        return
-      }
-      const result = Effect.runSync(collectBrewingPotion(gameplayState))
-      if (result._tag === 'Rejected') {
-        brewingStatus = `Cannot collect bottle: ${result.reason}`
-      } else {
-        const leftover = Effect.runSync(world.inventory.add(result.returned.item, 1))
-        if (leftover === 0) {
-          brewingStatus = `Collected ${result.returned.item}`
+        const bottle = brewingBottleFromItem(selected.item)
+        const ingredients: ReadonlySet<string> = new Set([
+          'nether_wart', 'sugar', 'spider_eye', 'ghast_tear',
+        ])
+        if (selected.item !== 'blaze_powder' && bottle === undefined && !ingredients.has(selected.item)) {
+          brewingStatus = 'That item cannot be used for brewing'
+          renderBrewingUi()
+          return
+        }
+        const removal = Effect.runSync(
+          world.inventory.removeAt(selectedHotbarIndex, selected.item, 1),
+        )
+        if (removal._tag !== 'Removed' || removal.removed !== 1) {
+          brewingStatus = 'The selected item is no longer available'
+          renderBrewingUi()
+          return
+        }
+        const result = selected.item === 'blaze_powder'
+          ? Effect.runSync(insertBrewingFuel(gameplayState))
+          : bottle !== undefined
+            ? Effect.runSync(insertBrewingBottle(gameplayState, bottle))
+            : Effect.runSync(insertBrewingIngredient(gameplayState, selected.item as BrewingIngredient))
+        if (result._tag === 'Rejected') {
+          const leftover = Effect.runSync(world.inventory.add(selected.item, 1))
+          if (leftover !== 0) throw new Error('Failed to restore rejected brewing item')
+          brewingStatus = `Cannot insert item: ${result.reason}`
+        } else {
+          brewingStatus = `Inserted ${selected.item}`
           markSessionDirty()
-        } else {
-          const bottle = brewingBottleFromItem(result.returned.item)
-          if (bottle === undefined) throw new Error('Collected an invalid brewing bottle')
-          const restored = Effect.runSync(insertBrewingBottle(gameplayState, bottle))
-          if (restored._tag !== 'Accepted') throw new Error('Failed to restore uncollected potion')
-          brewingStatus = 'Inventory is full'
-        }
-      }
-      renderBrewingUi()
-      renderPlayerUi()
-      return
-    }
-    if (action === 'drink') {
-      if (multiplayer !== undefined) {
-        if (requestBrewing({ _tag: 'drink' })) {
-          brewingStatus = 'Drinking potion...'
-        } else {
-          brewingStatus = 'Brewing action is unavailable'
         }
         renderBrewingUi()
+        renderPlayerUi()
         return
       }
-      const result = Effect.runSync(useBrewingPotion(gameplayState))
-      brewingStatus = result._tag === 'Consumed'
-        ? `Drank ${result.consumed.item}`
-        : `Cannot drink bottle: ${result.reason}`
-      if (result._tag === 'Consumed') markSessionDirty()
-      renderBrewingUi()
-      renderPlayerUi()
-    }
+      if (action === 'collect') {
+        if (multiplayer !== undefined) {
+          if (requestBrewing({ _tag: 'collect' })) {
+            brewingStatus = 'Collecting bottle...'
+          } else {
+            brewingStatus = 'Brewing action is unavailable'
+          }
+          renderBrewingUi()
+          return
+        }
+        const result = Effect.runSync(collectBrewingPotion(gameplayState))
+        if (result._tag === 'Rejected') {
+          brewingStatus = `Cannot collect bottle: ${result.reason}`
+        } else {
+          const leftover = Effect.runSync(world.inventory.add(result.returned.item, 1))
+          if (leftover === 0) {
+            brewingStatus = `Collected ${result.returned.item}`
+            markSessionDirty()
+          } else {
+            const bottle = brewingBottleFromItem(result.returned.item)
+            if (bottle === undefined) throw new Error('Collected an invalid brewing bottle')
+            const restored = Effect.runSync(insertBrewingBottle(gameplayState, bottle))
+            if (restored._tag !== 'Accepted') throw new Error('Failed to restore uncollected potion')
+            brewingStatus = 'Inventory is full'
+          }
+        }
+        renderBrewingUi()
+        renderPlayerUi()
+        return
+      }
+      if (action === 'drink') {
+        if (multiplayer !== undefined) {
+          if (requestBrewing({ _tag: 'drink' })) {
+            brewingStatus = 'Drinking potion...'
+          } else {
+            brewingStatus = 'Brewing action is unavailable'
+          }
+          renderBrewingUi()
+          return
+        }
+        const result = Effect.runSync(useBrewingPotion(gameplayState))
+        brewingStatus = result._tag === 'Consumed'
+          ? `Drank ${result.consumed.item}`
+          : `Cannot drink bottle: ${result.reason}`
+        if (result._tag === 'Consumed') markSessionDirty()
+        renderBrewingUi()
+        renderPlayerUi()
+      }
+    })
   })
 
   let selectedHotbarIndex = 0
@@ -2810,6 +2824,7 @@ const bootGame = async (
   let chestSelected: ChestStorageSlotTarget | undefined
   let chestStatus = ''
   const inventoryRuntime = createPlayerUiRuntime({
+    deferToFrameBoundary,
     document,
     window,
     canvas,
@@ -2857,7 +2872,7 @@ const bootGame = async (
     writeBlocks: writeBlocksThroughPort,
     resolveExplosionEffects: (effects) => {
       for (const effect of effects) {
-        Effect.runSync(resolveBowHits(world.entities, [{
+        Effect.runSync(resolveBowHits(ownerBacked.entityManager, [{
           id: SimEntityId(effect.id),
           damage: effect.damage,
         }]))
@@ -3019,7 +3034,7 @@ const bootGame = async (
     customNames,
     enchantedItems,
     getFramesTotal: () => framesTotal,
-    spawnDroppedItems: (drops) => Effect.runSync(spawnDroppedItems(world.entities, drops)),
+    spawnDroppedItems: (drops) => Effect.runSync(spawnDroppedItems(ownerBacked.entityManager, drops)),
     getPlayerDimension: () => Effect.runSync(world.player.dimension),
     droppedItemMetadataKey,
     droppedItemMetadata,
@@ -3063,7 +3078,7 @@ const bootGame = async (
         presentSwimmingState()
       },
       respawnVitals: () => {
-        if (multiplayer === undefined) survivalHunger.respawn()
+        if (multiplayer === undefined) Effect.runSync(gameplayState.survivalHunger.respawn)
         else sendVitalsCommand('respawn')
       },
       clearGameplayDeathState: () => {
@@ -3151,6 +3166,7 @@ const bootGame = async (
   })
 
   const handlePauseRequest = installPauseControls({
+    deferToFrameBoundary,
     document,
     window,
     canvas,
@@ -3291,7 +3307,7 @@ const bootGame = async (
       endDragonPosition,
       vehicleList,
       nearestVillagerForTrade,
-      survivalHunger,
+      survivalHunger: gameplayState.survivalHunger,
       setTradeOpen,
       setBrewingOpen,
       setInventoryOpen,
@@ -3348,6 +3364,9 @@ const bootGame = async (
         qaTeardowns.push(dispose)
       },
       getStopBrowserPreview: () => stopBrowserPreview,
+      atFrameBoundary: (run) => Effect.runPromise(
+        frameBoundary.atFrameBoundary(Effect.try({ try: run, catch: (error) => error })),
+      ),
     },
   }, failBoot)
   if (!qaInstalled) return
@@ -3447,8 +3466,9 @@ const bootGame = async (
       syncRedstoneSnapshot: () => syncRedstoneSnapshot(currentChunkContext),
       currentChunkContext: () => currentChunkContext,
       world,
+      entityManager: ownerBacked.entityManager,
       isCreativeMode,
-      survivalHunger,
+      survivalHunger: gameplayState.survivalHunger,
       playerIsDead,
       handleLocalPlayerDeath,
       markSessionDirty,
@@ -3717,7 +3737,10 @@ const bootGame = async (
     // handler and awaits it before taking the next frame, so the coordinator
     // commits of one frame complete before the next frame starts. A typed
     // failure reaches the preview's frame-failure path, which stops the loop.
-    return Effect.gen(function* () {
+    //
+    // The frame holds the frame lock throughout and first runs the writes queued
+    // since the previous frame (see `frameBoundary`).
+    return frameBoundary.frame(Effect.gen(function* () {
       const nowSecs = readNow()
       const frameInput = yield* inputApi.snapshot
       yield* Effect.gen(function* () {
@@ -3744,32 +3767,39 @@ const bootGame = async (
           ambient: null,
         })
       }).pipe(Effect.ensuring(inputApi.endFrame(frameInput)))
-    })
+    }))
   })()
 
   const preview = Effect.runSync(makeBrowserPreview({
     container: gameShell,
     canvas,
     startRuntime: (surface) => Effect.sync(() => {
+      // A hidden tab runs no frames, so this pump drains the frame-boundary
+      // queue itself, under the frame lock, after queueing its own network work.
       const hiddenNetworkPump = window.setInterval(() => {
-        if (
-          document.visibilityState !== 'hidden'
-          || multiplayerInboundStage === undefined
-          || multiplayerOutboundStage === undefined
-        ) return
-        Effect.runSync(multiplayerInboundStage.run(DeltaTimeSecs(0)).pipe(Effect.provide(BrowserClockLayer)))
-        drainMultiplayerInbound()
-        drainCraftingInbound()
-        drainBrewingInbound()
-        drainAnvilInbound()
-        drainEnchantingInbound()
-        drainPlayerDamageInbound()
-        // The hidden-tab pump runs outside the frame runner, so a failed entity
-        // sync is reported here like a failed screenshot capture.
-        const synced = Effect.runSync(Effect.result(syncRenderedEntities()))
-        if (Result.isFailure(synced)) console.error('[mc-compose] hidden-tab entity sync failed', synced.failure)
-        enqueueMultiplayerPlayerMove(performance.now() / 1_000)
-        Effect.runSync(multiplayerOutboundStage.run(DeltaTimeSecs(0)).pipe(Effect.provide(BrowserClockLayer)))
+        if (document.visibilityState !== 'hidden') return
+        if (multiplayerInboundStage !== undefined && multiplayerOutboundStage !== undefined) {
+          frameBoundary.enqueue(Effect.gen(function* () {
+            yield* multiplayerInboundStage.run(DeltaTimeSecs(0)).pipe(Effect.provide(BrowserClockLayer))
+            drainMultiplayerInbound()
+            drainCraftingInbound()
+            drainBrewingInbound()
+            drainAnvilInbound()
+            drainEnchantingInbound()
+            drainPlayerDamageInbound()
+            // The hidden-tab pump runs outside the frame runner, so a failed entity
+            // sync is reported here like a failed screenshot capture.
+            const synced = yield* Effect.result(syncRenderedEntities())
+            if (Result.isFailure(synced)) console.error('[mc-compose] hidden-tab entity sync failed', synced.failure)
+            enqueueMultiplayerPlayerMove(performance.now() / 1_000)
+            yield* multiplayerOutboundStage.run(DeltaTimeSecs(0)).pipe(Effect.provide(BrowserClockLayer))
+          }))
+        }
+        Effect.runFork(frameBoundary.drainOutsideFrame.pipe(Effect.catchCause((cause) => Effect.sync(() => {
+          // The same outcome as a failed frame: report it and stop the loop.
+          failBoot('a queued world write defected', Cause.squash(cause))
+          void stopBrowserPreview?.()
+        }))))
       }, 100)
       surface.onCleanup(() => {
         window.clearInterval(hiddenNetworkPump)

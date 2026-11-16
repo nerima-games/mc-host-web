@@ -185,7 +185,14 @@ export class FakeElement {
   }
 }
 
-export const createPlayerUiRuntimeHarness = (overrides: Partial<HarnessContext> = {}): PlayerUiRuntimeHarness => {
+/**
+ * Builds the runtime over fakes. `overrides` replaces context members; by
+ * default deferred work runs at once, since most tests drive the listeners'
+ * logic rather than the frame-boundary routing.
+ */
+export const createPlayerUiRuntimeHarness = (
+  overrides: Partial<HarnessContext> = {},
+): PlayerUiRuntimeHarness => {
   const state = {
     inventoryOpen: false,
     inventoryMode: 'player' as InventoryMode,
@@ -255,6 +262,7 @@ export const createPlayerUiRuntimeHarness = (overrides: Partial<HarnessContext> 
     craft: () => Effect.succeed({ _tag: 'NoMatch' }),
   }
   const context: HarnessContext = {
+    deferToFrameBoundary: (work) => work(),
     document: document as unknown as Document,
     window,
     canvas,

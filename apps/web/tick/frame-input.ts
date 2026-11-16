@@ -62,21 +62,9 @@ export const runTickFrameInput = (
   }
 
   const walk = frameInput
-  const healthBeforeHungerTick = Effect.runSync(context.world.vitals.view).healthPoints
-  const hungerOutcome = context.isCreativeMode || context.multiplayer !== undefined
-    ? undefined
-    : context.survivalHunger.tick(timing.deltaSecs)
-  if (healthBeforeHungerTick > 0 && context.playerIsDead() && context.multiplayer === undefined) {
-    context.handleLocalPlayerDeath()
-  }
-  if (
-    hungerOutcome !== undefined && (
-      hungerOutcome.exhaustionAdded > 0 ||
-      hungerOutcome.foodTicks > 0 ||
-      hungerOutcome.regeneratedHealth > 0 ||
-      hungerOutcome.starvationDamage > 0
-    )
-  ) context.markSessionDirty()
+  // Hunger is ticked by mx-gameplay's survival-hunger stage inside the frame
+  // (I4); its starvation death and save marking are handled after `runFrame`
+  // in `runTickPlayerMovement`.
   state.simulationElapsedSecs.set(state.simulationElapsedSecs.get() + timing.deltaSecs)
 
   const dead = context.playerIsDead()
@@ -131,7 +119,7 @@ export const runTickFrameInput = (
     !dead && !state.inventoryOpen.get() && !state.tradeOpen.get() && !state.brewingOpen.get()
     && (Effect.runSync(inputApi.wasActionJustTriggered('attack')) || queuedNativeAttack)
   if (attackTriggered && !context.isCreativeMode) {
-    if (context.multiplayer === undefined) context.survivalHunger.submit({ _tag: 'attack', count: 1 })
+    if (context.multiplayer === undefined) Effect.runSync(context.survivalHunger.submit({ _tag: 'attack', count: 1 }))
     else context.sendVitalsCommand({ _tag: 'activity', activity: 'attack', amount: 1 })
   }
   const attackHeld = held('attack') > 0 || queuedNativeAttack

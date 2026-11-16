@@ -6,7 +6,6 @@ import {
   type CraftResult,
   type InventoryCarriedSlot,
   type InventoryClickResult,
-  type InventoryServiceApi,
   type ItemStack,
   type ItemStackFailure,
   type PlayerStorageFailure,
@@ -14,11 +13,22 @@ import {
   type Slot,
 } from '@nerima-games/mc-sim'
 
-export type InventoryInteractionError = ItemStackFailure | PlayerStorageFailure
+import type {
+  OwnerBackedInventory,
+  OwnerBackedInventorySyncError,
+  OwnerBackedInventoryWriteError,
+} from './owner-backed-services'
 
-/** The part of mc-sim's `InventoryServiceApi` the interaction controller calls. */
+export type InventoryInteractionError = ItemStackFailure | PlayerStorageFailure | OwnerBackedInventoryWriteError
+
+type InventoryInteractionReadError = ItemStackFailure | OwnerBackedInventorySyncError
+
+/**
+ * The part of the inventory the interaction controller calls, as the
+ * owner-backed view types it (mc-sim's `InventoryServiceApi` also fits).
+ */
 export type InventoryInteractionInventory = Pick<
-  InventoryServiceApi,
+  OwnerBackedInventory,
   'click' | 'snapshot' | 'previewCraft' | 'craft'
 >
 
@@ -39,7 +49,7 @@ export type InventoryInteractionController = {
   ) => InventoryInteractionState
   readonly pickupInventoryItem: (
     inventoryIndex: number,
-  ) => Effect.Effect<InventoryInteractionState, ItemStackFailure>
+  ) => Effect.Effect<InventoryInteractionState, InventoryInteractionReadError>
   readonly clickInventoryItem: (
     inventoryIndex: number,
     button: 'left' | 'right',
@@ -243,7 +253,7 @@ export const createInventoryInteraction = (
 
   const pickupInventoryItem = (
     inventoryIndex: number,
-  ): Effect.Effect<InventoryInteractionState, ItemStackFailure> =>
+  ): Effect.Effect<InventoryInteractionState, InventoryInteractionReadError> =>
     Effect.flatMap(service.snapshot, (inventory) => {
       if (crafting) return Effect.succeed(state())
       const selected = inventory.slots[inventoryIndex]

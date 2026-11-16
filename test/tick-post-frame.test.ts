@@ -38,7 +38,7 @@ import {
   launchRuntimeProjectile,
   recoverProjectile,
 } from '../apps/web/projectile-runtime'
-import { makeSurvivalHungerCoordinator } from '../apps/web/survival-hunger-runtime'
+import { makeOwnerBackedHost } from '../apps/web/owner-backed-services'
 import { initialPlayerSwimmingRuntimeState } from '../apps/web/player-swimming-runtime'
 import { type DimensionChunkContext } from '../apps/web/chunk-streaming'
 import { mutableState, type H5aFrameInputResult, type H5aMovementResult } from '../apps/web/tick/h5a-context'
@@ -92,29 +92,45 @@ const isSwordItem = (
   item === 'wooden_sword' || item === 'stone_sword' || item === 'iron_sword' || item === 'diamond_sword'
 
 const makeContext = async (primaryAttackConsumed: ReturnType<typeof cell<boolean>>) => {
-  const world = await Effect.runPromise(gameplay.makeGeneratedWorld<MobBehaviour>({
+  const generated = await Effect.runPromise(gameplay.makeGeneratedWorld<MobBehaviour>({
     dimension: 'overworld',
     chunkSource: allAirChunkSource,
   }))
   const owners = await Effect.runPromise(Effect.fromResult(gameplay.gameplayOwnerRegistrations({
-    playerPose: Effect.runSync(world.player.pose),
+    playerPose: Effect.runSync(generated.player.pose),
     dimension: 'overworld',
-    playerStorage: Effect.runSync(world.inventory.storageSnapshot),
-    vitals: Effect.runSync(world.vitals.snapshot),
-    entities: Effect.runSync(world.entities.snapshot),
+    playerStorage: Effect.runSync(generated.inventory.storageSnapshot),
+    vitals: Effect.runSync(generated.vitals.snapshot),
+    entities: Effect.runSync(generated.entities.snapshot),
   })))
   const coordinator = await Effect.runPromise(makeWorldCommitCoordinator({
     world: WorldId('tick-post-frame-test'),
     owners,
     dimensions: ['overworld', 'nether', 'end'],
-    chunkStores: { forDimension: () => world.chunkStore },
+    chunkStores: { forDimension: () => generated.chunkStore },
   }))
+  // The host reaches the generated world's services only through the
+  // owner-backed views and adapters, as main.ts wires them.
+  const host = await Effect.runPromise(makeOwnerBackedHost({
+    coordinator,
+    world: generated,
+    ownerIds: {
+      player: gameplay.GAMEPLAY_PLAYER_OWNER_ID,
+      playerStorage: gameplay.GAMEPLAY_PLAYER_STORAGE_OWNER_ID,
+      vitals: gameplay.GAMEPLAY_VITALS_OWNER_ID,
+      entities: gameplay.GAMEPLAY_ENTITIES_OWNER_ID,
+    },
+  }))
+  const world = host.views
   const targeting = {
     coordinator,
     playerOwnerId: gameplay.GAMEPLAY_PLAYER_OWNER_ID,
     entitiesOwnerId: gameplay.GAMEPLAY_ENTITIES_OWNER_ID,
   }
-  const gameplayState = await Effect.runPromise(gameplay.makeGameplayFrameState)
+  const gameplayState = await Effect.runPromise(gameplay.makeGameplayFrameStateForOwner({
+    coordinator,
+    vitalsOwnerId: gameplay.GAMEPLAY_VITALS_OWNER_ID,
+  }))
   const simState = await Effect.runPromise(makeSimFrameState)
   const weatherService = await Effect.runPromise(makeWeatherService())
   const weatherBeforeFrame = Effect.runSync(weatherService.snapshot)
@@ -123,12 +139,12 @@ const makeContext = async (primaryAttackConsumed: ReturnType<typeof cell<boolean
     dimension: Effect.succeed('nether'),
   }
   const lighting = trackChunkLightColor((chunk, quads) =>
-    makeChunkStoreLightColor(world.worldgenChunkStore, chunk, quads),
+    makeChunkStoreLightColor(generated.worldgenChunkStore, chunk, quads),
   )
   const currentChunkContext: DimensionChunkContext = {
     dimension: 'overworld',
-    chunkStore: world.chunkStore,
-    worldgenChunkStore: world.worldgenChunkStore,
+    chunkStore: generated.chunkStore,
+    worldgenChunkStore: generated.worldgenChunkStore,
     renderAttachment: {
       update: Effect.succeed(EMPTY_SYNC_REPORT),
       drainFaults: Effect.succeed([]),
@@ -151,20 +167,18 @@ const makeContext = async (primaryAttackConsumed: ReturnType<typeof cell<boolean
 
   const h5a = {
     world,
+    entityManager: host.entityManager,
     targeting,
     playerApi,
     simState,
     currentChunkContext: () => currentChunkContext,
-    currentChunkStore: world.chunkStore,
+    currentChunkStore: generated.chunkStore,
     blockPosition: (x, y, z) => blockPosition(BlockAxis(x), BlockAxis(y), BlockAxis(z)),
     blockTypeOfId,
     gameplayState,
     multiplayer: undefined,
     isCreativeMode: false,
-    survivalHunger: makeSurvivalHungerCoordinator({
-      snapshot: world.vitals.snapshot,
-      restore: world.vitals.restore,
-    }),
+    survivalHunger: gameplayState.survivalHunger,
     playerIsDead: () => false,
     setInventoryOpen: (open) => { inventoryOpenEvents.push(open) },
     markSessionDirty: () => { sessionDirtyCount += 1 },
@@ -324,6 +338,7 @@ const makeContext = async (primaryAttackConsumed: ReturnType<typeof cell<boolean
 
   return {
     context,
+    generated,
     input,
     movement,
     environmentalContactDamageState,
@@ -407,7 +422,7 @@ describe('tick post-frame processing', () => {
       (count, stack) => count + (stack?.item === 'apple' ? stack.count : 0),
       0,
     )
-    const spawned = Effect.runSync(gameplay.spawnDroppedItems(world.entities, [{
+    const spawned = Effect.runSync(gameplay.spawnDroppedItems(harness.context.h5a.entityManager, [{
       item: 'apple',
       count: 2,
       at: position,
@@ -777,10 +792,9 @@ describe('tick post-frame processing', () => {
 
   it('queues a crop harvest before changing its block', async () => {
     const harness = await makeContext(cell(false))
-    const world = harness.context.h5a.world
     const at = blockPosition(BlockAxis(0), BlockAxis(64), BlockAxis(1))
-    Effect.runSync(world.chunkStore.load(chunkCoord(ChunkAxis(0), ChunkAxis(0))))
-    Effect.runSync(world.chunkStore.setBlock(at, Option.getOrThrow(blockIdOf('potato_crop'))))
+    Effect.runSync(harness.generated.chunkStore.load(chunkCoord(ChunkAxis(0), ChunkAxis(0))))
+    Effect.runSync(harness.generated.chunkStore.setBlock(at, Option.getOrThrow(blockIdOf('potato_crop'))))
     const harvestRequests = new Map<string, Parameters<H5bPostFrameContext['pendingItemUses']['set']>[1]>()
     const context: H5bPostFrameContext = {
       ...inOverworld(harness.context),
@@ -800,7 +814,7 @@ describe('tick post-frame processing', () => {
       framesTotal: 5,
     })
 
-    expect(Effect.runSync(world.chunkStore.getBlock(at))).toMatchObject({ _tag: 'Block', block: Option.getOrThrow(blockIdOf('potato_crop')) })
+    expect(Effect.runSync(harness.generated.chunkStore.getBlock(at))).toMatchObject({ _tag: 'Block', block: Option.getOrThrow(blockIdOf('potato_crop')) })
     expect(harvestRequests.get('item-use-1')).toMatchObject({ kind: 'harvest', dimension: 'overworld', position: at })
     expect(context.state.blockBreakCounters.get().completed).toBe(0)
     expect(context.pendingBlockBreakConfirmations).toHaveLength(1)
@@ -812,11 +826,10 @@ describe('tick post-frame processing', () => {
 
   it('retains a retried harvest confirmation until the committed block is air', async () => {
     const harness = await makeContext(cell(false))
-    const world = harness.context.h5a.world
     const at = blockPosition(BlockAxis(0), BlockAxis(64), BlockAxis(1))
     const crop = Option.getOrThrow(blockIdOf('potato_crop'))
-    Effect.runSync(world.chunkStore.load(chunkCoord(ChunkAxis(0), ChunkAxis(0))))
-    Effect.runSync(world.chunkStore.setBlock(at, crop))
+    Effect.runSync(harness.generated.chunkStore.load(chunkCoord(ChunkAxis(0), ChunkAxis(0))))
+    Effect.runSync(harness.generated.chunkStore.setBlock(at, crop))
     const context: H5bPostFrameContext = {
       ...inOverworld(harness.context),
       dimensionContexts: new Map([['overworld', harness.context.h5a.currentChunkContext()]]),
@@ -830,9 +843,9 @@ describe('tick post-frame processing', () => {
 
     expect(context.pendingBlockBreakConfirmations).toHaveLength(1)
     expect(context.state.blockBreakCounters.get().completed).toBe(0)
-    expect(Effect.runSync(world.chunkStore.getBlock(at))).toMatchObject({ _tag: 'Block', block: crop })
+    expect(Effect.runSync(harness.generated.chunkStore.getBlock(at))).toMatchObject({ _tag: 'Block', block: crop })
     Effect.runSync(Ref.set(context.h5a.gameplayState.pendingItemUses, []))
-    Effect.runSync(world.chunkStore.setBlock(at, Option.getOrThrow(blockIdOf('air'))))
+    Effect.runSync(harness.generated.chunkStore.setBlock(at, Option.getOrThrow(blockIdOf('air'))))
 
     runTickPostFrame(context, frame)
     runTickPostFrame(context, frame)
@@ -844,12 +857,11 @@ describe('tick post-frame processing', () => {
 
   it('records and completes a fixed creative block-break request', async () => {
     const harness = await makeContext(cell(false))
-    const world = harness.context.h5a.world
     const position = blockPosition(BlockAxis(0), BlockAxis(64), BlockAxis(1))
-    await Effect.runPromise(world.worldgenChunkStore.load(chunkCoord(ChunkAxis(0), ChunkAxis(0))))
-    await Effect.runPromise(world.chunkStore.load(chunkCoord(ChunkAxis(0), ChunkAxis(0))))
-    await Effect.runPromise(world.worldgenChunkStore.setBlock(position, Option.getOrThrow(blockIdOf('stone'))))
-    await Effect.runPromise(world.chunkStore.setBlock(position, Option.getOrThrow(blockIdOf('stone'))))
+    await Effect.runPromise(harness.generated.worldgenChunkStore.load(chunkCoord(ChunkAxis(0), ChunkAxis(0))))
+    await Effect.runPromise(harness.generated.chunkStore.load(chunkCoord(ChunkAxis(0), ChunkAxis(0))))
+    await Effect.runPromise(harness.generated.worldgenChunkStore.setBlock(position, Option.getOrThrow(blockIdOf('stone'))))
+    await Effect.runPromise(harness.generated.chunkStore.setBlock(position, Option.getOrThrow(blockIdOf('stone'))))
     const currentChunkContext = harness.context.h5a.currentChunkContext()
     const context: H5bPostFrameContext = {
       ...inOverworld(harness.context),
@@ -877,8 +889,8 @@ describe('tick post-frame processing', () => {
     expect(context.pendingBlockBreakConfirmations).toHaveLength(1)
     expect(context.h5a.state.redstoneDirty.get()).toBe(true)
 
-    await Effect.runPromise(world.worldgenChunkStore.setBlock(position, Option.getOrThrow(blockIdOf('air'))))
-    await Effect.runPromise(world.chunkStore.setBlock(position, Option.getOrThrow(blockIdOf('air'))))
+    await Effect.runPromise(harness.generated.worldgenChunkStore.setBlock(position, Option.getOrThrow(blockIdOf('air'))))
+    await Effect.runPromise(harness.generated.chunkStore.setBlock(position, Option.getOrThrow(blockIdOf('air'))))
     runTickPostFrame(context, {
       frame: { ...harness.input, attackTriggered: false, attackHeld: false },
       movement: inOverworldMovement(harness.movement),

@@ -96,6 +96,8 @@ describe('player inventory runtime', () => {
       craft: () => Effect.succeed({ _tag: 'NoMatch' }),
     }
     const context: PlayerUiRuntimeContext = {
+      // This test drives the listeners' logic; frame-boundary routing is covered elsewhere.
+      deferToFrameBoundary: (work) => work(),
       document: document as unknown as Document,
       window,
       canvas,
