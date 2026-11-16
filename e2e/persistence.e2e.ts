@@ -1,5 +1,7 @@
 import { expect, test, type ConsoleMessage, type Page } from '@playwright/test'
+import { isDroppedItemBehaviour } from '@nerima-games/mx-gameplay'
 
+import type { SessionHead } from '../apps/web/session-persistence'
 import { callQa, callQaWithFrames } from './helpers/qa'
 import { clearDatabase } from './helpers/database'
 import { startGameSession } from './helpers/session'
@@ -138,18 +140,6 @@ const sawSavedPersistenceWithFrames = (
     value: (globalThis as unknown as Record<string, boolean>)[key] === true,
   }), { key: SAVED_MARKER_KEY }) as Promise<{ frames: number; value: boolean }>
 
-const grantPointerLock = async (page: Page): Promise<void> => {
-  await page.evaluate(() => {
-    const gameCanvas = document.querySelector<HTMLCanvasElement>('#game-canvas')
-    if (gameCanvas === null) throw new Error('missing game canvas')
-    Object.defineProperty(document, 'pointerLockElement', {
-      configurable: true,
-      get: () => gameCanvas,
-    })
-    document.dispatchEvent(new Event('pointerlockchange'))
-  })
-}
-
 const seedGroundedMiningEncounter = async (page: Page): Promise<void> => {
   await callQa(page, 'gameplay.seedSmokeGroundingEncounter')
   await callQa(page, 'gameplay.setPose', STONE_BLOCK_ID)
@@ -248,29 +238,11 @@ test('retains death-drop custom name and enchantments through reload and pickup'
   expect(faults.consoleErrors).toEqual([])
 })
 
-// mx-gameplay 0.3.x added natural ecosystem spawning (mobSimulation gates all
-// mob logic, and the product wants it on; there is deliberately no
-// off-switch). The nether now spawns NETHER_HOSTILE_KINDS near the player on
-// a cadence, so a raw entity roster is no longer just what this test seeded.
-// A naturally spawned mob is wrapped the same way the rest of this codebase
-// wraps a `HostileMobSnapshot` (see `apps/web/session-persistence.ts`'s
-// `restoreHostileMobBehaviour` comment): `behaviour._tag === 'HostileMob'`
-// with a nested `behaviour.behaviour._tag === 'EcosystemMob'`. A seeded
-// creeper/dropped-item never carries that nested tag, so filtering on it
-// isolates exactly the entities this test is responsible for, regardless of
-// how many ecosystem mobs spawn around it.
-const isEcosystemSpawn = (entity: GameplaySnapshot['entities'][number]): boolean => {
-  const behaviour = entity.behaviour
-  if (typeof behaviour !== 'object' || behaviour === null) return false
-  const nested = (behaviour as Record<string, unknown>)['behaviour']
-  return typeof nested === 'object' && nested !== null
-    && (nested as Record<string, unknown>)['_tag'] === 'EcosystemMob'
-}
-
-const seededEntities = (
+// This fixture creates only death drops; natural hostile spawning remains enabled.
+const droppedEntities = (
   current: GameplaySnapshot,
 ): ReadonlyArray<GameplaySnapshot['entities'][number]> =>
-  current.entities.filter((entity) => !isEcosystemSpawn(entity))
+  current.entities.filter((entity) => entity.kind === 'dropped_item')
 
 test('isolates and restores entity rosters across dimensions and reload', async ({ page }) => {
   const faults = watchForFaults(page)
@@ -279,17 +251,23 @@ test('isolates and restores entity rosters across dimensions and reload', async 
   await startGameSession(page)
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
 
+  const serial = (id: string): number => {
+    const match = /(?<serial>\d+)$/u.exec(id)
+    if (match?.groups?.['serial'] === undefined) throw new Error(`entity id has no serial: ${id}`)
+    return Number(match.groups['serial'])
+  }
   const damageUntilNewDrop = async (
     existingEntityIds: ReadonlyArray<string>,
   ): Promise<GameplaySnapshot> => {
     const maximumAttempts = 10
     const dropState = async () => {
-      const entities = seededEntities(await snapshot(page))
+      const entities = droppedEntities(await snapshot(page))
       const ids = new Set(entities.map(({ id }) => id))
       return {
         count: entities.length,
         kinds: entities.map(({ kind }) => kind),
         retainedExistingIds: existingEntityIds.every((id) => ids.has(id)),
+        uniqueIds: ids.size === entities.length,
       }
     }
 
@@ -316,38 +294,38 @@ test('isolates and restores entity rosters across dimensions and reload', async 
         () => 'dropped_item',
       ),
       retainedExistingIds: true,
+      uniqueIds: true,
     })
-    return snapshot(page)
+    const current = await snapshot(page)
+    const newDrop = droppedEntities(current).find(({ id }) => !existingEntityIds.includes(id))
+    expect(newDrop?.kind).toBe('dropped_item')
+    if (newDrop === undefined || !isDroppedItemBehaviour(newDrop.behaviour)) {
+      throw new Error('new death drop has no dropped-item behaviour')
+    }
+    expect({ item: newDrop.behaviour.item, count: newDrop.behaviour.count }).toEqual({
+      item: 'potato', count: 2,
+    })
+    return current
   }
 
-  const canvas = page.locator('#game-canvas')
-  await canvas.hover()
-  await callQa(page, 'gameplay.seedMeleeDropEncounter')
-  const overworldCreeper = seededEntities(await snapshot(page))[0]
-  expect(overworldCreeper?.kind).toBe('creeper')
-  await grantPointerLock(page)
-  await page.mouse.down({ button: 'left' })
-  await page.waitForTimeout(250)
-  await page.mouse.up({ button: 'left' })
-  await expect.poll(async () => seededEntities(await snapshot(page)).map(({ kind }) => kind)).toEqual([
-    'dropped_item',
-  ])
-  const overworld = await snapshot(page)
-  const seededOverworld = seededEntities(overworld)
+  await callQa(page, 'gameplay.seedFoodUseEncounter')
+  // Keep the first drop away from the respawn point used to prepare the next dimension.
+  await callQa(page, 'gameplay.seedSmokeGroundingEncounter')
+  await expect(page.locator('#game-canvas')).toHaveAttribute('data-player-grounded', 'true')
+  const priorOverworldSerial = Math.max(-1, ...(await snapshot(page)).entities.map(({ id }) => serial(id)))
+  const overworld = await damageUntilNewDrop([])
+  const seededOverworld = droppedEntities(overworld)
   const overworldDrop = seededOverworld[0]
   expect(overworld.dimension).toBe('overworld')
-  expect(overworldDrop?.id).not.toBe(overworldCreeper?.id)
+  expect(serial(overworldDrop?.id ?? '')).toBeGreaterThan(priorOverworldSerial)
 
   await callQa(page, 'gameplay.seedFoodUseEncounter')
   await callQa(page, 'gameplay.enterNether')
   await expect.poll(async () => (await snapshot(page)).activeChunkDimension).toBe('nether')
-  // Only the SEEDED roster is asserted empty here — the property under test
-  // is that entering the nether does not leak the overworld's seeded
-  // entities in, not that the nether roster starts empty of everything (see
-  // `isEcosystemSpawn`'s comment: natural spawns are on by design).
-  expect(seededEntities(await snapshot(page))).toEqual([])
+  // Entering the nether must not carry the overworld's death drops with it.
+  expect(droppedEntities(await snapshot(page))).toEqual([])
   const nether = await damageUntilNewDrop([])
-  const seededNether = seededEntities(nether)
+  const seededNether = droppedEntities(nether)
   expect(seededNether).toHaveLength(1)
   expect(seededNether[0]?.kind).toBe('dropped_item')
   // NOT an id-string comparison against `overworldDrop`: ids are minted
@@ -357,22 +335,8 @@ test('isolates and restores entity rosters across dimensions and reload', async 
   // and once natural spawns can consume serials ahead of a seeded entity,
   // that coincidence is no longer rare enough to treat as a leak signal.
   // The leak property — that the overworld's seeded entities did not carry
-  // into the nether roster — is what the empty-`seededEntities` assertion
+  // into the nether roster — is what the empty-`droppedEntities` assertion
   // just above already proved, by roster membership rather than by id.
-
-  const serial = (id: string): number => {
-    const match = /(?<serial>\d+)$/u.exec(id)
-    if (match?.groups?.['serial'] === undefined) throw new Error(`entity id has no serial: ${id}`)
-    return Number(match.groups['serial'])
-  }
-  // Natural spawns mint from the SAME per-dimension serial counter as
-  // seeded entities (mc-sim's entity manager has one `spawn` per dimension
-  // roster), so a literal serial value is no longer meaningful once natural
-  // spawns can land before a seeded one. What the literal assertions this
-  // replaces actually protected — that id allocation is per-dimension and
-  // strictly increasing within a dimension's own lifetime, not that any
-  // particular value is minted next — is asserted directly instead.
-  expect(serial(overworldDrop?.id ?? '')).toBeGreaterThan(serial(overworldCreeper?.id ?? ''))
 
   await callQa(page, 'persistence.flush')
   await expect(page.locator('body')).toHaveAttribute('data-session-persistence', 'saved')
@@ -380,7 +344,7 @@ test('isolates and restores entity rosters across dimensions and reload', async 
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
   await expect.poll(async () => (await snapshot(page)).activeChunkDimension).toBe('nether')
   const restoredNether = await snapshot(page)
-  const seededRestoredNether = seededEntities(restoredNether)
+  const seededRestoredNether = droppedEntities(restoredNether)
   // Compares the SEEDED subset only: the ecosystem's own population keeps
   // evolving in real time (including across a reload's round trip), so
   // asserting the full roster is byte-identical would just be asserting how
@@ -395,11 +359,23 @@ test('isolates and restores entity rosters across dimensions and reload', async 
   await expect.poll(async () => (await snapshot(page)).activeChunkDimension).toBe('overworld')
   await callQa(page, 'gameplay.respawn')
   await expect.poll(async () => (await snapshot(page)).dead).toBe(false)
-  await callQa(page, 'gameplay.seedCraftingLog')
-  await callQa(page, 'gameplay.enterNether')
+  await callQa(page, 'gameplay.seedFoodUseEncounter')
+  // Queue travel and grounding together so the live player never stands on the first nether drop.
+  await page.evaluate(async () => {
+    const transport = window.__NERIMA_GAMES_QA__
+    if (transport === undefined) throw new Error('missing QA transport')
+    const results = await Promise.all([
+      transport.dispatch('gameplay', 'enterNether', null),
+      transport.dispatch('gameplay', 'seedSmokeGroundingEncounter', null),
+    ])
+    for (const result of results) {
+      if (result._tag === 'Failure') throw new Error(`QA command failed: ${JSON.stringify(result.error)}`)
+    }
+  })
   await expect.poll(async () => (await snapshot(page)).activeChunkDimension).toBe('nether')
+  await expect(page.locator('#game-canvas')).toHaveAttribute('data-player-grounded', 'true')
   const expandedNether = await damageUntilNewDrop(seededNether.map(({ id }) => id))
-  const seededExpandedNether = seededEntities(expandedNether)
+  const seededExpandedNether = droppedEntities(expandedNether)
   expect(seededExpandedNether).toHaveLength(2)
   const nextNether = seededExpandedNether.find(({ id }) => id !== seededNether[0]?.id)
   expect(serial(nextNether?.id ?? '')).toBeGreaterThan(serial(seededNether[0]?.id ?? ''))
@@ -407,7 +383,7 @@ test('isolates and restores entity rosters across dimensions and reload', async 
   await callQa(page, 'gameplay.enterOverworld')
   await expect.poll(async () => (await snapshot(page)).activeChunkDimension).toBe('overworld')
   const restoredOverworld = await snapshot(page)
-  const seededRestoredOverworld = seededEntities(restoredOverworld)
+  const seededRestoredOverworld = droppedEntities(restoredOverworld)
   expect(seededRestoredOverworld.map(({ id, kind }) => ({ id, kind }))).toEqual(
     seededOverworld.map(({ id, kind }) => ({ id, kind })),
   )
@@ -487,12 +463,56 @@ test('debounces dirty gameplay into a durable save without an explicit flush', a
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
 
   await seedGroundedMiningEncounter(page)
+  const durableEntityRoster = (value: GameplaySnapshot) => value.entities.map((entity) => ({
+    id: entity.id,
+    kind: entity.kind,
+    healthPoints: entity.healthPoints,
+  }))
+  const readPublishedHead = () => page.evaluate(async () => {
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open('nerima-games-minecraft')
+      request.addEventListener('success', () => resolve(request.result), { once: true })
+      request.addEventListener('error', () => reject(request.error), { once: true })
+    })
+    try {
+      const record = await new Promise<{
+        readonly seq: number
+        readonly envelope: { readonly payload: SessionHead }
+      } | undefined>((resolve, reject) => {
+        const request = database.transaction('saves', 'readonly').objectStore('saves')
+          .get('mc-compose/session/e2e/head')
+        request.addEventListener('success', () => resolve(request.result), { once: true })
+        request.addEventListener('error', () => reject(request.error), { once: true })
+      })
+      if (record === undefined) return undefined
+      return {
+        sequence: record.seq,
+        roster: record.envelope.payload.state.entities.overworld.entities.map(({ id, kind, healthPoints }) => ({
+          id, kind, healthPoints,
+        })),
+      }
+    } finally {
+      database.close()
+    }
+  })
+  const beforeMining = await readPublishedHead()
   expect(await callQa<unknown>(page, 'gameplay.breakTarget')).not.toBeNull()
   await expect.poll(async () => (await snapshot(page)).target.block).toBe(AIR_BLOCK_ID)
   await expect(page.locator('#game-canvas')).toHaveAttribute('data-player-grounded', 'true')
 
-  await expect(page.locator('body')).toHaveAttribute('data-session-persistence', 'saved')
+  await page.keyboard.press('Escape')
+  await expect(page.getByTestId('pause-overlay')).toBeVisible()
+  await expect(page.locator('body')).toHaveAttribute('data-session-paused', 'true')
   const published = await snapshot(page)
+  // A live frame can spawn a mob after a save completes; wait for the frozen roster's own publication.
+  await expect.poll(async () => {
+    const head = await readPublishedHead()
+    return {
+      newer: head !== undefined && (beforeMining === undefined || head.sequence > beforeMining.sequence),
+      roster: head?.roster,
+    }
+  }).toEqual({ newer: true, roster: durableEntityRoster(published) })
+  await expect(page.locator('body')).toHaveAttribute('data-session-persistence', 'saved')
 
   await page.reload()
   await expect(page).toHaveURL(/\?session=e2e$/u)
@@ -522,11 +542,6 @@ test('debounces dirty gameplay into a durable save without an explicit flush', a
       restockElapsedSecs: expect.any(Number),
     },
   })
-  const durableEntityRoster = (value: GameplaySnapshot) => value.entities.map((entity) => ({
-    id: entity.id,
-    kind: entity.kind,
-    healthPoints: entity.healthPoints,
-  }))
   expect(durableEntityRoster(restored)).toEqual(durableEntityRoster(published))
   expect(Math.abs(restored.weather.remainingSecs - published.weather.remainingSecs)).toBeLessThan(5)
   expect(restored.vitals.foodTimerSecs).toBeGreaterThanOrEqual(0)
