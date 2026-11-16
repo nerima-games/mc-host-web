@@ -7,6 +7,7 @@ import {
   ChunkAxis,
   chunkCoord,
   DeltaTimeSecs,
+  DimensionIdSchema,
   EpochMillis,
   FixedClockLayer,
   MonotonicTimeSecs,
@@ -47,10 +48,12 @@ import {
   GAMEPLAY_VILLAGER_TRADES_OWNER_ID,
   GAMEPLAY_VITALS_OWNER_ID,
   gameplayOwnerRegistrations,
+  drainBlockStateRuleResults,
   makeGameplayFrameStateForOwner,
   makeGeneratedWorld,
   requestStatusEffect,
   snapshotStatusEffects,
+  type GameplayBlockStateWorldApi,
   type GameplayOwnerInitialState,
   type MobBehaviour,
 } from '@nerima-games/mx-gameplay'
@@ -61,6 +64,7 @@ import {
   generatedChunkSource,
   makeChunkStore,
   NoiseSeed,
+  type ChunkStoreRegistryApi,
 } from '@nerima-games/mc-worldgen'
 import {
   makeHostServiceContext,
@@ -73,6 +77,7 @@ import {
 } from '../apps/web/host-modules'
 import { makeOwnerBackedHost } from '../apps/web/owner-backed-services'
 import { makeHostWorldWrite } from '../apps/web/world-write-port'
+import { makeHostGameplayBlockStateWorld } from '../apps/web/gameplay-block-state-world'
 
 // The browser twin of this list is e2e/smoke.e2e.ts #3b; both must change together.
 const SMOKE_STAGE_ORDER = [
@@ -94,6 +99,9 @@ const SMOKE_STAGE_ORDER = [
   'render:draw',
   'ui:hud-sync',
   'ui:overlay-sync',
+  // mx-gameplay 0.12.0 declares this stage only `after` interactions, so the
+  // planner places it last.
+  'gameplay:block-state-rules',
 ]
 
 // InputService and RedstoneWorldRuntime are built once into a Context, as
@@ -102,10 +110,11 @@ const SMOKE_STAGE_ORDER = [
 // over one coordinator, with the generated world's services behind the views.
 const makeHostWithInitial = (initial: GameplayOwnerInitialState) => Effect.gen(function* () {
   const chunkStore = yield* makeChunkStore(generatedChunkSource(NoiseSeed(1)), ChunkCapacity(16))
+  const chunkStores: ChunkStoreRegistryApi = { forDimension: () => chunkStore }
   const hostWorldWrite = yield* makeHostWorldWrite({
     world: yield* Schema.decodeEffect(WorldIdSchema)('host-modules-test'),
     owners: yield* Effect.fromResult(gameplayOwnerRegistrations(initial)),
-    chunkStores: { forDimension: () => chunkStore },
+    chunkStores,
   })
   const generated = yield* makeGeneratedWorld<MobBehaviour>({ dimension: 'overworld' })
   const owned = yield* makeOwnerBackedHost({
@@ -141,7 +150,24 @@ const makeHostWithInitial = (initial: GameplayOwnerInitialState) => Effect.gen(f
     brewingOwnerId: GAMEPLAY_BREWING_OWNER_ID,
     brewingService: yield* makeBrewingService(GAMEPLAY_BREWING_OWNER_ID),
   }
-  return { instances, owned, generated, hostWorldWrite, gameplayCommit, coordinator: hostWorldWrite.coordinator }
+  const gameplayBlockStateWorld = makeHostGameplayBlockStateWorld({
+    coordinator: hostWorldWrite.coordinator,
+    chunkStores,
+    dimensionIds: yield* Effect.all({
+      overworld: Schema.decodeEffect(DimensionIdSchema)('overworld'),
+      nether: Schema.decodeEffect(DimensionIdSchema)('nether'),
+      end: Schema.decodeEffect(DimensionIdSchema)('end'),
+    }),
+  })
+  return {
+    instances,
+    owned,
+    generated,
+    hostWorldWrite,
+    gameplayCommit,
+    gameplayBlockStateWorld,
+    coordinator: hostWorldWrite.coordinator,
+  }
 })
 
 const makeHost = makeHostWithInitial({})
@@ -149,7 +175,11 @@ const makeHost = makeHostWithInitial({})
 const makeInstances = Effect.map(makeHost, ({ instances }) => instances)
 
 const makeDeps = (
-  { instances, gameplayCommit }: { readonly instances: HostServiceInstances; readonly gameplayCommit: GameplayCommitServices },
+  { instances, gameplayCommit, gameplayBlockStateWorld }: {
+    readonly instances: HostServiceInstances
+    readonly gameplayCommit: GameplayCommitServices
+    readonly gameplayBlockStateWorld: GameplayBlockStateWorldApi
+  },
   chunkSync: ChunkSyncPort = NO_CHUNK_SYNC,
   simState?: SimFrameState,
 ) =>
@@ -166,6 +196,7 @@ const makeDeps = (
         vitalsOwnerId: GAMEPLAY_VITALS_OWNER_ID,
       }),
       gameplayCommit,
+      gameplayBlockStateWorld,
       isActiveDimension: () => true,
       poweredRails: new Set<string>(),
       leverKeyOf: (lever) =>
@@ -234,6 +265,42 @@ describe('host modules', () => {
       const saved = (yield* host.coordinator.snapshot(GAMEPLAY_CROPS_OWNER_ID, CropSnapshotSchema)).state
       expect(saved.crops).toHaveLength(1)
       expect(saved.crops[0]?.growthSecs).toBeCloseTo(120.15)
+    }))
+
+  it.effect('projects a crop stage onto its block state through the wired block-state world', () =>
+    Effect.gen(function* () {
+      // 480 s to maturity over 7 ages: one 0.05 s frame crosses age 1 at 68.57 s.
+      const cropPosition = { x: 1, y: 100, z: 2 }
+      const crops = yield* Schema.decodeUnknownEffect(CropSnapshotSchema)({
+        crops: [{ dimension: 'overworld', position: cropPosition, crop: 'potato_crop', growthSecs: 68.56 }],
+      })
+      const host = yield* makeHostWithInitial({ crops })
+      const { chunkStore } = host.instances
+      const potato = Option.getOrThrow(blockIdOf('potato_crop'))
+      const at = blockPosition(BlockAxis(cropPosition.x), BlockAxis(cropPosition.y), BlockAxis(cropPosition.z))
+      yield* chunkStore.load(chunkCoord(ChunkAxis(0), ChunkAxis(0)))
+      yield* host.hostWorldWrite.port.applyBatch(yield* Schema.decodeUnknownEffect(WorldWriteBatchSchema)({
+        world: host.coordinator.worldId,
+        expectedWorldRevision: yield* host.coordinator.revision,
+        dimension: 'overworld',
+        expectedDimensionRevision: yield* host.coordinator.dimensionRevision('overworld'),
+        edits: [{ position: at, block: potato, state: { age: 0 } }],
+      }))
+      const deps = yield* makeDeps(host)
+      const game = yield* composeGame(yield* registerHostModules(deps))
+
+      yield* Effect.provide(
+        game.runFrame(DeltaTimeSecs(0.05)),
+        FixedClockLayer({ monotonicSecs: MonotonicTimeSecs(0), wallClockEpochMillis: EpochMillis(0) }),
+      )
+
+      expect(yield* chunkStore.getBlockWithState(at)).toMatchObject({ _tag: 'Block', block: potato, state: { age: 1 } })
+      const saved = (yield* host.coordinator.snapshot(GAMEPLAY_CROPS_OWNER_ID, CropSnapshotSchema)).state
+      expect(saved.crops[0]?.growthSecs).toBeCloseTo(68.61)
+      expect(yield* drainBlockStateRuleResults(deps.gameplayState)).toStrictEqual([{
+        requestId: 'crop-growth:overworld:1:100:2:1',
+        outcome: { _tag: 'Applied', edits: [{ position: at, block: potato, state: { age: 1 } }] },
+      }])
     }))
 
   it.effect('commits gameplay stage changes and Context port batches through the same coordinator', () =>

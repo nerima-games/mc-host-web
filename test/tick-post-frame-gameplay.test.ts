@@ -1134,6 +1134,36 @@ describe('tick post-frame gameplay processing', () => {
     })
   })
 
+  it('drains block-state rule results every frame and reports only failures', async () => {
+    await withHarness({}, (harness) => {
+      const state = harness.context.h5a.gameplayState
+      const failed: gameplay.BlockStateRuleResult = {
+        requestId: 'crop-growth:overworld:1:64:1:1',
+        outcome: { _tag: 'Unsupported', operation: 'writeState', position: blockPosition(1, 64, 1) },
+      }
+      Effect.runSync(Ref.set(state.blockStateRuleResults, [
+        { requestId: 'applied', outcome: { _tag: 'Applied', edits: [] } },
+        { requestId: 'no-change', outcome: { _tag: 'NoChange', reason: 'mature' } },
+        { requestId: 'not-applicable', outcome: { _tag: 'NotApplicable', block: 'stone' } },
+        failed,
+      ]))
+      const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+      try {
+        runTickPostFrameGameplay(harness.context, {
+          frame: harness.frame,
+          movement: harness.movement,
+          postFrame: harness.postFrame,
+          nowSecs: MonotonicTimeSecs(2),
+        })
+
+        expect(warning.mock.calls).toStrictEqual([['Unable to apply block-state rule', failed]])
+        expect(Effect.runSync(Ref.get(state.blockStateRuleResults))).toStrictEqual([])
+      } finally {
+        warning.mockRestore()
+      }
+    })
+  })
+
   it.each(['conflict', 'invalid', 'unavailable'])('propagates a %s port failure before confirming a lamp', async (kind) => {
     const at = blockPosition(4, 70, -2)
     await withHarness({ lampTransitions: [{ dimension: 'overworld', position: at, lit: true }] }, (harness) => {

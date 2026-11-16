@@ -204,8 +204,8 @@ importers:
         specifier: 0.9.1
         version: 0.9.1
       '@nerima-games/mx-gameplay':
-        specifier: 0.11.0
-        version: 0.11.0
+        specifier: 0.12.0
+        version: 0.12.0
       '@nerima-games/mx-multiplayer':
         specifier: 0.17.0
         version: 0.17.0

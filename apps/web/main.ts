@@ -152,7 +152,7 @@ import {
   wrapHotbarSelection,
   type DrawPort,
 } from '@nerima-games/mc-render'
-import { BLOCK } from '@nerima-games/mc-worldgen'
+import { BLOCK, type ChunkStoreRegistryApi } from '@nerima-games/mc-worldgen'
 import { makeRedstoneContainerRuntime } from './redstone-container-runtime'
 import { makeScreenshotRuntime } from './screenshot'
 import { makeMusicRuntime } from './music-runtime'
@@ -417,6 +417,7 @@ import {
   type GameplayCommitServices,
 } from './host-modules'
 import { makeHostWorldWrite } from './world-write-port'
+import { makeHostGameplayBlockStateWorld } from './gameplay-block-state-world'
 import {
   bootTitleMenu,
   installPlayerOnboarding,
@@ -1077,18 +1078,22 @@ const bootGame = async (
     failBoot('gameplay owner registration failed', gameplayOwners.failure)
     return
   }
+  // The one registry behind the coordinator's commits and gameplay's
+  // block-state reads, so a state rule reads what its commit is checked against.
+  const hostChunkStores: ChunkStoreRegistryApi = {
+    // `getOrCreateDimensionChunkContext` is declared further down. This is
+    // safe because mc-sim calls `forDimension` only on observe and commit, and
+    // the gameplay block-state port only inside a frame stage, never while
+    // either is being built.
+    forDimension: (dimension) => getOrCreateDimensionChunkContext(dimension).chunkStore,
+  }
   const hostWorldWriteExit = await Effect.runPromiseExit(
     Effect.flatMap(
       Schema.decodeEffect(WorldIdSchema)(sessionId),
       (worldId) => makeHostWorldWrite({
         world: worldId,
         owners: gameplayOwners.success,
-        chunkStores: {
-          // `getOrCreateDimensionChunkContext` is declared further down. This
-          // is safe because mc-sim calls `forDimension` only on observe and
-          // commit, never while building the coordinator.
-          forDimension: (dimension) => getOrCreateDimensionChunkContext(dimension).chunkStore,
-        },
+        chunkStores: hostChunkStores,
       }),
     ),
   )
@@ -1176,6 +1181,13 @@ const bootGame = async (
     brewingService: gameplayBrewingService,
     eventBus: Context.get(gameplayEventContext, DomainEventBus),
   }
+  // State reads and stateful edits (doors, stairs, crop ages, saplings) for
+  // the gameplay stages, committed through the same coordinator.
+  const gameplayBlockStateWorld = makeHostGameplayBlockStateWorld({
+    coordinator: hostWorldWrite.coordinator,
+    chunkStores: hostChunkStores,
+    dimensionIds,
+  })
   const snapshotGameplayVillagerTrades = gameplayCommit.coordinator
     .snapshot(GAMEPLAY_VILLAGER_TRADES_OWNER_ID, GameplayVillagerTradeSnapshotSchema)
     .pipe(Effect.map(({ state }) => state))
@@ -2525,6 +2537,7 @@ const bootGame = async (
         simState,
         gameplayState,
         gameplayCommit,
+        gameplayBlockStateWorld,
         isActiveDimension: (dimension) => dimension === currentChunkContext.dimension,
         poweredRails,
         leverKeyOf,

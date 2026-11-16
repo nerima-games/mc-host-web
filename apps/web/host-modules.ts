@@ -18,6 +18,7 @@ import {
 import {
   GAMEPLAY_STAGE_IDS,
   gameplayStages,
+  type GameplayBlockStateWorldApi,
   type GameplayFrameState,
   type MobBehaviour,
   type VehicleControlInput,
@@ -98,6 +99,9 @@ export type HostModulesDeps = {
   readonly simState: SimFrameState
   readonly gameplayState: GameplayFrameState
   readonly gameplayCommit: GameplayCommitServices
+  // Required: without it mx-gameplay refuses door and stair placement, records
+  // crop-age projection as PortUnavailable, and never grows saplings.
+  readonly gameplayBlockStateWorld: GameplayBlockStateWorldApi
   readonly isActiveDimension: (dimension: Dimension) => boolean
   readonly poweredRails: ReadonlySet<string>
   readonly leverKeyOf: (lever: Pick<PersistedLeverState, 'dimension' | 'position'>) => string
@@ -134,6 +138,7 @@ export const registerHostModules = (deps: HostModulesDeps): Effect.Effect<Readon
     simState,
     gameplayState,
     gameplayCommit,
+    gameplayBlockStateWorld,
     isActiveDimension,
     poweredRails,
     leverKeyOf,
@@ -226,6 +231,7 @@ export const registerHostModules = (deps: HostModulesDeps): Effect.Effect<Readon
           mobSimulation: multiplayer === undefined,
         },
         gameplayCommit,
+        gameplayBlockStateWorld,
       )
       // The survival-hunger stage ticks the vitals owner on every frame and
       // has no option to stop. Hunger is local only in single-player survival:

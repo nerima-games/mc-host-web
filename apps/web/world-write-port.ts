@@ -7,6 +7,7 @@ import {
   WorldWriteConflict,
   WorldWriteInvalidBatch,
   type WorldWriteBatch,
+  type WorldWriteCommit,
   type WorldWritePort,
 } from '@nerima-games/mc-kernel'
 import {
@@ -14,13 +15,14 @@ import {
   type WorldCommitCoordinatorApi,
   type WorldCommitCoordinatorError,
   type WorldCommitCoordinatorOptions,
+  type ReplicatedOwnerCandidate,
 } from '@nerima-games/mc-sim'
 import { CHUNK_HEIGHT, type ChunkStoreRegistryApi } from '@nerima-games/mc-worldgen'
 import { Effect, Result, Schema } from 'effect'
 
 // Failures listed as invariant violations in the C7 ruling (section 3). The
 // original failure stays reachable through the defect's `cause`.
-const dieUnexpected = (failure: { readonly _tag: string }): Effect.Effect<never> =>
+export const dieUnexpected = (failure: { readonly _tag: string }): Effect.Effect<never> =>
   Effect.die(new Error(`c7-adapter: unexpected ${failure._tag}`, { cause: failure }))
 
 const invalidBlockState = (position: WorldWriteBatch['edits'][number]['position']) =>
@@ -42,22 +44,27 @@ const validateBeforeCommit = (batch: WorldWriteBatch) => Effect.gen(function* ()
   }
 })
 
-const commitRequestOf = (batch: WorldWriteBatch) => ({
+const commitRequestOf = (batch: WorldWriteBatch, changes: ReadonlyArray<ReplicatedOwnerCandidate>) => ({
   expectedRevision: batch.expectedWorldRevision,
   expectedDimensions: [{ dimension: batch.dimension, expectedRevision: batch.expectedDimensionRevision }],
-  changes: [],
+  changes,
   blockWrite: batch,
 })
 
 /**
- * The C7 `WorldWritePort` over a wired world commit coordinator, following the
- * C7 ruling's section 3: validate, check the world, check the vertical range,
- * then commit and map the coordinator's failures onto the port's three types.
+ * One C7 commit of `batch` together with `changes`, following the C7 ruling's
+ * section 3: validate, check the world, check the vertical range, then commit
+ * and map the coordinator's failures onto the port's three types. The owner
+ * changes ride in the same coordinator transaction as the block edits, so both
+ * apply or neither does. Owner failures (unknown or duplicate owner, a state
+ * its schema rejects) are wiring defects of the caller and die.
  */
-export const makeWorldWritePortFromCoordinator = (
+export const commitWorldWrite = (
   coordinator: WorldCommitCoordinatorApi,
-): WorldWritePort['Service'] => ({
-  applyBatch: (batch) => Effect.gen(function* () {
+  batch: WorldWriteBatch,
+  changes: ReadonlyArray<ReplicatedOwnerCandidate>,
+): Effect.Effect<WorldWriteCommit, WorldWriteConflict | WorldWriteInvalidBatch | WorldWriteChunkUnavailable> =>
+  Effect.gen(function* () {
     yield* validateBeforeCommit(batch)
     if (batch.world !== coordinator.worldId) {
       return yield* Effect.die(new Error('c7-adapter: world mismatch', {
@@ -71,7 +78,7 @@ export const makeWorldWritePortFromCoordinator = (
         chunk: chunkKeyOfPosition(outOfWorld.position),
       }))
     }
-    const delta = yield* coordinator.commit(commitRequestOf(batch)).pipe(
+    const delta = yield* coordinator.commit(commitRequestOf(batch, changes)).pipe(
       Effect.catchTags({
         WorldWriteInvalidBatch: (error) => Effect.fail(error),
         WorldWriteChunkUnavailable: (error) => Effect.fail(error),
@@ -105,7 +112,13 @@ export const makeWorldWritePortFromCoordinator = (
       worldRevision: delta.revision,
       dimensionRevision: batch.expectedDimensionRevision + 1,
     }).pipe(Effect.catchTag('SchemaError', dieUnexpected))
-  }),
+  })
+
+/** The C7 `WorldWritePort` over a wired world commit coordinator. */
+export const makeWorldWritePortFromCoordinator = (
+  coordinator: WorldCommitCoordinatorApi,
+): WorldWritePort['Service'] => ({
+  applyBatch: (batch) => commitWorldWrite(coordinator, batch, []),
 })
 
 export type HostWorldWriteOptions = Omit<WorldCommitCoordinatorOptions, 'chunkStores'> & {

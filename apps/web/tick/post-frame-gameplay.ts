@@ -5,6 +5,7 @@ import {
   boardVehicle,
   castFishing,
   drainBlockPlacementResults,
+  drainBlockStateRuleResults,
   drainBlockUseResults,
   drainBowKnockbacks,
   drainItemUseResults,
@@ -881,6 +882,17 @@ export const runTickPostFrameGameplay = (
   placementAudio.confirm([...consumedPlacements, ...confirmedPlacementItems])
   if (consumedPlacements.some((item) => REDSTONE_PLACEMENT_ITEMS.has(item))) {
     h5aState.redstoneDirty.set(true)
+  }
+
+  // Crop-age projection, sapling growth and the block-state-rules stage append
+  // one result per attempt and nothing else reads them, so they are drained
+  // every frame. A failure is already settled (nothing was committed), so it is
+  // reported rather than retried.
+  for (const result of yield* drainBlockStateRuleResults(gameplayState)) {
+    const { _tag } = result.outcome
+    if (_tag !== 'Applied' && _tag !== 'NoChange' && _tag !== 'NotApplicable') {
+      console.warn('Unable to apply block-state rule', result)
+    }
   }
 
   for (const result of Effect.runSync(drainBlockUseResults(gameplayState))) {
