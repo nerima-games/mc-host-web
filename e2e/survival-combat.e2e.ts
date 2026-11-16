@@ -526,15 +526,16 @@ test('preserves Nether death drops and unrelated drops across respawn', async ({
   const faults = watchForFaults(page)
 
   await startGameSession(page)
-  const canvas = page.locator('#game-canvas')
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
 
-  await canvas.hover()
-  await callQa<unknown>(page, 'gameplay.seedMeleeDropEncounter')
-  await grantPointerLock(page)
-  await page.mouse.down({ button: 'left' })
-  await page.waitForTimeout(250)
-  await page.mouse.up({ button: 'left' })
+  // Death loot supplies the unrelated drop without relying on random mob loot.
+  await callQa(page, 'gameplay.seedFoodUseEncounter')
+  await callQa(page, 'gameplay.seedSmokeGroundingEncounter')
+  await expect(page.locator('#game-canvas')).toHaveAttribute('data-player-grounded', 'true')
+  for (let hit = 0; hit < 5 && !(await snapshot(page)).dead; hit += 1) {
+    await callQa(page, 'gameplay.damage')
+  }
+  await expect.poll(async () => (await snapshot(page)).dead).toBe(true)
 
   await expect.poll(async () => {
     const current = await snapshot(page)
@@ -877,12 +878,24 @@ test('kills a hostile with a left click and collects its dropped item', async ({
   await expect(body).toHaveAttribute('data-mc-compose-boot', 'running')
 
   await canvas.hover()
-  await callQa<unknown>(page, 'gameplay.seedMeleeDropEncounter')
-  await expect.poll(async () => {
-    const current = await snapshot(page)
-    return current.entities.map(({ kind, healthPoints }) => ({ kind, healthPoints }))
-  }).toEqual([{ kind: 'creeper', healthPoints: 1 }])
-  const seededSnapshot = await snapshot(page)
+  const { before, seeded: seededSnapshot } = await page.evaluate(async () => {
+    const transport = window.__NERIMA_GAMES_QA__
+    if (transport === undefined) throw new Error('missing QA transport')
+    const results = await Promise.all([
+      transport.dispatch('gameplay', 'snapshot', null),
+      transport.dispatch('gameplay', 'seedMeleeDropEncounter', null),
+    ])
+    const snapshots = results.map((result) => {
+      if (result._tag === 'Failure') throw new Error(JSON.stringify(result.error))
+      return result.value as GameplaySnapshot
+    })
+    return { before: snapshots[0]!, seeded: snapshots[1]! }
+  })
+  const baselineIds = new Set(before.entities.map(({ id }) => id))
+  const added = seededSnapshot.entities.filter(({ id }) => !baselineIds.has(id))
+  expect(added.map(({ kind, healthPoints }) => ({ kind, healthPoints })))
+    .toEqual([{ kind: 'creeper', healthPoints: 1 }])
+  const creeperId = added[0]!.id
   expect(seededSnapshot.inventory.slots[0]).toEqual({
     item: 'wooden_sword',
     count: 1,
@@ -913,7 +926,7 @@ test('kills a hostile with a left click and collects its dropped item', async ({
     const current = await snapshot(page)
     return {
       hostileKinds: current.entities
-        .filter((entity) => entity.kind !== 'dropped_item')
+        .filter((entity) => entity.id === creeperId)
         .map((entity) => entity.kind),
       droppedKinds: current.entities
         .filter((entity) => entity.kind === 'dropped_item')
