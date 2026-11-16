@@ -15,7 +15,7 @@ import type {
 import type { InputAction, InputServiceApi, InputSnapshot } from '@nerima-games/mc-render'
 import type { Effect } from 'effect'
 
-import type { DimensionChunkContext } from '../chunk-streaming'
+import type { ChunkRenderFailure, DimensionChunkContext } from '../chunk-streaming'
 import type { MultiplayerRuntime } from '../multiplayer-client'
 import type { PlayerSettingsV1 } from '../settings'
 import type { SurvivalHungerCoordinator } from '../survival-hunger-runtime'
@@ -180,6 +180,7 @@ export type H5aTickContext = {
   readonly drainEnchantingInbound: () => void
   readonly drainPlayerDamageInbound: () => void
   readonly runFrame: (deltaSecs: DeltaTimeSecs) => Effect.Effect<void>
+  readonly drainChunkRenderFaults: () => Effect.Effect<void, ChunkRenderFailure>
   readonly applyPlayerDamage: (damage: { readonly amount: number; readonly cause: 'generic' }) => void
   readonly failBoot: (message: string, error: unknown) => void
   readonly droppedItemLifetime: {
@@ -301,6 +302,7 @@ export type H5aMovementContext = {
   readonly drainEnchantingInbound: H5aTickContext['drainEnchantingInbound']
   readonly drainPlayerDamageInbound: H5aTickContext['drainPlayerDamageInbound']
   readonly runFrame: H5aTickContext['runFrame']
+  readonly drainChunkRenderFaults: H5aTickContext['drainChunkRenderFaults']
   readonly applyPlayerDamage: H5aTickContext['applyPlayerDamage']
   readonly failBoot: H5aTickContext['failBoot']
   readonly markSessionDirty: H5aTickContext['markSessionDirty']

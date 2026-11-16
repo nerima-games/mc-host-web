@@ -1,10 +1,19 @@
-import { describe, expect, it } from '@effect/vitest'
-import { Deferred, Effect, Fiber, Result } from 'effect'
+import { assert, describe, expect, it } from '@effect/vitest'
+import { Deferred, Effect, Fiber, Option, Result } from 'effect'
 
-import { ChunkAxis, chunkCoord, CHUNK_SIZE_XZ, WorldId } from '@nerima-games/mc-kernel'
+import { BlockAxis, blockIdOf, blockPosition, ChunkAxis, chunkCoord, CHUNK_SIZE_XZ, WorldId } from '@nerima-games/mc-kernel'
+import { EMPTY_SYNC_REPORT, type WorldRendererAttachment } from '@nerima-games/mc-render'
 import { makeWorldCommitCoordinator, ReplicatedOwnerUnknown, type WorldCommitCoordinatorApi } from '@nerima-games/mc-sim'
 import { StorageError } from '@nerima-games/mc-save'
-import { CHUNK_VOLUME, type Chunk, type ChunkWithBlockStates } from '@nerima-games/mc-worldgen'
+import {
+  CHUNK_VOLUME,
+  ChunkCapacity,
+  generatedChunkSource,
+  makeChunkStore,
+  NoiseSeed,
+  type Chunk,
+  type ChunkWithBlockStates,
+} from '@nerima-games/mc-worldgen'
 import {
   GAMEPLAY_VILLAGER_TRADES_OWNER_ID,
   GameplayVillagerTradeSnapshotSchema,
@@ -13,8 +22,13 @@ import {
 } from '@nerima-games/mx-gameplay'
 
 import {
+  activeDimensionChunkSync,
+  budgetedRendererStore,
+  ChunkRenderFailure,
   desiredChunksAround,
+  drainChunkRenderFaults,
   makeChunkStreaming,
+  type ChunkRenderFault,
   type ChunkStreamingContext,
 } from '../apps/web/chunk-streaming'
 import type { PersistedVillager } from '../apps/web/session-persistence'
@@ -45,7 +59,6 @@ const chunkContext = (events: Array<string>): ChunkStreamingContext => ({
       return chunk(coord.cx, coord.cz)
     }),
   },
-  queueLoadedChunk: (coord) => events.push(`queue:${String(coord.cx)},${String(coord.cz)}`),
   streamLoaded: new Set(),
 })
 
@@ -98,8 +111,10 @@ describe('chunk streaming', () => {
     expect(context.streamLoaded.size).toBe(9)
     expect(context.streamLoaded.has('0,0')).toBe(false)
     expect(counters).toEqual({ streamed: 9, dropped: 1 })
-    expect(events.filter((event) => event === 'queue:-18,44')).toHaveLength(1)
-    expect(events.filter((event) => event.startsWith('queue:'))).toHaveLength(9)
+    // The published chunk is not loaded again; the failed one is loaded on both attempts.
+    expect(events.filter((event) => event === 'load:-18,44')).toHaveLength(1)
+    expect(events.filter((event) => event === 'load:-18,45')).toHaveLength(2)
+    expect(events.filter((event) => event.startsWith('load:'))).toHaveLength(10)
     expect(events.filter((event) => event === 'unload:0,0')).toHaveLength(1)
     expect(events.filter((event) => event === 'retain')).toHaveLength(1)
     expect(events.filter((event) => event === 'redstone-dirty')).toHaveLength(2)
@@ -188,8 +203,8 @@ describe('chunk streaming', () => {
     expect(villagerResidents.get(villagerId)).toMatchObject({
       profession: 'farmer', dimension: 'overworld', feetPosition: { x: -271.5, y: 76, z: 724.5 },
     })
-    expect(events.slice(0, 9)).toEqual([
-      'load:-17,45', 'load:-17,45', 'queue:-17,45', 'dirty',
+    expect(events.slice(0, 8)).toEqual([
+      'load:-17,45', 'load:-17,45', 'dirty',
       'snapshot:0,0', 'retain', 'dirty', 'unload:0,0', 'redstone-dirty',
     ])
     expect([...context.streamLoaded]).toEqual(['-17,45'])
@@ -202,7 +217,7 @@ describe('chunk streaming', () => {
     ))).state).toEqual(intervening)
   })
 
-  it('interrupts an in-flight load without queueing or unloading and can retry it', async () => {
+  it('interrupts an in-flight load without marking it loaded or unloading and can retry it', async () => {
     const events: string[] = []
     const started = Deferred.makeUnsafe<void>()
     const coordinator = await Effect.runPromise(makeWorldCommitCoordinator({
@@ -253,7 +268,7 @@ describe('chunk streaming', () => {
     suspended = false
     await Effect.runPromise(streaming.streamAround(context, 16, 0))
     expect(events).toEqual([
-      'start:1,0', 'interrupted', 'load:1,0', 'queue:1,0',
+      'start:1,0', 'interrupted', 'load:1,0',
       'snapshot:0,0', 'retain', 'dirty', 'unload:0,0', 'redstone-dirty',
     ])
     expect([...context.streamLoaded]).toEqual(['1,0'])
@@ -304,10 +319,8 @@ describe('chunk streaming', () => {
 
     expect(events).toEqual([
       'load:0,0',
-      'queue:0,0',
       'redstone-dirty',
       'load:1,0',
-      'queue:1,0',
       'snapshot:0,0',
       'dirty',
       'unload:0,0',
@@ -343,7 +356,7 @@ describe('chunk streaming', () => {
         setChunksDropped: (count) => { counters.dropped = count },
       })
 
-    it('returns a load failure without queueing or marking the chunk loaded', async () => {
+    it('returns a load failure without marking the chunk loaded', async () => {
       const events: Array<string> = []
       const counters = { streamed: 0, dropped: 0 }
       const streaming = await streamingFor(events, counters)
@@ -381,4 +394,107 @@ describe('chunk streaming', () => {
       expect(counters).toEqual({ streamed: 0, dropped: 0 })
     })
   })
+})
+
+describe('chunk render attachment wiring', () => {
+  const coords = (chunks: ReadonlyArray<{ readonly cx: number; readonly cz: number }>) =>
+    chunks.map(({ cx, cz }) => `${String(cx)},${String(cz)}`)
+
+  it.effect('throttles the ChunkStore dirty channel and reports loads, block writes and unloads', () =>
+    Effect.gen(function* () {
+      const store = yield* makeChunkStore(generatedChunkSource(NoiseSeed(1)), ChunkCapacity(16))
+      const rendererStore = yield* budgetedRendererStore(store, 2)
+      const subscription = yield* rendererStore.subscribeDirty
+      // Far apart, so no load also dirties a resident neighbour.
+      for (const cx of [0, 10, 20]) yield* store.load(chunkCoord(ChunkAxis(cx), ChunkAxis(0)))
+
+      const first = yield* subscription.drain
+      expect(coords(first.changed)).toEqual(['0,0', '10,0'])
+      expect(first.removed).toEqual([])
+      expect(coords((yield* subscription.drain).changed)).toEqual(['20,0'])
+      expect(yield* subscription.drain).toEqual({ changed: [], removed: [] })
+
+      yield* store.setBlock(
+        blockPosition(BlockAxis(1), BlockAxis(70), BlockAxis(1)),
+        Option.getOrThrow(blockIdOf('stone')),
+      )
+      expect(coords((yield* subscription.drain).changed)).toEqual(['0,0'])
+
+      yield* store.unload(chunkCoord(ChunkAxis(10), ChunkAxis(0)))
+      const unloaded = yield* subscription.drain
+      expect(unloaded.changed).toEqual([])
+      expect(coords(unloaded.removed)).toEqual(['10,0'])
+    }))
+
+  it.effect('rejects an invalid frame budget and releases the subscription it took', () =>
+    Effect.gen(function* () {
+      const store = yield* makeChunkStore(generatedChunkSource(NoiseSeed(1)), ChunkCapacity(16))
+      const events: Array<string> = []
+      const result = yield* Effect.result(budgetedRendererStore({
+        ...store,
+        subscribeDirty: Effect.map(store.subscribeDirty, (subscription) => ({
+          ...subscription,
+          unsubscribe: Effect.andThen(subscription.unsubscribe, Effect.sync(() => { events.push('unsubscribe') })),
+        })),
+      }, 0))
+
+      expect(result).toEqual(Result.fail({ _tag: 'BudgetedDirtySourceInputError', reason: 'invalid-frame-budget' }))
+      expect(events).toEqual(['unsubscribe'])
+    }))
+
+  const recordingAttachment = (
+    name: string,
+    events: Array<string>,
+    pendingFaults: Array<ChunkRenderFault>,
+  ): WorldRendererAttachment => ({
+    update: Effect.sync(() => {
+      events.push(`update:${name}`)
+      return EMPTY_SYNC_REPORT
+    }),
+    drainFaults: Effect.sync(() => pendingFaults.splice(0)),
+    detach: Effect.void,
+    attached: Effect.succeed(true),
+  })
+
+  it.effect('updates only the active dimension attachment', () =>
+    Effect.gen(function* () {
+      const events: Array<string> = []
+      const overworld = { renderAttachment: recordingAttachment('overworld', events, []) }
+      const nether = { renderAttachment: recordingAttachment('nether', events, []) }
+      let active = overworld
+      const port = activeDimensionChunkSync(() => active)
+
+      yield* port.update
+      active = nether
+      yield* port.update
+
+      expect(events).toEqual(['update:overworld', 'update:nether'])
+    }))
+
+  it.effect('drains typed render faults from every dimension once as a ChunkRenderFailure', () =>
+    Effect.gen(function* () {
+      const fault = (cx: number): ChunkRenderFault => ({
+        _tag: 'ChunkRenderFault',
+        chunk: chunkCoord(ChunkAxis(cx), ChunkAxis(0)),
+        error: { _tag: 'ChunkMeshGeometryInputFailure', field: 'fluids' },
+        occurrences: 1,
+      })
+      const overworldFault = fault(1)
+      const netherFault = fault(2)
+      const contexts: Parameters<typeof drainChunkRenderFaults>[0] = [
+        { dimension: 'overworld', renderAttachment: recordingAttachment('overworld', [], [overworldFault]) },
+        { dimension: 'nether', renderAttachment: recordingAttachment('nether', [], [netherFault]) },
+      ]
+
+      const drained = yield* Effect.result(drainChunkRenderFaults(contexts))
+
+      assert(Result.isFailure(drained))
+      expect(drained.failure).toBeInstanceOf(ChunkRenderFailure)
+      expect(drained.failure._tag).toBe('ChunkRenderFailure')
+      expect(drained.failure.faults).toEqual([
+        { dimension: 'overworld', fault: overworldFault },
+        { dimension: 'nether', fault: netherFault },
+      ])
+      expect(yield* Effect.result(drainChunkRenderFaults(contexts))).toEqual(Result.succeed(undefined))
+    }))
 })

@@ -1,6 +1,6 @@
 import { Context, Effect } from 'effect'
 import { WorldWritePort, type QaNamespace, type SaveSliceRegistration } from '@nerima-games/mc-kernel'
-import { renderModule, InputService, type DrawPort, type GraphicsQuality } from '@nerima-games/mc-render'
+import { renderModule, InputService, type ChunkSyncPort, type DrawPort, type GraphicsQuality } from '@nerima-games/mc-render'
 import {
   CropService,
   entityManagerTag,
@@ -32,7 +32,6 @@ import {
   EMPTY_MODULE_LAYER,
   registerModule,
   type GameModule,
-  type StageRegistration,
 } from '@nerima-games/mc-compose'
 import { type PersistedLeverState } from './session-persistence'
 
@@ -97,7 +96,7 @@ export type HostModulesDeps = {
   readonly services: Context.Context<HostServices>
   readonly renderQuality: GraphicsQuality | undefined
   readonly draw: DrawPort
-  readonly chunkSyncStage: StageRegistration
+  readonly chunkSync: ChunkSyncPort
   readonly uiFrameState: UiFrameState
   readonly simState: SimFrameState
   readonly gameplayState: GameplayFrameState
@@ -131,7 +130,7 @@ export const registerHostModules = (deps: HostModulesDeps): Effect.Effect<Readon
     services,
     renderQuality,
     draw,
-    chunkSyncStage,
+    chunkSync,
     uiFrameState,
     simState,
     gameplayState,
@@ -146,17 +145,12 @@ export const registerHostModules = (deps: HostModulesDeps): Effect.Effect<Readon
 
   // The host drives movement and jump intent itself, so the render factory
   // keeps its default `PlayerControlPort`; the camera mirror reads the shared
-  // `PlayerService`.
+  // `PlayerService`. `chunkSync` is what mc-render's own `render:chunk-sync`
+  // stage updates each frame.
   const render = registerModule({
     name: '@nerima-games/mc-render',
     layers: EMPTY_MODULE_LAYER,
-    frameStages: renderModule(renderQuality, undefined, draw).frameStages,
-  })
-
-  const chunkSync = registerModule({
-    name: '@nerima-games/mc-render/world-sync',
-    layers: EMPTY_MODULE_LAYER,
-    frameStages: Effect.succeed([chunkSyncStage]),
+    frameStages: renderModule(renderQuality, undefined, draw, undefined, chunkSync).frameStages,
   })
 
   // `uiModule` allocates a UiFrameState the host cannot reach, so the UI stages
@@ -237,7 +231,7 @@ export const registerHostModules = (deps: HostModulesDeps): Effect.Effect<Readon
     : [registerModule({ name: '@nerima-games/mx-multiplayer', ...multiplayer.host.module })]
 
   return Effect.provide(
-    Effect.all([render, chunkSync, ui, redstone, sim, gameplay, ...multiplayerModules]),
+    Effect.all([render, ui, redstone, sim, gameplay, ...multiplayerModules]),
     services,
   )
 }

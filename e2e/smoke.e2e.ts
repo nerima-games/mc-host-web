@@ -261,7 +261,6 @@ test.describe('smoke — the composed frame in a real browser', () => {
       'redstone:effects',
       'gameplay:time-weather',
       'render:camera-mirror',
-      'compose:chunk-sync',
       'render:chunk-sync',
       'render:post-fx',
       'render:draw',

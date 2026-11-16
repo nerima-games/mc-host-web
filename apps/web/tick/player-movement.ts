@@ -17,7 +17,10 @@ export const movementInput = (
 export const runTickPlayerMovement = (
   context: H5aMovementContext,
   frame: H5aMovementFrameInput,
-): Effect.Effect<H5aMovementResult | undefined, Effect.Error<H5aMovementContext['time']['timeOfDay']>> => Effect.gen(function* () {
+): Effect.Effect<
+  H5aMovementResult | undefined,
+  Effect.Error<H5aMovementContext['time']['timeOfDay'] | ReturnType<H5aMovementContext['drainChunkRenderFaults']>>
+> => Effect.gen(function* () {
   const { deltaSecs, dead } = frame
   const poseBeforeFrame = Effect.runSync(context.playerApi.pose)
   const groundedBeforeFrame = Effect.runSync(Ref.get(context.simState.isGrounded))
@@ -230,6 +233,9 @@ export const runTickPlayerMovement = (
     context.failBoot('a frame stage defected', outcome.cause)
     return undefined
   }
+  // render:chunk-sync cannot fail the frame, so mc-render queues meshing
+  // faults on the attachment; they leave the tick here as a typed failure.
+  yield* context.drainChunkRenderFaults()
 
   const activeEntities = Effect.runSync(context.world.entities.entities)
   const droppedEntitiesById = new Map(

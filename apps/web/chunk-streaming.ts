@@ -1,6 +1,14 @@
-import { BlockAxis, ChunkAxis, chunkCoord, type ChunkCoord } from '@nerima-games/mc-kernel'
+import { BlockAxis, ChunkAxis, chunkCoord } from '@nerima-games/mc-kernel'
 import type { WorldCommitCoordinatorApi, WorldCommitCoordinatorError } from '@nerima-games/mc-sim'
-import { chunkKeyOf, type ChunkRef, syncWorld } from '@nerima-games/mc-render'
+import {
+  chunkKeyOf,
+  makeBudgetedDirtySource,
+  type BudgetedDirtySourceInputError,
+  type ChunkRef,
+  type ChunkSyncPort,
+  type RendererChunkStore,
+  type WorldRendererAttachment,
+} from '@nerima-games/mc-render'
 import {
   biomeFor,
   DEFAULT_TERRAIN_LEVELS,
@@ -17,7 +25,8 @@ import {
   GAMEPLAY_VILLAGER_TRADES_OWNER_ID,
   GameplayVillagerTradeSnapshotSchema,
 } from '@nerima-games/mx-gameplay'
-import { Effect, Exit, Result } from 'effect'
+import { Data, Effect, Exit, Result } from 'effect'
+import type { YieldableError } from 'effect/Cause'
 
 import { snapshotResidentChunks, type PersistedVillager } from './session-persistence'
 import type { SessionSaveCoordinator } from './session-save-coordinator'
@@ -33,14 +42,12 @@ export type ChunkStreamingContext<
   readonly dimension: Dimension
   readonly chunkStore: ChunkStore
   readonly worldgenChunkStore: WorldgenChunkStore
-  readonly queueLoadedChunk: (chunk: ChunkCoord) => void
   readonly streamLoaded: Set<string>
 }
 
 export type DimensionChunkContext = ChunkStreamingContext<ChunkStoreApi, ChunkStoreApi> & {
-  readonly dirtyChunks: Parameters<typeof syncWorld>[1]
-  readonly meshChunkFromStore: Parameters<typeof syncWorld>[2]
-  readonly colorForChunk: NonNullable<NonNullable<Parameters<typeof syncWorld>[3]>['colorForChunk']>
+  /** mc-render's attachment to this dimension's ChunkStore; exactly one per store. */
+  readonly renderAttachment: WorldRendererAttachment
   readonly lightingSnapshot: () => RenderLightingSnapshot
 }
 
@@ -177,7 +184,6 @@ export const makeChunkStreaming = (
               }
             }
           }
-          context.queueLoadedChunk(chunk)
           context.streamLoaded.add(chunkKeyOf(chunk))
           streamed += 1
           if (discovered) dependencies.getMarkSessionDirty()()
@@ -224,4 +230,72 @@ export const clearRenderedChunks = <Key extends string, KeyError, KeyRequirement
   Effect.gen(function* () {
     const rendered = yield* worldRenderer.chunkKeys
     for (const key of rendered) yield* worldRenderer.removeChunk(key)
+  })
+
+/**
+ * The store `attachChunkStoreRenderer` reads, with the dirty channel throttled
+ * by mc-render's `makeBudgetedDirtySource` so one storm of edits does not
+ * remesh every dirtied chunk in the same frame.
+ *
+ * The subscription is taken here, once: `attachWorldRenderer` reads
+ * `subscribeDirty` exactly once per attachment, so the returned store is meant
+ * for a single `attachChunkStoreRenderer` call.
+ */
+export const budgetedRendererStore = (
+  store: RendererChunkStore,
+  maxUpdatesPerFrame: number,
+): Effect.Effect<RendererChunkStore, BudgetedDirtySourceInputError> =>
+  Effect.gen(function* () {
+    const subscription = yield* store.subscribeDirty
+    const budgeted = yield* Effect.fromResult(makeBudgetedDirtySource(subscription, maxUpdatesPerFrame)).pipe(
+      Effect.onError(() => subscription.unsubscribe),
+    )
+    return {
+      peek: store.peek,
+      neighbours: store.neighbours,
+      getLight: store.getLight,
+      subscribeDirty: Effect.succeed({ drain: budgeted.drain, unsubscribe: subscription.unsubscribe }),
+    }
+  })
+
+/**
+ * The port mc-render's `render:chunk-sync` stage calls once per frame. Only
+ * the active dimension's attachment is updated; an inactive dimension's
+ * subscription keeps coalescing its dirty set until it is active again.
+ */
+export const activeDimensionChunkSync = (
+  active: () => Pick<DimensionChunkContext, 'renderAttachment'>,
+): ChunkSyncPort => ({
+  update: Effect.suspend(() => active().renderAttachment.update),
+})
+
+export type ChunkRenderFault = Effect.Success<WorldRendererAttachment['drainFaults']>[number]
+
+type ChunkRenderFailureFields = {
+  readonly faults: ReadonlyArray<{ readonly dimension: Dimension; readonly fault: ChunkRenderFault }>
+}
+
+/** Typed meshing faults mc-render recorded while `render:chunk-sync` ran. */
+export type ChunkRenderFailure = YieldableError &
+  ChunkRenderFailureFields & { readonly _tag: 'ChunkRenderFailure' }
+
+export const ChunkRenderFailure: new (fields: ChunkRenderFailureFields) => ChunkRenderFailure =
+  Data.TaggedError('ChunkRenderFailure')
+
+/**
+ * The stage's error channel is `never`, so mc-render queues meshing faults on
+ * the attachment instead of failing the frame. Draining every dimension (not
+ * only the active one) reports a fault recorded just before a dimension switch.
+ */
+export const drainChunkRenderFaults = (
+  contexts: ReadonlyArray<Pick<DimensionChunkContext, 'dimension' | 'renderAttachment'>>,
+): Effect.Effect<void, ChunkRenderFailure> =>
+  Effect.gen(function* () {
+    const faults: Array<ChunkRenderFailureFields['faults'][number]> = []
+    for (const context of contexts) {
+      for (const fault of yield* context.renderAttachment.drainFaults) {
+        faults.push({ dimension: context.dimension, fault })
+      }
+    }
+    if (faults.length > 0) return yield* Effect.fail(new ChunkRenderFailure({ faults }))
   })
