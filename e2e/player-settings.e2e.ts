@@ -1,32 +1,56 @@
 import { expect, test } from '@playwright/test'
 
+import { PLAYER_SETTINGS_KEY } from '../apps/web/settings'
 import { startGameSession } from './helpers/session'
 
 const installSettingsWriteFault = async (page: import('@playwright/test').Page): Promise<void> => {
-  await page.addInitScript(() => {
+  await page.addInitScript(({ settingsKey }) => {
     const faultState = { remaining: 0 }
-    const originalTransaction = IDBDatabase.prototype.transaction
-    const transactionWithFault = function (
-      this: IDBDatabase,
-      ...arguments_: Parameters<IDBDatabase['transaction']>
-    ): IDBTransaction {
-      if (arguments_[1] === 'readwrite' && faultState.remaining > 0) {
+    const consumed: Array<{ key: string; mode: IDBTransactionMode; operation: string }> = []
+    const originalGet = IDBObjectStore.prototype.get
+    const getWithFault = function (
+      this: IDBObjectStore,
+      query: IDBValidKey | IDBKeyRange,
+    ): IDBRequest {
+      if (this.transaction.mode === 'readwrite' && typeof query === 'string'
+        && query === settingsKey && faultState.remaining > 0) {
         faultState.remaining -= 1
+        consumed.push({ key: query, mode: this.transaction.mode, operation: 'get' })
         throw new DOMException('Injected settings write failure', 'InvalidStateError')
       }
-      return originalTransaction.apply(this, arguments_)
+      return originalGet.call(this, query)
     }
-    IDBDatabase.prototype.transaction = transactionWithFault
+    IDBObjectStore.prototype.get = getWithFault
     ;(globalThis as unknown as { failNextSettingsWrite: () => void }).failNextSettingsWrite = () => {
       faultState.remaining += 1
     }
-  })
+    ;(globalThis as unknown as { settingsWriteFaultReport: () => unknown }).settingsWriteFaultReport = () => ({
+      remaining: faultState.remaining,
+      consumed: [...consumed],
+    })
+  }, { settingsKey: PLAYER_SETTINGS_KEY })
 }
 
 const failNextSettingsWrite = (page: import('@playwright/test').Page): Promise<void> =>
   page.evaluate(() => {
     ;(globalThis as unknown as { failNextSettingsWrite: () => void }).failNextSettingsWrite()
   })
+
+const expectSettingsWriteFaultConsumed = async (
+  page: import('@playwright/test').Page,
+  count: number,
+): Promise<void> => {
+  await expect.poll(() => page.evaluate(() =>
+    (globalThis as unknown as { settingsWriteFaultReport: () => unknown }).settingsWriteFaultReport(),
+  )).toEqual({
+    remaining: 0,
+    consumed: Array.from({ length: count }, () => ({
+      key: PLAYER_SETTINGS_KEY,
+      mode: 'readwrite',
+      operation: 'get',
+    })),
+  })
+}
 
 test('player settings persist and preserve Escape priority from title and pause', async ({ page }) => {
   await page.goto('/')
@@ -163,8 +187,10 @@ test('settings write failures block navigation until a later save succeeds', asy
 
   await page.keyboard.press('Escape')
   await page.getByTestId('options-button').click()
+  await expect(page.locator('[data-audio-enabled]')).toBeChecked()
   await failNextSettingsWrite(page)
   await page.locator('[data-audio-enabled]').uncheck()
+  await expectSettingsWriteFaultConsumed(page, 1)
   await expect(page.locator('[data-settings-error]')).toHaveText('Settings could not be saved.')
   await expect(page.locator('[data-settings-error]')).toHaveAttribute('role', 'alert')
   await page.locator('[data-settings-close]').click()
@@ -189,6 +215,7 @@ test('settings write failures block navigation until a later save succeeds', asy
   await expect(page.locator('body')).toHaveAttribute('data-player-settings-persistence', 'saved')
   await failNextSettingsWrite(page)
   await page.locator('[data-audio-enabled]').uncheck()
+  await expectSettingsWriteFaultConsumed(page, 1)
   await expect(page.locator('[data-settings-error]')).toHaveText('Settings could not be saved.')
   await page.locator('[data-settings-close]').click()
   await page.locator('[data-menu-entry="single-player"]').click()
