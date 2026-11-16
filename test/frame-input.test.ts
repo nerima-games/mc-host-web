@@ -1,10 +1,10 @@
 import { describe, expect, it } from '@effect/vitest'
-import { Effect, Result } from 'effect'
+import { Deferred, Effect, Fiber, Result } from 'effect'
 
 import { DeltaTimeSecs, MonotonicTimeSecs, position, PositionAxis } from '@nerima-games/mc-kernel'
-import { ESCAPE_KEY_CODE, wrapHotbarSelection, type InputAction, type InputSnapshot } from '@nerima-games/mc-render'
+import { ESCAPE_KEY_CODE, makeInputService, wrapHotbarSelection, type InputAction, type InputSnapshot } from '@nerima-games/mc-render'
 
-import { runTickFrameInput, readFrameTiming } from '../apps/web/tick/frame-input'
+import { makeFrameInputBoundary, runTickFrameInput, readFrameTiming } from '../apps/web/tick/frame-input'
 import { mutableState, type H5aFrameInputContext } from '../apps/web/tick/h5a-context'
 import { consumeNativeInput, EMPTY_NATIVE_INPUT_QUEUE, type NativeInputQueueState } from '../apps/web/native-input-queue'
 import { selectedHotbarAfterInput } from '../apps/web/player-experience'
@@ -144,6 +144,216 @@ const makeFrameInputFixture = (options: FrameInputFixtureOptions = {}) => {
     setSensitivity: (next: number) => { sensitivity = next },
   }
 }
+
+describe('frame input boundary', () => {
+  it.effect('preserves a hotbar key delivered after the frame read its selection', () =>
+    Effect.gen(function* () {
+      const boundary = makeFrameInputBoundary(yield* makeInputService())
+      const { input } = boundary
+      const fixture = makeFrameInputFixture()
+      const context: H5aFrameInputContext = { ...fixture.context, inputApi: input }
+      const readSelection = yield* Deferred.make<void>()
+      const resumeFrame = yield* Deferred.make<void>()
+      const frame = yield* Effect.forkChild(boundary.runFrame((reading) => Effect.gen(function* () {
+        runTickFrameInput(context, MonotonicTimeSecs(10), reading)
+        expect(context.state.selectedHotbarIndex.get()).toBe(0)
+        yield* Deferred.succeed(readSelection, undefined)
+        yield* Deferred.await(resumeFrame)
+        // The render stage also samples and ends input before the outer host frame ends.
+        yield* input.endFrame(yield* input.snapshot)
+        yield* input.endFrame(reading)
+      })))
+      yield* Deferred.await(readSelection)
+      yield* input.dispatch({ kind: 'keydown', code: 'Digit4', target: 'window' })
+      yield* Deferred.succeed(resumeFrame, undefined)
+      yield* Fiber.join(frame)
+
+      yield* boundary.runFrame((reading) => Effect.sync(() => {
+        runTickFrameInput(context, MonotonicTimeSecs(10.05), reading)
+        expect(context.state.selectedHotbarIndex.get()).toBe(3)
+      }))
+      expect(yield* input.wasActionJustTriggered('hotbarSlot4')).toBe(false)
+    }),
+  )
+
+  it.effect('retains a release and repress of a key already present in the reading', () =>
+    Effect.gen(function* () {
+      const boundary = makeFrameInputBoundary(yield* makeInputService())
+      const { input } = boundary
+      yield* input.dispatch({ kind: 'keydown', code: 'Digit4', target: 'window' })
+      yield* boundary.runFrame((reading) => Effect.gen(function* () {
+        expect(reading.justPressed.has('Digit4')).toBe(true)
+        yield* input.dispatch({ kind: 'keyup', code: 'Digit4', target: 'window' })
+        yield* input.dispatch({ kind: 'keydown', code: 'Digit4', target: 'window' })
+        yield* input.endFrame(yield* input.snapshot)
+        expect(yield* input.wasActionJustTriggered('hotbarSlot4')).toBe(true)
+      }))
+      yield* boundary.runFrame((reading) => Effect.sync(() => {
+        expect(reading.pressed.has('Digit4')).toBe(true)
+        expect(reading.justPressed.has('Digit4')).toBe(true)
+      }))
+      expect(yield* input.wasActionJustTriggered('hotbarSlot4')).toBe(false)
+      expect(yield* input.isActionActive('hotbarSlot4')).toBe(true)
+    }),
+  )
+
+  it.effect('defers pointer, wheel, mouse and gamepad input without spending unread movement', () =>
+    Effect.gen(function* () {
+      const boundary = makeFrameInputBoundary(yield* makeInputService())
+      const { input } = boundary
+      yield* input.dispatch({ kind: 'pointerlockchange', locked: true })
+      yield* input.dispatch({ kind: 'pointermove', deltaX: 4, deltaY: -3 })
+      yield* input.dispatch({ kind: 'wheel', deltaY: 140, deltaMode: 'pixel' })
+      yield* boundary.runFrame((reading) => Effect.gen(function* () {
+        expect(reading.pointerDelta).toEqual({ x: 4, y: -3 })
+        expect(reading.wheelSteps).toBe(1)
+        yield* input.dispatch({ kind: 'pointermove', deltaX: 9, deltaY: 7 })
+        yield* input.dispatch({ kind: 'wheel', deltaY: 80, deltaMode: 'pixel' })
+        yield* input.dispatch({ kind: 'mousedown', button: 'MouseLeft', target: 'window', landing: 'lock-target' })
+        yield* input.dispatch({ kind: 'mouseup', button: 'MouseLeft', target: 'window' })
+        yield* input.dispatch({ kind: 'gamepadpress', action: 'jump', target: 'window' })
+        yield* input.endFrame(yield* input.snapshot)
+        expect(yield* input.wasActionJustTriggered('attack')).toBe(false)
+        expect(yield* input.wasActionJustTriggered('jump')).toBe(false)
+      }))
+      yield* boundary.runFrame((reading) => Effect.gen(function* () {
+        expect(reading.pointerDelta).toEqual({ x: 9, y: 7 })
+        expect(reading.wheelSteps).toBe(1)
+        expect(reading.wheelNotches).toBeCloseTo(1.2)
+        expect(yield* input.wasActionJustTriggered('attack')).toBe(true)
+        expect(yield* input.isActionActive('attack')).toBe(false)
+        expect(yield* input.wasActionJustTriggered('jump')).toBe(true)
+      }))
+      const after = yield* input.snapshot
+      expect(after.pointerDelta).toEqual({ x: 0, y: 0 })
+      expect(after.wheelSteps).toBe(0)
+      expect(after.wheelNotches).toBeCloseTo(0.2)
+      expect(yield* input.wasActionJustTriggered('jump')).toBe(false)
+    }),
+  )
+
+  it.effect('keeps unread UI clicks in arrival order for the next frame', () =>
+    Effect.gen(function* () {
+      const boundary = makeFrameInputBoundary(yield* makeInputService())
+      const { input } = boundary
+      yield* input.dispatch({ kind: 'mousedown', button: 'MouseRight', target: 'window', landing: 'ui' })
+      yield* boundary.runFrame((reading) => Effect.gen(function* () {
+        expect(reading.uiClickLandings).toEqual([{ button: 'MouseRight', landing: 'ui' }])
+        yield* input.dispatch({ kind: 'mousedown', button: 'MouseMiddle', target: 'window', landing: 'elsewhere' })
+        yield* input.dispatch({ kind: 'mousedown', button: 'MouseLeft', target: 'window', landing: 'lock-target' })
+        yield* input.endFrame(yield* input.snapshot)
+      }))
+      yield* boundary.runFrame((reading) => Effect.sync(() => {
+        expect(reading.uiClickLandings).toEqual([
+          { button: 'MouseMiddle', landing: 'elsewhere' },
+          { button: 'MouseLeft', landing: 'lock-target' },
+        ])
+      }))
+      expect((yield* input.snapshot).uiClickLandings).toEqual([])
+    }),
+  )
+
+  it.effect('clearHeld discards queued input without recreating wheel travel from the old reading', () =>
+    Effect.gen(function* () {
+      const boundary = makeFrameInputBoundary(yield* makeInputService())
+      const { input } = boundary
+      yield* input.dispatch({ kind: 'pointerlockchange', locked: true })
+      yield* input.dispatch({ kind: 'wheel', deltaY: 250, deltaMode: 'pixel' })
+      yield* boundary.runFrame(() => Effect.gen(function* () {
+        yield* input.dispatch({ kind: 'keydown', code: 'Digit4', target: 'window' })
+        yield* input.dispatch({ kind: 'wheel', deltaY: 100, deltaMode: 'pixel' })
+        yield* input.clearHeld
+        yield* input.dispatch({ kind: 'keydown', code: 'Digit5', target: 'window' })
+      }))
+      const after = yield* input.snapshot
+      expect(after.justPressed).toEqual(new Set(['Digit5']))
+      expect(after.pressed).toEqual(new Set(['Digit5']))
+      expect(after.wheelNotches).toBe(0)
+      expect(after.wheelSteps).toBe(0)
+    }),
+  )
+
+  it.effect('preserves a typed frame failure and flushes input queued before it', () =>
+    Effect.gen(function* () {
+      const boundary = makeFrameInputBoundary(yield* makeInputService())
+      const failure = { _tag: 'FrameRejected' }
+      const result = yield* Effect.result(boundary.runFrame(() =>
+        boundary.input.dispatch({ kind: 'keydown', code: 'Digit4', target: 'window' }).pipe(
+          Effect.andThen(Effect.fail(failure)),
+        )))
+      expect(result).toEqual(Result.fail(failure))
+      expect(yield* boundary.input.wasActionJustTriggered('hotbarSlot4')).toBe(true)
+      yield* boundary.input.endFrame(yield* boundary.input.snapshot)
+      expect(yield* boundary.input.wasActionJustTriggered('hotbarSlot4')).toBe(false)
+    }),
+  )
+
+  it.effect('queues new arrivals behind replay even when the finalizer yields', () =>
+    Effect.gen(function* () {
+      const source = yield* makeInputService()
+      const replayStarted = yield* Deferred.make<void>()
+      const resumeReplay = yield* Deferred.make<void>()
+      const boundary = makeFrameInputBoundary({
+        ...source,
+        dispatch: (event) => Deferred.succeed(replayStarted, undefined).pipe(
+          Effect.andThen(Deferred.await(resumeReplay)),
+          Effect.andThen(source.dispatch(event)),
+        ),
+      })
+      const frame = yield* Effect.forkChild(boundary.runFrame(() =>
+        boundary.input.dispatch({ kind: 'keydown', code: 'Digit4', target: 'window' })))
+      yield* Deferred.await(replayStarted)
+      yield* boundary.input.dispatch({ kind: 'keyup', code: 'Digit4', target: 'window' })
+      yield* boundary.input.dispatch({ kind: 'keydown', code: 'Digit5', target: 'window' })
+      yield* Deferred.succeed(resumeReplay, undefined)
+      yield* Fiber.join(frame)
+      const after = yield* boundary.input.snapshot
+      expect(after.pressed).toEqual(new Set(['Digit5']))
+      expect(after.justPressed).toEqual(new Set(['Digit4', 'Digit5']))
+    }),
+  )
+
+  it.effect('clearHeld during replay cancels an in-flight press before applying newer input', () =>
+    Effect.gen(function* () {
+      const source = yield* makeInputService()
+      const replayStarted = yield* Deferred.make<void>()
+      const resumeReplay = yield* Deferred.make<void>()
+      const boundary = makeFrameInputBoundary({
+        ...source,
+        dispatch: (event) => Deferred.succeed(replayStarted, undefined).pipe(
+          Effect.andThen(Deferred.await(resumeReplay)),
+          Effect.andThen(source.dispatch(event)),
+        ),
+      })
+      const frame = yield* Effect.forkChild(boundary.runFrame(() =>
+        boundary.input.dispatch({ kind: 'keydown', code: 'Digit4', target: 'window' })))
+      yield* Deferred.await(replayStarted)
+      yield* boundary.input.dispatch({ kind: 'keydown', code: 'Digit6', target: 'window' })
+      yield* boundary.input.clearHeld
+      yield* boundary.input.dispatch({ kind: 'keydown', code: 'Digit5', target: 'window' })
+      yield* Deferred.succeed(resumeReplay, undefined)
+      yield* Fiber.join(frame)
+      const after = yield* boundary.input.snapshot
+      expect(after.pressed).toEqual(new Set(['Digit5']))
+      expect(after.justPressed).toEqual(new Set(['Digit5']))
+    }),
+  )
+
+  it.effect('flushes input after interruption and resumes direct dispatch outside the frame', () =>
+    Effect.gen(function* () {
+      const boundary = makeFrameInputBoundary(yield* makeInputService())
+      const entered = yield* Deferred.make<void>()
+      const frame = yield* Effect.forkChild(boundary.runFrame(() =>
+        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never))))
+      yield* Deferred.await(entered)
+      yield* boundary.input.dispatch({ kind: 'keydown', code: 'Digit4', target: 'window' })
+      yield* Fiber.interrupt(frame)
+      expect(yield* boundary.input.wasActionJustTriggered('hotbarSlot4')).toBe(true)
+      yield* boundary.input.dispatch({ kind: 'keyup', code: 'Digit4', target: 'window' })
+      expect(yield* boundary.input.isActionActive('hotbarSlot4')).toBe(false)
+    }),
+  )
+})
 
 describe('tick frame timing', () => {
   it('stores the current time and clamps a long frame to the physics limit', () => {

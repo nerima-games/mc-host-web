@@ -1,9 +1,53 @@
-import { ESCAPE_KEY_CODE, type InputAction, type InputSnapshot } from '@nerima-games/mc-render'
+import { ESCAPE_KEY_CODE, type InputAction, type InputServiceApi, type InputSnapshot } from '@nerima-games/mc-render'
 import type { DeltaTimeSecs, MonotonicTimeSecs } from '@nerima-games/mc-kernel'
 import { Effect, Result } from 'effect'
 
 import { gamepadLookDelta } from '../gamepad-input'
 import type { H5aFrameInputContext, H5aFrameInputResult } from './h5a-context'
+
+export const makeFrameInputBoundary = (source: InputServiceApi): {
+  readonly input: InputServiceApi
+  readonly runFrame: <A, E, R>(run: (reading: InputSnapshot) => Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>
+} => {
+  let buffering = false
+  const pending: Array<Effect.Effect<void>> = []
+  const flush: Effect.Effect<void> = Effect.suspend(() => {
+    const operation = pending.shift()
+    if (operation === undefined) {
+      buffering = false
+      return Effect.void
+    }
+    return operation.pipe(Effect.andThen(flush))
+  })
+  const input: InputServiceApi = {
+    ...source,
+    dispatch: (event) => Effect.suspend(() => {
+      if (!buffering) return source.dispatch(event)
+      pending.push(source.dispatch(event))
+      return Effect.void
+    }),
+    // render:input also ends its sample; only the outer host frame may clear edges.
+    endFrame: (frame) => Effect.suspend(() => buffering ? Effect.void : source.endFrame(frame)),
+    clearHeld: Effect.suspend(() => {
+      pending.length = 0
+      // A replay may yield before applying its press; reset again after that in-flight operation.
+      if (buffering) pending.push(source.clearHeld)
+      return source.clearHeld
+    }),
+  }
+  const runFrame = <A, E, R>(run: (reading: InputSnapshot) => Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+    Effect.acquireUseRelease(
+      Effect.suspend(() => {
+        buffering = true
+        return source.snapshot
+      }),
+      run,
+      // The frame fiber yields: events arriving after its sample belong to the next frame.
+      // Keep buffering during replay too, so newly arriving events cannot overtake the FIFO.
+      (reading) => source.endFrame(reading).pipe(Effect.andThen(flush)),
+    )
+  return { input, runFrame }
+}
 
 export type FrameTiming = {
   readonly raw: number
