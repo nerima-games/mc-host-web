@@ -101,6 +101,7 @@ export type HostModulesDeps = {
   readonly uiFrameState: UiFrameState
   readonly simState: SimFrameState
   readonly gameplayState: GameplayFrameState
+  readonly gameplayCommit: GameplayCommitServices
   readonly isActiveDimension: (dimension: Dimension) => boolean
   readonly poweredRails: ReadonlySet<string>
   readonly leverKeyOf: (lever: Pick<PersistedLeverState, 'dimension' | 'position'>) => string
@@ -109,6 +110,12 @@ export type HostModulesDeps = {
   readonly getVehicleControls: () => VehicleControlInput
   readonly multiplayer: { readonly host: MultiplayerHost } | undefined
 }
+
+/**
+ * `gameplayStages`' commit services. The package root does not re-export the
+ * type, so it is read from the public function's tenth parameter.
+ */
+export type GameplayCommitServices = NonNullable<Parameters<typeof gameplayStages>[9]>
 
 /** A registered module whose stages were built from `HostServices`. */
 export type HostGameModule = GameModule<
@@ -129,6 +136,7 @@ export const registerHostModules = (deps: HostModulesDeps): Effect.Effect<Readon
     uiFrameState,
     simState,
     gameplayState,
+    gameplayCommit,
     isActiveDimension,
     poweredRails,
     leverKeyOf,
@@ -222,6 +230,7 @@ export const registerHostModules = (deps: HostModulesDeps): Effect.Effect<Readon
           droppedItemPickup: false,
           mobSimulation: multiplayer === undefined,
         },
+        gameplayCommit,
       )
     }),
   })

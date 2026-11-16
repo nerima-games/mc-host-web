@@ -27,7 +27,14 @@ import {
 import { InputService, InputServiceLayer, NO_DRAW_TARGET } from '@nerima-games/mc-render'
 import { RedstoneWorldRuntime, RedstoneWorldRuntimeLayer } from '@nerima-games/mx-redstone'
 import { makeUiFrameState } from '@nerima-games/mx-ui'
-import { makeGameplayFrameState, type MobBehaviour } from '@nerima-games/mx-gameplay'
+import {
+  GAMEPLAY_PLAYER_OWNER_ID,
+  GAMEPLAY_PLAYER_STORAGE_OWNER_ID,
+  GAMEPLAY_VITALS_OWNER_ID,
+  gameplayOwnerRegistrations,
+  makeGameplayFrameStateForOwner,
+  type MobBehaviour,
+} from '@nerima-games/mx-gameplay'
 import {
   ChunkCapacity,
   ChunkStore,
@@ -74,7 +81,7 @@ const makeInstances = Effect.gen(function* () {
   const chunkStore = yield* makeChunkStore(generatedChunkSource(NoiseSeed(1)), ChunkCapacity(16))
   const hostWorldWrite = yield* makeHostWorldWrite({
     world: yield* Schema.decodeEffect(WorldIdSchema)('host-modules-test'),
-    owners: [],
+    owners: gameplayOwnerRegistrations(),
     chunkStores: { forDimension: () => chunkStore },
   })
   const instances: HostServiceInstances = {
@@ -89,10 +96,10 @@ const makeInstances = Effect.gen(function* () {
     inputContext: yield* Layer.build(InputServiceLayer()),
     redstoneContext: yield* Layer.build(RedstoneWorldRuntimeLayer),
   }
-  return instances
+  return { instances, coordinator: hostWorldWrite.coordinator }
 })
 
-const makeDeps = (instances: HostServiceInstances) =>
+const makeDeps = ({ instances, coordinator }: Effect.Success<typeof makeInstances>) =>
   Effect.gen(function* () {
     const chunkSyncStage: StageRegistration = {
       id: StageId('compose:chunk-sync'),
@@ -106,7 +113,13 @@ const makeDeps = (instances: HostServiceInstances) =>
       chunkSyncStage,
       uiFrameState: yield* makeUiFrameState,
       simState: yield* makeSimFrameState,
-      gameplayState: yield* makeGameplayFrameState,
+      gameplayState: yield* makeGameplayFrameStateForOwner({ coordinator, vitalsOwnerId: GAMEPLAY_VITALS_OWNER_ID }),
+      gameplayCommit: {
+        coordinator,
+        playerOwnerId: GAMEPLAY_PLAYER_OWNER_ID,
+        playerStorageOwnerId: GAMEPLAY_PLAYER_STORAGE_OWNER_ID,
+        vitalsOwnerId: GAMEPLAY_VITALS_OWNER_ID,
+      },
       isActiveDimension: () => true,
       poweredRails: new Set<string>(),
       leverKeyOf: (lever) =>
@@ -134,7 +147,7 @@ describe('host modules', () => {
 
   it.effect('resolves every host service tag to the instance the host passed in', () =>
     Effect.gen(function* () {
-      const instances = yield* makeInstances
+      const { instances } = yield* makeInstances
       const services = makeHostServiceContext(instances)
 
       expect(Context.get(services, TimeService)).toBe(instances.time)
@@ -153,8 +166,9 @@ describe('host modules', () => {
 
   it.effect('the registered sim:physics stage advances the host-owned TimeService', () =>
     Effect.gen(function* () {
-      const instances = yield* makeInstances
-      const modules = yield* registerHostModules(yield* makeDeps(instances))
+      const built = yield* makeInstances
+      const { instances } = built
+      const modules = yield* registerHostModules(yield* makeDeps(built))
       const physics = modules
         .find((module) => module.name === '@nerima-games/mc-sim')
         ?.frameStages.find((stage) => stage.id === 'sim:physics')

@@ -119,6 +119,7 @@ import {
   containerIdAt,
   emptyPlayerStorage,
   itemStack,
+  makeBrewingService,
   makeCropService,
   makeSimFrameState,
   makeTimeService,
@@ -191,13 +192,20 @@ import {
   drainVillagerTradeResults,
   EYE_LEVEL_OFFSET,
   fishingPhase,
+  GAMEPLAY_BREWING_OWNER_ID,
+  GAMEPLAY_ENTITIES_OWNER_ID,
+  GAMEPLAY_PLAYER_OWNER_ID,
+  GAMEPLAY_PLAYER_STORAGE_OWNER_ID,
+  GAMEPLAY_STATUS_EFFECTS_OWNER_ID,
+  GAMEPLAY_VILLAGER_TRADES_OWNER_ID,
+  GAMEPLAY_VITALS_OWNER_ID,
   gameplayOwnerRegistrations,
   getPlayerMovementSpeedMultiplier,
   insertBrewingBottle,
   insertBrewingFuel,
   insertBrewingIngredient,
   INITIAL_ENVIRONMENTAL_CONTACT_DAMAGE_STATE,
-  makeGameplayFrameState,
+  makeGameplayFrameStateForOwner,
   makeGeneratedWorld,
   isDroppedItemBehaviour,
   isHoeItem,
@@ -281,7 +289,7 @@ import {
 } from '@nerima-games/mc-server/shared'
 import {
   composeGame,
-  QA_GLOBAL_KEY,
+  EMPTY_MODULE_LAYER,
   type StageRegistration,
 } from '@nerima-games/mc-compose'
 
@@ -365,7 +373,11 @@ import {
   makePlatformAdapters,
   type SettingsWriteQueue,
 } from './platform-adapters'
-import { makeHostServiceContext, registerHostModules } from './host-modules'
+import {
+  makeHostServiceContext,
+  registerHostModules,
+  type GameplayCommitServices,
+} from './host-modules'
 import { makeHostWorldWrite } from './world-write-port'
 import { bootTitleMenu } from './title-menu'
 import {
@@ -909,11 +921,19 @@ const bootGame = async (
   const time = await Effect.runPromise(makeTimeService())
   const weather = await Effect.runPromise(makeWeatherService())
   const crops = await Effect.runPromise(makeCropService())
-  // Restored villager trades seed their coordinator owner here; chunk streaming
-  // reads and updates them through the coordinator.
-  const gameplayOwners = gameplayOwnerRegistrations(
-    loadedSessionState === undefined ? undefined : { villagerTrades: loadedSessionState.villagers.trades },
-  )
+  // The player, storage and vitals owners start from the state just restored
+  // into the host services (or the fresh-world state), so the gameplay stages
+  // begin from the same values the host shows. Villager trades exist only as
+  // an owner; chunk streaming reads and updates them through the coordinator.
+  // `gameplayOwnerRegistrations(undefined)` is a typed failure, so a fresh
+  // session passes an object without the restored-only fields.
+  const gameplayOwners = gameplayOwnerRegistrations({
+    playerPose: await Effect.runPromise(world.player.pose),
+    dimension: await Effect.runPromise(world.player.dimension),
+    playerStorage: await Effect.runPromise(world.inventory.storageSnapshot),
+    vitals: await Effect.runPromise(world.vitals.snapshot),
+    ...(loadedSessionState === undefined ? {} : { villagerTrades: loadedSessionState.villagers.trades }),
+  })
   if (Result.isFailure(gameplayOwners)) {
     failBoot('gameplay owner registration failed', gameplayOwners.failure)
     return
@@ -938,7 +958,24 @@ const bootGame = async (
     return
   }
   const hostWorldWrite = hostWorldWriteExit.value
-  const gameplayState = await Effect.runPromise(makeGameplayFrameState)
+  const gameplayBrewingService = await Effect.runPromise(makeBrewingService(GAMEPLAY_BREWING_OWNER_ID))
+  // The one set of commit services every reader of the gameplay owners shares.
+  // Owners the host still simulates in its own services (crops, entities,
+  // dropped items) stay unset, as before this wiring.
+  const gameplayCommit: GameplayCommitServices = {
+    coordinator: hostWorldWrite.coordinator,
+    playerOwnerId: GAMEPLAY_PLAYER_OWNER_ID,
+    playerStorageOwnerId: GAMEPLAY_PLAYER_STORAGE_OWNER_ID,
+    vitalsOwnerId: GAMEPLAY_VITALS_OWNER_ID,
+    statusEffectsOwnerId: GAMEPLAY_STATUS_EFFECTS_OWNER_ID,
+    villagerTradesOwnerId: GAMEPLAY_VILLAGER_TRADES_OWNER_ID,
+    brewingOwnerId: GAMEPLAY_BREWING_OWNER_ID,
+    brewingService: gameplayBrewingService,
+  }
+  const gameplayState = await Effect.runPromise(makeGameplayFrameStateForOwner({
+    coordinator: hostWorldWrite.coordinator,
+    vitalsOwnerId: GAMEPLAY_VITALS_OWNER_ID,
+  }))
   const villagerResidents = new Map<string, PersistedVillager>(
     (Option.isSome(loadedSession) ? loadedSession.value.state.villagers.residents : [])
       .map((villager) => [villager.id, villager]),
@@ -2269,6 +2306,7 @@ const bootGame = async (
         uiFrameState,
         simState,
         gameplayState,
+        gameplayCommit,
         isActiveDimension: (dimension) => dimension === currentChunkContext.dimension,
         poweredRails,
         leverKeyOf,
@@ -3042,12 +3080,36 @@ const bootGame = async (
   const { syncRenderedEntities, nearestVillagerForTrade } = playerSessionRuntime
 
   let stopBrowserPreview: (() => Promise<void>) | undefined
+  // `installPlayerQaSurface` registers the dispatch teardown synchronously.
+  // Draining the list makes every later call a no-op.
+  const qaTeardowns: Array<() => void> = []
+  const disposeQaSurface = (): void => {
+    for (const dispose of qaTeardowns.splice(0)) dispose()
+  }
   const qaInstalled = installPlayerQaSurface({
     render: {
       weather,
       getLightingSnapshot: () => currentChunkContext.lightingSnapshot(),
     },
+    // QA-only host namespaces join the composed modules with no layers and no
+    // stages, so composeGame checks them against the module namespaces without
+    // registering or running anything again.
+    makeQaBridge: (namespaces) => Effect.runSync(Effect.result(Effect.map(
+      composeGame([
+        ...game.modules,
+        ...namespaces.map((qa) => ({
+          name: `@nerima-games/mc-host-web/qa:${qa.name}`,
+          layers: EMPTY_MODULE_LAYER,
+          frameStages: [],
+          qa,
+        })),
+      ]),
+      (composed) => composed.qaBridge,
+    ))),
     gameplay: {
+      commit: gameplayCommit,
+      targetingEntitiesOwnerId: GAMEPLAY_ENTITIES_OWNER_ID,
+      brewingService: gameplayBrewingService,
       world,
       worldRenderer,
       gameplayState,
@@ -3153,6 +3215,9 @@ const bootGame = async (
       browserClock,
     },
     lifecycle: {
+      registerQaTeardown: (dispose) => {
+        qaTeardowns.push(dispose)
+      },
       getStopBrowserPreview: () => stopBrowserPreview,
     },
   }, failBoot)
@@ -3185,6 +3250,7 @@ const bootGame = async (
     weatherAudio,
     clearPendingThunder: adapters.clearPendingThunder,
     removeNativeMouseDown: () => window.removeEventListener('mousedown', handleNativeMouseDown, true),
+    disposeQaSurface,
     disposeWorldRenderer: () => { Effect.runSync(worldRenderer.dispose) },
     disposeAtlasTexture: () => { atlasTexture.dispose() },
     closeAudio: () => { audio.close() },
@@ -3549,7 +3615,7 @@ const bootGame = async (
       }, 100)
       surface.onCleanup(() => {
         window.clearInterval(hiddenNetworkPump)
-        Reflect.deleteProperty(globalThis, QA_GLOBAL_KEY)
+        disposeQaSurface()
         document.body.setAttribute('data-mc-compose-boot', 'stopped')
       })
       return {

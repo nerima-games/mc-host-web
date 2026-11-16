@@ -33,6 +33,9 @@ import {
   QaNamespaceNameSchema,
   QaOperationNameSchema,
   type QaNamespace as ModuleQaNamespace,
+  type WorldWriteChunkUnavailable,
+  type WorldWriteConflict,
+  type WorldWriteInvalidBatch,
   type BlockPosition,
   type ClockService,
   type Position as Vec3,
@@ -49,7 +52,9 @@ import {
   villageVillagerSpawnsForChunk,
   NoiseSeed,
   type ChunkStoreApi,
+  type ChunkStoreError,
   type Dimension,
+  type InvalidNaturalStructureCoordinate,
 } from '@nerima-games/mc-worldgen'
 import {
   type ChunkMesher,
@@ -75,6 +80,7 @@ import {
   WorldCommitCoordinator,
   type BrewingServiceApi,
   type WorldCommitCoordinatorApi,
+  type WorldCommitCoordinatorError,
 } from '@nerima-games/mc-sim'
 import {
   BLAZE_KIND,
@@ -125,7 +131,16 @@ import {
   type ChestStorageSlotTarget,
   type InventoryInteractionTarget,
 } from '@nerima-games/mx-ui'
-import { QaBridge, type QaBridgeApi, type DuplicateModuleContract, QaOperationNotFound, QA_GLOBAL_KEY } from '@nerima-games/mc-compose'
+import {
+  QaBridge,
+  type ComposeOptionsError,
+  type DuplicateModuleContract,
+  type InvalidModuleContract,
+  type QaBridgeApi,
+  QaOperationNotFound,
+  QA_GLOBAL_KEY,
+  type StageOrderError,
+} from '@nerima-games/mc-compose'
 import {
   FARMLAND_BLOCK_ID,
   KNOWN_TARGET_BLOCK,
@@ -211,6 +226,14 @@ type QaSurfaceApi = {
   readonly install: () => void
 }
 
+/** Every failure `composeGame` reports while the host builds the QA bridge. */
+export type QaBridgeCompositionFailure =
+  | DuplicateModuleContract
+  | InvalidModuleContract
+  | ComposeOptionsError
+  | Schema.SchemaError
+  | StageOrderError
+
 /** The chunk context QA helpers stream around. Structurally identical to the
  * `DimensionChunkContext` `bootGame` builds, so the `streamAround` and
  * `getOrCreateDimensionChunkContext` closures accept it without a cast. */
@@ -279,7 +302,7 @@ type QaSurfaceDeps = {
     readonly weather: WeatherServiceApi
     readonly getLightingSnapshot: () => RenderLightingSnapshot
   }
-  readonly makeQaBridge: (namespaces: ReadonlyArray<ModuleQaNamespace>) => Result.Result<QaBridgeApi<unknown>, DuplicateModuleContract>
+  readonly makeQaBridge: (namespaces: ReadonlyArray<ModuleQaNamespace>) => Result.Result<QaBridgeApi<unknown>, QaBridgeCompositionFailure>
   readonly gameplay: {
     readonly commit: NonNullable<Parameters<typeof gameplayStages>[9]>
     readonly targetingEntitiesOwnerId: NonNullable<Parameters<typeof requestTargetedBlockBreak>[2]['entitiesOwnerId']>
@@ -320,9 +343,19 @@ type QaSurfaceDeps = {
     readonly markSessionDirty: () => void
     readonly renderPlayerUi: () => void
     readonly applyPlayerDamage: (damage: Damage) => void
-    readonly streamAround: (context: QaChunkContext, x: number, z: number) => Effect.Effect<void>
+    readonly streamAround: (context: QaChunkContext, x: number, z: number) => Effect.Effect<
+      void,
+      WorldCommitCoordinatorError | InvalidNaturalStructureCoordinate
+    >
     readonly getOrCreateDimensionChunkContext: (dimension: Dimension) => QaChunkContext
-    readonly materializePortal: (dimension: Dimension, layout: PortalLayout) => Effect.Effect<void>
+    readonly materializePortal: (dimension: Dimension, layout: PortalLayout) => Effect.Effect<
+      void,
+      | Schema.SchemaError
+      | WorldWriteChunkUnavailable
+      | WorldWriteConflict
+      | ChunkStoreError
+      | WorldWriteInvalidBatch
+    >
     readonly registerPortal: (portal: PersistedPortalState) => boolean
     readonly syncPortalCandidatesFor: (dimension: Dimension) => Effect.Effect<void>
     readonly portalKeyOf: (portal: Pick<PersistedPortalState, 'dimension' | 'position'>) => string
@@ -507,7 +540,7 @@ export const observeQaBrewing = (
 export const makeQaSurface = (
   deps: QaSurfaceDeps,
 ):
-  Result.Result<QaSurfaceApi, DuplicateModuleContract> => {
+  Result.Result<QaSurfaceApi, QaBridgeCompositionFailure> => {
   // Composition validates registrations without invoking handlers; acquire session state only on success.
   const moduleNamespaces = makeQaNamespaces([
     {
@@ -1797,7 +1830,7 @@ export const makeQaSurface = (
     return gameplaySnapshot()
   }
 
-  // Deterministic core for ensureSafePortalLanding: a QA harness that
+  // Deterministic core for planSafePortalLanding: a QA harness that
   // reproduces "the Nether side of the crossing is solid rock" on demand
   // rather than hoping a live trial happens to land there. Leaving the
   // Nether side undiscovered would let stepPortalTravel plan a FRESH portal
@@ -1808,7 +1841,7 @@ export const makeQaSurface = (
   // so no frame gets built and the arrival lands on whatever this fixture
   // put there.
   //
-  // The fill is the SINGLE COLUMN ensureSafePortalLanding checks — same
+  // The fill is the SINGLE COLUMN planSafePortalLanding checks — same
   // x/z as the destination, nothing either side of it — because a wider
   // footprint check was tried and measured wrong: `e2e/persistence.e2e.ts`'s
   // portal round trip already exercises a REAL freshly built portal, whose
@@ -1818,7 +1851,7 @@ export const makeQaSurface = (
   // one:
   //
   //   AT and ABOVE the destination: solid through the whole vertical search
-  //   band. This both embeds the body (satisfying ensureSafePortalLanding's
+  //   band. This both embeds the body (satisfying planSafePortalLanding's
   //   own "is the body's own space clear" test the way real solid terrain
   //   would) and blocks every candidate the search would try ABOVE the
   //   destination.
