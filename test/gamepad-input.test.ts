@@ -15,9 +15,11 @@ import {
   makeHostGamepadInput,
 } from '../apps/web/gamepad-input'
 
-// Standard-mapping indices used below.
-const START = 7
-const DPAD_UP = 10
+// W3C standard-mapping indices (https://w3c.github.io/gamepad/#remapping).
+// mc-render 0.13.0 GAMEPAD_BUTTONS omits the two triggers (Start at 7, dpad up
+// at 10), so the tests that press these fail until mc-render is fixed.
+const START = 9
+const DPAD_UP = 12
 
 type PadState = {
   readonly pressed?: ReadonlyArray<number>
