@@ -224,7 +224,6 @@ export const makeMultiplayerClientHarness = async (): Promise<MultiplayerClientH
       multiplayerInventorySelection: null,
       queuedPlayerDamages: [],
       pendingCrafting: null,
-      pendingBrewingCommand: null,
       activeBrewingStandAt: undefined,
       closeChestOnFacilityIdle: false,
       networkSleepState: initialSleepClientState(),

@@ -1,5 +1,5 @@
 import { AngleRadians, BlockId, BlockPositionKey, blockOfPlaceableItem, DimensionIdSchema, InterpolationFraction, blockIdOf, encodeBlockState, MonotonicTimeSecs as KernelMonotonicTimeSecs, position, PositionAxis, VehicleVelocityComponent, type WorldWriteBatch } from '@nerima-games/mc-kernel'
-import { addExperience as addVitalsExperience, ExperienceDelta, changed, emptyFurnaceState, UNCHANGED, type WeatherState } from '@nerima-games/mc-sim'
+import { addExperience as addVitalsExperience, ExperienceDelta, changed, emptyFurnaceState, UNCHANGED, WorldCommitCoordinator, type WeatherState } from '@nerima-games/mc-sim'
 import { Effect, Option, Ref, Result, Schema } from 'effect'
 import {
   boardVehicle,
@@ -76,6 +76,7 @@ type TickGameplayFailure = Effect.Error<
   | ReturnType<H5cTickContext['services']['fishingEnvironmentAt']>
   | ReturnType<H5cTickContext['services']['presentWeatherRuntime']>
   | ReturnType<H5cTickContext['services']['syncRenderedEntities']>
+  | ReturnType<H5cTickContext['services']['brewingService']['advance']>
 > | Result.Result.Failure<
   | ReturnType<H5cTickContext['h5b']['applyWorldExplosion']>
   | ReturnType<typeof matchRuntimeWitherSummon>
@@ -168,6 +169,7 @@ export const runTickPostFrameGameplay = (
     endPortalComplete,
     useEndFeature,
     renderBrewingUi,
+    brewingService,
     time,
     weather,
     redstoneContainerRuntime,
@@ -205,7 +207,6 @@ export const runTickPostFrameGameplay = (
     sendPortalUseCommand,
     sendToggleLeverCommand,
     sendFacilityCommand,
-    requestBrewing,
   } = multiplayerClient
   const {
     containerIdForStorageBlock,
@@ -482,11 +483,7 @@ export const runTickPostFrameGameplay = (
       renderPlayerUi()
     } else if (opensBrewing) {
       setBrewingOpen(true)
-      if (multiplayer !== undefined && brewingTarget !== undefined) {
-        state.activeBrewingStandAt.set({ ...brewingTarget.position })
-        if (!requestBrewing({ _tag: 'open' })) state.brewingStatus.set('Brewing stand is unavailable')
-        renderBrewingUi()
-      }
+      if (brewingTarget !== undefined) state.activeBrewingStandAt.set({ ...brewingTarget.position })
     } else if (routeResult !== undefined && '_tag' in routeResult) {
       console.warn('Unable to route use to an unavailable block', routeResult)
     } else if (route?.kind === 'craftingTable') {
@@ -1048,6 +1045,31 @@ export const runTickPostFrameGameplay = (
     nowSecs,
   )
 
+  // The public drain clears every kind. Remove only correlated brewing
+  // refusals so the other host consumers retain their own unsupported records.
+  const unsupportedBrewing = yield* Ref.modify(gameplayState.unsupportedOperations, (operations) => {
+    const matched: Array<{
+      readonly requestId: string
+      readonly action: 'insert' | 'collect' | 'drink'
+      readonly reason: (typeof operations)[number]['reason']
+    }> = []
+    const retained: Array<(typeof operations)[number]> = []
+    for (const operation of operations) {
+      const pending = operation.requestId === undefined ? undefined : pendingItemUses.get(operation.requestId)
+      if (operation.requestId !== undefined && pending?.kind === 'brewing') {
+        matched.push({ requestId: operation.requestId, action: pending.action, reason: operation.reason })
+      } else {
+        retained.push(operation)
+      }
+    }
+    return [matched, retained]
+  })
+  for (const operation of unsupportedBrewing) {
+    pendingItemUses.delete(operation.requestId)
+    state.brewingStatus.set(`Cannot ${operation.action} brewing item: ${operation.reason}`)
+    renderBrewingUi()
+  }
+
   const itemUseResults = Effect.runSync(drainItemUseResults(gameplayState))
   for (const result of itemUseResults) {
     if ('action' in result && result.action === 'AdvanceFurnace') {
@@ -1078,6 +1100,33 @@ export const runTickPostFrameGameplay = (
     state.lastObservedItemUse.set(result)
     const pending = pendingItemUses.get(result.requestId)
     pendingItemUses.delete(result.requestId)
+    if (pending?.kind === 'brewing') {
+      if (!('action' in result)) {
+        if (result.outcome === 'PlayerDead') {
+          state.brewingStatus.set(`Cannot ${pending.action} brewing item: PlayerDead`)
+        }
+      } else if (pending.action === 'insert' && (
+        result.action === 'InsertBrewingFuel' || result.action === 'InsertBrewingBottle'
+        || result.action === 'InsertBrewingIngredient'
+      )) {
+        state.brewingStatus.set(result.success
+          ? `Inserted ${pending.item}` : `Cannot insert item: ${result.failure}`)
+      } else if (pending.action === 'collect' && result.action === 'CollectBrewingBottle') {
+        state.brewingStatus.set(result.outcome._tag === 'Collected'
+          ? `Collected ${result.outcome.item}`
+          : result.outcome._tag === 'InventoryFull'
+            ? 'Inventory is full' : `Cannot collect bottle: ${result.outcome._tag}`)
+      } else if (pending.action === 'drink' && result.action === 'DrinkPotion') {
+        state.brewingStatus.set(result.success
+          ? `Drank ${result.outcome.item}` : `Cannot drink bottle: ${result.failure._tag}`)
+      }
+      if (result.success) {
+        markSessionDirty()
+        renderPlayerUi()
+      }
+      renderBrewingUi()
+      continue
+    }
     if (pending === undefined || !result.success) continue
 
     // Successful item-use outcomes already include their committed storage,
@@ -1106,6 +1155,25 @@ export const runTickPostFrameGameplay = (
       multiplayerClient.sendVitalsCommand({ _tag: 'eat', item: 'potato' })
     }
     markSessionDirty()
+  }
+
+  // gameplayStages omits brewing-advance; this is its sole local clock owner (I4).
+  if (multiplayer === undefined) {
+    const before = yield* brewingService.snapshot.pipe(
+      Effect.provideService(WorldCommitCoordinator, targeting.coordinator),
+    )
+    // Empty stands need no commit. An interrupted recipe still needs advance to
+    // reset its progress, even when its ingredient or bottles were removed.
+    if (before.brewProgressSecs > 0 || (
+      before.ingredient !== undefined && before.fuelCharges > 0
+      && before.bottles.some((bottle) => bottle !== undefined)
+    )) {
+      const advanced = yield* brewingService.advance(deltaSecs).pipe(
+        Effect.provideService(WorldCommitCoordinator, targeting.coordinator),
+      )
+      if (advanced.brewed > 0 || advanced.state.brewProgressSecs !== before.brewProgressSecs) markSessionDirty()
+      renderBrewingUi()
+    }
   }
 
   const mobDrops = multiplayer === undefined
