@@ -1,6 +1,10 @@
 import {
   makeAudioRuntime as makeEffectAudioRuntime,
+  mapAudioEvent,
   type AudioBackend,
+  type AudioEvent,
+  type AudioEventMapFailure,
+  type AudioEventMapping,
   type AudioRuntimeSettings,
   type AudioRuntimeSnapshot,
   type CaptionEvent,
@@ -10,12 +14,15 @@ import {
   type GameAudioHost,
 } from '@nerima-games/mc-audio'
 import { type ClockPort, type MonotonicTimeSecs, type Position } from '@nerima-games/mc-kernel'
-import { Effect, type Layer } from 'effect'
+import { Effect, type Layer, Result } from 'effect'
 
 export {
   captionRenderSignature,
   horizontalListenerForward,
   pruneExpiredCaptionEvents,
+  type AudioEvent,
+  type AudioEventMapFailure,
+  type AudioEventMapping,
   type AudioRuntimeSettings,
   type AudioRuntimeSnapshot,
 } from '@nerima-games/mc-audio'
@@ -66,3 +73,19 @@ export const makeAudioRuntime = (input: {
       void Effect.runPromise(runtime.close()).catch(() => undefined)
     },
   }))
+
+// Which cue (and therefore which caption) an event plays is owned by mc-audio's
+// mapAudioEvent; the host only forwards. As with play above, the caption is
+// recorded even when backend playback dies. A mapping failure plays nothing and
+// is returned as-is for the caller to handle.
+export const playAudioEvent = (
+  audio: Pick<AudioRuntime, 'play'>,
+  event: AudioEvent,
+  options?: CuePlayOptions,
+): Result.Result<AudioEventMapping, AudioEventMapFailure> => {
+  const mapping = mapAudioEvent(event)
+  if (Result.isSuccess(mapping) && mapping.success.cueId !== null) {
+    audio.play(mapping.success.cueId, options)
+  }
+  return mapping
+}
