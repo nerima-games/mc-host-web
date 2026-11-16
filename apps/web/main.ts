@@ -253,6 +253,7 @@ import {
   WorldId,
   type AuthoritativeEntityState,
 } from '@nerima-games/mx-multiplayer'
+import { AudioVolume } from '@nerima-games/mc-audio'
 import { makeBrowserPreview } from './browser-preview.js'
 import {
   advanceBowUse,
@@ -1052,7 +1053,7 @@ const bootGame = async (
     const lightningSequence = receivedLightning?.sequence ?? (state.weather === 'thunder'
       ? Math.floor(timeState.ticks / (60 * 8))
       : undefined)
-    const intensity = state.weather === 'clear' ? 0 : 1
+    const intensity = state.weather === 'clear' ? AudioVolume(0) : AudioVolume(1)
     const camera = {
       x: pose.feetPosition.x,
       y: pose.feetPosition.y + EYE_LEVEL_OFFSET,
@@ -1084,7 +1085,7 @@ const bootGame = async (
       intensity,
       listener: camera,
       listenerForward: adapters.getReadAudioListenerForward(),
-      occlusion: 0,
+      occlusion: AudioVolume(0),
       ...(thunder === undefined ? {} : { thunder }),
     })
     canvas.setAttribute('data-weather-particles', String(renderPlan.particles.length))

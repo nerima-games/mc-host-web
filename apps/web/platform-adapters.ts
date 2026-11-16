@@ -1,6 +1,7 @@
 import * as THREE from 'three'
 import { Context, Effect, Layer, Option, Scope } from 'effect'
 import {
+  AudioVolume,
   createOriginalSampleManifest,
   makeEndAudioController,
   makeWeatherAudioController,
@@ -133,7 +134,7 @@ export const makePlatformAdapters = async (deps: {
   const sampleManifest = createOriginalSampleManifest()
   const audioBackend = Effect.runSync(makeWebAudioBackend({
     global: globalThis,
-    initialMasterGain: playerSettings.audioEnabled ? playerSettings.masterVolume : 0,
+    initialMasterGain: playerSettings.audioEnabled ? playerSettings.masterVolume : AudioVolume(0),
     sampleManifest,
   }))
   canvas.setAttribute('data-audio-samples', String(Object.keys(sampleManifest).length))

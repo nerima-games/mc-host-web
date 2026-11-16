@@ -555,7 +555,7 @@
     "count": 1,
     "file": "apps/web/platform-adapters.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(makeWebAudioBackend({ global: globalThis, initialMasterGain: playerSettings.audioEnabled ? playerSettings.masterVolume : 0, sampleManifest, }))"
+    "text": "Effect.runSync(makeWebAudioBackend({ global: globalThis, initialMasterGain: playerSettings.audioEnabled ? playerSettings.masterVolume : AudioVolume(0), sampleManifest, }))"
   },
   {
     "count": 1,
