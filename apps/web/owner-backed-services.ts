@@ -1,5 +1,6 @@
-import type { Dimension, WorldRevision } from '@nerima-games/mc-kernel'
+import { monotonicSecs, type Dimension, type WorldRevision } from '@nerima-games/mc-kernel'
 import {
+  cameraPoseOf,
   PlayerServiceSnapshotSchema,
   PlayerStorageSnapshotSchema,
   type Entity,
@@ -25,6 +26,7 @@ import {
 import {
   ExperienceOrbVitalsOwnerSnapshotSchema,
   GameplayEntityRosterSchema,
+  makeInMemoryPlayer,
   restoreGameplayEntityMetadata,
   type GameplayEntityMetadataFailure,
   type GameplayEntityRoster,
@@ -233,26 +235,32 @@ const playerOwnerState = (pose: PlayerPose, dimension: Dimension) => ({
   },
 })
 
+type PlayerOwnerState = ReplicatedSnapshot<typeof PlayerServiceSnapshotSchema>['state']
+
+// The player services keep every key of the pose they are given, so the
+// owner's dimension must not stay inside `feetPosition`.
+const poseOfPlayerOwner = ({ pose }: PlayerOwnerState): PlayerPose => ({
+  feetPosition: { x: pose.feetPosition.x, y: pose.feetPosition.y, z: pose.feetPosition.z },
+  yawRadians: pose.yawRadians,
+  pitchRadians: pose.pitchRadians,
+})
+
+const playerOwnerChange = (ownerId: ReplicatedOwnerId, pose: PlayerPose, dimension: Dimension): ReplicatedOwnerCandidate => ({
+  ownerId,
+  state: playerOwnerState(pose, dimension),
+})
+
 const makePlayerView = (
   coordinator: OwnerBackedCoordinator,
   player: PlayerServiceApi,
   ownerId: ReplicatedOwnerId,
 ): Effect.Effect<OwnerBackedPlayer> => {
   const ownerSnapshot = coordinator.snapshot(ownerId, PlayerServiceSnapshotSchema)
-  const load = Effect.flatMap(ownerSnapshot, ({ state: { pose } }) =>
-    // `restore` keeps every key of the pose it is given, so the owner's
-    // dimension must not stay inside `feetPosition`.
-    player.restore(
-      {
-        feetPosition: { x: pose.feetPosition.x, y: pose.feetPosition.y, z: pose.feetPosition.z },
-        yawRadians: pose.yawRadians,
-        pitchRadians: pose.pitchRadians,
-      },
-      pose.feetPosition.dimension,
-    ))
+  const load = Effect.flatMap(ownerSnapshot, ({ state }) =>
+    player.restore(poseOfPlayerOwner(state), state.pose.feetPosition.dimension))
   const toCommit = (): Effect.Effect<OwnerCommit<void>> =>
     Effect.map(Effect.all([player.pose, player.dimension]), ([pose, dimension]) => ({
-      changes: [{ ownerId, state: playerOwnerState(pose, dimension) }],
+      changes: [playerOwnerChange(ownerId, pose, dimension)],
       cache: undefined,
     }))
   return Effect.map(makeOwnerSync(coordinator, load), ({ read, write }): OwnerBackedPlayer => ({
@@ -274,6 +282,72 @@ const makePlayerView = (
       read(player.submitReplicatedCandidate(expectedRevision, expectedDimensionRevision)),
     reset: write(player.reset, toCommit),
   }))
+}
+
+export type OwnerBackedStagePlayerOptions = Readonly<{
+  coordinator: OwnerBackedCoordinator
+  playerOwnerId: ReplicatedOwnerId
+}>
+
+/**
+ * The `PlayerService` for stages and the registration Context. It keeps no
+ * state: every read decodes the player owner and every write commits to it.
+ * Host code keeps using the player view, whose members return the coordinator
+ * failures this adapter cannot.
+ */
+export const makeOwnerBackedStagePlayer = ({
+  coordinator,
+  playerOwnerId,
+}: OwnerBackedStagePlayerOptions): PlayerServiceApi => {
+  const ownerSnapshot = coordinator.snapshot(playerOwnerId, PlayerServiceSnapshotSchema)
+  // Invariant: the player owner is always registered (mx-gameplay
+  // `gameplayOwnerRegistrations`) and is read with the schema it was registered
+  // with, so neither `ReplicatedOwnerUnknown` nor `SchemaError` can occur.
+  const committed = Effect.orDie(ownerSnapshot)
+  const pose = Effect.map(committed, ({ state }) => poseOfPlayerOwner(state))
+  // Each write runs the in-memory player's own member on a throwaway copy of
+  // the owner state, so its input validation and pitch clamp apply unchanged
+  // (mx-gameplay does not export its validators), then commits the result.
+  const write = <A, E>(operation: (player: PlayerServiceApi) => Effect.Effect<A, E>): Effect.Effect<A, E> =>
+    Effect.gen(function* () {
+      const snapshot = yield* committed
+      const scratch = yield* makeInMemoryPlayer(poseOfPlayerOwner(snapshot.state), snapshot.state.pose.feetPosition.dimension)
+      const result = yield* operation(scratch)
+      const [nextPose, nextDimension] = yield* Effect.all([scratch.pose, scratch.dimension])
+      // I3: the revision comes from the snapshot this operation read.
+      // Invariant: every world write happens inside the frame fiber or through
+      // the frame-boundary queue, so no other writer commits between this
+      // operation's revision read and its commit.
+      yield* Effect.orDie(coordinator.commit({
+        expectedRevision: snapshot.revision,
+        expectedDimensions: [],
+        changes: [playerOwnerChange(playerOwnerId, nextPose, nextDimension)],
+      }))
+      return result
+    })
+  return {
+    pose,
+    dimension: Effect.map(committed, ({ state }) => state.pose.feetPosition.dimension),
+    look: (deltaYaw, deltaPitch) => write((player) => player.look(deltaYaw, deltaPitch)),
+    moveTo: (feetPosition) => write((player) => player.moveTo(feetPosition)),
+    setDimension: (dimension) => write((player) => player.setDimension(dimension)),
+    cameraPose: Effect.flatMap(monotonicSecs, (now) =>
+      Effect.flatMap(pose, (current) => Effect.fromResult(cameraPoseOf(current, now)))),
+    restore: (nextPose, dimension) => write((player) => player.restore(nextPose, dimension)),
+    snapshot: ownerSnapshot,
+    // The service state is the owner state, so the candidate is the committed state.
+    replicatedCandidate: Effect.map(committed, ({ state }) => state),
+    // The candidate never changes dimension here, so only the committed
+    // dimension's revision is expected (mc-sim's same-dimension branch).
+    submitReplicatedCandidate: (expectedRevision, expectedDimensionRevision) =>
+      Effect.flatMap(ownerSnapshot, ({ state }) =>
+        coordinator.commit({
+          expectedRevision,
+          expectedDimensions: [{ dimension: state.pose.feetPosition.dimension, expectedRevision: expectedDimensionRevision }],
+          changes: [{ ownerId: playerOwnerId, state }],
+        })),
+    reset: write((player) => player.reset),
+  }
 }
 
 const makeInventoryView = (

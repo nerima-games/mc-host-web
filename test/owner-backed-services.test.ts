@@ -1,10 +1,25 @@
-import { EntityId, position, PositionAxis, WorldId } from '@nerima-games/mc-kernel'
+import { BlockLength, PLAYER_HALF_HEIGHT, PLAYER_HALF_WIDTH } from '@nerima-games/mc-physics'
+import {
+  DeltaTimeSecs,
+  EntityId,
+  EpochMillis,
+  FixedClockLayer,
+  MonotonicTimeSecs,
+  position,
+  PositionAxis,
+  WorldId,
+} from '@nerima-games/mc-kernel'
 import {
   EntityHealthPoints,
   EntityKind,
+  makeCropService,
+  makeSimFrameState,
+  makeTimeService,
   makeWorldCommitCoordinator,
   PlayerServiceSnapshotSchema,
   PlayerStorageSnapshotSchema,
+  simStages,
+  WorldCommitCoordinator,
   WorldRevisionConflict,
   type EntityManagerApi,
   type InventoryServiceApi,
@@ -21,16 +36,18 @@ import {
   GameplayEntityRosterSchema,
   gameplayOwnerRegistrations,
   makeInMemoryInventory,
+  makeInMemoryPlayer,
   makeInMemoryWorld,
   totalOf,
   type InMemoryVitalsApi,
   type InMemoryWorld,
   type MobBehaviour,
 } from '@nerima-games/mx-gameplay'
-import { Effect } from 'effect'
+import { Effect, Option, Ref, Result } from 'effect'
 import { describe, expect, expectTypeOf, it } from 'vitest'
 
 import {
+  makeOwnerBackedStagePlayer,
   makeOwnerBackedWorld,
   type OwnerBackedCoordinator,
   type OwnerBackedEntities,
@@ -313,5 +330,125 @@ describe('owner-backed views', () => {
     commitOwners(coordinator, [{ ownerId: GAMEPLAY_PLAYER_STORAGE_OWNER_ID, state: storage }])
     expect(Effect.runSync(view.inventory.countOf('cobblestone'))).toBe(6)
     expect(Effect.runSync(view.inventory.containerStorageSnapshot)).toEqual(containers)
+  })
+})
+
+describe('owner-backed stage player', () => {
+  const makeStageHarness = async () => {
+    const harness = await makeHarness()
+    const player = makeOwnerBackedStagePlayer({ coordinator: harness.coordinator, playerOwnerId: GAMEPLAY_PLAYER_OWNER_ID })
+    return { ...harness, player }
+  }
+  const ownerState = (coordinator: WorldCommitCoordinatorApi) =>
+    snapshotOf(coordinator.snapshot(GAMEPLAY_PLAYER_OWNER_ID, PlayerServiceSnapshotSchema)).state
+  const clock = FixedClockLayer({ monotonicSecs: MonotonicTimeSecs(12.5), wallClockEpochMillis: EpochMillis(0) })
+
+  it('is exactly the PlayerService the Context and simStages take', () => {
+    expectTypeOf(makeOwnerBackedStagePlayer).returns.toEqualTypeOf<PlayerServiceApi>()
+  })
+
+  it('commits moveTo to the owner, and the player view reloads it', async () => {
+    const { coordinator, view, player } = await makeStageHarness()
+    // The view caches the owner at this revision before the adapter writes.
+    expect(Effect.runSync(view.player.pose).feetPosition).toEqual({ x: 0, y: 0, z: 0 })
+    Effect.runSync(player.moveTo(at(3.5, 70, -2.25)))
+    expect(ownerState(coordinator).pose.feetPosition).toEqual({ dimension: 'overworld', x: 3.5, y: 70, z: -2.25 })
+    expect(Effect.runSync(view.player.pose).feetPosition).toEqual({ x: 3.5, y: 70, z: -2.25 })
+    expect(Effect.runSync(player.pose).feetPosition).toEqual({ x: 3.5, y: 70, z: -2.25 })
+  })
+
+  it('reads what the player view commits, without a store of its own', async () => {
+    const { view, player } = await makeStageHarness()
+    Effect.runSync(view.player.setDimension('nether'))
+    Effect.runSync(view.player.look(0.5, 0.25))
+    expect(Effect.runSync(player.dimension)).toBe('nether')
+    expect(Effect.runSync(player.pose)).toEqual(Effect.runSync(view.player.pose))
+    expect(Effect.runSync(player.replicatedCandidate)).toEqual(Effect.runSync(view.player.snapshot).state)
+  })
+
+  it('returns the in-memory player input errors and does not commit', async () => {
+    const { coordinator, player } = await makeStageHarness()
+    const revision = Effect.runSync(coordinator.revision)
+    const before = ownerState(coordinator)
+    // `Position` brands reject non-finite axes at construction, so a non-finite
+    // value reaches the adapter through the unbranded pose angles and look deltas.
+    expect(Effect.runSync(Effect.flip(player.look(Number.NaN, 0))))
+      .toEqual({ _tag: 'PlayerServiceInputError', reason: 'invalid-look', field: 'deltaYaw' })
+    expect(Effect.runSync(Effect.flip(player.restore(
+      { feetPosition: at(1, 2, 3), yawRadians: Number.POSITIVE_INFINITY, pitchRadians: 0 },
+      'overworld',
+    )))).toEqual({ _tag: 'PlayerServiceInputError', reason: 'invalid-pose', field: 'yawRadians' })
+    expect(Effect.runSync(coordinator.revision)).toBe(revision)
+    expect(ownerState(coordinator)).toEqual(before)
+  })
+
+  it('applies the in-memory player rules on restore, look and reset', async () => {
+    const { coordinator, player } = await makeStageHarness()
+    Effect.runSync(player.restore({ feetPosition: at(1, 2, 3), yawRadians: 0.5, pitchRadians: 9 }, 'end'))
+    const reference = Effect.runSync(makeInMemoryPlayer())
+    Effect.runSync(reference.restore({ feetPosition: at(1, 2, 3), yawRadians: 0.5, pitchRadians: 9 }, 'end'))
+    expect(Effect.runSync(player.pose)).toEqual(Effect.runSync(reference.pose))
+    expect(Effect.runSync(player.look(1, -20))).toEqual(Effect.runSync(reference.look(1, -20)))
+    expect(ownerState(coordinator).pose.pitchRadians).toBe(Effect.runSync(reference.pose).pitchRadians)
+    Effect.runSync(player.reset)
+    expect(ownerState(coordinator)).toEqual(playerOwnerState('overworld', 0, 0, 0, 0, 0))
+  })
+
+  it('builds the camera pose from the owner with the supplied clock', async () => {
+    const { player } = await makeStageHarness()
+    Effect.runSync(player.restore({ feetPosition: at(4, 65, -1), yawRadians: 1, pitchRadians: 0.2 }, 'overworld'))
+    const reference = Effect.runSync(makeInMemoryPlayer({ feetPosition: at(4, 65, -1), yawRadians: 1, pitchRadians: 0.2 }))
+    expect(Effect.runSync(Effect.provide(player.cameraPose, clock)))
+      .toEqual(Effect.runSync(Effect.provide(reference.cameraPose, clock)))
+  })
+
+  it('submits and snapshots through its own coordinator, not the Context one', async () => {
+    const { coordinator, player } = await makeStageHarness()
+    // A second coordinator in the Context: the members' `R` still names the
+    // tag, but nothing the adapter does may reach it.
+    const other = await Effect.runPromise(makeWorldCommitCoordinator({
+      world: WorldId('owner-backed-services-other'),
+      owners: gameplayOwnerRegistrations(),
+    }))
+    const inContext = <A, E>(effect: Effect.Effect<A, E, WorldCommitCoordinator>) =>
+      Effect.provideService(effect, WorldCommitCoordinator, other)
+    const revision = Effect.runSync(coordinator.revision)
+    const dimensionRevision = Effect.runSync(coordinator.dimensionRevision('overworld'))
+    const delta = Effect.runSync(inContext(player.submitReplicatedCandidate(revision, dimensionRevision)))
+    expect(delta.revision).toBe(revision + 1)
+    expect(Effect.runSync(Effect.flip(inContext(player.submitReplicatedCandidate(revision, dimensionRevision)))))
+      .toBeInstanceOf(WorldRevisionConflict)
+    const snapshot = Effect.runSync(inContext(player.snapshot))
+    expect(snapshot).toMatchObject({ world: 'owner-backed-services-test', revision: revision + 1 })
+    expect(Effect.runSync(other.revision)).toBe(revision)
+  })
+
+  it('carries the sim:physics write to the owner', async () => {
+    const { coordinator, view, player } = await makeStageHarness()
+    const state = await Effect.runPromise(makeSimFrameState)
+    const time = await Effect.runPromise(makeTimeService())
+    const crops = await Effect.runPromise(makeCropService())
+    Effect.runSync(Ref.set(state.physicsConfig, Option.some({
+      resolve: {
+        blockPropertiesAt: () => Result.succeed(null),
+        environment: { blockAt: () => Result.succeed(null) },
+        halfWidth: PLAYER_HALF_WIDTH,
+        halfHeight: PLAYER_HALF_HEIGHT,
+        stepHeight: BlockLength(0.6),
+      },
+      walkSpeed: 2,
+      jumpSpeed: 1,
+    })))
+    Effect.runSync(Ref.set(state.movementIntent, { forward: 1, strafe: 0 }))
+    const stages = simStages(state, time, player, crops)
+    expect(stages.map((stage) => stage.id)).toEqual(['sim:physics'])
+    const revision = Effect.runSync(coordinator.revision)
+    for (const stage of stages) Effect.runSync(Effect.provide(stage.run(DeltaTimeSecs(0.05)), clock))
+    // One commit per tick; yaw 0 walks towards -z and the body falls through air.
+    expect(Effect.runSync(coordinator.revision)).toBe(revision + 1)
+    const moved = ownerState(coordinator).pose.feetPosition
+    expect(moved.z).toBeCloseTo(-0.1)
+    expect(moved.y).toBeLessThan(0)
+    expect(Effect.runSync(view.player.pose).feetPosition).toEqual({ x: moved.x, y: moved.y, z: moved.z })
   })
 })
