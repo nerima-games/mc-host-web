@@ -21,6 +21,7 @@
  * #16 and #17 are OBSOLETE in the triage for exactly that reason, and nothing
  * here is allowed to reintroduce the shape.
  */
+import { ATLAS_COLUMNS, ATLAS_ROWS, TILE_GUTTER_PIXELS, TILE_PIXELS } from '@nerima-games/mc-render'
 import { expect, test, type ConsoleMessage, type Page } from '@playwright/test'
 
 import { callQa } from './helpers/qa'
@@ -183,7 +184,8 @@ test.describe('smoke — the composed frame in a real browser', () => {
     expect(probe?.bufferHeight).toBe(probe?.layoutHeight)
     expect(probe?.layoutWidth).toBeGreaterThan(0)
     expect(probe?.audioSamples).toBeGreaterThan(0)
-    expect(probe?.atlasSize).toBe('512x512')
+    const atlasCellPixels = TILE_PIXELS + 2 * TILE_GUTTER_PIXELS
+    expect(probe?.atlasSize).toBe(`${String(ATLAS_COLUMNS * atlasCellPixels)}x${String(ATLAS_ROWS * atlasCellPixels)}`)
     // The naive pair, kept because they are what the row is named after — but
     // they are a postscript to the two above, not the claim.
     expect(probe?.hasWebgl2).toBe(true)
