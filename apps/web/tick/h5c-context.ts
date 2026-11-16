@@ -49,6 +49,8 @@ type PendingItemUse =
   | { readonly kind: 'plant'; readonly slotIndex: number; readonly dimension: Dimension }
   | { readonly kind: 'harvest'; readonly dimension: Dimension; readonly position: SessionPosition }
   | { readonly kind: 'eat'; readonly slotIndex: number }
+  | { readonly kind: 'brewing'; readonly action: 'insert'; readonly item: string }
+  | { readonly kind: 'brewing'; readonly action: 'collect' | 'drink' }
 
 export type H5cPostFrameInput = Readonly<{
   frame: H5aFrameInputResult
@@ -108,6 +110,7 @@ export type H5cTickContext = {
     readonly endPortalComplete: () => boolean
     readonly useEndFeature: () => Effect.Effect<boolean, EndFeatureFailure>
     readonly renderBrewingUi: () => void
+    readonly brewingService: import('@nerima-games/mc-sim').BrewingServiceApi
     readonly time: EffectValue<ReturnType<typeof import('@nerima-games/mc-sim').makeTimeService>>
     readonly weather: EffectValue<ReturnType<typeof import('@nerima-games/mc-sim').makeWeatherService>>
     readonly redstoneContainerRuntime: RedstoneContainerRuntime

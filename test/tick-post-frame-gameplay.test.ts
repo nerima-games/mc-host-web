@@ -1,6 +1,6 @@
-import { AngleRadians, BlockAxis, BlockId, ClockPort, EpochMillis, fixedClock, blockIdOf, blockTypeOfId, blockPosition as kernelBlockPosition, ChunkAxis, chunkCoord as kernelChunkCoord, DeltaTimeSecs, MonotonicTimeSecs, position, PositionAxis, WorldId, MAX_PORTAL_WIDTH, WorldWriteChunkUnavailableSchema, WorldWriteConflict, WorldWriteInvalidBatch, type WorldWriteBatch, type WorldWritePort } from '@nerima-games/mc-kernel'
+import { AngleRadians, BlockAxis, BlockId, ClockPort, EpochMillis, fixedClock, blockIdOf, blockTypeOfId, blockPosition as kernelBlockPosition, ChunkAxis, chunkCoord as kernelChunkCoord, DeltaTimeSecs, itemStack, MonotonicTimeSecs, position, PositionAxis, StackCount, WorldId, MAX_PORTAL_WIDTH, WorldWriteChunkUnavailableSchema, WorldWriteConflict, WorldWriteInvalidBatch, type WorldWriteBatch, type WorldWritePort } from '@nerima-games/mc-kernel'
 import { type InputSnapshot } from '@nerima-games/mc-render'
-import { CropSnapshotSchema, PlayerServiceSnapshotSchema, PlayerStorageSnapshotSchema, makeTimeService, makeWeatherService, makeWorldCommitCoordinator, HungerPoints, POTATO_MATURITY_SECS, type CropSnapshot } from '@nerima-games/mc-sim'
+import { CropSnapshotSchema, PlayerServiceSnapshotSchema, PlayerStorageSnapshotSchema, WorldCommitCoordinator, makeBrewingService, makeTimeService, makeWeatherService, makeWorldCommitCoordinator, HungerPoints, POTATO_MATURITY_SECS, type CropSnapshot } from '@nerima-games/mc-sim'
 import { CHUNK_SIZE_XZ, CHUNK_VOLUME, BIOMES, type ChunkSource } from '@nerima-games/mc-worldgen'
 import { type ItemUseResult, type MobBehaviour } from '@nerima-games/mx-gameplay'
 import { Effect, Option, Ref, Result, Schema } from 'effect'
@@ -66,7 +66,7 @@ const makeDocument = (attributes: Map<string, string>): Document => ({
 
 type HarnessOptions = Readonly<{
   useTriggered?: boolean
-  selectedItem?: 'eye_of_ender' | 'ender_pearl' | 'fishing_rod' | 'stone' | 'flint_and_steel' | 'wooden_hoe' | 'potato'
+  selectedItem?: 'eye_of_ender' | 'ender_pearl' | 'fishing_rod' | 'stone' | 'flint_and_steel' | 'wooden_hoe' | 'potato' | 'blaze_powder'
   nearbyVillager?: PersistedVillager
   endFeatureResult?: boolean
   deadAfterFrame?: boolean
@@ -134,6 +134,7 @@ const makeHarness = async (options: HarnessOptions = {}) => {
   const gameplayState = await Effect.runPromise(gameplay.makeGameplayFrameState)
   const time = await Effect.runPromise(makeTimeService())
   const weather = await Effect.runPromise(makeWeatherService())
+  const brewingService = Effect.runSync(makeBrewingService(gameplay.GAMEPLAY_BREWING_OWNER_ID))
   const weatherBeforeFrame = Effect.runSync(weather.snapshot)
   const commit = {
     coordinator,
@@ -143,6 +144,8 @@ const makeHarness = async (options: HarnessOptions = {}) => {
     droppedItemsOwnerId: gameplay.GAMEPLAY_DROPPED_ITEMS_OWNER_ID,
     vitalsOwnerId: gameplay.GAMEPLAY_VITALS_OWNER_ID,
     entitiesOwnerId: gameplay.GAMEPLAY_ENTITIES_OWNER_ID,
+    brewingOwnerId: gameplay.GAMEPLAY_BREWING_OWNER_ID,
+    brewingService,
   }
   const interactions = Option.getOrThrow(Option.fromNullishOr(gameplay.gameplayStages(
     gameplayState, world.chunkStore, world.entities, world.inventory, world.player,
@@ -309,6 +312,7 @@ const makeHarness = async (options: HarnessOptions = {}) => {
       return Effect.succeed(options.endFeatureResult ?? false)
     },
     renderBrewingUi: () => undefined,
+    brewingService,
     time,
     weather,
     redstoneContainerRuntime: {
@@ -430,6 +434,129 @@ const withHarness = async (
 }
 
 describe('tick post-frame gameplay processing', () => {
+  it('advances an active brew by one frame delta', async () => {
+    await withHarness({}, (harness) => {
+      const service = harness.context.services.brewingService
+      Effect.runSync(service.restore({
+        bottles: [Result.getOrThrow(itemStack('water_bottle', StackCount(1))), undefined, undefined],
+        ingredient: Result.getOrThrow(itemStack('nether_wart', StackCount(1))),
+        fuel: undefined,
+        fuelCharges: 2,
+        brewProgressSecs: 5,
+      }).pipe(Effect.provideService(WorldCommitCoordinator, harness.coordinator)))
+
+      runTickPostFrameGameplay(harness.context, { frame: harness.frame, movement: harness.movement, postFrame: harness.postFrame, nowSecs: MonotonicTimeSecs(2) })
+
+      const brewing = Effect.runSync(service.snapshot.pipe(Effect.provideService(WorldCommitCoordinator, harness.coordinator)))
+      expect(brewing.brewProgressSecs).toBeCloseTo(5.05)
+      expect(brewing.fuelCharges).toBe(2)
+      expect(brewing.bottles[0]?.item).toBe('water_bottle')
+    })
+  })
+
+  it('drains a queued brewing fuel result without consuming storage twice', async () => {
+    await withHarness({ selectedItem: 'blaze_powder' }, (harness) => {
+      const state = harness.context.h5a.gameplayState
+      harness.context.services.pendingItemUses.set('brewing-fuel-1', { kind: 'brewing', action: 'insert', item: 'blaze_powder' })
+      Effect.runSync(gameplay.insertBrewingFuel(state, 'brewing-fuel-1'))
+      expect(Effect.runSync(harness.coordinator.snapshot(gameplay.GAMEPLAY_PLAYER_STORAGE_OWNER_ID, PlayerStorageSnapshotSchema)).state.inventory.slots[0]?.count).toBe(1)
+      expect(harness.context.state.brewingStatus.get()).toBe('closed')
+
+      Effect.runSync(harness.runInteractions())
+
+      expect(Effect.runSync(Ref.get(state.itemUseResults))).toEqual([
+        { action: 'InsertBrewingFuel', requestId: 'brewing-fuel-1', success: true, outcome: undefined },
+      ])
+      expect(Effect.runSync(harness.coordinator.snapshot(gameplay.GAMEPLAY_PLAYER_STORAGE_OWNER_ID, PlayerStorageSnapshotSchema)).state.inventory.slots[0]).toBeUndefined()
+      runTickPostFrameGameplay(harness.context, { frame: harness.frame, movement: harness.movement, postFrame: harness.postFrame, nowSecs: MonotonicTimeSecs(2) })
+
+      expect(harness.context.state.brewingStatus.get()).toBe('Inserted blaze_powder')
+      expect(harness.context.services.pendingItemUses.has('brewing-fuel-1')).toBe(false)
+      expect(Effect.runSync(Ref.get(state.itemUseResults))).toEqual([])
+      expect(harness.playerUiCalls.get()).toBe(2)
+      const committedStorage = Effect.runSync(harness.coordinator.snapshot(gameplay.GAMEPLAY_PLAYER_STORAGE_OWNER_ID, PlayerStorageSnapshotSchema)).state
+
+      runTickPostFrameGameplay(harness.context, { frame: harness.frame, movement: harness.movement, postFrame: harness.postFrame, nowSecs: MonotonicTimeSecs(2) })
+
+      expect(harness.context.state.brewingStatus.get()).toBe('Inserted blaze_powder')
+      expect(harness.playerUiCalls.get()).toBe(3)
+      expect(Effect.runSync(harness.coordinator.snapshot(gameplay.GAMEPLAY_PLAYER_STORAGE_OWNER_ID, PlayerStorageSnapshotSchema)).state).toEqual(committedStorage)
+    })
+  })
+
+  const brewingResults: ReadonlyArray<{
+    readonly name: string
+    readonly pending: Extract<H5cTickContext['services']['pendingItemUses'] extends Map<string, infer Pending> ? Pending : never, { kind: 'brewing' }>
+    readonly result: ItemUseResult
+    readonly status: string
+  }> = [
+    {
+      name: 'missing insertion item',
+      pending: { kind: 'brewing', action: 'insert', item: 'water_bottle' },
+      result: { action: 'InsertBrewingBottle', requestId: 'brewing-1', success: false, failure: 'MissingItem' },
+      status: 'Cannot insert item: MissingItem',
+    },
+    {
+      name: 'collected bottle',
+      pending: { kind: 'brewing', action: 'collect' },
+      result: { action: 'CollectBrewingBottle', requestId: 'brewing-1', success: true, outcome: { _tag: 'Collected', item: 'awkward_potion', count: 1, remainingCount: 0 } },
+      status: 'Collected awkward_potion',
+    },
+    {
+      name: 'full collection inventory',
+      pending: { kind: 'brewing', action: 'collect' },
+      result: { action: 'CollectBrewingBottle', requestId: 'brewing-1', success: false, outcome: { _tag: 'InventoryFull', item: 'awkward_potion', count: 1 } },
+      status: 'Inventory is full',
+    },
+    {
+      name: 'empty collection slot',
+      pending: { kind: 'brewing', action: 'collect' },
+      result: { action: 'CollectBrewingBottle', requestId: 'brewing-1', success: false, outcome: { _tag: 'Empty' } },
+      status: 'Cannot collect bottle: Empty',
+    },
+    {
+      name: 'drunk potion',
+      pending: { kind: 'brewing', action: 'drink' },
+      result: { action: 'DrinkPotion', requestId: 'brewing-1', success: true, outcome: { _tag: 'ConsumedWithoutEffect', item: 'awkward_potion' } },
+      status: 'Drank awkward_potion',
+    },
+    {
+      name: 'dead player',
+      pending: { kind: 'brewing', action: 'insert', item: 'water_bottle' },
+      result: { requestId: 'brewing-1', success: false, outcome: 'PlayerDead' },
+      status: 'Cannot insert brewing item: PlayerDead',
+    },
+  ]
+
+  it.each(brewingResults)('updates brewing status for $name by request id', async ({ pending, result, status }) => {
+    await withHarness({}, (harness) => {
+      harness.context.services.pendingItemUses.set('brewing-1', pending)
+      harness.context.services.pendingItemUses.set('brewing-2', { kind: 'brewing', action: 'insert', item: 'sugar' })
+      Effect.runSync(Ref.set(harness.context.h5a.gameplayState.itemUseResults, [result]))
+
+      runTickPostFrameGameplay(harness.context, { frame: harness.frame, movement: harness.movement, postFrame: harness.postFrame, nowSecs: MonotonicTimeSecs(2) })
+
+      expect(harness.context.state.brewingStatus.get()).toBe(status)
+      expect(harness.context.services.pendingItemUses.has('brewing-1')).toBe(false)
+      expect(harness.context.services.pendingItemUses.has('brewing-2')).toBe(true)
+      expect(Effect.runSync(Ref.get(harness.context.h5a.gameplayState.itemUseResults))).toEqual([])
+    })
+  })
+
+  it('ignores brewing results without a matching pending request', async () => {
+    await withHarness({}, (harness) => {
+      harness.context.services.pendingItemUses.set('brewing-1', { kind: 'brewing', action: 'insert', item: 'blaze_powder' })
+      Effect.runSync(Ref.set(harness.context.h5a.gameplayState.itemUseResults, [
+        { action: 'InsertBrewingFuel', requestId: 'unrelated', success: true, outcome: undefined },
+      ]))
+
+      runTickPostFrameGameplay(harness.context, { frame: harness.frame, movement: harness.movement, postFrame: harness.postFrame, nowSecs: MonotonicTimeSecs(2) })
+
+      expect(harness.context.state.brewingStatus.get()).toBe('closed')
+      expect(harness.context.services.pendingItemUses.has('brewing-1')).toBe(true)
+    })
+  })
+
   it.each([false, true])('settles mature harvest once with full inventory %s', async (fullInventory) => {
     const cropPosition = blockPosition(0, 64, 1)
     await withHarness({

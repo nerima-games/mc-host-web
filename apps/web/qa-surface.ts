@@ -271,6 +271,8 @@ type PendingItemUse =
       readonly position: { readonly x: number; readonly y: number; readonly z: number }
     }
   | { readonly kind: 'eat'; readonly slotIndex: number }
+  | { readonly kind: 'brewing'; readonly action: 'insert'; readonly item: string }
+  | { readonly kind: 'brewing'; readonly action: 'collect' | 'drink' }
 
 type PendingBlockUse = {
   readonly dimension: Dimension

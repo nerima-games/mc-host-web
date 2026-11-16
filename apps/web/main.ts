@@ -88,12 +88,15 @@ import {
   BLOCK_PROPERTY_DEFAULTS,
   BREWING_TIME_SECS,
   BlockAxis,
+  BlockAddressSchema,
   BlockId,
   blockPosition,
   blockPositionKeyOf,
   blockTypeOfId,
   DeltaTimeSecs,
   DimensionIdSchema,
+  EntityIdSchema,
+  SimulationTickSchema,
   blockPositionOfPosition,
   chunkCoordOfBlock,
   isEmpty,
@@ -2192,6 +2195,8 @@ const bootGame = async (
         readonly position: { readonly x: number; readonly y: number; readonly z: number }
       }
     | { readonly kind: 'eat'; readonly slotIndex: number }
+    | { readonly kind: 'brewing'; readonly action: 'insert'; readonly item: string }
+    | { readonly kind: 'brewing'; readonly action: 'collect' | 'drink' }
   const pendingItemUses = new Map<string, PendingItemUse>()
   let bowUseState: BowUseState = IDLE_BOW_USE
   let projectileRuntimeState = initialProjectileRuntimeState()
@@ -2758,8 +2763,8 @@ const bootGame = async (
     if (open && document.pointerLockElement === canvas) document.exitPointerLock()
   }
 
-  // The brewing actions read and write the inventory and brewing owners and act
-  // on the results, so the whole action runs at the frame boundary.
+  // Queue against the owners at the frame boundary; the stage alone consumes
+  // storage, and the result drain presents the correlated outcome.
   brewingParent.addEventListener('click', (event) => {
     if (!(event.target instanceof Element)) return
     const action = event.target.closest<HTMLElement>('[data-brewing-action]')
@@ -2789,35 +2794,32 @@ const bootGame = async (
           return
         }
         const bottle = brewingBottleFromItem(selected.item)
-        const ingredients: ReadonlySet<string> = new Set([
-          'nether_wart', 'sugar', 'spider_eye', 'ghast_tear',
-        ])
-        if (selected.item !== 'blaze_powder' && bottle === undefined && !ingredients.has(selected.item)) {
+        const ingredient: BrewingIngredient | undefined = selected.item === 'nether_wart'
+          || selected.item === 'sugar' || selected.item === 'spider_eye' || selected.item === 'ghast_tear'
+          ? selected.item : undefined
+        if (selected.item !== 'blaze_powder' && bottle === undefined && ingredient === undefined) {
           brewingStatus = 'That item cannot be used for brewing'
           renderBrewingUi()
           return
         }
-        const removal = Effect.runSync(
-          world.inventory.removeAt(selectedHotbarIndex, selected.item, 1),
-        )
-        if (removal._tag !== 'Removed' || removal.removed !== 1) {
-          brewingStatus = 'The selected item is no longer available'
+        const bottleIndex = bottle === undefined ? undefined
+          : Effect.runSync(snapshotGameplayBrewing).bottles.findIndex((slot) => slot === undefined)
+        if (bottleIndex === -1) {
+          brewingStatus = 'Cannot insert item: Occupied'
           renderBrewingUi()
           return
         }
-        const result = selected.item === 'blaze_powder'
-          ? Effect.runSync(insertBrewingFuel(gameplayState))
-          : bottle !== undefined
-            ? Effect.runSync(insertBrewingBottle(gameplayState, bottle))
-            : Effect.runSync(insertBrewingIngredient(gameplayState, selected.item as BrewingIngredient))
-        if (result._tag === 'Rejected') {
-          const leftover = Effect.runSync(world.inventory.add(selected.item, 1))
-          if (leftover !== 0) throw new Error('Failed to restore rejected brewing item')
-          brewingStatus = `Cannot insert item: ${result.reason}`
-        } else {
-          brewingStatus = `Inserted ${selected.item}`
-          markSessionDirty()
+        nextItemUseRequestId += 1
+        const requestId = `brewing-${String(nextItemUseRequestId)}`
+        if (selected.item === 'blaze_powder') {
+          Effect.runSync(insertBrewingFuel(gameplayState, requestId))
+        } else if (bottle !== undefined && bottleIndex !== undefined) {
+          Effect.runSync(insertBrewingBottle(gameplayState, requestId, bottleIndex, bottle))
+        } else if (ingredient !== undefined) {
+          Effect.runSync(insertBrewingIngredient(gameplayState, requestId, ingredient))
         }
+        pendingItemUses.set(requestId, { kind: 'brewing', action: 'insert', item: selected.item })
+        brewingStatus = `Submitting ${selected.item}...`
         renderBrewingUi()
         renderPlayerUi()
         return
@@ -2832,22 +2834,30 @@ const bootGame = async (
           renderBrewingUi()
           return
         }
-        const result = Effect.runSync(collectBrewingPotion(gameplayState))
-        if (result._tag === 'Rejected') {
-          brewingStatus = `Cannot collect bottle: ${result.reason}`
-        } else {
-          const leftover = Effect.runSync(world.inventory.add(result.returned.item, 1))
-          if (leftover === 0) {
-            brewingStatus = `Collected ${result.returned.item}`
-            markSessionDirty()
-          } else {
-            const bottle = brewingBottleFromItem(result.returned.item)
-            if (bottle === undefined) throw new Error('Collected an invalid brewing bottle')
-            const restored = Effect.runSync(insertBrewingBottle(gameplayState, bottle))
-            if (restored._tag !== 'Accepted') throw new Error('Failed to restore uncollected potion')
-            brewingStatus = 'Inventory is full'
-          }
+        const bottleIndex = Effect.runSync(snapshotGameplayBrewing).bottles.findIndex((slot) => slot !== undefined)
+        if (bottleIndex === -1) {
+          brewingStatus = 'Cannot collect bottle: Empty'
+          renderBrewingUi()
+          return
         }
+        if (activeBrewingStandAt === undefined) {
+          brewingStatus = 'Brewing stand is unavailable'
+          renderBrewingUi()
+          return
+        }
+        nextItemUseRequestId += 1
+        const requestId = `brewing-${String(nextItemUseRequestId)}`
+        Effect.runSync(collectBrewingPotion(gameplayState, {
+          requestId,
+          actor: Schema.decodeUnknownSync(EntityIdSchema)('mx-gameplay:player-avatar'),
+          tick: Schema.decodeUnknownSync(SimulationTickSchema)(Effect.runSync(Ref.get(gameplayState.tickCount))),
+          address: Schema.decodeUnknownSync(BlockAddressSchema)({
+            dimension: Effect.runSync(playerApi.dimension), position: activeBrewingStandAt,
+          }),
+          bottleIndex,
+        }))
+        pendingItemUses.set(requestId, { kind: 'brewing', action: 'collect' })
+        brewingStatus = 'Collecting bottle...'
         renderBrewingUi()
         renderPlayerUi()
         return
@@ -2862,11 +2872,16 @@ const bootGame = async (
           renderBrewingUi()
           return
         }
-        const result = Effect.runSync(useBrewingPotion(gameplayState))
-        brewingStatus = result._tag === 'Consumed'
-          ? `Drank ${result.consumed.item}`
-          : `Cannot drink bottle: ${result.reason}`
-        if (result._tag === 'Consumed') markSessionDirty()
+        nextItemUseRequestId += 1
+        const requestId = `brewing-${String(nextItemUseRequestId)}`
+        Effect.runSync(useBrewingPotion(gameplayState, {
+          requestId,
+          actor: Schema.decodeUnknownSync(EntityIdSchema)('mx-gameplay:player-avatar'),
+          tick: Schema.decodeUnknownSync(SimulationTickSchema)(Effect.runSync(Ref.get(gameplayState.tickCount))),
+          slotIndex: selectedHotbarIndex,
+        }))
+        pendingItemUses.set(requestId, { kind: 'brewing', action: 'drink' })
+        brewingStatus = 'Drinking potion...'
         renderBrewingUi()
         renderPlayerUi()
       }
@@ -3815,6 +3830,7 @@ const bootGame = async (
         endPortalComplete: () => endPortalComplete,
         useEndFeature,
         renderBrewingUi,
+        brewingService: gameplayBrewingService,
         time,
         weather,
         redstoneContainerRuntime: {
