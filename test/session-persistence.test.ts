@@ -343,6 +343,15 @@ describe('dynamic entity persistence', () => {
 })
 
 const defaultMetadata: SessionMetadata = { name: 'Test World', mode: 'survival' }
+
+// loadSession opens through openSession, so an unreadable live head without a
+// checkpoint fails as corrupt; the decode failure itself is its live failure.
+const loadFailureOf = (sessionId: string) =>
+  Effect.flip(loadSession(sessionId)).pipe(Effect.map((error) => {
+    expect(error).toMatchObject({ _tag: 'SessionCorruptError', sessionId, checkpoint: 'absent' })
+    assert(error._tag === 'SessionCorruptError')
+    return error.liveFailure
+  }))
 const saveSession = (
   input: Omit<SaveSessionInput, 'metadata'> & { readonly metadata?: SessionMetadata },
 ) => persistSession({ ...input, metadata: input.metadata ?? defaultMetadata })
@@ -625,7 +634,7 @@ describe('session persistence', () => {
     })
 
     return Effect.gen(function* () {
-      const error = yield* Effect.flip(loadSession(sessionId))
+      const error = yield* loadFailureOf(sessionId)
       expect(error).toMatchObject({
         _tag: 'SaveDecodeError',
         format: SESSION_FORMAT_NAME,
@@ -676,7 +685,7 @@ describe('session persistence', () => {
 
     return Effect.gen(function* () {
       for (const index of invalidStates.keys()) {
-        const error = yield* Effect.flip(loadSession(`invalid-gameplay-snapshot-${String(index)}`))
+        const error = yield* loadFailureOf(`invalid-gameplay-snapshot-${String(index)}`)
         expect(error).toMatchObject({ _tag: 'SaveDecodeError' })
       }
     }).pipe(Effect.provide(storage.layer))
@@ -709,9 +718,10 @@ describe('session persistence', () => {
       for (const version of legacyVersions) {
         const error = yield* Effect.flip(loadSession(`legacy-v${String(version)}`))
         expect(error).toMatchObject({
-          _tag: 'SaveDecodeError',
-          format: SESSION_FORMAT_NAME,
-          version,
+          _tag: 'SessionIncompatibleError',
+          reason: 'unsupported-version',
+          storedVersion: version,
+          currentVersion: 18,
         })
       }
     }).pipe(Effect.provide(storage.layer))
@@ -788,7 +798,7 @@ describe('session persistence', () => {
     })
 
     return Effect.gen(function* () {
-      const error = yield* Effect.flip(loadSession(sessionId))
+      const error = yield* loadFailureOf(sessionId)
       expect(error).toMatchObject({
         _tag: 'SaveDecodeError',
         format: SESSION_FORMAT_NAME,
@@ -818,7 +828,7 @@ describe('session persistence', () => {
     })
 
     return Effect.gen(function* () {
-      const error = yield* Effect.flip(loadSession(sessionId))
+      const error = yield* loadFailureOf(sessionId)
       expect(error).toMatchObject({
         _tag: 'SaveDecodeError',
         format: SESSION_FORMAT_NAME,
@@ -843,7 +853,7 @@ describe('session persistence', () => {
     })
 
     return Effect.gen(function* () {
-      const error = yield* Effect.flip(loadSession(sessionId))
+      const error = yield* loadFailureOf(sessionId)
       expect(error).toMatchObject({
         _tag: 'SaveDecodeError',
         format: SESSION_FORMAT_NAME,
@@ -879,7 +889,7 @@ describe('session persistence', () => {
 
     return Effect.gen(function* () {
       for (const index of invalidPortals.keys()) {
-        const error = yield* Effect.flip(loadSession(`invalid-portal-${String(index)}`))
+        const error = yield* loadFailureOf(`invalid-portal-${String(index)}`)
         expect(error).toMatchObject({
           _tag: 'SaveDecodeError',
           format: SESSION_FORMAT_NAME,
@@ -931,7 +941,7 @@ describe('session persistence', () => {
 
     return Effect.gen(function* () {
       for (const index of invalidCrops.keys()) {
-        const error = yield* Effect.flip(loadSession(`invalid-crops-${String(index)}`))
+        const error = yield* loadFailureOf(`invalid-crops-${String(index)}`)
         expect(error).toMatchObject({
           _tag: 'SaveDecodeError',
           format: SESSION_FORMAT_NAME,
@@ -959,9 +969,11 @@ describe('session persistence', () => {
     return Effect.gen(function* () {
       const error = yield* Effect.flip(loadSession(sessionId))
       expect(error).toMatchObject({
-        _tag: 'SaveDecodeError',
-        format: SESSION_FORMAT_NAME,
-        version: SESSION_FORMAT_VERSION + 1,
+        _tag: 'SessionIncompatibleError',
+        reason: 'future-version',
+        key: 'mc-compose/session/future-version/head',
+        storedVersion: 19,
+        currentVersion: 18,
       })
     }).pipe(Effect.provide(storage.layer))
   })
@@ -1004,7 +1016,7 @@ describe('session persistence', () => {
   const expectAllRejected = (prefix: string, count: number) =>
     Effect.gen(function* () {
       for (let index = 0; index < count; index += 1) {
-        const error = yield* Effect.flip(loadSession(`${prefix}-${String(index)}`))
+        const error = yield* loadFailureOf(`${prefix}-${String(index)}`)
         expect(error).toMatchObject({
           _tag: 'SaveDecodeError',
           format: SESSION_FORMAT_NAME,
@@ -1057,7 +1069,7 @@ describe('session persistence', () => {
     })
 
     return Effect.gen(function* () {
-      const error = yield* Effect.flip(loadSession(sessionId))
+      const error = yield* loadFailureOf(sessionId)
       expect(error).toMatchObject({
         _tag: 'SaveDecodeError',
         format: SESSION_FORMAT_NAME,
@@ -1087,7 +1099,7 @@ describe('session persistence', () => {
     })
 
     return Effect.gen(function* () {
-      const error = yield* Effect.flip(loadSession(sessionId))
+      const error = yield* loadFailureOf(sessionId)
       expect(error).toMatchObject({
         _tag: 'SaveDecodeError',
         format: SESSION_FORMAT_NAME,
@@ -1117,7 +1129,7 @@ describe('session persistence', () => {
 
     return Effect.gen(function* () {
       for (const index of invalidNames.keys()) {
-        const error = yield* Effect.flip(loadSession(`invalid-metadata-${String(index)}`))
+        const error = yield* loadFailureOf(`invalid-metadata-${String(index)}`)
         expect(error).toMatchObject({
           _tag: 'SaveDecodeError',
           format: SESSION_FORMAT_NAME,
@@ -1308,7 +1320,7 @@ describe('session persistence', () => {
     })
 
     return Effect.gen(function* () {
-      const error = yield* Effect.flip(loadSession('invalid-storage-durability'))
+      const error = yield* loadFailureOf('invalid-storage-durability')
 
       expect(error).toMatchObject({
         _tag: 'SaveDecodeError',
@@ -1383,7 +1395,7 @@ describe('session persistence', () => {
     })
 
     return Effect.gen(function* () {
-      const error = yield* Effect.flip(loadSession('invalid-time'))
+      const error = yield* loadFailureOf('invalid-time')
 
       expect(error).toMatchObject({ _tag: 'SaveDecodeError', version: SESSION_FORMAT_VERSION })
     }).pipe(Effect.provide(storage.layer))
@@ -1405,7 +1417,7 @@ describe('session persistence', () => {
     })
 
     return Effect.gen(function* () {
-      const error = yield* Effect.flip(loadSession('invalid-weather'))
+      const error = yield* loadFailureOf('invalid-weather')
 
       expect(error).toMatchObject({ _tag: 'SaveDecodeError', version: SESSION_FORMAT_VERSION })
     }).pipe(Effect.provide(storage.layer))
@@ -1429,7 +1441,7 @@ describe('session persistence', () => {
     })
 
     return Effect.gen(function* () {
-      const error = yield* Effect.flip(loadSession('invalid-vitals'))
+      const error = yield* loadFailureOf('invalid-vitals')
 
       expect(error).toMatchObject({ _tag: 'SaveDecodeError', version: SESSION_FORMAT_VERSION })
     }).pipe(Effect.provide(storage.layer))
@@ -1456,7 +1468,7 @@ describe('session persistence', () => {
     })
 
     return Effect.gen(function* () {
-      const decodeError = yield* Effect.flip(loadSession(decodeSessionId))
+      const decodeError = yield* loadFailureOf(decodeSessionId)
       expect(decodeError).toMatchObject({
         _tag: 'SaveDecodeError',
         reason: 'the payload does not satisfy the current schema',
@@ -1505,7 +1517,7 @@ describe('session persistence', () => {
     })
 
     return Effect.gen(function* () {
-      const error = yield* Effect.flip(loadSession('unknown-item'))
+      const error = yield* loadFailureOf('unknown-item')
 
       expect(error).toMatchObject({
         _tag: 'SaveDecodeError',
@@ -2044,7 +2056,7 @@ describe('session persistence', () => {
       seedFixture(storage, 'v17-brewing-fuel-overflow', 'session-v17-brewing-fuel-overflow-envelope.json')
       return Effect.gen(function* () {
         // 1301 units: 20 charges plus ceil(1281 / 20) = 65 blaze powder, one over a stack of 64.
-        const error = yield* Effect.flip(loadSession('v17-brewing-fuel-overflow'))
+        const error = yield* loadFailureOf('v17-brewing-fuel-overflow')
 
         expect(error).toMatchObject({
           _tag: 'SaveDecodeError',
@@ -2069,7 +2081,7 @@ describe('session persistence', () => {
     )
 
     return Effect.gen(function* () {
-      const error = yield* Effect.flip(loadSession('v17-stackless-fixture'))
+      const error = yield* loadFailureOf('v17-stackless-fixture')
 
       expect(error).toMatchObject({ _tag: 'SaveDecodeError', reason: 'save contains a non-finite number' })
     }).pipe(Effect.provide(storage.layer))
@@ -2087,9 +2099,10 @@ describe('session checkpoint and compatibility', () => {
   const storedSnapshot = (storage: ControlledStorage): ReadonlyArray<readonly [string, string]> =>
     storage.keys.map((key): readonly [string, string] => [key, JSON.stringify(storage.envelope(key))])
 
-  const savedMarker = (head: SessionHead, cx: number, cz: number) =>
+  // One chunk source per head: each one decodes every chunk the manifest lists.
+  const savedMarkers = (head: SessionHead) =>
     makeSessionChunkSource(head, 'overworld', (coord) => Effect.succeed(chunk(coord.cx, coord.cz, 99))).pipe(
-      Effect.map((loaded) => Effect.runSync(loaded.source(coordOf(cx, cz))).blocks[0]),
+      Effect.map((loaded) => head.chunks.map(({ coord }) => Effect.runSync(loaded.source(coord)).blocks[0])),
     )
 
   const saveRevision = (sessionId: string, revision: string, seed: number, markers: ReadonlyArray<number>) =>
@@ -2121,8 +2134,7 @@ describe('session checkpoint and compatibility', () => {
 
       expect(opened).toEqual({ _tag: 'Live', head: saved })
       expect(sessionOpenNotice(opened)).toEqual(Option.none())
-      expect(yield* savedMarker(opened.head, 0, 0)).toBe(3)
-      expect(yield* savedMarker(opened.head, 1, 0)).toBe(4)
+      expect(yield* savedMarkers(opened.head)).toEqual([3, 4])
       expect(Option.isNone(yield* openSession('absent-world'))).toBe(true)
     }).pipe(Effect.provide(storage.layer))
   })
@@ -2150,13 +2162,13 @@ describe('session checkpoint and compatibility', () => {
         record: { _tag: 'Head', key: 'mc-compose/session/checkpointed/head' },
         repair: { lastHealthyRevisionAvailable: true },
       })
-      expect(yield* savedMarker(opened.head, 0, 0)).toBe(3)
+      expect(yield* savedMarkers(opened.head)).toEqual([3])
       expect(sessionOpenNotice(opened)).toEqual(
         Option.some('The latest save could not be read. The previous save was opened instead.'),
       )
       expect(yield* listSessionEntries()).toEqual({ sessions: [opened.head], unavailable: [] })
-      // loadSession still reads only the live head, so the plain listing hides this session.
-      expect(yield* listSessions()).toEqual([])
+      expect(yield* listSessions()).toEqual([opened.head])
+      expect(yield* loadSession('checkpointed')).toEqual(Option.some(opened.head))
     }).pipe(Effect.provide(storage.layer))
   })
 
@@ -2176,7 +2188,7 @@ describe('session checkpoint and compatibility', () => {
       const opened = Option.getOrThrow(yield* openSession('recovering'))
       assert(opened._tag === 'Checkpoint')
       expect(opened.head.revision).toBe('r1')
-      expect(yield* savedMarker(opened.head, 0, 0)).toBe(3)
+      expect(yield* savedMarkers(opened.head)).toEqual([3])
     }).pipe(Effect.provide(storage.layer))
   })
 
@@ -2202,14 +2214,15 @@ describe('session checkpoint and compatibility', () => {
           discardableChunkKeys: ['mc-compose/session/missing-live-chunk/revision/r2/dimension/overworld/chunk/0/0'],
         },
       })
-      expect(yield* savedMarker(opened.head, 0, 0)).toBe(3)
+      expect(yield* savedMarkers(opened.head)).toEqual([3])
     }).pipe(Effect.provide(storage.layer))
   })
 
   it.effect('opens the checkpoint when a live chunk is corrupt', () => {
     const storage = controlledStorage()
     return Effect.gen(function* () {
-      yield* saveRevision('corrupt-live-chunk', 'r1', 1, [3, 4])
+      yield* saveRevision('corrupt-live-chunk', 'r1', 1, [3])
+      // The damaged chunk is the second, so the first one decodes before it fails.
       yield* saveRevision('corrupt-live-chunk', 'r2', 2, [5, 6])
       tamper(storage, 'mc-compose/session/corrupt-live-chunk/revision/r2/dimension/overworld/chunk/1/0')
 
@@ -2224,8 +2237,7 @@ describe('session checkpoint and compatibility', () => {
           key: 'mc-compose/session/corrupt-live-chunk/revision/r2/dimension/overworld/chunk/1/0',
         },
       })
-      expect(yield* savedMarker(opened.head, 0, 0)).toBe(3)
-      expect(yield* savedMarker(opened.head, 1, 0)).toBe(4)
+      expect(yield* savedMarkers(opened.head)).toEqual([3])
     }).pipe(Effect.provide(storage.layer))
   })
 
@@ -2320,10 +2332,10 @@ describe('session checkpoint and compatibility', () => {
   it.effect('fails as corrupt when a checkpoint chunk is unreadable', () => {
     const storage = controlledStorage()
     return Effect.gen(function* () {
-      yield* saveRevision('partial-checkpoint', 'r1', 1, [3, 4])
-      yield* saveRevision('partial-checkpoint', 'r2', 2, [5, 6])
+      yield* saveRevision('partial-checkpoint', 'r1', 1, [3])
+      yield* saveRevision('partial-checkpoint', 'r2', 2, [5])
       tamper(storage, 'mc-compose/session/partial-checkpoint/head')
-      tamper(storage, 'mc-compose/session/partial-checkpoint/checkpoint/revision/r1/dimension/overworld/chunk/1/0')
+      tamper(storage, 'mc-compose/session/partial-checkpoint/checkpoint/revision/r1/dimension/overworld/chunk/0/0')
 
       expect(yield* Effect.flip(openSession('partial-checkpoint'))).toMatchObject({
         _tag: 'SessionCorruptError',
@@ -2331,7 +2343,7 @@ describe('session checkpoint and compatibility', () => {
           _tag: 'SaveDecodeError',
           record: {
             _tag: 'Chunk',
-            key: 'mc-compose/session/partial-checkpoint/checkpoint/revision/r1/dimension/overworld/chunk/1/0',
+            key: 'mc-compose/session/partial-checkpoint/checkpoint/revision/r1/dimension/overworld/chunk/0/0',
           },
         },
       })
@@ -2366,7 +2378,7 @@ describe('session checkpoint and compatibility', () => {
         key: 'mc-compose/session/checkpoint-failure/checkpoint/revision/r1/dimension/overworld/chunk/0/0',
       })
       expect(yield* openSession('checkpoint-failure')).toEqual(Option.some({ _tag: 'Live', head: saved }))
-      expect(yield* savedMarker(saved, 0, 0)).toBe(3)
+      expect(yield* savedMarkers(saved)).toEqual([3])
       expect([...storage.keys].sort()).toEqual([
         'mc-compose/session/checkpoint-failure/head',
         'mc-compose/session/checkpoint-failure/revision/r1/dimension/overworld/chunk/0/0',
@@ -2377,7 +2389,7 @@ describe('session checkpoint and compatibility', () => {
   it.effect('restores the previous live revision and keeps the checkpoint when publishing fails', () => {
     const storage = controlledStorage()
     return Effect.gen(function* () {
-      const saved = yield* saveRevision('publish-failure', 'r1', 1, [3, 4])
+      const saved = yield* saveRevision('publish-failure', 'r1', 1, [3])
       storage.failChunkKey = 'mc-compose/session/publish-failure/revision/r2/dimension/overworld/chunk/1/0'
 
       expect(yield* Effect.flip(saveRevision('publish-failure', 'r2', 2, [5, 6]))).toMatchObject({
@@ -2385,15 +2397,13 @@ describe('session checkpoint and compatibility', () => {
         key: 'mc-compose/session/publish-failure/revision/r2/dimension/overworld/chunk/1/0',
       })
       expect(yield* openSession('publish-failure')).toEqual(Option.some({ _tag: 'Live', head: saved }))
-      expect(yield* savedMarker(saved, 0, 0)).toBe(3)
-      expect(yield* savedMarker(saved, 1, 0)).toBe(4)
+      expect(yield* savedMarkers(saved)).toEqual([3])
+      // r2's first chunk was published before the second failed; it is gone again.
       expect([...storage.keys].sort()).toEqual([
         'mc-compose/session/publish-failure/checkpoint/head',
         'mc-compose/session/publish-failure/checkpoint/revision/r1/dimension/overworld/chunk/0/0',
-        'mc-compose/session/publish-failure/checkpoint/revision/r1/dimension/overworld/chunk/1/0',
         'mc-compose/session/publish-failure/head',
         'mc-compose/session/publish-failure/revision/r1/dimension/overworld/chunk/0/0',
-        'mc-compose/session/publish-failure/revision/r1/dimension/overworld/chunk/1/0',
       ])
       tamper(storage, 'mc-compose/session/publish-failure/head')
       const opened = Option.getOrThrow(yield* openSession('publish-failure'))
@@ -2539,7 +2549,7 @@ describe('session checkpoint and compatibility', () => {
       assert(opened._tag === 'Live')
       expect(opened.head.revision).toBe('r1')
       expect(opened.head.chunks).toEqual([{ dimension: 'overworld', coord: coordOf(0, 0), key: liveChunkKey }])
-      expect(yield* savedMarker(opened.head, 0, 0)).toBe(3)
+      expect(yield* savedMarkers(opened.head)).toEqual([3])
       expect(yield* listSessionEntries()).toEqual({ sessions: [opened.head], unavailable: [] })
 
       yield* saveRevision('v17-fixture', 'r2', 2, [5])
@@ -2554,7 +2564,50 @@ describe('session checkpoint and compatibility', () => {
         coord: coordOf(0, 0),
         key: 'mc-compose/session/v17-fixture/checkpoint/revision/r1/dimension/overworld/chunk/0/0',
       }])
-      expect(yield* savedMarker(fromCheckpoint.head, 0, 0)).toBe(3)
+      expect(yield* savedMarkers(fromCheckpoint.head)).toEqual([3])
+    }).pipe(Effect.provide(storage.layer))
+  })
+
+  it.effect('a save after a failed publish succeeds and keeps r1 retained', () => {
+    const storage = controlledStorage()
+    return Effect.gen(function* () {
+      yield* saveRevision('retry-after-failure', 'r1', 1, [3])
+      storage.failChunkKey = 'mc-compose/session/retry-after-failure/revision/r2/dimension/overworld/chunk/0/0'
+      yield* Effect.flip(saveRevision('retry-after-failure', 'r2', 2, [5]))
+      storage.failChunkKey = undefined
+
+      const saved = yield* saveRevision('retry-after-failure', 'r3', 3, [7])
+
+      expect(yield* openSession('retry-after-failure')).toEqual(Option.some({ _tag: 'Live', head: saved }))
+      expect([...storage.keys].sort()).toEqual([
+        'mc-compose/session/retry-after-failure/checkpoint/head',
+        'mc-compose/session/retry-after-failure/checkpoint/revision/r1/dimension/overworld/chunk/0/0',
+        'mc-compose/session/retry-after-failure/head',
+        'mc-compose/session/retry-after-failure/revision/r3/dimension/overworld/chunk/0/0',
+      ])
+      tamper(storage, 'mc-compose/session/retry-after-failure/head')
+      const opened = Option.getOrThrow(yield* openSession('retry-after-failure'))
+      assert(opened._tag === 'Checkpoint')
+      expect(opened.head.revision).toBe('r1')
+      expect(yield* savedMarkers(opened.head)).toEqual([3])
+    }).pipe(Effect.provide(storage.layer))
+  })
+
+  it.effect('does not copy a previous revision whose chunk is damaged over the checkpoint', () => {
+    const storage = controlledStorage()
+    return Effect.gen(function* () {
+      yield* saveRevision('damaged-previous', 'r1', 1, [3])
+      yield* saveRevision('damaged-previous', 'r2', 2, [5])
+      tamper(storage, 'mc-compose/session/damaged-previous/revision/r2/dimension/overworld/chunk/0/0')
+
+      yield* saveRevision('damaged-previous', 'r3', 3, [7])
+
+      tamper(storage, 'mc-compose/session/damaged-previous/head')
+      const opened = Option.getOrThrow(yield* openSession('damaged-previous'))
+      assert(opened._tag === 'Checkpoint')
+      expect(opened.head.revision).toBe('r1')
+      expect(yield* savedMarkers(opened.head)).toEqual([3])
     }).pipe(Effect.provide(storage.layer))
   })
 })
+
