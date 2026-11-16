@@ -70,7 +70,6 @@ type TickGameplayFailure = Effect.Error<
   | H5cTickContext['services']['time']['timeOfDay']
   | ReturnType<H5cTickContext['services']['worldWrite']['applyBatch']>
   | ReturnType<H5cTickContext['services']['streamAround']>
-  | Effect.Effect<never, Schema.SchemaError>
 >
 
 export const runTickPostFrameGameplay = (
@@ -91,13 +90,14 @@ export const runTickPostFrameGameplay = (
   } = postFrame
   const { h5a, h5b, services, state } = context
   const targeting = h5a.targeting
-  const writeBlocks = (dimension: Dimension, edits: WorldWriteBatch['edits']) => Effect.gen(function* () {
-    const dimensionId = yield* Schema.decodeEffect(DimensionIdSchema)(dimension)
+  // Dimension is the same closed literal union as the schema; decoding only adds its brand.
+  const asDimensionId = (dimension: Dimension) => Schema.decodeUnknownSync(DimensionIdSchema)(dimension)
+  const writeBlocks = (dimension: WorldWriteBatch['dimension'], edits: WorldWriteBatch['edits']) => Effect.gen(function* () {
     const coordinator = targeting.coordinator
     yield* services.worldWrite.applyBatch({
       world: coordinator.worldId,
       expectedWorldRevision: yield* coordinator.revision,
-      dimension: dimensionId,
+      dimension,
       expectedDimensionRevision: yield* coordinator.dimensionRevision(dimension),
       edits,
     })
@@ -489,7 +489,7 @@ export const runTickPostFrameGameplay = (
         document.body.setAttribute('data-sleep-result', 'unavailable')
       } else if (currentDimension !== 'overworld') {
         state.sleepRuntimeState.set(leaveSleep(state.sleepRuntimeState.get(), multiplayer?.query.player ?? 'local'))
-        yield* writeBlocks(currentDimension, [{ position: bedPosition, block: Option.getOrThrow(blockIdOf('air')) }])
+        yield* writeBlocks(asDimensionId(currentDimension), [{ position: bedPosition, block: Option.getOrThrow(blockIdOf('air')) }])
         applyWorldExplosion(
           { x: bedPosition.x + 0.5, y: bedPosition.y + 0.5, z: bedPosition.z + 0.5 },
           5,
@@ -848,7 +848,7 @@ export const runTickPostFrameGameplay = (
           },
         )
         if (match !== undefined && context !== undefined) {
-          yield* writeBlocks(pending.dimension, match.consumedBlocks.map((position) => ({
+          yield* writeBlocks(asDimensionId(pending.dimension), match.consumedBlocks.map((position) => ({
             position: blockPosition(position.x, position.y, position.z),
             block: Option.getOrThrow(blockIdOf('air')),
           })))
@@ -894,8 +894,7 @@ export const runTickPostFrameGameplay = (
       const context = dimensionContexts.get(transition.dimension as Dimension)
       if (context === undefined) continue
       const lampPosition = asBlockPosition(transition.position)
-      const dimension = yield* Schema.decodeEffect(DimensionIdSchema)(transition.dimension)
-      yield* writeBlocks(dimension, [{
+      yield* writeBlocks(transition.dimension, [{
         position: lampPosition,
         block: transition.lit ? Option.getOrThrow(blockIdOf('redstone_lamp_lit')) : Option.getOrThrow(blockIdOf('redstone_lamp')),
       }])
@@ -933,8 +932,7 @@ export const runTickPostFrameGameplay = (
         position: transition.position,
       })
       if (transition.kind === 'door') {
-        const dimension = yield* Schema.decodeEffect(DimensionIdSchema)(transition.dimension)
-        yield* writeBlocks(dimension, [{
+        yield* writeBlocks(transition.dimension, [{
           position: asBlockPosition(transition.position),
           block: transition.powered ? Option.getOrThrow(blockIdOf('door_open')) : Option.getOrThrow(blockIdOf('door')),
         }])
@@ -1151,7 +1149,7 @@ export const runTickPostFrameGameplay = (
               edits.push({ position: blockPosition(x, portalY, z), block: END_PORTAL_BLOCK.PORTAL })
             }
           }
-          yield* writeBlocks(dimensionAfterFrame, edits)
+          yield* writeBlocks(asDimensionId(dimensionAfterFrame), edits)
           state.exitPortalMaterialized.set(true)
           queueEndAudio('exitPortal', position(PositionAxis(0), PositionAxis(portalY), PositionAxis(0)))
         }
