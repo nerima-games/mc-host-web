@@ -23,8 +23,15 @@ export type SettingsView = {
   readonly reportPersistenceSaved: () => void
   readonly reportPersistenceError: (message: string) => void
   readonly clearPersistenceError: () => void
+  // The stored settings could not be read, so the dialog shows defaults and
+  // the next successful save replaces the stored record. The warning is shown
+  // on every open until reportPersistenceSaved reports that replacement.
+  readonly reportLoadFailure: () => void
   readonly dispose: () => void
 }
+
+export const PLAYER_SETTINGS_LOAD_FAILURE_MESSAGE =
+  'Saved settings could not be read. Changing a setting will replace them.'
 
 const ACTION_LABELS: Readonly<Record<BindableAction, string>> = {
   moveForward: 'Move forward',
@@ -126,6 +133,15 @@ export const createSettingsView = (
   let current = DEFAULT_PLAYER_SETTINGS
   let returnFocus: HTMLElement | undefined
   let capturing: BindableAction | undefined
+  let loadFailed = false
+  let saveError: string | undefined
+
+  // A save failure is the newer and more specific problem, so it takes the
+  // alert while present; the load warning returns once it is cleared.
+  const renderPersistenceError = (): void => {
+    if (saveError !== undefined) persistenceError.textContent = saveError
+    else persistenceError.textContent = loadFailed ? PLAYER_SETTINGS_LOAD_FAILURE_MESSAGE : ''
+  }
 
   const publish = (next: PlayerSettingsV1): void => {
     current = next
@@ -268,8 +284,9 @@ export const createSettingsView = (
       returnFocus = nextReturnFocus
       capturing = undefined
       status.textContent = ''
-      persistenceError.textContent = ''
-      saveIndicator.render(undefined)
+      saveError = undefined
+      renderPersistenceError()
+      saveIndicator.render(loadFailed ? 'failed' : undefined)
       render()
       root.hidden = false
       closeButton.focus()
@@ -281,14 +298,24 @@ export const createSettingsView = (
       saveIndicator.render('saving')
     },
     reportPersistenceSaved: () => {
+      loadFailed = false
+      saveError = undefined
+      renderPersistenceError()
       saveIndicator.render('saved')
     },
     reportPersistenceError: (message) => {
-      persistenceError.textContent = message
+      saveError = message
+      renderPersistenceError()
       saveIndicator.render('failed')
     },
     clearPersistenceError: () => {
-      persistenceError.textContent = ''
+      saveError = undefined
+      renderPersistenceError()
+    },
+    reportLoadFailure: () => {
+      loadFailed = true
+      renderPersistenceError()
+      saveIndicator.render('failed')
     },
     dispose: () => {
       document.removeEventListener('keydown', handleDocumentKeydown, true)
