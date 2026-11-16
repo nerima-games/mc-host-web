@@ -254,8 +254,8 @@ const grantPointerLock = async (page: Page): Promise<void> => {
 }
 
 const seedZombieEncounter = async (page: Page, command: string) => {
-  // Capture the baseline and fixture addition before an ecosystem tick can
-  // introduce unrelated natural mobs between the two observations.
+  // Capture the baseline before queuing the fixture's spawn request. The
+  // entities stage processes that request after this frame-boundary callback.
   const { before, seeded } = await page.evaluate(async (operation) => {
     const transport = window.__NERIMA_GAMES_QA__
     if (transport === undefined) throw new Error('missing QA transport')
@@ -272,10 +272,19 @@ const seedZombieEncounter = async (page: Page, command: string) => {
   const baselineIds = new Set(before.entities.map(({ id }) => id))
   const identity = ({ id, kind }: EntitySnapshot) => ({ id, kind })
   expect(seeded.entities.filter(({ id }) => baselineIds.has(id)).map(identity)).toEqual(before.entities.map(identity))
-  const added = seeded.entities.filter(({ id }) => !baselineIds.has(id))
-  expect(added).toHaveLength(1)
-  expect(added[0]?.kind).toBe('zombie')
-  return { baselineIds, zombieId: added[0]!.id }
+  let spawnedZombie: EntitySnapshot | undefined
+  await expect.poll(async () => {
+    const current = await snapshot(page)
+    const added = current.entities.filter(({ id, kind }) => kind === 'zombie' && !baselineIds.has(id))
+    if (added.length !== 1) return false
+    const zombie = added[0]!
+    const rendered = current.renderedEntities.filter(({ id }) => id === zombie.id)
+    if (rendered.length !== 1 || rendered[0]?.kind !== 'zombie' || rendered[0]?.category !== 'hostile') return false
+    spawnedZombie = zombie
+    return true
+  }).toBe(true)
+  expect(spawnedZombie).toBeDefined()
+  return { baselineIds, zombieId: spawnedZombie!.id }
 }
 
 test('renders a zombie pursuing the player and persists contact damage', async ({ page }) => {
