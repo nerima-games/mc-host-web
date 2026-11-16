@@ -76,7 +76,7 @@ test('player settings persist and preserve Escape priority from title and pause'
   await startGameSession(page, 'player-settings')
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
   await page.keyboard.press('Escape')
-  await page.getByTestId('settings-button').click()
+  await page.getByTestId('options-button').click()
   await expect(settingsRoot).toBeVisible()
   await expect(page.locator('[data-settings-close]')).toBeFocused()
   await page.keyboard.press('Tab')
@@ -92,7 +92,7 @@ test('player settings persist and preserve Escape priority from title and pause'
 
   await page.keyboard.press('Escape')
   await expect(settingsRoot).toBeHidden()
-  await expect(page.getByTestId('settings-button')).toBeFocused()
+  await expect(page.getByTestId('options-button')).toBeFocused()
   await expect(page.getByTestId('pause-overlay')).toBeVisible()
   await expect(page.locator('body')).toHaveAttribute('data-session-paused', 'true')
 })
@@ -149,7 +149,7 @@ test('rapid setting changes finish saving before title navigation', async ({ pag
   await expect(page).toHaveURL(/\?session=rapid-settings-[^&]+&create=1/u)
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
   await page.keyboard.press('Escape')
-  await page.getByTestId('settings-button').click()
+  await page.getByTestId('options-button').click()
   await expect(page.locator('[data-sensitivity]')).toHaveValue('245')
 })
 
@@ -159,7 +159,7 @@ test('settings write failures block navigation until a later save succeeds', asy
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
 
   await page.keyboard.press('Escape')
-  await page.getByTestId('settings-button').click()
+  await page.getByTestId('options-button').click()
   await failNextSettingsWrite(page)
   await page.locator('[data-audio-enabled]').uncheck()
   await expect(page.locator('[data-settings-error]')).toHaveText('Settings could not be saved.')
@@ -168,11 +168,12 @@ test('settings write failures block navigation until a later save succeeds', asy
 
   await page.getByTestId('save-quit-button').click()
   await expect(page).toHaveURL(/\?session=settings-write-failure$/u)
-  await expect(page.locator('#pause-error')).toHaveText(
+  await expect(page.locator('[data-pause-error]')).toHaveText(
     'Save failed. Your world is still open; please try again.',
   )
+  await expect(page.locator('[data-pause-error]')).toHaveAttribute('role', 'alert')
 
-  await page.getByTestId('settings-button').click()
+  await page.getByTestId('options-button').click()
   await page.locator('[data-audio-enabled]').check()
   await expect(page.locator('body')).toHaveAttribute('data-player-settings-persistence', 'saved')
   await page.locator('[data-settings-close]').click()

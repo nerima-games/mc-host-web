@@ -397,7 +397,7 @@ test('joins a saved world from the title screen multiplayer form', async ({ page
   await page.keyboard.press('Escape')
   await Promise.all([
     page.waitForURL((url) => url.pathname === '/'),
-    page.locator('#save-quit-button').click(),
+    page.getByTestId('save-quit-button').click(),
   ])
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-route', 'title')
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')

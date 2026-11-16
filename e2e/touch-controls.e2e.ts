@@ -136,7 +136,7 @@ test.describe('touch input surface', () => {
     await page.locator('[data-touch-action="escape"]').tap()
     await expect(controls).toBeHidden()
     await expect(page.locator('body')).toHaveAttribute('data-session-paused', 'true')
-    await page.locator('#resume-button').click()
+    await page.getByTestId('resume-button').click()
     await expect(controls).toBeVisible()
 
     await dispatchTouch(client, 'touchStart', forward)
