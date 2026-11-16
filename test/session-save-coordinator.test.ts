@@ -1,5 +1,16 @@
 import { assert, describe, expect, it, vi } from 'vitest'
-import { Effect, Option, Result, Schema } from 'effect'
+import { Effect, Layer, Option, Result, Schema } from 'effect'
+import {
+  makeInMemoryStorage,
+  SaveFormatName,
+  SaveFormatVersion,
+  SaveKey,
+  sealSaveEnvelope,
+  StorageError,
+  StorageOperation,
+  StoragePort,
+  failingStorageLayer,
+} from '@nerima-games/mc-save'
 import {
   ChunkAxis,
   CHUNK_SIZE_XZ,
@@ -47,7 +58,11 @@ import {
   EMPTY_ENTITY_ROSTERS,
   EMPTY_VILLAGER_STATE,
   SESSION_FORMAT,
+  SESSION_FORMAT_NAME,
   SESSION_FORMAT_VERSION,
+  SessionIncompatibleError,
+  saveSession,
+  toStoredSessionState,
   type DimensionChunk,
   type SessionHead,
   type SessionState,
@@ -60,6 +75,8 @@ import { makeHostWorldWrite } from '../apps/web/world-write-port'
 
 import {
   createSessionSaveCoordinator,
+  sessionSaveFailureMessage,
+  SessionSnapshotUnstableError,
   snapshotOwnedSessionState,
   type OwnedSessionState,
   type SessionSavePublication,
@@ -322,9 +339,9 @@ describe('session save coordinator', () => {
       publish: async (publication) => { publications.push(publication) },
     })
 
-    await expect(coordinator.requestSave()).rejects.toThrow(
-      'Unable to capture a consistent save snapshot after 8 attempts',
-    )
+    const rejection: unknown = await coordinator.requestSave().catch((error: unknown) => error)
+    expect(rejection).toBeInstanceOf(SessionSnapshotUnstableError)
+    expect(rejection).toMatchObject({ _tag: 'SessionSnapshotUnstableError', attempts: 8 })
     expect(snapshotCount).toBe(8)
     expect(publications).toHaveLength(0)
 
@@ -599,5 +616,125 @@ describe('owner-backed save state', () => {
     for (const dimension of dimensions) {
       expect(state?.entities[dimension].nextSerial).toBe(3)
     }
+  })
+})
+
+describe('session save failure messages', () => {
+  const generatedSessionState = async (): Promise<SessionState> => {
+    const generated = await Effect.runPromise(makeGeneratedWorld<MobBehaviour>({ dimension: 'overworld' }))
+    return {
+      seed: 1,
+      dimension: 'overworld',
+      player: await Effect.runPromise(generated.player.pose),
+      storage: await Effect.runPromise(generated.inventory.storageSnapshot),
+      containerStorage: await Effect.runPromise(generated.inventory.containerStorageSnapshot),
+      vitals: await Effect.runPromise(generated.vitals.snapshot),
+      time: { ticks: 0, dayLengthTicks: 24_000 },
+      weather: { weather: 'clear', remainingSecs: 120 },
+      redstone: { levers: [] },
+      furnaces: [],
+      portals: [],
+      crops: await Effect.runPromise(Schema.decodeUnknownEffect(CropSnapshotSchema)({ crops: [] })),
+      entities: EMPTY_ENTITY_ROSTERS,
+      villagers: EMPTY_VILLAGER_STATE,
+      brewing: Result.getOrThrow(emptyBrewingState()),
+      statusEffects: emptyStatusEffectState(),
+      end: EMPTY_END_STATE,
+    }
+  }
+
+  // The host's publish: Effect.runPromise over saveSession, so a coordinator
+  // rejection is whatever that promise rejects with.
+  const rejectionOfHostSave = async (layer: Layer.Layer<StoragePort>): Promise<unknown> => {
+    const state = await generatedSessionState()
+    const failures: unknown[] = []
+    const coordinator = createSessionSaveCoordinator<SessionState>({
+      initialKnownChunks: [],
+      snapshotResidents: async () => [dimensionChunk('overworld', 0, 0, 3)],
+      currentGeneration: () => 0,
+      snapshotState: async () => state,
+      publish: ({ state: published, chunks }) =>
+        Effect.runPromise(Effect.provide(saveSession({
+          sessionId: 'host-world',
+          revision: 'r2',
+          metadata: { name: 'Host World', mode: 'survival' },
+          state: published,
+          chunks,
+        }), layer)).then(() => undefined),
+      onFailure: (error) => { failures.push(error) },
+    })
+    const rejection: unknown = await coordinator.requestSave().catch((error: unknown) => error)
+    expect(failures).toEqual([rejection])
+    return rejection
+  }
+
+  it('classifies a storage failure from a real save', async () => {
+    const rejection = await rejectionOfHostSave(failingStorageLayer(StorageOperation('put')))
+
+    expect(rejection).toBeInstanceOf(StorageError)
+    expect(sessionSaveFailureMessage(rejection)).toBe(
+      'The world could not be saved. Your progress since the last save is not stored yet.',
+    )
+  })
+
+  it('classifies a save blocked by a newer build\'s session', async () => {
+    const storage = await Effect.runPromise(makeInMemoryStorage)
+    const state = await generatedSessionState()
+    const futureHead = Result.getOrThrow(sealSaveEnvelope({
+      format: SaveFormatName(SESSION_FORMAT_NAME),
+      version: SaveFormatVersion(19),
+      payload: {
+        sessionId: 'host-world',
+        revision: 'r1',
+        metadata: { name: 'Host World', mode: 'survival' },
+        state: Result.getOrThrow(toStoredSessionState(state)),
+        chunks: [],
+      },
+    }))
+    await Effect.runPromise(storage.put(SaveKey('mc-compose/session/host-world/head'), futureHead))
+
+    const rejection = await rejectionOfHostSave(Layer.succeed(StoragePort, storage))
+
+    expect(rejection).toBeInstanceOf(SessionIncompatibleError)
+    expect(rejection).toMatchObject({ reason: 'future-version', storedVersion: 19, currentVersion: 18 })
+    expect(sessionSaveFailureMessage(rejection)).toBe(
+      'This world was saved by a newer version. Saving is blocked so it is not overwritten.',
+    )
+    expect(await Effect.runPromise(storage.get(SaveKey('mc-compose/session/host-world/head'))))
+      .toEqual(Option.some(futureHead))
+  })
+
+  it('classifies a save blocked by a session version without a migration path', async () => {
+    const storage = await Effect.runPromise(makeInMemoryStorage)
+    const state = await generatedSessionState()
+    await Effect.runPromise(storage.put(
+      SaveKey('mc-compose/session/host-world/head'),
+      Result.getOrThrow(sealSaveEnvelope({
+        format: SaveFormatName(SESSION_FORMAT_NAME),
+        version: SaveFormatVersion(16),
+        payload: {
+          sessionId: 'host-world',
+          revision: 'r1',
+          metadata: { name: 'Host World', mode: 'survival' },
+          state: Result.getOrThrow(toStoredSessionState(state)),
+          chunks: [],
+        },
+      })),
+    ))
+
+    const rejection = await rejectionOfHostSave(Layer.succeed(StoragePort, storage))
+
+    expect(rejection).toMatchObject({ _tag: 'SessionIncompatibleError', reason: 'unsupported-version', storedVersion: 16 })
+    expect(sessionSaveFailureMessage(rejection)).toBe(
+      'This world was saved by an older version that can no longer be opened. Saving is blocked so it is not overwritten.',
+    )
+  })
+
+  it('classifies unstable snapshots and falls back for any other rejection', () => {
+    expect(sessionSaveFailureMessage(new SessionSnapshotUnstableError({ attempts: 8 }))).toBe(
+      'The world kept changing while it was being saved. Your progress since the last save is not stored yet.',
+    )
+    expect(sessionSaveFailureMessage(new Error('publish aborted'))).toBe('The world could not be saved.')
+    expect(sessionSaveFailureMessage('publish aborted')).toBe('The world could not be saved.')
   })
 })

@@ -1,9 +1,10 @@
 import { readFileSync } from 'node:fs'
 
-import { describe, expect, it } from '@effect/vitest'
+import { assert, describe, expect, it } from '@effect/vitest'
 import { Effect, Layer, Option, Result, Schema } from 'effect'
 
 import {
+  encodeSave,
   SaveFormatName,
   SaveFormatVersion,
   SaveEnvelopeSchema,
@@ -48,6 +49,7 @@ import {
   type ChunkCoord,
 } from '@nerima-games/mc-kernel'
 import {
+  CHUNK_FORMAT,
   CHUNK_VOLUME,
   type ChunkSource,
   type ChunkWithBlockStates,
@@ -67,8 +69,10 @@ import {
   SESSION_FORMAT_NAME,
   SESSION_FORMAT_VERSION,
   deleteSession,
+  listSessionEntries,
   listSessions,
   loadSession,
+  openSession,
   makeSessionChunkSource,
   normalizePersistedEntityRoster,
   normalizePersistedEntityRosters,
@@ -80,9 +84,15 @@ import {
   toStoredSessionState,
   type DimensionChunk,
   type SaveSessionInput,
+  type SessionHead,
   type SessionMetadata,
   type SessionState,
 } from '../apps/web/session-persistence'
+import {
+  sessionLoadErrorOf,
+  sessionOpenFailureMessage,
+  sessionOpenNotice,
+} from '../apps/web/session-restoration'
 
 const fixtureEnvelopeText = (name: string): string =>
   readFileSync(new URL(`./fixtures/${name}`, import.meta.url), 'utf8')
@@ -384,10 +394,15 @@ type ControlledStorage = {
   failNextHeadWrite: boolean
   failChunkRemoves: boolean
   chunkWriteCount: number
+  readonly mutationCount: number
   readonly keys: ReadonlyArray<string>
   readonly envelope: (key: string) => SaveEnvelope | undefined
   readonly setEnvelope: (key: string, envelope: SaveEnvelope | SeededEnvelope) => void
+  readonly removeEnvelope: (key: string) => void
 }
+
+// Only a live session head: the checkpoint head also ends in `/head`.
+const LIVE_HEAD_KEY_PATTERN = /^mc-compose\/session\/[^/]+\/head$/u
 
 const controlledStorage = (): ControlledStorage => {
   const entries = new Map<string, SaveEnvelope>()
@@ -396,16 +411,18 @@ const controlledStorage = (): ControlledStorage => {
     failNextHeadWrite: false,
     failChunkRemoves: false,
     chunkWriteCount: 0,
+    mutationCount: 0,
   }
   const storage: StorageService = {
     get: (key) => Effect.succeed(Option.fromNullishOr(entries.get(key))),
     put: (key, envelope) =>
       Effect.suspend(() => {
+        state.mutationCount += 1
         if (String(key).includes('/chunk/')) state.chunkWriteCount += 1
         if (state.failChunkKey === String(key)) {
           return Effect.fail(new StorageError({ operation: 'put', key }))
         }
-        if (state.failNextHeadWrite && String(key).endsWith('/head')) {
+        if (state.failNextHeadWrite && LIVE_HEAD_KEY_PATTERN.test(key)) {
           state.failNextHeadWrite = false
           // Model an adapter that reports failure after partially mutating its backing store.
           entries.set(key, envelope)
@@ -416,6 +433,7 @@ const controlledStorage = (): ControlledStorage => {
       }),
     remove: (key) =>
       Effect.suspend(() => {
+        state.mutationCount += 1
         if (state.failChunkRemoves && String(key).includes('/chunk/')) {
           return Effect.fail(new StorageError({ operation: 'remove', key }))
         }
@@ -432,7 +450,7 @@ const controlledStorage = (): ControlledStorage => {
             if (state.failChunkKey === String(key)) {
               return Effect.fail(new StorageError({ operation: 'commitBatch', key }))
             }
-            if (state.failNextHeadWrite && String(key).endsWith('/head')) {
+            if (state.failNextHeadWrite && LIVE_HEAD_KEY_PATTERN.test(key)) {
               state.failNextHeadWrite = false
               return Effect.fail(new StorageError({ operation: 'commitBatch', key }))
             }
@@ -478,10 +496,16 @@ const controlledStorage = (): ControlledStorage => {
     set chunkWriteCount(value) {
       state.chunkWriteCount = value
     },
+    get mutationCount() {
+      return state.mutationCount
+    },
     get keys() {
       return [...entries.keys()]
     },
     envelope: (key) => entries.get(key),
+    removeEnvelope: (key) => {
+      entries.delete(key)
+    },
     // mc-save 0.3.0 made `integrity` a required part of `SaveEnvelope` (a
     // checksum sealed over format/version/payload/extensions). Test fixtures
     // below build envelopes as plain drafts — the shape this suite has always
@@ -1706,11 +1730,15 @@ describe('session persistence', () => {
       )
       expect(head.state.seed).toBe(1)
       expect(Effect.runSync(loaded.source(coordOf(0, 0))).blocks[0]).toBe(1)
-      expect(storage.keys.filter((key) => key.includes('/chunk/'))).toHaveLength(1)
+      // The first save of r1 was copied to the checkpoint before the failed publish.
+      expect(storage.keys.filter((key) => key.includes('/chunk/')).sort()).toEqual([
+        'mc-compose/session/same-revision-failure/checkpoint/revision/r1/dimension/overworld/chunk/0/0',
+        'mc-compose/session/same-revision-failure/revision/r1/dimension/overworld/chunk/0/0',
+      ])
     }).pipe(Effect.provide(storage.layer))
   })
 
-  it.effect('keeps storage bounded across revisions and collects chunks for an empty manifest', () => {
+  it.effect('keeps storage bounded to the live revision and one checkpoint across revisions', () => {
     const storage = controlledStorage()
     return Effect.gen(function* () {
       yield* saveSession({
@@ -1726,8 +1754,12 @@ describe('session persistence', () => {
         chunks: [dimensionChunk('overworld', 2, 0, 2)],
       })
 
-      expect(storage.keys.filter((key) => key.includes('/chunk/'))).toEqual([
-        sessionChunkKey('bounded', 'r2', 'overworld', coordOf(2, 0)),
+      expect([...storage.keys].sort()).toEqual([
+        'mc-compose/session/bounded/checkpoint/head',
+        'mc-compose/session/bounded/checkpoint/revision/r1/dimension/overworld/chunk/0/0',
+        'mc-compose/session/bounded/checkpoint/revision/r1/dimension/overworld/chunk/1/0',
+        'mc-compose/session/bounded/head',
+        'mc-compose/session/bounded/revision/r2/dimension/overworld/chunk/2/0',
       ])
 
       yield* saveSession({
@@ -1736,7 +1768,11 @@ describe('session persistence', () => {
         state: sessionState(3),
         chunks: [],
       })
-      expect(storage.keys).toEqual([sessionHeadKey('bounded')])
+      expect([...storage.keys].sort()).toEqual([
+        'mc-compose/session/bounded/checkpoint/head',
+        'mc-compose/session/bounded/checkpoint/revision/r2/dimension/overworld/chunk/2/0',
+        'mc-compose/session/bounded/head',
+      ])
     }).pipe(Effect.provide(storage.layer))
   })
 
@@ -1759,7 +1795,11 @@ describe('session persistence', () => {
 
       expect(saved.revision).toBe('r2')
       expect(Option.getOrThrow(yield* loadSession('cleanup-failure')).revision).toBe('r2')
-      expect(storage.keys.filter((key) => key.includes('/chunk/'))).toHaveLength(2)
+      expect(storage.keys.filter((key) => key.includes('/chunk/')).sort()).toEqual([
+        'mc-compose/session/cleanup-failure/checkpoint/revision/r1/dimension/overworld/chunk/0/0',
+        'mc-compose/session/cleanup-failure/revision/r1/dimension/overworld/chunk/0/0',
+        'mc-compose/session/cleanup-failure/revision/r2/dimension/overworld/chunk/1/0',
+      ])
     }).pipe(Effect.provide(storage.layer))
   })
 
@@ -2032,6 +2072,489 @@ describe('session persistence', () => {
       const error = yield* Effect.flip(loadSession('v17-stackless-fixture'))
 
       expect(error).toMatchObject({ _tag: 'SaveDecodeError', reason: 'save contains a non-finite number' })
+    }).pipe(Effect.provide(storage.layer))
+  })
+})
+
+describe('session checkpoint and compatibility', () => {
+  // Keeps the record's integrity block, so its checksum no longer matches.
+  const tamper = (storage: ControlledStorage, key: string): void => {
+    const envelope = storage.envelope(key)
+    if (envelope === undefined) throw new Error(`no record at ${key}`)
+    storage.setEnvelope(key, { ...envelope, payload: { tampered: true } })
+  }
+
+  const storedSnapshot = (storage: ControlledStorage): ReadonlyArray<readonly [string, string]> =>
+    storage.keys.map((key): readonly [string, string] => [key, JSON.stringify(storage.envelope(key))])
+
+  const savedMarker = (head: SessionHead, cx: number, cz: number) =>
+    makeSessionChunkSource(head, 'overworld', (coord) => Effect.succeed(chunk(coord.cx, coord.cz, 99))).pipe(
+      Effect.map((loaded) => Effect.runSync(loaded.source(coordOf(cx, cz))).blocks[0]),
+    )
+
+  const saveRevision = (sessionId: string, revision: string, seed: number, markers: ReadonlyArray<number>) =>
+    saveSession({
+      sessionId,
+      revision,
+      state: sessionState(seed),
+      chunks: markers.map((marker, cx) => dimensionChunk('overworld', cx, 0, marker)),
+    })
+
+  const sealedHeadDraft = (sessionId: string, version: number) => ({
+    format: SESSION_FORMAT_NAME,
+    version,
+    payload: {
+      sessionId,
+      revision: 'other-build',
+      metadata: defaultMetadata,
+      state: storedRecord(sessionState(9)),
+      chunks: [],
+    },
+  })
+
+  it.effect('opens the live revision that a save published', () => {
+    const storage = controlledStorage()
+    return Effect.gen(function* () {
+      const saved = yield* saveRevision('live-world', 'r1', 1, [3, 4])
+
+      const opened = Option.getOrThrow(yield* openSession('live-world'))
+
+      expect(opened).toEqual({ _tag: 'Live', head: saved })
+      expect(sessionOpenNotice(opened)).toEqual(Option.none())
+      expect(yield* savedMarker(opened.head, 0, 0)).toBe(3)
+      expect(yield* savedMarker(opened.head, 1, 0)).toBe(4)
+      expect(Option.isNone(yield* openSession('absent-world'))).toBe(true)
+    }).pipe(Effect.provide(storage.layer))
+  })
+
+  it.effect('copies the previous revision to the checkpoint and opens it when the live head is corrupt', () => {
+    const storage = controlledStorage()
+    return Effect.gen(function* () {
+      yield* saveRevision('checkpointed', 'r1', 1, [3])
+      yield* saveRevision('checkpointed', 'r2', 2, [5])
+      expect(storage.keys).toContain('mc-compose/session/checkpointed/checkpoint/head')
+      tamper(storage, 'mc-compose/session/checkpointed/head')
+
+      const opened = Option.getOrThrow(yield* openSession('checkpointed'))
+
+      assert(opened._tag === 'Checkpoint')
+      expect(opened.head.revision).toBe('r1')
+      expect(opened.head.state.seed).toBe(1)
+      expect(opened.head.chunks).toEqual([{
+        dimension: 'overworld',
+        coord: coordOf(0, 0),
+        key: 'mc-compose/session/checkpointed/checkpoint/revision/r1/dimension/overworld/chunk/0/0',
+      }])
+      expect(opened.liveFailure).toMatchObject({
+        _tag: 'SaveDecodeError',
+        record: { _tag: 'Head', key: 'mc-compose/session/checkpointed/head' },
+        repair: { lastHealthyRevisionAvailable: true },
+      })
+      expect(yield* savedMarker(opened.head, 0, 0)).toBe(3)
+      expect(sessionOpenNotice(opened)).toEqual(
+        Option.some('The latest save could not be read. The previous save was opened instead.'),
+      )
+      expect(yield* listSessionEntries()).toEqual({ sessions: [opened.head], unavailable: [] })
+      // loadSession still reads only the live head, so the plain listing hides this session.
+      expect(yield* listSessions()).toEqual([])
+    }).pipe(Effect.provide(storage.layer))
+  })
+
+  it.effect('keeps the healthy checkpoint when a save replaces a corrupt live head', () => {
+    const storage = controlledStorage()
+    return Effect.gen(function* () {
+      yield* saveRevision('recovering', 'r1', 1, [3])
+      yield* saveRevision('recovering', 'r2', 2, [5])
+      tamper(storage, 'mc-compose/session/recovering/head')
+
+      const saved = yield* saveRevision('recovering', 'r3', 3, [7])
+
+      expect(yield* openSession('recovering')).toEqual(Option.some({ _tag: 'Live', head: saved }))
+      // The unreadable r2 head named no chunks, so its chunk stays until deleteSession.
+      expect(storage.keys).toContain('mc-compose/session/recovering/revision/r2/dimension/overworld/chunk/0/0')
+      tamper(storage, 'mc-compose/session/recovering/head')
+      const opened = Option.getOrThrow(yield* openSession('recovering'))
+      assert(opened._tag === 'Checkpoint')
+      expect(opened.head.revision).toBe('r1')
+      expect(yield* savedMarker(opened.head, 0, 0)).toBe(3)
+    }).pipe(Effect.provide(storage.layer))
+  })
+
+  it.effect('opens the checkpoint when a live chunk is missing', () => {
+    const storage = controlledStorage()
+    return Effect.gen(function* () {
+      yield* saveRevision('missing-live-chunk', 'r1', 1, [3])
+      yield* saveRevision('missing-live-chunk', 'r2', 2, [5])
+      storage.removeEnvelope('mc-compose/session/missing-live-chunk/revision/r2/dimension/overworld/chunk/0/0')
+
+      const opened = Option.getOrThrow(yield* openSession('missing-live-chunk'))
+
+      assert(opened._tag === 'Checkpoint')
+      expect(opened.head.revision).toBe('r1')
+      expect(opened.liveFailure).toMatchObject({
+        _tag: 'SaveDecodeError',
+        record: {
+          _tag: 'Chunk',
+          key: 'mc-compose/session/missing-live-chunk/revision/r2/dimension/overworld/chunk/0/0',
+        },
+        repair: {
+          lastHealthyRevisionAvailable: true,
+          discardableChunkKeys: ['mc-compose/session/missing-live-chunk/revision/r2/dimension/overworld/chunk/0/0'],
+        },
+      })
+      expect(yield* savedMarker(opened.head, 0, 0)).toBe(3)
+    }).pipe(Effect.provide(storage.layer))
+  })
+
+  it.effect('opens the checkpoint when a live chunk is corrupt', () => {
+    const storage = controlledStorage()
+    return Effect.gen(function* () {
+      yield* saveRevision('corrupt-live-chunk', 'r1', 1, [3, 4])
+      yield* saveRevision('corrupt-live-chunk', 'r2', 2, [5, 6])
+      tamper(storage, 'mc-compose/session/corrupt-live-chunk/revision/r2/dimension/overworld/chunk/1/0')
+
+      const opened = Option.getOrThrow(yield* openSession('corrupt-live-chunk'))
+
+      assert(opened._tag === 'Checkpoint')
+      expect(opened.head.revision).toBe('r1')
+      expect(opened.liveFailure).toMatchObject({
+        _tag: 'SaveDecodeError',
+        record: {
+          _tag: 'Chunk',
+          key: 'mc-compose/session/corrupt-live-chunk/revision/r2/dimension/overworld/chunk/1/0',
+        },
+      })
+      expect(yield* savedMarker(opened.head, 0, 0)).toBe(3)
+      expect(yield* savedMarker(opened.head, 1, 0)).toBe(4)
+    }).pipe(Effect.provide(storage.layer))
+  })
+
+  it.effect('refuses to open, overwrite, or list a session saved by a newer build', () => {
+    const storage = controlledStorage()
+    const incompatible = {
+      _tag: 'SessionIncompatibleError',
+      reason: 'future-version',
+      key: 'mc-compose/session/future/head',
+      storedVersion: 19,
+      currentVersion: 18,
+    }
+    return Effect.gen(function* () {
+      yield* saveRevision('future', 'r1', 1, [3])
+      yield* saveRevision('future', 'r2', 2, [5])
+      storage.setEnvelope('mc-compose/session/future/head', sealedHeadDraft('future', 19))
+
+      // The checkpoint is readable, but an older copy must not hide the newer save.
+      const openError = yield* Effect.flip(openSession('future'))
+      expect(openError).toMatchObject(incompatible)
+      expect(sessionOpenFailureMessage(openError)).toBe('This world was saved by a newer version and cannot be opened.')
+      expect(sessionLoadErrorOf(openError)).toBe('future-version-session')
+      const before = storedSnapshot(storage)
+      const mutations = storage.mutationCount
+      expect(yield* Effect.flip(saveRevision('future', 'r3', 3, [7]))).toMatchObject(incompatible)
+      expect(storedSnapshot(storage)).toEqual(before)
+      expect(storage.mutationCount).toBe(mutations)
+      const entries = yield* listSessionEntries()
+      expect(entries.sessions).toEqual([])
+      expect(entries.unavailable).toMatchObject([{ sessionId: 'future', failure: incompatible }])
+      expect(yield* listSessions()).toEqual([])
+    }).pipe(Effect.provide(storage.layer))
+  })
+
+  it.effect('refuses to open or overwrite a session version without a migration path', () => {
+    const storage = controlledStorage()
+    const incompatible = {
+      _tag: 'SessionIncompatibleError',
+      reason: 'unsupported-version',
+      key: 'mc-compose/session/legacy/head',
+      storedVersion: 16,
+      currentVersion: 18,
+    }
+    storage.setEnvelope('mc-compose/session/legacy/head', sealedHeadDraft('legacy', 16))
+    return Effect.gen(function* () {
+      const openError = yield* Effect.flip(openSession('legacy'))
+      expect(openError).toMatchObject(incompatible)
+      expect(sessionOpenFailureMessage(openError)).toBe(
+        'This world was saved by an older version that can no longer be opened.',
+      )
+      expect(sessionLoadErrorOf(openError)).toBe('unsupported-version-session')
+      const before = storedSnapshot(storage)
+      expect(yield* Effect.flip(saveRevision('legacy', 'r1', 1, [3]))).toMatchObject(incompatible)
+      expect(storedSnapshot(storage)).toEqual(before)
+      expect((yield* listSessionEntries()).unavailable).toMatchObject([{ sessionId: 'legacy', failure: incompatible }])
+    }).pipe(Effect.provide(storage.layer))
+  })
+
+  it.effect('fails as corrupt when the live head and the checkpoint head are both unreadable', () => {
+    const storage = controlledStorage()
+    return Effect.gen(function* () {
+      yield* saveRevision('unreadable', 'r1', 1, [3])
+      yield* saveRevision('unreadable', 'r2', 2, [5])
+      tamper(storage, 'mc-compose/session/unreadable/head')
+      tamper(storage, 'mc-compose/session/unreadable/checkpoint/head')
+      const corrupt = {
+        _tag: 'SessionCorruptError',
+        sessionId: 'unreadable',
+        liveFailure: {
+          _tag: 'SaveDecodeError',
+          record: { _tag: 'Head', key: 'mc-compose/session/unreadable/head' },
+          repair: { lastHealthyRevisionAvailable: false },
+        },
+        checkpoint: {
+          _tag: 'SaveDecodeError',
+          record: { _tag: 'Head', key: 'mc-compose/session/unreadable/checkpoint/head' },
+        },
+      }
+
+      const openError = yield* Effect.flip(openSession('unreadable'))
+      expect(openError).toMatchObject(corrupt)
+      expect(sessionOpenFailureMessage(openError)).toBe(
+        'This world could not be read, and no earlier save of it could be opened.',
+      )
+      expect(sessionLoadErrorOf(openError)).toBe('corrupt-session')
+      const entries = yield* listSessionEntries()
+      expect(entries.sessions).toEqual([])
+      expect(entries.unavailable).toMatchObject([{ sessionId: 'unreadable', failure: corrupt }])
+    }).pipe(Effect.provide(storage.layer))
+  })
+
+  it.effect('fails as corrupt when a checkpoint chunk is unreadable', () => {
+    const storage = controlledStorage()
+    return Effect.gen(function* () {
+      yield* saveRevision('partial-checkpoint', 'r1', 1, [3, 4])
+      yield* saveRevision('partial-checkpoint', 'r2', 2, [5, 6])
+      tamper(storage, 'mc-compose/session/partial-checkpoint/head')
+      tamper(storage, 'mc-compose/session/partial-checkpoint/checkpoint/revision/r1/dimension/overworld/chunk/1/0')
+
+      expect(yield* Effect.flip(openSession('partial-checkpoint'))).toMatchObject({
+        _tag: 'SessionCorruptError',
+        checkpoint: {
+          _tag: 'SaveDecodeError',
+          record: {
+            _tag: 'Chunk',
+            key: 'mc-compose/session/partial-checkpoint/checkpoint/revision/r1/dimension/overworld/chunk/1/0',
+          },
+        },
+      })
+    }).pipe(Effect.provide(storage.layer))
+  })
+
+  it.effect('fails as corrupt with an absent checkpoint when only one revision was saved', () => {
+    const storage = controlledStorage()
+    return Effect.gen(function* () {
+      yield* saveRevision('single-revision', 'r1', 1, [3])
+      tamper(storage, 'mc-compose/session/single-revision/head')
+
+      expect(yield* Effect.flip(openSession('single-revision'))).toMatchObject({
+        _tag: 'SessionCorruptError',
+        sessionId: 'single-revision',
+        liveFailure: { _tag: 'SaveDecodeError', repair: { lastHealthyRevisionAvailable: false } },
+        checkpoint: 'absent',
+      })
+    }).pipe(Effect.provide(storage.layer))
+  })
+
+  it.effect('leaves the live revision unchanged when the checkpoint copy fails', () => {
+    const storage = controlledStorage()
+    return Effect.gen(function* () {
+      const saved = yield* saveRevision('checkpoint-failure', 'r1', 1, [3])
+      storage.failChunkKey =
+        'mc-compose/session/checkpoint-failure/checkpoint/revision/r1/dimension/overworld/chunk/0/0'
+
+      expect(yield* Effect.flip(saveRevision('checkpoint-failure', 'r2', 2, [5]))).toMatchObject({
+        _tag: 'StorageError',
+        operation: 'put',
+        key: 'mc-compose/session/checkpoint-failure/checkpoint/revision/r1/dimension/overworld/chunk/0/0',
+      })
+      expect(yield* openSession('checkpoint-failure')).toEqual(Option.some({ _tag: 'Live', head: saved }))
+      expect(yield* savedMarker(saved, 0, 0)).toBe(3)
+      expect([...storage.keys].sort()).toEqual([
+        'mc-compose/session/checkpoint-failure/head',
+        'mc-compose/session/checkpoint-failure/revision/r1/dimension/overworld/chunk/0/0',
+      ])
+    }).pipe(Effect.provide(storage.layer))
+  })
+
+  it.effect('restores the previous live revision and keeps the checkpoint when publishing fails', () => {
+    const storage = controlledStorage()
+    return Effect.gen(function* () {
+      const saved = yield* saveRevision('publish-failure', 'r1', 1, [3, 4])
+      storage.failChunkKey = 'mc-compose/session/publish-failure/revision/r2/dimension/overworld/chunk/1/0'
+
+      expect(yield* Effect.flip(saveRevision('publish-failure', 'r2', 2, [5, 6]))).toMatchObject({
+        _tag: 'StorageError',
+        key: 'mc-compose/session/publish-failure/revision/r2/dimension/overworld/chunk/1/0',
+      })
+      expect(yield* openSession('publish-failure')).toEqual(Option.some({ _tag: 'Live', head: saved }))
+      expect(yield* savedMarker(saved, 0, 0)).toBe(3)
+      expect(yield* savedMarker(saved, 1, 0)).toBe(4)
+      expect([...storage.keys].sort()).toEqual([
+        'mc-compose/session/publish-failure/checkpoint/head',
+        'mc-compose/session/publish-failure/checkpoint/revision/r1/dimension/overworld/chunk/0/0',
+        'mc-compose/session/publish-failure/checkpoint/revision/r1/dimension/overworld/chunk/1/0',
+        'mc-compose/session/publish-failure/head',
+        'mc-compose/session/publish-failure/revision/r1/dimension/overworld/chunk/0/0',
+        'mc-compose/session/publish-failure/revision/r1/dimension/overworld/chunk/1/0',
+      ])
+      tamper(storage, 'mc-compose/session/publish-failure/head')
+      const opened = Option.getOrThrow(yield* openSession('publish-failure'))
+      assert(opened._tag === 'Checkpoint')
+      expect(opened.head.revision).toBe('r1')
+    }).pipe(Effect.provide(storage.layer))
+  })
+
+  it.effect('lists and deletes sessions without treating checkpoint records as sessions', () => {
+    const storage = controlledStorage()
+    return Effect.gen(function* () {
+      yield* saveRevision('kept', 'r1', 1, [3])
+      yield* saveRevision('kept', 'r2', 2, [5])
+      yield* saveRevision('deleted', 'r1', 1, [3])
+      yield* saveRevision('deleted', 'r2', 2, [5])
+
+      expect((yield* listSessions()).map(({ sessionId, revision }) => [sessionId, revision])).toEqual([
+        ['deleted', 'r2'],
+        ['kept', 'r2'],
+      ])
+      expect((yield* listSessionEntries()).unavailable).toEqual([])
+      yield* deleteSession('deleted')
+
+      expect(storage.keys.filter((key) => key.startsWith('mc-compose/session/deleted/'))).toEqual([])
+      expect([...storage.keys].sort()).toEqual([
+        'mc-compose/session/kept/checkpoint/head',
+        'mc-compose/session/kept/checkpoint/revision/r1/dimension/overworld/chunk/0/0',
+        'mc-compose/session/kept/head',
+        'mc-compose/session/kept/revision/r2/dimension/overworld/chunk/0/0',
+      ])
+    }).pipe(Effect.provide(storage.layer))
+  })
+
+  it.effect('rejects a third save of one revision id before writing anything', () => {
+    const storage = controlledStorage()
+    return Effect.gen(function* () {
+      yield* saveRevision('reused-revision', 'r1', 1, [3])
+      const saved = yield* saveRevision('reused-revision', 'r1', 2, [5])
+      const before = storedSnapshot(storage)
+
+      // The checkpoint already holds r1 under the same revision-specific keys.
+      expect(yield* Effect.flip(saveRevision('reused-revision', 'r1', 3, [7]))).toMatchObject({
+        _tag: 'SessionManifestError',
+        reason: 'duplicate-key',
+        key: 'mc-compose/session/reused-revision/checkpoint/revision/r1/dimension/overworld/chunk/0/0',
+      })
+      expect(storedSnapshot(storage)).toEqual(before)
+      expect(yield* openSession('reused-revision')).toEqual(Option.some({ _tag: 'Live', head: saved }))
+    }).pipe(Effect.provide(storage.layer))
+  })
+
+  const seedChunkVersion = (storage: ControlledStorage, key: string, version: number): void => {
+    storage.setEnvelope(key, {
+      format: CHUNK_FORMAT.name,
+      version,
+      payload: { written: 'by another build' },
+    })
+  }
+
+  it.effect('refuses to open or overwrite a session whose live chunk a newer build wrote', () => {
+    const storage = controlledStorage()
+    const incompatible = {
+      _tag: 'SessionIncompatibleError',
+      reason: 'future-version',
+      key: 'mc-compose/session/future-chunk/revision/r2/dimension/overworld/chunk/0/0',
+      storedVersion: 4,
+      currentVersion: 3,
+    }
+    return Effect.gen(function* () {
+      yield* saveRevision('future-chunk', 'r1', 1, [3])
+      yield* saveRevision('future-chunk', 'r2', 2, [5])
+      seedChunkVersion(storage, 'mc-compose/session/future-chunk/revision/r2/dimension/overworld/chunk/0/0', 4)
+
+      // The r1 checkpoint is readable, but must not stand in for the newer chunk.
+      expect(yield* Effect.flip(openSession('future-chunk'))).toMatchObject(incompatible)
+      const before = storedSnapshot(storage)
+      const mutations = storage.mutationCount
+      expect(yield* Effect.flip(saveRevision('future-chunk', 'r3', 3, [7]))).toMatchObject(incompatible)
+      expect(storedSnapshot(storage)).toEqual(before)
+      expect(storage.mutationCount).toBe(mutations)
+    }).pipe(Effect.provide(storage.layer))
+  })
+
+  it.effect('refuses to open a session whose live chunk version has no migration path', () => {
+    const storage = controlledStorage()
+    return Effect.gen(function* () {
+      yield* saveRevision('legacy-chunk', 'r1', 1, [3])
+      seedChunkVersion(storage, 'mc-compose/session/legacy-chunk/revision/r1/dimension/overworld/chunk/0/0', 2)
+
+      expect(yield* Effect.flip(openSession('legacy-chunk'))).toMatchObject({
+        _tag: 'SessionIncompatibleError',
+        reason: 'unsupported-version',
+        key: 'mc-compose/session/legacy-chunk/revision/r1/dimension/overworld/chunk/0/0',
+        storedVersion: 2,
+        currentVersion: 3,
+      })
+    }).pipe(Effect.provide(storage.layer))
+  })
+
+  it.effect('reports an incompatible checkpoint chunk as the checkpoint failure', () => {
+    const storage = controlledStorage()
+    return Effect.gen(function* () {
+      yield* saveRevision('future-checkpoint-chunk', 'r1', 1, [3])
+      yield* saveRevision('future-checkpoint-chunk', 'r2', 2, [5])
+      tamper(storage, 'mc-compose/session/future-checkpoint-chunk/head')
+      seedChunkVersion(
+        storage,
+        'mc-compose/session/future-checkpoint-chunk/checkpoint/revision/r1/dimension/overworld/chunk/0/0',
+        4,
+      )
+
+      expect(yield* Effect.flip(openSession('future-checkpoint-chunk'))).toMatchObject({
+        _tag: 'SessionCorruptError',
+        liveFailure: { _tag: 'SaveDecodeError', record: { _tag: 'Head' } },
+        checkpoint: {
+          _tag: 'SessionIncompatibleError',
+          reason: 'future-version',
+          key: 'mc-compose/session/future-checkpoint-chunk/checkpoint/revision/r1/dimension/overworld/chunk/0/0',
+          storedVersion: 4,
+        },
+      })
+    }).pipe(Effect.provide(storage.layer))
+  })
+
+  it.effect('opens, lists, and checkpoints a migrated v17 head with chunks', () => {
+    const storage = controlledStorage()
+    const fixture = Schema.decodeUnknownSync(SaveEnvelopeSchema)(parseJson(fixtureEnvelopeText('session-v17-envelope.json')))
+    if (!isRecord(fixture.payload)) throw new Error('the v17 fixture payload must be a record')
+    const liveChunkKey = 'mc-compose/session/v17-fixture/revision/r1/dimension/overworld/chunk/0/0'
+    storage.setEnvelope('mc-compose/session/v17-fixture/head', {
+      format: SESSION_FORMAT_NAME,
+      version: 17,
+      payload: {
+        ...fixture.payload,
+        chunks: [{ dimension: 'overworld', coord: { cx: 0, cz: 0 }, key: liveChunkKey }],
+      },
+    })
+    return Effect.gen(function* () {
+      const chunkDraft = yield* encodeSave(CHUNK_FORMAT, chunk(0, 0, 3))
+      storage.setEnvelope(liveChunkKey, Result.getOrThrow(sealSaveEnvelope(chunkDraft)))
+
+      const opened = Option.getOrThrow(yield* openSession('v17-fixture'))
+      assert(opened._tag === 'Live')
+      expect(opened.head.revision).toBe('r1')
+      expect(opened.head.chunks).toEqual([{ dimension: 'overworld', coord: coordOf(0, 0), key: liveChunkKey }])
+      expect(yield* savedMarker(opened.head, 0, 0)).toBe(3)
+      expect(yield* listSessionEntries()).toEqual({ sessions: [opened.head], unavailable: [] })
+
+      yield* saveRevision('v17-fixture', 'r2', 2, [5])
+
+      expect(storage.envelope('mc-compose/session/v17-fixture/checkpoint/head')).toMatchObject({ version: 17 })
+      tamper(storage, 'mc-compose/session/v17-fixture/head')
+      const fromCheckpoint = Option.getOrThrow(yield* openSession('v17-fixture'))
+      assert(fromCheckpoint._tag === 'Checkpoint')
+      expect(fromCheckpoint.head.state).toEqual(opened.head.state)
+      expect(fromCheckpoint.head.chunks).toEqual([{
+        dimension: 'overworld',
+        coord: coordOf(0, 0),
+        key: 'mc-compose/session/v17-fixture/checkpoint/revision/r1/dimension/overworld/chunk/0/0',
+      }])
+      expect(yield* savedMarker(fromCheckpoint.head, 0, 0)).toBe(3)
     }).pipe(Effect.provide(storage.layer))
   })
 })
