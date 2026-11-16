@@ -1,5 +1,5 @@
 import { AngleRadians, BlockId, BlockPositionKey, blockOfPlaceableItem, DimensionIdSchema, InterpolationFraction, blockIdOf, encodeBlockState, MonotonicTimeSecs as KernelMonotonicTimeSecs, position, PositionAxis, VehicleVelocityComponent } from '@nerima-games/mc-kernel'
-import { addExperience as addVitalsExperience, ExperienceDelta, changed, emptyFurnaceState, UNCHANGED, type CropLocation, type WeatherState } from '@nerima-games/mc-sim'
+import { addExperience as addVitalsExperience, ExperienceDelta, changed, emptyFurnaceState, UNCHANGED, type WeatherState } from '@nerima-games/mc-sim'
 import { Effect, Option, Ref, Result, Schema } from 'effect'
 import {
   boardVehicle,
@@ -13,6 +13,7 @@ import {
   isBucketItem,
   requestBlockPlacementCommand,
   requestPotatoFoodUse,
+  requestEnderPearlThrow,
   requestTargetedBlockPlacement,
   requestTargetedBlockUse,
   requestTargetedItemUse,
@@ -57,7 +58,21 @@ import type { PersistedVillager } from '../session-persistence'
 type Dimension = import('../session-persistence').SessionState['dimension']
 type GameplayItemType = Parameters<typeof import('@nerima-games/mx-gameplay').isPlaceableItem>[0]
 
-export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPostFrameInput): void => {
+type TickGameplayFailure = Effect.Error<
+  | ReturnType<typeof requestTargetedPotatoPlanting>
+  | ReturnType<typeof requestTargetedSoilTill>
+  | ReturnType<typeof resolveTargetedBlock>
+  | ReturnType<typeof requestTargetedItemUse>
+  | ReturnType<typeof requestTargetedBlockPlacement>
+  | ReturnType<typeof requestTargetedBlockUse>
+  | ReturnType<typeof requestEnderPearlThrow>
+  | H5cTickContext['services']['time']['timeOfDay']
+>
+
+export const runTickPostFrameGameplay = (
+  context: H5cTickContext,
+  input: H5cPostFrameInput,
+): Effect.Effect<void, TickGameplayFailure> => Effect.gen(function* () {
   const { frame, movement, postFrame, nowSecs } = input
   const { deltaSecs, useTriggered } = frame
   const { poseBeforeFrame, weatherBeforeFrame } = movement
@@ -71,6 +86,7 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
     playerHeals,
   } = postFrame
   const { h5a, h5b, services, state } = context
+  const targeting = h5a.targeting
   const {
     world,
     playerApi,
@@ -79,7 +95,6 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
     gameplayState,
     multiplayer,
     isCreativeMode,
-    survivalHunger,
     setBrewingOpen,
     markSessionDirty,
     setFishingResult,
@@ -154,7 +169,6 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
     comparatorModes,
     poweredRails,
     redstoneLampTransitionLog,
-    crops,
     isGameplayUseItemType,
     isGameplayHoeItem,
     isGameplayIgnitionItem,
@@ -311,23 +325,18 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
               target.position.y + 0.5 - origin.y,
               target.position.z + 0.5 - origin.z,
             )
-        Effect.runSync(Ref.update(gameplayState.pendingPearlThrows, (requests) => [
-          ...requests,
-          {
-            origin,
-            inventory: {
-              mode: isCreativeMode ? 'creative' as const : 'survival' as const,
-              slotIndex: h5aState.selectedHotbarIndex.get(),
-            },
-            dirX: -Math.sin(pose.yawRadians) * horizontal,
-            dirY: Math.sin(pose.pitchRadians),
-            dirZ: -Math.cos(pose.yawRadians) * horizontal,
-            ...(hitDistance === undefined ? {} : { hitDistance }),
+        increment(h5aState.nextItemUseRequestId)
+        yield* requestEnderPearlThrow(gameplayState, {
+          requestId: `item-use-${String(h5aState.nextItemUseRequestId.get())}`,
+          inventory: {
+            mode: isCreativeMode ? 'creative' : 'survival',
+            slotIndex: h5aState.selectedHotbarIndex.get(),
           },
-        ]))
-        if (!isCreativeMode) {
-          Effect.runSync(world.inventory.removeAt(h5aState.selectedHotbarIndex.get(), 'ender_pearl', 1))
-        }
+          dirX: -Math.sin(pose.yawRadians) * horizontal,
+          dirY: Math.sin(pose.pitchRadians),
+          dirZ: -Math.cos(pose.yawRadians) * horizontal,
+          ...(hitDistance === undefined ? {} : { hitDistance }),
+        })
         markSessionDirty()
         renderPlayerUi()
       }
@@ -486,7 +495,7 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
           bedPosition,
           dangerNearby: isDangerNearby(bedPosition, hostilePositions),
           dimension: currentDimension,
-          timeOfDay: Effect.runSync(time.timeOfDay),
+          timeOfDay: yield* time.timeOfDay,
           weather: Effect.runSync(weather.snapshot).weather,
         }))
         if (decision._tag === 'SleepAccepted') {
@@ -568,13 +577,11 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
         increment(h5aState.nextItemUseRequestId)
         const requestId = `item-use-${String(h5aState.nextItemUseRequestId.get())}`
         if (selected.item === 'potato') {
-          const target = Effect.runSync(
-            requestTargetedPotatoPlanting(
-              gameplayState,
-              currentChunkStore,
-              playerApi,
-              requestId,
-            ),
+          const target = yield* requestTargetedPotatoPlanting(
+            gameplayState,
+            currentChunkStore,
+            targeting,
+            requestId,
           )
           if (Option.isSome(target)) {
             pendingItemUses.set(requestId, {
@@ -596,14 +603,12 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
           isLegacyGameplayItemType(selected.item) &&
           isGameplayHoeItem(selected.item)
         ) {
-          const target = Effect.runSync(
-            requestTargetedSoilTill(
-              gameplayState,
-              currentChunkStore,
-              playerApi,
-              requestId,
-              selected.item,
-            ),
+          const target = yield* requestTargetedSoilTill(
+            gameplayState,
+            currentChunkStore,
+            targeting,
+            requestId,
+            selected.item,
           )
           if (Option.isSome(target)) {
             pendingItemUses.set(requestId, {
@@ -616,7 +621,7 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
           isLegacyGameplayItemType(selected.item) &&
           isGameplayIgnitionItem(selected.item)
         ) {
-          const blockTarget = Effect.runSync(resolveTargetedBlock(currentChunkStore, playerApi))
+          const blockTarget = yield* resolveTargetedBlock(currentChunkStore, targeting)
           const blockReading = Option.isSome(blockTarget)
             ? Effect.runSync(currentChunkStore.getBlock(blockPosition(blockTarget.value.position.x, blockTarget.value.position.y, blockTarget.value.position.z)))
             : undefined
@@ -628,14 +633,12 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
           ) {
             sendEntityCommand({ _tag: 'IgniteTntCommand', at: blockTarget.value.position })
           } else {
-            const target = Effect.runSync(
-              requestTargetedItemUse(
-                gameplayState,
-                currentChunkStore,
-                playerApi,
-                requestId,
-                selected.item,
-              ),
+            const target = yield* requestTargetedItemUse(
+              gameplayState,
+              currentChunkStore,
+              targeting,
+              requestId,
+              selected.item,
             )
             if (Option.isSome(target)) {
               pendingItemUses.set(requestId, {
@@ -653,107 +656,96 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
 
       if (shouldAttemptPlacement) {
         placementAudio.request()
+        const placementItems: Array<import('@nerima-games/mx-gameplay').PlaceableItemType> = []
         requestPlacementFromSelectedSlot(
           inventoryBeforeUse.slots,
           h5aState.selectedHotbarIndex.get(),
           isPlaceableGameplayItem,
-          (heldItem) => {
-            if (multiplayer !== undefined) {
-              const target = Effect.runSync(
-                requestTargetedBlockPlacement(
-                  gameplayState,
-                  currentChunkStore,
-                  playerApi,
-                  heldItem,
-                ),
-              )
-              Effect.runSync(Ref.set(gameplayState.pendingPlacements, []))
-              if (Option.isSome(target)) {
-                Effect.runSync(multiplayer.host.enqueueOutbound({
-                  _tag: 'BlockPlace',
-                  player: multiplayer.query.player,
-                  world: WorldId.make(Effect.runSync(playerApi.dimension)),
-                  at: target.value.adjacentPosition,
-                  block: heldItem,
-                  state: Result.getOrThrow(encodeBlockState(Option.getOrThrow(blockIdOf(blockOfPlaceableItem(heldItem))), {})),
-                }))
-                increment(state.placementsRequested)
-                placementAudio.request(target.value.adjacentPosition)
-                canvas.setAttribute('data-placements-requested', String(state.placementsRequested.get()))
-              }
-              return
-            }
-            increment(state.nextBlockUseRequestId)
-            const requestId = `block-use-${String(state.nextBlockUseRequestId.get())}`
-            const target = Effect.runSync(
-              requestTargetedBlockUse(
-                gameplayState,
-                currentChunkStore,
-                playerApi,
-                requestId,
-                heldItem,
-              ),
-            )
-            if (Option.isSome(target)) {
-              const reading = Effect.runSync(currentChunkStore.getBlock(blockPosition(target.value.position.x, target.value.position.y, target.value.position.z)))
-              if (reading._tag === 'Block' && reading.block === 76) {
-                pendingBlockUses.set(requestId, {
-                  dimension: currentChunkContext().dimension,
-                  position: target.value.position,
-                })
-              } else if (reading._tag === 'Block' && reading.block === 77) {
-                Effect.runSync(redstoneRuntime.pressButton(
-                  Schema.decodeUnknownSync(DimensionIdSchema)(currentChunkContext().dimension),
-                  blockPosition(target.value.position.x, target.value.position.y, target.value.position.z),
-                ))
-              } else if (reading._tag === 'Block' && reading.block === 82) {
-                const key = leverKeyOf({
-                  dimension: currentChunkContext().dimension,
-                  position: target.value.position,
-                })
-                comparatorModes.set(
-                  key,
-                  comparatorModes.get(key) === 'subtract' ? 'compare' : 'subtract',
-                )
-                h5aState.redstoneDirty.set(true)
-              } else {
-                Effect.runSync(Ref.set(gameplayState.pendingPlacements, []))
-                increment(state.nextBlockPlacementRequestId)
-                const placementRequestId = `block-placement-${String(state.nextBlockPlacementRequestId.get())}`
-                Effect.runSync(requestBlockPlacementCommand(gameplayState, {
-                  requestId: placementRequestId,
-                  positionKey: Result.getOrThrow(BlockPositionKey(`${target.value.adjacentPosition.x},${target.value.adjacentPosition.y},${target.value.adjacentPosition.z}`)),
-                  heldItem,
-                  mode: isCreativeMode ? 'creative' : 'survival',
-                }))
-                pendingBlockPlacements.set(placementRequestId, {
-                  dimension: currentChunkContext().dimension,
-                  item: heldItem,
-                  position: target.value.adjacentPosition,
-                })
-                increment(state.placementsRequested)
-                placementAudio.request(target.value.adjacentPosition)
-                canvas.setAttribute('data-placements-requested', String(state.placementsRequested.get()))
-              }
-              markSessionDirty()
-            }
-          },
+          (heldItem) => { placementItems.push(heldItem) },
         )
+        for (const heldItem of placementItems) {
+          if (multiplayer !== undefined) {
+            const target = yield* requestTargetedBlockPlacement(
+              gameplayState,
+              currentChunkStore,
+              targeting,
+              heldItem,
+            )
+            Effect.runSync(Ref.set(gameplayState.pendingPlacements, []))
+            if (Option.isSome(target)) {
+              Effect.runSync(multiplayer.host.enqueueOutbound({
+                _tag: 'BlockPlace',
+                player: multiplayer.query.player,
+                world: WorldId.make(Effect.runSync(playerApi.dimension)),
+                at: target.value.adjacentPosition,
+                block: heldItem,
+                state: Result.getOrThrow(encodeBlockState(Option.getOrThrow(blockIdOf(blockOfPlaceableItem(heldItem))), {})),
+              }))
+              increment(state.placementsRequested)
+              placementAudio.request(target.value.adjacentPosition)
+              canvas.setAttribute('data-placements-requested', String(state.placementsRequested.get()))
+            }
+            continue
+          }
+          increment(state.nextBlockUseRequestId)
+          const requestId = `block-use-${String(state.nextBlockUseRequestId.get())}`
+          const target = yield* requestTargetedBlockUse(
+            gameplayState,
+            currentChunkStore,
+            targeting,
+            requestId,
+            heldItem,
+          )
+          if (Option.isSome(target)) {
+            const reading = Effect.runSync(currentChunkStore.getBlock(blockPosition(target.value.position.x, target.value.position.y, target.value.position.z)))
+            if (reading._tag === 'Block' && reading.block === 76) {
+              pendingBlockUses.set(requestId, {
+                dimension: currentChunkContext().dimension,
+                position: target.value.position,
+              })
+            } else if (reading._tag === 'Block' && reading.block === 77) {
+              Effect.runSync(redstoneRuntime.pressButton(
+                Schema.decodeUnknownSync(DimensionIdSchema)(currentChunkContext().dimension),
+                blockPosition(target.value.position.x, target.value.position.y, target.value.position.z),
+              ))
+            } else if (reading._tag === 'Block' && reading.block === 82) {
+              const key = leverKeyOf({
+                dimension: currentChunkContext().dimension,
+                position: target.value.position,
+              })
+              comparatorModes.set(
+                key,
+                comparatorModes.get(key) === 'subtract' ? 'compare' : 'subtract',
+              )
+              h5aState.redstoneDirty.set(true)
+            } else {
+              Effect.runSync(Ref.set(gameplayState.pendingPlacements, []))
+              increment(state.nextBlockPlacementRequestId)
+              const placementRequestId = `block-placement-${String(state.nextBlockPlacementRequestId.get())}`
+              Effect.runSync(requestBlockPlacementCommand(gameplayState, {
+                requestId: placementRequestId,
+                positionKey: Result.getOrThrow(BlockPositionKey(`${target.value.adjacentPosition.x},${target.value.adjacentPosition.y},${target.value.adjacentPosition.z}`)),
+                heldItem,
+                mode: isCreativeMode ? 'creative' : 'survival',
+              }))
+              pendingBlockPlacements.set(placementRequestId, {
+                dimension: currentChunkContext().dimension,
+                item: heldItem,
+                position: target.value.adjacentPosition,
+              })
+              increment(state.placementsRequested)
+              placementAudio.request(target.value.adjacentPosition)
+              canvas.setAttribute('data-placements-requested', String(state.placementsRequested.get()))
+            }
+            markSessionDirty()
+          }
+        }
       }
     }
   }
   if (multiplayer === undefined) {
-    for (const outcome of Effect.runSync(Ref.getAndSet(gameplayState.enderPearlOutcomes, []))) {
-      const pose = Effect.runSync(playerApi.pose)
-      // The pose and displacement were validated by their owning services.
-      Effect.runSync(playerApi.moveTo(position(
-        PositionAxis(pose.feetPosition.x + outcome.displacement.x),
-        PositionAxis(pose.feetPosition.y + outcome.displacement.y),
-        PositionAxis(pose.feetPosition.z + outcome.displacement.z),
-      )))
-      if (outcome.damage !== undefined) applyPlayerDamage(outcome.damage)
-      markSessionDirty()
-    }
+    const pearlOutcomes = yield* Ref.getAndSet(gameplayState.enderPearlOutcomes, [])
+    if (pearlOutcomes.length > 0) markSessionDirty()
     for (const knockback of Effect.runSync(drainBowKnockbacks(gameplayState))) {
       let applied = false
       Effect.runSync(world.entities.sweep((entity) => {
@@ -1002,7 +994,7 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
     state.appliedNightSkipRevision.set(multiplayer === undefined ? null : state.networkSleepState.get().revision)
     if (multiplayer === undefined) {
       const clearWeather: WeatherState = { weather: 'clear', remainingSecs: 300 }
-      Effect.runSync(time.setTimeOfDay(InterpolationFraction(0.25)))
+      yield* time.setTimeOfDay(InterpolationFraction(0.25))
       Effect.runSync(weather.applyTransition(clearWeather))
       presentWeather(clearWeather)
       markSessionDirty()
@@ -1049,6 +1041,8 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
     pendingItemUses.delete(result.requestId)
     if (pending === undefined || !result.success) continue
 
+    // Successful item-use outcomes already include their committed storage,
+    // crop, durability and vitals changes; only presentation remains here.
     if (!('action' in result) && pending.kind === 'ignition' && pending.heldItem === result.heldItem) {
       if (
         result.outcome._tag === 'Portal'
@@ -1063,74 +1057,14 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
           registerPortal({ dimension: pending.dimension, position: anchor })
         }
       }
-      if (result.heldItem === 'fire_charge') {
-        Effect.runSync(world.inventory.removeAt(pending.slotIndex, pending.heldItem, 1))
-      } else if (Effect.runSync(world.inventory.snapshot).slots[pending.slotIndex]?.item === 'flint_and_steel') {
-        Effect.runSync(world.inventory.damageAt({ _tag: 'Inventory', slotIndex: pending.slotIndex }, 1))
-      }
-    } else if ('action' in result) {
-      switch (result.action) {
-        case 'TillSoil':
-          if (
-            pending.kind === 'till'
-            && pending.heldItem === result.heldItem
-            && Effect.runSync(world.inventory.snapshot).slots[pending.slotIndex]?.item === result.heldItem
-          ) {
-            Effect.runSync(
-              world.inventory.damageAt(
-                { _tag: 'Inventory', slotIndex: pending.slotIndex },
-                result.durabilityDamage,
-              ),
-            )
-          }
-          break
-        case 'PlantPotato':
-          if (pending.kind === 'plant' && result.outcome._tag === 'planted') {
-            const planted = Effect.runSync(crops.plant({
-              dimension: pending.dimension,
-              position: result.outcome.at as CropLocation['position'],
-            }))
-            if (planted) {
-              Effect.runSync(
-                world.inventory.removeAt(pending.slotIndex, 'potato', result.consumedCount),
-              )
-            }
-          }
-          break
-        case 'HarvestPotato':
-          if (pending.kind === 'harvest' && result.outcome._tag === 'drops') {
-            const at = position(
-              PositionAxis(pending.position.x + 0.5),
-              PositionAxis(pending.position.y + 0.5),
-              PositionAxis(pending.position.z + 0.5),
-            )
-            const leftovers = result.outcome.drops.flatMap((drop) => {
-              const leftover = Effect.runSync(world.inventory.add(drop.item, drop.count))
-              return leftover > 0 ? [{ item: drop.item, count: leftover }] : []
-            })
-            if (leftovers.length > 0) {
-              Effect.runSync(spawnDroppedItems(world.entities, leftovers.map((stack) => ({ ...stack, at }))))
-            }
-          }
-          break
-        case 'EatPotato':
-          if (pending.kind === 'eat' && result.outcome._tag === 'consume') {
-            if (multiplayer !== undefined) {
-                  multiplayerClient.sendVitalsCommand({ _tag: 'eat', item: 'potato' })
-              break
-            }
-            const removal = Effect.runSync(
-              world.inventory.removeAt(pending.slotIndex, 'potato', result.consumedCount),
-            )
-            if (removal._tag === 'Removed') {
-              survivalHunger.eat(
-                result.outcome.foodPoints,
-                result.outcome.saturationModifier,
-              )
-            }
-          }
-          break
-      }
+    } else if (
+      'action' in result
+      && result.action === 'EatPotato'
+      && pending.kind === 'eat'
+      && result.outcome._tag === 'consume'
+      && multiplayer !== undefined
+    ) {
+      multiplayerClient.sendVitalsCommand({ _tag: 'eat', item: 'potato' })
     }
     markSessionDirty()
   }
@@ -1240,4 +1174,4 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
   // Readable by a test without a QA command: the frame count IS the claim
   // that the loop is running, and docs/e2e-triage.md #4 is exactly that claim.
   document.body.setAttribute('data-frames', String(state.framesTotal.get()))
-}
+})

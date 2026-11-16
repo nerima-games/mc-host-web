@@ -17,7 +17,7 @@ export const movementInput = (
 export const runTickPlayerMovement = (
   context: H5aMovementContext,
   frame: H5aMovementFrameInput,
-): H5aMovementResult | undefined => {
+): Effect.Effect<H5aMovementResult | undefined, Effect.Error<H5aMovementContext['time']['timeOfDay']>> => Effect.gen(function* () {
   const { deltaSecs, dead } = frame
   const poseBeforeFrame = Effect.runSync(context.playerApi.pose)
   const groundedBeforeFrame = Effect.runSync(Ref.get(context.simState.isGrounded))
@@ -85,7 +85,8 @@ export const runTickPlayerMovement = (
             * Effect.runSync(context.getPlayerMovementSpeedMultiplier(context.gameplayState)),
         })),
   )
-  Effect.runSync(Ref.set(context.gameplayState.timeOfDay, Effect.runSync(context.time.timeOfDay)))
+  const timeOfDay = yield* context.time.timeOfDay
+  yield* Ref.set(context.gameplayState.timeOfDay, timeOfDay)
   const weatherBeforeFrame = Effect.runSync(context.weather.snapshot)
   Effect.runSync(Ref.set(context.gameplayState.weather, weatherBeforeFrame))
   Effect.runSync(Ref.set(context.gameplayState.weatherAdvanced, undefined))
@@ -191,18 +192,25 @@ export const runTickPlayerMovement = (
   context.drainPlayerDamageInbound()
   // WIRING, NOT A RULE. mx-gameplay owns vehicle motion and collision; this
   // loop supplies input intent before the frame and mirrors its authoritative state after.
-  const outcome = Effect.runSyncExit(context.runFrame(deltaSecs))
+  const pearlOutcomesBeforeFrame = yield* Ref.get(context.gameplayState.enderPearlOutcomes)
+  const outcome = yield* Effect.exit(context.runFrame(deltaSecs))
+  const pearlOutcomesAfterFrame = yield* Ref.get(context.gameplayState.enderPearlOutcomes)
+  // The stage appends an outcome only after committing the teleport.
+  // Post-frame gameplay drains it later; old outcomes do not suppress movement.
+  const pearlTeleported = pearlOutcomesAfterFrame.length > pearlOutcomesBeforeFrame.length
   if (context.state.swimmingState.get().active && mountedVehicle === undefined) {
     Effect.runSync(Ref.set(context.simState.velocity, {
       x: BlocksPerSecond(swimmingTick.state.velocity.x),
       y: BlocksPerSecond(swimmingTick.state.velocity.y),
       z: BlocksPerSecond(swimmingTick.state.velocity.z),
     }))
-    Effect.runSync(context.playerApi.moveTo(position(
-      PositionAxis(poseBeforeFrame.feetPosition.x + swimmingTick.state.velocity.x * deltaSecs),
-      PositionAxis(poseBeforeFrame.feetPosition.y + swimmingTick.state.velocity.y * deltaSecs),
-      PositionAxis(poseBeforeFrame.feetPosition.z + swimmingTick.state.velocity.z * deltaSecs),
-    )))
+    if (!pearlTeleported) {
+      Effect.runSync(context.playerApi.moveTo(position(
+        PositionAxis(poseBeforeFrame.feetPosition.x + swimmingTick.state.velocity.x * deltaSecs),
+        PositionAxis(poseBeforeFrame.feetPosition.y + swimmingTick.state.velocity.y * deltaSecs),
+        PositionAxis(poseBeforeFrame.feetPosition.z + swimmingTick.state.velocity.z * deltaSecs),
+      )))
+    }
   } else if (wasSwimming) {
     Effect.runSync(Ref.set(context.simState.velocity, { x: BlocksPerSecond(0), y: BlocksPerSecond(0), z: BlocksPerSecond(0) }))
   }
@@ -212,7 +220,7 @@ export const runTickPlayerMovement = (
   }
   if (mountedVehicle !== undefined) {
     const moved = context.vehicleById(String(mountedVehicle.id))
-    if (moved !== undefined) Effect.runSync(context.playerApi.moveTo(moved.position))
+    if (moved !== undefined && !pearlTeleported) Effect.runSync(context.playerApi.moveTo(moved.position))
   }
 
   if (Exit.isFailure(outcome)) {
@@ -250,5 +258,5 @@ export const runTickPlayerMovement = (
     dimensionBeforeFrame,
     weatherBeforeFrame,
     sprinting,
-  }
-}
+  } satisfies H5aMovementResult
+})

@@ -35,6 +35,7 @@ export type H5bPostFrameContext = {
     | 'blockPosition'
     | 'blockTypeOfId'
     | 'gameplayState'
+    | 'targeting'
     | 'multiplayer'
     | 'isCreativeMode'
     | 'survivalHunger'
