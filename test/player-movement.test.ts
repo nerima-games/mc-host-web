@@ -344,7 +344,7 @@ describe('tick player movement branches', () => {
     expect(Effect.runSync(context.playerApi.pose).feetPosition).toEqual(destination)
     expect(overlayMoves).toEqual([])
     expect(Effect.runSync(Ref.get(harness.context.gameplayState.enderPearlOutcomes))).toEqual([pearl])
-    expect(mode === 'mounted' || harness.swimmingState.get().active).toBe(true)
+    if (mode === 'swimming') expect(harness.swimmingState.get().active).toBe(true)
   })
 
   it.each(['swimming', 'mounted'])('keeps normal %s movement when a pearl outcome is stale', async (mode) => {

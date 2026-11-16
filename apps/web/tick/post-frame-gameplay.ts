@@ -66,6 +66,7 @@ type TickGameplayFailure = Effect.Error<
   | ReturnType<typeof requestTargetedBlockPlacement>
   | ReturnType<typeof requestTargetedBlockUse>
   | ReturnType<typeof requestEnderPearlThrow>
+  | ReturnType<typeof targetedRightClickRoute>
   | H5cTickContext['services']['time']['timeOfDay']
 >
 
@@ -444,7 +445,7 @@ export const runTickPostFrameGameplay = (
     const opensBrewing = brewingTarget !== undefined && typeOfBlock(brewingTarget.block) === 'brewing_stand'
     const routeResult = usedEndFeature || usedMultiplayerLever || opensBrewing
       ? undefined
-      : Effect.runSync(targetedRightClickRoute(currentChunkStore, postFramePose, DEFAULT_BLOCK_REACH))
+      : yield* targetedRightClickRoute(currentChunkStore, postFramePose, DEFAULT_BLOCK_REACH)
     const route = routeResult !== undefined && 'kind' in routeResult ? routeResult : undefined
     if (usedEndFeature || usedMultiplayerLever) {
       renderPlayerUi()

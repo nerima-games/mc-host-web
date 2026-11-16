@@ -133,7 +133,6 @@ export type H5cTickContext = {
     readonly comparatorModes: Map<string, 'compare' | 'subtract'>
     readonly poweredRails: Set<string>
     readonly redstoneLampTransitionLog: Map<string, Array<{ readonly lit: boolean; readonly writtenBlock: BlockId | null }>>
-    readonly crops: EffectValue<ReturnType<typeof import('@nerima-games/mc-sim').makeCropService>>
     readonly setInventoryOpen: (open: boolean, mode?: H5cInventoryMode) => void
     readonly isGameplayUseItemType: (item: ItemStack['item']) => item is GameplayUseItemType
     readonly isGameplayHoeItem: (item: ItemStack['item']) => item is GameplayHoeItemType

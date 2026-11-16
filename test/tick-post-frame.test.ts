@@ -296,10 +296,6 @@ const makeContext = async (primaryAttackConsumed: ReturnType<typeof cell<boolean
     requestMeleeAttack: gameplay.requestMeleeAttack,
     requestBlockBreak: gameplay.requestBlockBreak,
     requestPotatoHarvest: gameplay.requestPotatoHarvest,
-    crops: {
-      matureYieldsAt: () => Effect.succeed(null),
-      remove: () => Effect.void,
-    },
     pendingItemUses: new Map(),
     spawnDroppedItems: gameplay.spawnDroppedItems,
   }
@@ -689,14 +685,12 @@ describe('tick post-frame processing', () => {
     expect(context.state.primaryAttackGestureConsumed.get()).toBe(true)
   })
 
-  it('queues a crop harvest before changing its block or querying host maturity', async () => {
+  it('queues a crop harvest before changing its block', async () => {
     const harness = await makeContext(cell(false))
     const world = harness.context.h5a.world
     const at = blockPosition(BlockAxis(0), BlockAxis(64), BlockAxis(1))
     Effect.runSync(world.chunkStore.load(chunkCoord(ChunkAxis(0), ChunkAxis(0))))
     Effect.runSync(world.chunkStore.setBlock(at, Option.getOrThrow(blockIdOf('potato_crop'))))
-    let maturityReads = 0
-    let cropRemovals = 0
     const harvestRequests = new Map<string, Parameters<H5bPostFrameContext['pendingItemUses']['set']>[1]>()
     const context: H5bPostFrameContext = {
       ...inOverworld(harness.context),
@@ -707,10 +701,6 @@ describe('tick post-frame processing', () => {
       }),
       pendingItemUses: harvestRequests,
       requestPotatoHarvest: (state, requestId, position) => gameplay.requestPotatoHarvest(state, requestId, position, 0.25),
-      crops: {
-        matureYieldsAt: () => Effect.sync(() => { maturityReads += 1; return null }),
-        remove: () => Effect.sync(() => { cropRemovals += 1 }),
-      },
     }
 
     runTickPostFrame(context, {
@@ -720,8 +710,6 @@ describe('tick post-frame processing', () => {
     })
 
     expect(Effect.runSync(world.chunkStore.getBlock(at))).toMatchObject({ _tag: 'Block', block: Option.getOrThrow(blockIdOf('potato_crop')) })
-    expect(maturityReads).toBe(0)
-    expect(cropRemovals).toBe(0)
     expect(harvestRequests.get('item-use-1')).toMatchObject({ kind: 'harvest', dimension: 'overworld', position: at })
     expect(context.pendingBlockBreakConfirmations).toHaveLength(1)
     expect(Effect.runSync(Ref.get(context.h5a.gameplayState.pendingItemUses))).toEqual([

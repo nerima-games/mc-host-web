@@ -1,4 +1,4 @@
-import type { BlockPosition, MonotonicTimeSecs } from '@nerima-games/mc-kernel'
+import type { MonotonicTimeSecs } from '@nerima-games/mc-kernel'
 import type { ItemStack } from '@nerima-games/mc-sim'
 import type { GameplayFrameState } from '@nerima-games/mx-gameplay'
 import type { Effect } from 'effect'
@@ -186,10 +186,6 @@ export type H5bPostFrameContext = {
   readonly requestMeleeAttack: typeof import('@nerima-games/mx-gameplay').requestMeleeAttack
   readonly requestBlockBreak: typeof import('@nerima-games/mx-gameplay').requestBlockBreak
   readonly requestPotatoHarvest: typeof import('@nerima-games/mx-gameplay').requestPotatoHarvest
-  readonly crops: {
-    readonly matureYieldsAt: (location: { readonly dimension: import('../session-persistence').SessionState['dimension']; readonly position: BlockPosition }) => Effect.Effect<unknown>
-    readonly remove: (location: { readonly dimension: import('../session-persistence').SessionState['dimension']; readonly position: BlockPosition }) => Effect.Effect<void>
-  }
   readonly pendingItemUses: {
     readonly set: (
       requestId: string,

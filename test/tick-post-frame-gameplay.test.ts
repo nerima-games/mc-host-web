@@ -343,7 +343,6 @@ const makeHarness = async (options: HarnessOptions = {}) => {
     comparatorModes: new Map(),
     poweredRails: new Set(),
     redstoneLampTransitionLog: new Map(),
-    crops: {},
     isGameplayUseItemType: (item: string) => item === 'flint_and_steel',
     isGameplayHoeItem: () => false,
     isGameplayIgnitionItem: (item: string) => item === 'flint_and_steel',
