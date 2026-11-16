@@ -1,4 +1,4 @@
-import { AngleRadians, BlockAxis, BlockId, ClockPort, EpochMillis, fixedClock, blockIdOf, blockTypeOfId, blockPosition as kernelBlockPosition, ChunkAxis, chunkCoord as kernelChunkCoord, DeltaTimeSecs, MonotonicTimeSecs, position, PositionAxis, WorldId, WorldWriteChunkUnavailableSchema, WorldWriteConflict, WorldWriteInvalidBatch, type WorldWriteBatch, type WorldWritePort } from '@nerima-games/mc-kernel'
+import { AngleRadians, BlockAxis, BlockId, ClockPort, EpochMillis, fixedClock, blockIdOf, blockTypeOfId, blockPosition as kernelBlockPosition, ChunkAxis, chunkCoord as kernelChunkCoord, DeltaTimeSecs, MonotonicTimeSecs, position, PositionAxis, WorldId, MAX_PORTAL_WIDTH, WorldWriteChunkUnavailableSchema, WorldWriteConflict, WorldWriteInvalidBatch, type WorldWriteBatch, type WorldWritePort } from '@nerima-games/mc-kernel'
 import { type InputSnapshot } from '@nerima-games/mc-render'
 import { CropSnapshotSchema, PlayerServiceSnapshotSchema, PlayerStorageSnapshotSchema, makeTimeService, makeWeatherService, makeWorldCommitCoordinator, HungerPoints, POTATO_MATURITY_SECS, type CropSnapshot } from '@nerima-games/mc-sim'
 import { CHUNK_SIZE_XZ, CHUNK_VOLUME, BIOMES, type ChunkSource } from '@nerima-games/mc-worldgen'
@@ -499,6 +499,9 @@ describe('tick post-frame gameplay processing', () => {
         Effect.runSync(gameplay.requestPotatoFoodUse(state, 'item-1', Effect.runSync(harness.world.vitals.snapshot)))
         harness.context.services.pendingItemUses.set('item-1', { kind: 'eat', slotIndex: 0 })
       } else {
+        for (const chunk of gameplay.chunkCoordsAround(above, MAX_PORTAL_WIDTH + 1)) {
+          Effect.runSync(harness.world.chunkStore.load(chunk))
+        }
         Effect.runSync(gameplay.requestItemUse(state, 'item-1', above, 'flint_and_steel'))
         harness.context.services.pendingItemUses.set('item-1', { kind: 'ignition', slotIndex: 0, heldItem: 'flint_and_steel', dimension: 'overworld' })
       }

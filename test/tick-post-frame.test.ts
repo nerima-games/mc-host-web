@@ -615,7 +615,7 @@ describe('tick post-frame processing', () => {
     expect(harness.environmentalContactDamageState.get()).toEqual({ lastDamageElapsedSecs: undefined })
   })
 
-  it('releases a charged bow into a projectile with fixed damage and consumes one arrow', async () => {
+  it('releases a quarter-second bow charge with five damage and consumes one arrow', async () => {
     const harness = await makeContext(cell(false))
     const { world } = harness.context.h5a
     Effect.runSync(world.inventory.add('bow', 1))
@@ -641,7 +641,7 @@ describe('tick post-frame processing', () => {
     expect(projectile).toMatchObject({
       id: 'arrow-1',
       dimension: 'overworld',
-      damage: 2,
+      damage: 5,
       knockback: 0.5125,
     })
     expect(arrowCount).toBe(0)

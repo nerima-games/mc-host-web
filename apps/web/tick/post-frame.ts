@@ -5,7 +5,6 @@ import { BlocksPerSecond, DeltaTimeSecs, PLAYER_HALF_HEIGHT, PLAYER_HALF_WIDTH }
 import { changed, type ItemStack, UNCHANGED } from '@nerima-games/mc-sim'
 import { DEFAULT_BLOCK_REACH, INITIAL_ENVIRONMENTAL_CONTACT_DAMAGE_STATE, enchantmentLevel, resolveEnvironmentalContactDamage } from '@nerima-games/mx-gameplay'
 
-import { POTATO_CROP_BLOCK_ID } from '../qa-fixtures'
 import { initialFootstepRuntimeState } from '../footstep-runtime'
 import type { H5bPostFrameContext, H5bPostFrameInput, H5bPostFrameResult } from './h5b-context'
 
@@ -317,7 +316,7 @@ export const runTickPostFrame = (
       if (nextBlockBreakCounters === blockBreakCounters) {
         // A conflicted harvest stays queued until its atomic commit succeeds.
         if (
-          pending.blockId === POTATO_CROP_BLOCK_ID
+          pending.blockId === Option.getOrThrow(blockIdOf('potato_crop'))
           && retryingHarvestPositions.has(blockPositionKeyOf(blockPosition(pending.position.x, pending.position.y, pending.position.z)))
         ) {
           pendingBlockBreakConfirmations.push(pending)
@@ -1062,7 +1061,7 @@ export const runTickPostFrame = (
                 world: WorldId.make(dimension),
                 at: target.position,
               }))
-            } else if (target.blockId === POTATO_CROP_BLOCK_ID) {
+            } else if (target.blockId === Option.getOrThrow(blockIdOf('potato_crop'))) {
               h5aState.nextItemUseRequestId.set(h5aState.nextItemUseRequestId.get() + 1)
               const requestId = `item-use-${String(h5aState.nextItemUseRequestId.get())}`
               Effect.runSync(
