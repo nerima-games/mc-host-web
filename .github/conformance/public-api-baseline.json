@@ -513,7 +513,7 @@
     "count": 1,
     "file": "apps/web/platform-adapters.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync( audioBackend.playTone({ durationSecs: 3600, frequency: kind === 'rain' ? 180 : 72, gain: initialGain, loop: true, pan: 0, wave: kind === 'rain' ? 'sawtooth' : 'triangle', }), )"
+    "text": "Effect.runSync( audioBackend.playTone({ durationSecs: AMBIENT_LOOP_DURATION_SECS, frequency: RAIN_LOOP_FREQUENCY, gain: initialGain, loop: true, pan: CENTERED_PAN, wave: 'sawtooth', }), )"
   },
   {
     "count": 1,
@@ -531,13 +531,13 @@
     "count": 1,
     "file": "apps/web/platform-adapters.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(audioBackend.playTone({ durationSecs: 1.8, frequency: 46, gain, loop: false, pan, wave: 'sawtooth', }))"
+    "text": "Effect.runSync(audioBackend.playTone({ durationSecs: THUNDER_CLAP_DURATION_SECS, frequency: THUNDER_CLAP_FREQUENCY, gain, loop: false, pan, wave: 'sawtooth', }))"
   },
   {
     "count": 1,
     "file": "apps/web/platform-adapters.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(audioBackend.playTone({ durationSecs: 3600, frequency: 42, gain: initialGain, loop: true, pan: 0, wave: 'sine', }))"
+    "text": "Effect.runSync(audioBackend.playTone({ durationSecs: AMBIENT_LOOP_DURATION_SECS, frequency: END_AMBIENCE_FREQUENCY, gain: initialGain, loop: true, pan: CENTERED_PAN, wave: 'sine', }))"
   },
   {
     "count": 2,
