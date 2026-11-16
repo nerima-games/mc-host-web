@@ -1467,6 +1467,7 @@ const bootGame = async (
   const redstoneContainerRuntime = makeRedstoneContainerRuntime({
     dimensionContexts,
     world,
+    writeBlocks: writeBlocksThroughPort,
     leverStates,
     comparatorModes,
     observerInputs,
