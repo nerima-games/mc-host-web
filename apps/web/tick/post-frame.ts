@@ -19,6 +19,8 @@ export const runTickPostFrame = (
 > | Result.Result.Failure<
   | ReturnType<H5bPostFrameContext['applyWorldExplosion']>
   | ReturnType<H5bPostFrameContext['isGameplayBlockSolid']>
+  | ReturnType<H5bPostFrameContext['advanceWitherRuntime']>
+  | ReturnType<H5bPostFrameContext['damageRuntimeWither']>
 >> => Effect.gen(function* () {
   const { frame, movement, framesTotal } = input
   const h5a = context.h5a
@@ -583,7 +585,7 @@ export const runTickPostFrame = (
 
     if (!deadAfterFrame && !dimensionChanged) {
       const witherSolidity = recordingSolidity()
-      const advancedWither = advanceWitherRuntime(
+      const advancedWitherResult = advanceWitherRuntime(
         witherRuntimeState,
         dimensionAfterFrame,
         postFramePose.feetPosition,
@@ -596,6 +598,7 @@ export const runTickPostFrame = (
       )
       const witherSolidityFailure = witherSolidity.failure()
       if (Option.isSome(witherSolidityFailure)) yield* Effect.fail(witherSolidityFailure.value)
+      const advancedWither = yield* Effect.fromResult(advancedWitherResult)
       witherRuntimeState = advancedWither.state
       if (advancedWither.meleeDamage > 0) {
         applyPlayerDamage({ amount: advancedWither.meleeDamage, cause: 'generic' })
@@ -706,7 +709,7 @@ export const runTickPostFrame = (
         const entityId = impact.hit.entityId
         const hitWither = witherRuntimeState.withers.find(({ id }) => id === entityId)
         if (hitWither !== undefined) {
-          const result = damageRuntimeWither(witherRuntimeState, hitWither.id, impact.damage, 'ranged')
+          const result = yield* Effect.fromResult(damageRuntimeWither(witherRuntimeState, hitWither.id, impact.damage, 'ranged'))
           witherRuntimeState = result.state
           if (result.death !== undefined) {
             Effect.runSync(spawnDroppedItems(entityManager, [{
@@ -944,12 +947,12 @@ export const runTickPostFrame = (
         .sort((left, right) => left.distance - right.distance)[0]
       if (target !== undefined) {
         if (multiplayer === undefined) {
-          const result = damageRuntimeWither(
+          const result = yield* Effect.fromResult(damageRuntimeWither(
             witherRuntimeState,
             target.wither.id,
             Math.max(1, inventoryMeleeDamage(h5aState.selectedHotbarIndex.get())),
             'melee',
-          )
+          ))
           witherRuntimeState = result.state
           if (result.death !== undefined) {
             Effect.runSync(spawnDroppedItems(entityManager, [{

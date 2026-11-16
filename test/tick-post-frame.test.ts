@@ -575,11 +575,11 @@ describe('tick post-frame processing', () => {
     const harness = await makeContext(cell(false))
     const failure = { _tag: 'ExplosionValidationFailure', path: 'power', reason: 'fixture rejection' } as const
     const advanced = initialWitherRuntimeState()
-    const explosion = { position: { x: 0, y: 64, z: 0 }, power: 5, destroysResistantBlocks: false }
+    const explosion = { position: position(PositionAxis(0), PositionAxis(64), PositionAxis(0)), power: 5, destroysResistantBlocks: false }
     let calls = 0
     const context: H5bPostFrameContext = {
       ...inOverworld(harness.context),
-      advanceWitherRuntime: () => ({ state: advanced, meleeDamage: 0, explosions: [explosion, explosion] }),
+      advanceWitherRuntime: () => Result.succeed({ state: advanced, meleeDamage: 0, explosions: [explosion, explosion] }),
       applyWorldExplosion: () => { calls += 1; return Result.fail(failure) },
     }
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
@@ -641,8 +641,8 @@ describe('tick post-frame processing', () => {
       ...inOverworld(harness.context),
       isGameplayBlockSolid: () => Result.fail(failure),
       advanceWitherRuntime: (_state, _dimension, _target, _deltaSecs, skullHitsWorld) => {
-        answers.push(skullHitsWorld(skull, { x: 0.5, y: 64.5, z: 0.5 }))
-        return { state: advanced, meleeDamage: 0, explosions: [] }
+        answers.push(skullHitsWorld(skull, position(PositionAxis(0.5), PositionAxis(64.5), PositionAxis(0.5))))
+        return Result.succeed({ state: advanced, meleeDamage: 0, explosions: [] })
       },
     }
 

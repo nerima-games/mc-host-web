@@ -76,7 +76,11 @@ type TickGameplayFailure = Effect.Error<
   | ReturnType<H5cTickContext['services']['fishingEnvironmentAt']>
   | ReturnType<H5cTickContext['services']['presentWeatherRuntime']>
   | ReturnType<H5cTickContext['services']['syncRenderedEntities']>
-> | Result.Result.Failure<ReturnType<H5cTickContext['h5b']['applyWorldExplosion']>>
+> | Result.Result.Failure<
+  | ReturnType<H5cTickContext['h5b']['applyWorldExplosion']>
+  | ReturnType<typeof matchRuntimeWitherSummon>
+  | ReturnType<typeof summonRuntimeWither>
+>
 
 export const runTickPostFrameGameplay = (
   context: H5cTickContext,
@@ -855,23 +859,23 @@ export const runTickPostFrameGameplay = (
       }
       if (pending !== undefined) {
         const context = dimensionContexts.get(pending.dimension)
-        const match = context === undefined ? undefined : matchRuntimeWitherSummon(
+        const match = context === undefined ? undefined : yield* Effect.fromResult(matchRuntimeWitherSummon(
           pending.position,
           (cell) => {
             const reading = Effect.runSync(context.chunkStore.getBlock(blockPosition(cell.x, cell.y, cell.z)))
             return reading._tag === 'Block' ? typeOfBlock(reading.block) : undefined
           },
-        )
+        ))
         if (match !== undefined && context !== undefined) {
           yield* writeBlocks(asDimensionId(pending.dimension), match.consumedBlocks.map((position) => ({
             position: blockPosition(position.x, position.y, position.z),
             block: Option.getOrThrow(blockIdOf('air')),
           })))
-          h5bState.witherRuntimeState.set(summonRuntimeWither(
+          h5bState.witherRuntimeState.set(yield* Effect.fromResult(summonRuntimeWither(
             h5bState.witherRuntimeState.get(),
             pending.dimension,
             match.spawnPosition,
-          ))
+          )))
           markSessionDirty()
         }
       }

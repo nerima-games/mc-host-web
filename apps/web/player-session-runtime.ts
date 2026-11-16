@@ -24,7 +24,7 @@ type LocalEntityProjection = Readonly<{
   feetPosition: Position
 }>
 
-// Runtime projectile descriptors carry plain string ids; the projection
+// Runtime projectile and wither descriptors carry plain string ids; the projection
 // decodes each one into the renderer's identifier like every other entity.
 type RenderEntityDescriptor = Omit<RenderEntity, 'id'> & Readonly<{ id: string }>
 
@@ -34,7 +34,7 @@ export type PlayerSessionRuntimeContext = {
   readonly getAuthoritativeEntities: () => ReadonlyArray<readonly [string, AuthoritativeEntityState]>
   readonly getProjectileEntities: () => ReadonlyArray<RenderEntityDescriptor>
   readonly getEyeOfEnderEntities: () => ReadonlyArray<RenderEntityDescriptor>
-  readonly getWitherEntities: () => ReadonlyArray<RenderEntity>
+  readonly getWitherEntities: () => ReadonlyArray<RenderEntityDescriptor>
   readonly getRemotePlayers: () => ReadonlyArray<readonly [string, RemotePlayer]>
   readonly getVillagerResidents: () => ReadonlyArray<PersistedVillager>
   readonly isCurrentChunkLoaded: (position: Position) => Result.Result<boolean, CoordinateConversionFailure>
@@ -117,7 +117,7 @@ export const createPlayerSessionRuntime = (
         } satisfies RenderEntity)),
         ...context.getProjectileEntities().map((entity) => ({ ...entity, id: renderEntityId(entity.id) } satisfies RenderEntity)),
         ...context.getEyeOfEnderEntities().map((entity) => ({ ...entity, id: renderEntityId(entity.id) } satisfies RenderEntity)),
-        ...context.getWitherEntities(),
+        ...context.getWitherEntities().map((entity) => ({ ...entity, id: renderEntityId(entity.id) } satisfies RenderEntity)),
         ...context.getRemotePlayers()
           .filter(([, player]) => player.world === context.getCurrentDimension())
           .map(([playerId, player]) => ({
