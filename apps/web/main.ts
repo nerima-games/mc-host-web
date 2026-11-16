@@ -2437,6 +2437,7 @@ const bootGame = async (
         },
         getVehicleControls: () => vehicleControls,
         multiplayer,
+        isCreativeMode,
       }),
       (modules) => composeGame(modules),
     ),

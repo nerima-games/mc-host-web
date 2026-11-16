@@ -17,6 +17,7 @@ import {
   type VehicleServiceApi,
 } from '@nerima-games/mc-sim'
 import {
+  GAMEPLAY_STAGE_IDS,
   gameplayStages,
   type GameplayFrameState,
   type MobBehaviour,
@@ -107,6 +108,7 @@ export type HostModulesDeps = {
   readonly setMountedVehicleId: (id: string | undefined) => void
   readonly getVehicleControls: () => VehicleControlInput
   readonly multiplayer: { readonly host: MultiplayerHost } | undefined
+  readonly isCreativeMode: boolean
 }
 
 /**
@@ -141,6 +143,7 @@ export const registerHostModules = (deps: HostModulesDeps): Effect.Effect<Readon
     setMountedVehicleId,
     getVehicleControls,
     multiplayer,
+    isCreativeMode,
   } = deps
 
   // The host drives movement and jump intent itself, so the render factory
@@ -198,7 +201,7 @@ export const registerHostModules = (deps: HostModulesDeps): Effect.Effect<Readon
       const vehicles = yield* VehicleService
       // mx-gameplay 0.11.0 drops `_inventory` and `_player` without reading
       // them, so no inventory or player service needs to reach the stages here.
-      return gameplayStages(
+      const stages = gameplayStages(
         gameplayState,
         store,
         roster,
@@ -223,6 +226,14 @@ export const registerHostModules = (deps: HostModulesDeps): Effect.Effect<Readon
           mobSimulation: multiplayer === undefined,
         },
       )
+      // The survival-hunger stage ticks the vitals owner on every frame and
+      // has no option to stop. Hunger is local only in single-player survival:
+      // in multiplayer the server's vitals overwrite the owner, and creative has
+      // no hunger. Both are fixed before registration, so the stage keeps its
+      // slot (`gameplay:entities` runs after it) with a run that does nothing.
+      if (multiplayer === undefined && !isCreativeMode) return stages
+      return stages.map((stage) =>
+        stage.id === GAMEPLAY_STAGE_IDS.survivalHunger ? { ...stage, run: () => Effect.void } : stage)
     }),
   })
 

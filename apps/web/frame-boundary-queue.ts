@@ -55,10 +55,14 @@ export const makeFrameBoundaryQueue = <E>(): FrameBoundaryQueue<E> => {
  * hidden-tab network pump and save snapshots. That work runs under the lock
  * instead, so it never interleaves with a frame that has yielded.
  *
- * Once the loop has stopped nothing drains, so work still queued then, or
- * queued later, never runs and an `atFrameBoundary` caller never resumes.
- * Such a caller holds only a pending promise, which page unload does not wait
- * for. Work under the lock still runs after the stop, so a final save does.
+ * Once the loop has stopped, only `drainOutsideFrame` drains. The hidden-tab
+ * pump keeps starting one until its interval is cleared, and clearing it does
+ * not cancel a drain already forked and still waiting for the lock: that drain
+ * runs once it takes the lock and applies what is queued at that moment. After
+ * the last such drain nothing drains, so work queued later never runs and an
+ * `atFrameBoundary` caller never resumes. Such a caller holds only a pending
+ * promise, which page unload does not wait for. Work under the lock still runs
+ * after the stop, so a final save does.
  */
 export type FrameBoundary<E> = Readonly<{
   enqueue: FrameBoundaryQueue<E>['enqueue']

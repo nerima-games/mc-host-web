@@ -28,15 +28,19 @@ import { EMPTY_SYNC_REPORT, InputService, InputServiceLayer, NO_CHUNK_SYNC, NO_D
 import { RedstoneWorldRuntime, RedstoneWorldRuntimeLayer } from '@nerima-games/mx-redstone'
 import { makeUiFrameState } from '@nerima-games/mx-ui'
 import {
+  ExperienceOrbVitalsOwnerSnapshotSchema,
   GAMEPLAY_ENTITIES_OWNER_ID,
   GAMEPLAY_PLAYER_OWNER_ID,
   GAMEPLAY_PLAYER_STORAGE_OWNER_ID,
+  GAMEPLAY_STAGE_IDS,
   GAMEPLAY_VITALS_OWNER_ID,
   gameplayOwnerRegistrations,
   makeGameplayFrameState,
+  makeGameplayFrameStateForOwner,
   makeGeneratedWorld,
   type MobBehaviour,
 } from '@nerima-games/mx-gameplay'
+import { disconnectedTransport, makeMultiplayerHost, TransportPort } from '@nerima-games/mx-multiplayer'
 import {
   ChunkCapacity,
   ChunkStore,
@@ -137,8 +141,42 @@ const makeDeps = (
       setMountedVehicleId: () => undefined,
       getVehicleControls: () => ({ throttle: 0, steering: 0 }),
       multiplayer: undefined,
+      isCreativeMode: false,
     }
     return deps
+  })
+
+// Runs the registered survival-hunger stage once over the vitals owner the host
+// reads, as main.ts wires it, with one jump's exhaustion already submitted.
+const runRegisteredHungerStage = (mode: 'single-player survival' | 'creative' | 'multiplayer') =>
+  Effect.gen(function* () {
+    const { instances, coordinator } = yield* makeHost
+    const gameplayState = yield* makeGameplayFrameStateForOwner({
+      coordinator,
+      vitalsOwnerId: GAMEPLAY_VITALS_OWNER_ID,
+    })
+    const multiplayer = mode === 'multiplayer'
+      ? { host: yield* makeMultiplayerHost.pipe(Effect.provideService(TransportPort, yield* disconnectedTransport)) }
+      : undefined
+    const modules = yield* registerHostModules({
+      ...(yield* makeDeps(instances)),
+      gameplayState,
+      multiplayer,
+      isCreativeMode: mode === 'creative',
+    })
+    const hunger = modules
+      .find((module) => module.name === '@nerima-games/mx-gameplay')
+      ?.frameStages.find((stage) => stage.id === GAMEPLAY_STAGE_IDS.survivalHunger)
+    assert.isDefined(hunger)
+
+    yield* gameplayState.survivalHunger.submit({ _tag: 'jump', count: 1, sprinting: false })
+    const before = yield* coordinator.snapshot(GAMEPLAY_VITALS_OWNER_ID, ExperienceOrbVitalsOwnerSnapshotSchema)
+    yield* Effect.provide(
+      hunger.run(DeltaTimeSecs(0.5)),
+      FixedClockLayer({ monotonicSecs: MonotonicTimeSecs(0), wallClockEpochMillis: EpochMillis(0) }),
+    )
+    const after = yield* coordinator.snapshot(GAMEPLAY_VITALS_OWNER_ID, ExperienceOrbVitalsOwnerSnapshotSchema)
+    return { before, after }
   })
 
 describe('host modules', () => {
@@ -270,5 +308,32 @@ describe('host modules', () => {
       const committed = yield* coordinator.snapshot(GAMEPLAY_PLAYER_OWNER_ID, PlayerServiceSnapshotSchema)
       expect(committed.state.pose.feetPosition).toEqual({ dimension: 'overworld', x: -2.5, y: 90, z: 3.5 })
       expect((yield* owned.views.player.pose).feetPosition).toEqual(destination)
+    }))
+})
+
+describe('the registered survival-hunger stage', () => {
+  it.effect('advances the vitals owner in single-player survival', () =>
+    Effect.gen(function* () {
+      const { before, after } = yield* runRegisteredHungerStage('single-player survival')
+
+      expect(after.revision).not.toBe(before.revision)
+      expect(after.state.vitals.foodTimerSecs).toBeGreaterThan(before.state.vitals.foodTimerSecs)
+      expect(after.state.vitals.exhaustion).toBeGreaterThan(before.state.vitals.exhaustion)
+    }))
+
+  // The server's vitals overwrite health, hunger and experience but not the
+  // food timer or exhaustion, so a local tick would drift them.
+  it.effect('leaves the vitals owner untouched in multiplayer', () =>
+    Effect.gen(function* () {
+      const { before, after } = yield* runRegisteredHungerStage('multiplayer')
+
+      expect(after).toStrictEqual(before)
+    }))
+
+  it.effect('leaves the vitals owner untouched in creative', () =>
+    Effect.gen(function* () {
+      const { before, after } = yield* runRegisteredHungerStage('creative')
+
+      expect(after).toStrictEqual(before)
     }))
 })
