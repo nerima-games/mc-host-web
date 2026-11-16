@@ -18,6 +18,8 @@ type EntitySnapshot = {
   readonly feetPosition: Position
   readonly healthPoints: number
   readonly behaviour?: unknown
+  readonly item?: string
+  readonly count?: number
 }
 type RenderedEntitySnapshot = {
   readonly id: string
@@ -251,19 +253,46 @@ const grantPointerLock = async (page: Page): Promise<void> => {
   })
 }
 
+const seedZombieEncounter = async (page: Page, command: string) => {
+  // Capture the baseline and fixture addition before an ecosystem tick can
+  // introduce unrelated natural mobs between the two observations.
+  const { before, seeded } = await page.evaluate(async (operation) => {
+    const transport = window.__NERIMA_GAMES_QA__
+    if (transport === undefined) throw new Error('missing QA transport')
+    const results = await Promise.all([
+      transport.dispatch('gameplay', 'snapshot', null),
+      transport.dispatch('gameplay', operation, null),
+    ])
+    const snapshots = results.map((result) => {
+      if (result._tag === 'Failure') throw new Error(JSON.stringify(result.error))
+      return result.value as GameplaySnapshot
+    })
+    return { before: snapshots[0]!, seeded: snapshots[1]! }
+  }, command)
+  const baselineIds = new Set(before.entities.map(({ id }) => id))
+  const identity = ({ id, kind }: EntitySnapshot) => ({ id, kind })
+  expect(seeded.entities.filter(({ id }) => baselineIds.has(id)).map(identity)).toEqual(before.entities.map(identity))
+  const added = seeded.entities.filter(({ id }) => !baselineIds.has(id))
+  expect(added).toHaveLength(1)
+  expect(added[0]?.kind).toBe('zombie')
+  return { baselineIds, zombieId: added[0]!.id }
+}
+
 test('renders a zombie pursuing the player and persists contact damage', async ({ page }) => {
   const faults = watchForFaults(page)
 
   await startGameSession(page)
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
-  await callQa<unknown>(page, 'gameplay.seedZombiePursuitEncounter')
+  const { zombieId } = await seedZombieEncounter(page, 'seedZombiePursuitEncounter')
 
   await expect.poll(async () => {
     const current = await snapshot(page)
-    const zombie = current.entities[0]
-    const renderedZombie = current.renderedEntities[0]
-    return current.entities.length === 1
-      && current.renderedEntities.length === 1
+    const zombies = current.entities.filter((entity) => entity.id === zombieId)
+    const renderedZombies = current.renderedEntities.filter((entity) => entity.id === zombieId)
+    const zombie = zombies[0]
+    const renderedZombie = renderedZombies[0]
+    return zombies.length === 1
+      && renderedZombies.length === 1
       && zombie?.kind === 'zombie'
       && renderedZombie?.kind === 'zombie'
       && renderedZombie.category === 'hostile'
@@ -271,7 +300,6 @@ test('renders a zombie pursuing the player and persists contact damage', async (
   }).toBe(true)
 
   const pursuitStart = await snapshot(page)
-  const zombieId = pursuitStart.entities[0]?.id
   expect(zombieId).toBeDefined()
   const initialZombie = pursuitStart.entities.find((entity) => entity.id === zombieId)
   expect(initialZombie).toBeDefined()
@@ -330,32 +358,32 @@ test('renders a lethal zombie encounter and recovers through the Respawn control
   await expect(hotbar.locator('[data-mx-ui="slot"]')).toHaveCount(9)
   const spawn = await callQa<GameplaySnapshot>(page, 'gameplay.respawn')
 
-  await callQa<unknown>(page, 'gameplay.seedLethalZombieEncounter')
+  const { baselineIds, zombieId } = await seedZombieEncounter(page, 'seedLethalZombieEncounter')
+  const isDeathDrop = (entity: EntitySnapshot) => entity.kind === 'dropped_item' && !baselineIds.has(entity.id)
   await expect.poll(async () => {
     const current = await snapshot(page)
-    const simulated = current.entities.find((entity) => entity.kind === 'zombie')
-    const rendered = current.renderedEntities.find((entity) => entity.kind === 'zombie')
+    const simulated = current.entities.find((entity) => entity.id === zombieId && entity.kind === 'zombie')
+    const rendered = current.renderedEntities.find((entity) => entity.id === zombieId && entity.kind === 'zombie')
     return simulated !== undefined
       && rendered?.category === 'hostile'
       && simulated.id === rendered.id
   }).toBe(true)
-  const zombieId = (await snapshot(page)).entities
-    .find((entity) => entity.kind === 'zombie')?.id
   expect(zombieId).toBeDefined()
 
   await expect.poll(async () => {
     const current = await snapshot(page)
-    const simulatedZombie = current.entities.find((entity) => entity.kind === 'zombie')
-    const simulatedDrops = current.entities.filter((entity) => entity.kind === 'dropped_item')
-    const renderedZombie = current.renderedEntities.find((entity) => entity.kind === 'zombie')
+    const simulatedZombie = current.entities.find((entity) => entity.id === zombieId && entity.kind === 'zombie')
+    const simulatedDrops = current.entities.filter(isDeathDrop)
+    const cohortIds = new Set([zombieId, ...simulatedDrops.map(({ id }) => id)])
+    const renderedZombie = current.renderedEntities.find((entity) => entity.id === zombieId && entity.kind === 'zombie')
     const renderedDrops = current.renderedEntities.filter(
-      (entity) => entity.kind === 'dropped_item',
+      (entity) => entity.kind === 'dropped_item' && cohortIds.has(entity.id),
     )
     return {
-      simulationEntityCount: current.entities.length,
+      simulationEntityCount: current.entities.filter(({ id }) => cohortIds.has(id)).length,
       simulationZombieId: simulatedZombie?.id,
       simulationDropIds: simulatedDrops.map((entity) => entity.id).sort(),
-      renderedEntityCount: current.renderedEntities.length,
+      renderedEntityCount: current.renderedEntities.filter(({ id }) => cohortIds.has(id)).length,
       renderedZombieId: renderedZombie?.id,
       renderedZombieCategory: renderedZombie?.category,
       renderedDropIds: renderedDrops.map((entity) => entity.id).sort(),
@@ -389,14 +417,22 @@ test('renders a lethal zombie encounter and recovers through the Respawn control
   })
 
   const deathSnapshot = await snapshot(page)
+  expect(deathSnapshot.entities.filter(isDeathDrop).map(({ item, count }) => ({ item, count }))
+    .sort((left, right) => String(left.item).localeCompare(String(right.item)))).toEqual([
+    { item: 'oak_planks', count: 4 },
+    { item: 'potato', count: 2 },
+    { item: 'stone_pickaxe', count: 1 },
+    { item: 'torch', count: 8 },
+  ])
   const dropIds = deathSnapshot.entities
-    .filter((entity) => entity.kind === 'dropped_item')
+    .filter(isDeathDrop)
     .map((entity) => entity.id)
     .sort()
   expect(dropIds).toHaveLength(4)
+  const cohortIds = new Set([zombieId, ...dropIds])
   expect(
     deathSnapshot.renderedEntities
-      .filter((entity) => entity.kind === 'dropped_item')
+      .filter((entity) => entity.kind === 'dropped_item' && cohortIds.has(entity.id))
       .map((entity) => entity.id)
       .sort(),
   ).toEqual(dropIds)
@@ -430,23 +466,23 @@ test('renders a lethal zombie encounter and recovers through the Respawn control
       maxHealthPoints: current.vitals.maxHealthPoints,
       lastDamageCause: current.vitals.lastDamageCause ?? null,
       dead: current.dead,
-      entityCount: current.entityCount,
+      entityCount: current.entityCount - current.entities.filter(({ id }) => !cohortIds.has(id)).length,
       simulationZombieIds: current.entities
-        .filter((entity) => entity.kind === 'zombie')
+        .filter((entity) => entity.id === zombieId && entity.kind === 'zombie')
         .map((entity) => entity.id),
       simulationDropIds: current.entities
-        .filter((entity) => entity.kind === 'dropped_item')
+        .filter((entity) => entity.kind === 'dropped_item' && cohortIds.has(entity.id))
         .map((entity) => entity.id)
         .sort(),
       renderedZombieIds: current.renderedEntities
-        .filter((entity) => entity.kind === 'zombie')
+        .filter((entity) => entity.id === zombieId && entity.kind === 'zombie')
         .map((entity) => entity.id),
       renderedDropIds: current.renderedEntities
-        .filter((entity) => entity.kind === 'dropped_item')
+        .filter((entity) => entity.kind === 'dropped_item' && cohortIds.has(entity.id))
         .map((entity) => entity.id)
         .sort(),
       renderedDropCategories: current.renderedEntities
-        .filter((entity) => entity.kind === 'dropped_item')
+        .filter((entity) => entity.kind === 'dropped_item' && cohortIds.has(entity.id))
         .map((entity) => entity.category),
     }
   }).toEqual({
