@@ -188,6 +188,7 @@ import {
   drainVillagerTradeResults,
   EYE_LEVEL_OFFSET,
   fishingPhase,
+  gameplayOwnerRegistrations,
   getPlayerMovementSpeedMultiplier,
   insertBrewingBottle,
   insertBrewingFuel,
@@ -905,12 +906,21 @@ const bootGame = async (
   const time = await Effect.runPromise(makeTimeService())
   const weather = await Effect.runPromise(makeWeatherService())
   const crops = await Effect.runPromise(makeCropService())
+  // Restored villager trades seed their coordinator owner here; chunk streaming
+  // reads and updates them through the coordinator.
+  const gameplayOwners = gameplayOwnerRegistrations(
+    loadedSessionState === undefined ? undefined : { villagerTrades: loadedSessionState.villagers.trades },
+  )
+  if (Result.isFailure(gameplayOwners)) {
+    failBoot('gameplay owner registration failed', gameplayOwners.failure)
+    return
+  }
   const hostWorldWriteExit = await Effect.runPromiseExit(
     Effect.flatMap(
       Schema.decodeEffect(WorldIdSchema)(sessionId),
       (worldId) => makeHostWorldWrite({
         world: worldId,
-        owners: [],
+        owners: gameplayOwners.success,
         chunkStores: {
           // `getOrCreateDimensionChunkContext` is declared further down. This
           // is safe because mc-sim calls `forDimension` only on observe and
@@ -1356,7 +1366,7 @@ const bootGame = async (
     streamRadiusChunks: STREAM_RADIUS_CHUNKS,
     activeSeed,
     canvas,
-    gameplayState,
+    coordinator: hostWorldWrite.coordinator,
     villagerResidents,
     saveCoordinator,
     getMarkSessionDirty: () => markSessionDirty,
@@ -1401,9 +1411,13 @@ const bootGame = async (
     applyPoweredPistonTransition,
   } = redstoneContainerRuntime
 
-  await Effect.runPromise(
+  const initialStreamExit = await Effect.runPromiseExit(
     streamAround(currentChunkContext, spawnPose.feetPosition.x, spawnPose.feetPosition.z),
   )
+  if (Exit.isFailure(initialStreamExit)) {
+    failBoot('initial chunk streaming failed', Cause.squash(initialStreamExit.cause))
+    return
+  }
 
   const uiFrameState = Effect.runSync(makeUiFrameState)
 
