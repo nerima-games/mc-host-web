@@ -207,7 +207,6 @@ export const runTickPostFrameGameplay = (
     sendPortalUseCommand,
     sendToggleLeverCommand,
     sendFacilityCommand,
-    requestBrewing,
   } = multiplayerClient
   const {
     containerIdForStorageBlock,
@@ -485,10 +484,6 @@ export const runTickPostFrameGameplay = (
     } else if (opensBrewing) {
       setBrewingOpen(true)
       if (brewingTarget !== undefined) state.activeBrewingStandAt.set({ ...brewingTarget.position })
-      if (multiplayer !== undefined && brewingTarget !== undefined) {
-        requestBrewing({ _tag: 'open' })
-        renderBrewingUi()
-      }
     } else if (routeResult !== undefined && '_tag' in routeResult) {
       console.warn('Unable to route use to an unavailable block', routeResult)
     } else if (route?.kind === 'craftingTable') {
@@ -1049,6 +1044,31 @@ export const runTickPostFrameGameplay = (
     postFramePose,
     nowSecs,
   )
+
+  // The public drain clears every kind. Remove only correlated brewing
+  // refusals so the other host consumers retain their own unsupported records.
+  const unsupportedBrewing = yield* Ref.modify(gameplayState.unsupportedOperations, (operations) => {
+    const matched: Array<{
+      readonly requestId: string
+      readonly action: 'insert' | 'collect' | 'drink'
+      readonly reason: (typeof operations)[number]['reason']
+    }> = []
+    const retained: Array<(typeof operations)[number]> = []
+    for (const operation of operations) {
+      const pending = operation.requestId === undefined ? undefined : pendingItemUses.get(operation.requestId)
+      if (operation.requestId !== undefined && pending?.kind === 'brewing') {
+        matched.push({ requestId: operation.requestId, action: pending.action, reason: operation.reason })
+      } else {
+        retained.push(operation)
+      }
+    }
+    return [matched, retained]
+  })
+  for (const operation of unsupportedBrewing) {
+    pendingItemUses.delete(operation.requestId)
+    state.brewingStatus.set(`Cannot ${operation.action} brewing item: ${operation.reason}`)
+    renderBrewingUi()
+  }
 
   const itemUseResults = Effect.runSync(drainItemUseResults(gameplayState))
   for (const result of itemUseResults) {

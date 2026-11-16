@@ -134,6 +134,7 @@ test.describe('brewing, effects, and experience', () => {
     expect(beforeReload.brewing.bottles).toHaveLength(3)
     expect(beforeReload.brewing.bottles[0]?.item).toBe('water_bottle')
     expect(beforeReload.brewing.ingredient?.item).toBe('nether_wart')
+    await expect(page.locator('#brewing-root [data-brewing-action="collect"]')).toBeDisabled()
     await callQa(page, 'persistence.flush')
     await startGameSession(page, sessionId)
     await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
@@ -167,6 +168,7 @@ test.describe('brewing, effects, and experience', () => {
     )
 
     const brewing = page.locator('#brewing-root')
+    await expect(brewing.locator('[data-brewing-action="collect"]')).toBeEnabled()
     await brewing.locator('[data-brewing-action="collect"]').click()
     await expect.poll(async () => (await snapshot(page)).inventory.slots[1]?.item).toBe('potion_of_poison')
     await selectHotbar(page, 'Digit2')

@@ -31,7 +31,8 @@ describe('H4b main.ts wiring', () => {
 
   it('connects the main-owned inventory state and commands before installing listeners and starting tick', () => {
     const clientContextStart = positionOf(mainSource, 'const multiplayerClientContext: MultiplayerClientContext = {')
-    const clientCreation = positionOf(mainSource, '} = createMultiplayerClient(multiplayerClientContext)')
+    const clientCreation = positionOf(mainSource, 'const multiplayerClientApi = createMultiplayerClient(multiplayerClientContext)')
+    const clientDestructure = positionOf(mainSource, '} = multiplayerClientApi', clientCreation)
     const runtimeCreation = positionOf(mainSource, 'const inventoryRuntime = createPlayerUiRuntime({')
     const runtimeDestructure = positionOf(mainSource, '} = inventoryRuntime')
     const listenerInstallation = positionOf(mainSource, 'installInventoryListeners()')
@@ -39,6 +40,9 @@ describe('H4b main.ts wiring', () => {
     const tickStart = positionOf(mainSource, 'const tick = (() => {')
 
     expect(clientCreation).toBeLessThan(runtimeCreation)
+    expect(clientContextStart).toBeLessThan(clientCreation)
+    expect(clientCreation).toBeLessThan(clientDestructure)
+    expect(clientDestructure).toBeLessThan(runtimeCreation)
     expect(runtimeCreation).toBeLessThan(runtimeDestructure)
     expect(runtimeDestructure).toBeLessThan(listenerInstallation)
     expect(listenerInstallation).toBeLessThan(pauseInstallation)

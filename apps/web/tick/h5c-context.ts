@@ -105,7 +105,7 @@ export type H5cTickContext = {
     readonly replaceVehicle: (vehicle: Vehicle) => void
     readonly multiplayerClient: Pick<
       MultiplayerClientApi,
-      'sendVitalsCommand' | 'sendPortalUseCommand' | 'sendToggleLeverCommand' | 'sendEntityCommand' | 'sendFacilityCommand' | 'requestBrewing'
+      'sendVitalsCommand' | 'sendPortalUseCommand' | 'sendToggleLeverCommand' | 'sendEntityCommand' | 'sendFacilityCommand'
     >
     readonly endPortalComplete: () => boolean
     readonly useEndFeature: () => Effect.Effect<boolean, EndFeatureFailure>
