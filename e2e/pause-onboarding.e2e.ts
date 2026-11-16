@@ -48,7 +48,8 @@ test('a short title viewport scrolls to reachable Controls and dismissal buttons
 
   await expect(onboarding).toBeVisible()
   const initialScrollTop = await title.evaluate((element) => element.scrollTop)
-  await page.mouse.move(400, 160)
+  // The center belongs to the menu's own scroller; wheel over the title padding.
+  await page.mouse.move(20, 160)
   await page.mouse.wheel(0, 1200)
   await expect.poll(() => title.evaluate((element) => element.scrollTop)).toBeGreaterThan(initialScrollTop)
   await controls.click()
