@@ -151,6 +151,7 @@ const makeContext = async (primaryAttackConsumed: ReturnType<typeof cell<boolean
       detach: Effect.void,
       attached: Effect.succeed(true),
     },
+    enqueueRenderUpdate: () => {},
     streamLoaded: new Set(),
     lightingSnapshot: lighting.snapshot,
   }

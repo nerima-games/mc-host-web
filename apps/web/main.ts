@@ -154,9 +154,9 @@ import { makeMusicRuntime } from './music-runtime'
 import {
   activeDimensionChunkSync,
   budgetedRendererStore,
-  clearRenderedChunks,
   drainChunkRenderFaults,
   makeChunkStreaming,
+  showDimensionChunks,
   type DimensionChunkContext,
 } from './chunk-streaming'
 import {
@@ -1219,20 +1219,24 @@ const bootGame = async (
     const lighting = trackChunkLightColor((chunk, quads) =>
       makeChunkStoreLightColor(dimensionWorld.worldgenChunkStore, chunk, quads),
     )
-    return Effect.map(
-      Effect.flatMap(
-        budgetedRendererStore(dimensionWorld.worldgenChunkStore, MAX_CHUNK_UPDATES_PER_FRAME),
-        (store) => attachChunkStoreRenderer(worldRenderer, store, { colorForChunk: lighting.colorForChunk }),
-      ),
-      (renderAttachment): DimensionChunkContext => ({
+    return Effect.gen(function* () {
+      const budgeted = yield* budgetedRendererStore(dimensionWorld.worldgenChunkStore, MAX_CHUNK_UPDATES_PER_FRAME)
+      const renderAttachment = yield* attachChunkStoreRenderer(
+        worldRenderer,
+        budgeted.store,
+        { colorForChunk: lighting.colorForChunk },
+      )
+      const context: DimensionChunkContext = {
         dimension,
         chunkStore: dimensionWorld.chunkStore,
         worldgenChunkStore: dimensionWorld.worldgenChunkStore,
         renderAttachment,
+        enqueueRenderUpdate: budgeted.enqueue,
         lightingSnapshot: lighting.snapshot,
         streamLoaded: new Set<string>(),
-      }),
-    )
+      }
+      return context
+    })
   }
   const dimensionContexts = new Map<Dimension, DimensionChunkContext>()
   const initialChunkContextExit = Effect.runSyncExit(makeDimensionChunkContext(initialDimension, world))
@@ -1847,7 +1851,7 @@ const bootGame = async (
     // The entities owner holds every dimension and the entities view shows the
     // player's current one, so no roster is swapped here.
     currentChunkContext = getOrCreateDimensionChunkContext(dimension)
-    Effect.runSync(clearRenderedChunks(worldRenderer))
+    Effect.runSync(showDimensionChunks(worldRenderer, currentChunkContext))
     redstoneDirty = true
     return true
   }

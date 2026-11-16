@@ -2,17 +2,25 @@ import { assert, describe, expect, it } from '@effect/vitest'
 import { Deferred, Effect, Fiber, Option, Result } from 'effect'
 
 import { BlockAxis, blockIdOf, blockPosition, ChunkAxis, chunkCoord, CHUNK_SIZE_XZ, WorldId } from '@nerima-games/mc-kernel'
-import { EMPTY_SYNC_REPORT, type WorldRendererAttachment } from '@nerima-games/mc-render'
+import {
+  attachChunkStoreRenderer,
+  chunkKeyOf,
+  EMPTY_SYNC_REPORT,
+  makeProductionWorldRenderer,
+  type WorldRendererAttachment,
+} from '@nerima-games/mc-render'
 import { makeWorldCommitCoordinator, ReplicatedOwnerUnknown, type WorldCommitCoordinatorApi } from '@nerima-games/mc-sim'
 import { StorageError } from '@nerima-games/mc-save'
 import {
   CHUNK_VOLUME,
   ChunkCapacity,
   generatedChunkSource,
+  generatedDimensionChunkSource,
   makeChunkStore,
   NoiseSeed,
   type Chunk,
   type ChunkWithBlockStates,
+  type Dimension,
 } from '@nerima-games/mc-worldgen'
 import {
   GAMEPLAY_VILLAGER_TRADES_OWNER_ID,
@@ -20,6 +28,7 @@ import {
   gameplayOwnerRegistrations,
   makeVillager,
 } from '@nerima-games/mx-gameplay'
+import * as THREE from 'three'
 
 import {
   activeDimensionChunkSync,
@@ -28,6 +37,7 @@ import {
   desiredChunksAround,
   drainChunkRenderFaults,
   makeChunkStreaming,
+  showDimensionChunks,
   type ChunkRenderFault,
   type ChunkStreamingContext,
 } from '../apps/web/chunk-streaming'
@@ -404,7 +414,7 @@ describe('chunk render attachment wiring', () => {
     Effect.gen(function* () {
       const store = yield* makeChunkStore(generatedChunkSource(NoiseSeed(1)), ChunkCapacity(16))
       const rendererStore = yield* budgetedRendererStore(store, 2)
-      const subscription = yield* rendererStore.subscribeDirty
+      const subscription = yield* rendererStore.store.subscribeDirty
       // Far apart, so no load also dirties a resident neighbour.
       for (const cx of [0, 10, 20]) yield* store.load(chunkCoord(ChunkAxis(cx), ChunkAxis(0)))
 
@@ -455,6 +465,88 @@ describe('chunk render attachment wiring', () => {
     detach: Effect.void,
     attached: Effect.succeed(true),
   })
+
+  it.effect('meshes a re-entered dimension\'s resident chunks again after the renderer was cleared', () =>
+    Effect.gen(function* () {
+      class GpuSurface {
+        render = () => {}
+        setSize = () => {}
+        setClearColor = () => {}
+        dispose = () => {}
+      }
+      const renderer = yield* makeProductionWorldRenderer<
+        object, THREE.BufferGeometry<THREE.NormalBufferAttributes>, THREE.MeshBasicMaterial,
+        THREE.InstancedBufferGeometry, THREE.ShaderMaterial
+      >({ ...THREE, WebGLRenderer: GpuSurface }, {}, { width: 64, height: 64 }, new THREE.Texture())
+      const counters = { streamed: 0, dropped: 0 }
+      const streaming = makeChunkStreaming({
+        streamRadiusChunks: 1,
+        activeSeed: 71,
+        canvas: { setAttribute: () => {} },
+        coordinator: yield* makeWorldCommitCoordinator({
+          world: WorldId('chunk-streaming-dimension-reentry'),
+          owners: gameplayOwnerRegistrations(),
+        }),
+        villagerResidents: new Map(),
+        saveCoordinator: { retainChunk: () => {} },
+        getMarkSessionDirty: () => () => {},
+        markRedstoneDirty: () => {},
+        getChunksStreamedIn: () => counters.streamed,
+        setChunksStreamedIn: (count) => { counters.streamed = count },
+        getChunksDropped: () => counters.dropped,
+        setChunksDropped: (count) => { counters.dropped = count },
+      })
+      // The same wiring as main.ts makeDimensionChunkContext: one real ChunkStore
+      // and one budgeted attachment per dimension, sharing one WorldRenderer.
+      const dimensionContext = (dimension: Dimension) =>
+        Effect.gen(function* () {
+          const store = yield* makeChunkStore(generatedDimensionChunkSource(NoiseSeed(71), dimension), ChunkCapacity(64))
+          const rendererStore = yield* budgetedRendererStore(store, 4)
+          const renderAttachment = yield* attachChunkStoreRenderer(renderer, rendererStore.store)
+          return {
+            dimension,
+            chunkStore: store,
+            worldgenChunkStore: store,
+            streamLoaded: new Set<string>(),
+            renderAttachment,
+            enqueueRenderUpdate: rendererStore.enqueue,
+          }
+        })
+      const overworld = yield* dimensionContext('overworld')
+      const nether = yield* dimensionContext('nether')
+      let active = overworld
+      const chunkSync = activeDimensionChunkSync(() => active)
+      const runFrames = Effect.gen(function* () {
+        const reports: Array<number> = []
+        for (let frame = 0; frame < 8; frame += 1) reports.push((yield* chunkSync.update).meshed)
+        return reports
+      })
+      const rendered = Effect.map(renderer.chunkKeys, (keys) => [...keys].sort())
+      const around = desiredChunksAround(1, 0, 0).map(chunkKeyOf).sort()
+
+      yield* Effect.gen(function* () {
+        yield* streaming.streamAround(overworld, 0, 0)
+        yield* runFrames
+        expect(yield* rendered).toEqual(around)
+
+        // main.ts alignActiveDimension: switch the context, then show its chunks.
+        active = nether
+        yield* showDimensionChunks(renderer, nether)
+        yield* streaming.streamAround(nether, 0, 0)
+        yield* runFrames
+        expect(yield* rendered).toEqual(around)
+
+        active = overworld
+        yield* showDimensionChunks(renderer, overworld)
+        yield* streaming.streamAround(overworld, 0, 0)
+        const reentryFrames = yield* runFrames
+
+        expect([...overworld.streamLoaded].sort()).toEqual(around)
+        // Nine resident chunks under a budget of four per frame.
+        expect(reentryFrames).toEqual([4, 4, 1, 0, 0, 0, 0, 0])
+        expect(yield* rendered).toEqual(around)
+      }).pipe(Effect.ensuring(renderer.dispose))
+    }))
 
   it.effect('updates only the active dimension attachment', () =>
     Effect.gen(function* () {
