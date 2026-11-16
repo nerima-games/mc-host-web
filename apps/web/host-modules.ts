@@ -2,13 +2,12 @@ import { Context, Effect } from 'effect'
 import { WorldWritePort, type QaNamespace, type SaveSliceRegistration } from '@nerima-games/mc-kernel'
 import { renderModule, InputService, type ChunkSyncPort, type DrawPort, type GraphicsQuality } from '@nerima-games/mc-render'
 import {
-  CropService,
   entityManagerTag,
+  makeCropService,
   PlayerService,
   simStages,
   TimeService,
   VehicleService,
-  type CropServiceApi,
   type EntityManager,
   type EntityManagerApi,
   type PlayerServiceApi,
@@ -42,7 +41,6 @@ export const MobEntityManager: Context.Service<EntityManager, EntityManagerApi<M
 export type HostServices =
   | TimeService
   | PlayerService
-  | CropService
   | VehicleService
   | EntityManager
   | ChunkStore
@@ -65,7 +63,6 @@ export type HostServices =
 export type HostServiceInstances = {
   readonly time: TimeServiceApi
   readonly player: PlayerServiceApi
-  readonly crops: CropServiceApi
   readonly vehicles: VehicleServiceApi
   readonly entities: EntityManagerApi<MobBehaviour>
   readonly chunkStore: ChunkStoreApi
@@ -80,7 +77,6 @@ export const makeHostServiceContext = (instances: HostServiceInstances): Context
     instances.redstoneContext,
     Context.make(TimeService, instances.time),
     Context.make(PlayerService, instances.player),
-    Context.make(CropService, instances.crops),
     Context.make(VehicleService, instances.vehicles),
     Context.make(MobEntityManager, instances.entities),
     Context.make(ChunkStore, instances.chunkStore),
@@ -101,6 +97,7 @@ export type HostModulesDeps = {
   readonly uiFrameState: UiFrameState
   readonly simState: SimFrameState
   readonly gameplayState: GameplayFrameState
+  readonly gameplayCommit: GameplayCommitServices
   readonly isActiveDimension: (dimension: Dimension) => boolean
   readonly poweredRails: ReadonlySet<string>
   readonly leverKeyOf: (lever: Pick<PersistedLeverState, 'dimension' | 'position'>) => string
@@ -136,6 +133,7 @@ export const registerHostModules = (deps: HostModulesDeps): Effect.Effect<Readon
     uiFrameState,
     simState,
     gameplayState,
+    gameplayCommit,
     isActiveDimension,
     poweredRails,
     leverKeyOf,
@@ -186,7 +184,9 @@ export const registerHostModules = (deps: HostModulesDeps): Effect.Effect<Readon
     frameStages: Effect.gen(function* () {
       const time = yield* TimeService
       const player = yield* PlayerService
-      const crops = yield* CropService
+      // Only gameplay advances crop owners. This private empty service keeps
+      // mc-sim's required crop tick from holding a second copy of their state.
+      const crops = yield* makeCropService()
       return simStages(simState, time, player, crops)
     }),
   })
@@ -225,6 +225,7 @@ export const registerHostModules = (deps: HostModulesDeps): Effect.Effect<Readon
           droppedItemPickup: false,
           mobSimulation: multiplayer === undefined,
         },
+        gameplayCommit,
       )
       // The survival-hunger stage ticks the vitals owner on every frame and
       // has no option to stop. Hunger is local only in single-player survival:

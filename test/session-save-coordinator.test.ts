@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest'
+import { assert, describe, expect, it, vi } from 'vitest'
 import { Effect, Option, Result, Schema } from 'effect'
 import {
   ChunkAxis,
@@ -10,7 +10,14 @@ import {
   PositionAxis,
   WorldIdSchema,
 } from '@nerima-games/mc-kernel'
-import { EntitySerial, PlayerStorageSnapshotSchema } from '@nerima-games/mc-sim'
+import {
+  CropSnapshotSchema,
+  emptyBrewingState,
+  EntitySerial,
+  makeWorldCommitCoordinator,
+  NETHER_WART_MATURITY_SECS,
+  PlayerStorageSnapshotSchema,
+} from '@nerima-games/mc-sim'
 import {
   ChunkCapacity,
   CHUNK_VOLUME,
@@ -21,11 +28,13 @@ import {
   type Dimension,
 } from '@nerima-games/mc-worldgen'
 import {
+  GAMEPLAY_CROPS_OWNER_ID,
   GAMEPLAY_ENTITIES_OWNER_ID,
   GAMEPLAY_PLAYER_OWNER_ID,
   GAMEPLAY_PLAYER_STORAGE_OWNER_ID,
   GAMEPLAY_VITALS_OWNER_ID,
   gameplayOwnerRegistrations,
+  emptyStatusEffectState,
   hostileMobSnapshot,
   makeGeneratedWorld,
   mintEntityId,
@@ -33,10 +42,20 @@ import {
   type MobEntity,
 } from '@nerima-games/mx-gameplay'
 
-import type { DimensionChunk } from '../apps/web/session-persistence'
+import {
+  EMPTY_END_STATE,
+  EMPTY_ENTITY_ROSTERS,
+  EMPTY_VILLAGER_STATE,
+  SESSION_FORMAT,
+  SESSION_FORMAT_VERSION,
+  type DimensionChunk,
+  type SessionHead,
+  type SessionState,
+} from '../apps/web/session-persistence'
 import { createDroppedItemLifetimeTracker } from '../apps/web/dropped-item-lifetime'
 import { makeOwnerBackedHost } from '../apps/web/owner-backed-services'
 import { initializeSessionWorld } from '../apps/web/session-world'
+import { gameplayOwnerInitialState } from '../apps/web/session-restoration'
 import { makeHostWorldWrite } from '../apps/web/world-write-port'
 
 import {
@@ -401,6 +420,115 @@ describe('owner-backed save state', () => {
     healthPoints: EntityHealthPoints(20),
     behaviour: hostileMobSnapshot(undefined),
     dimension,
+  })
+
+  it('round-trips growing and mature crops across dimensions through owner saves and the session schema', async () => {
+    const generated = await Effect.runPromise(makeGeneratedWorld<MobBehaviour>({ dimension: 'overworld' }))
+    const loaded: SessionState = {
+      seed: 1,
+      dimension: 'overworld',
+      player: await Effect.runPromise(generated.player.pose),
+      storage: await Effect.runPromise(generated.inventory.storageSnapshot),
+      containerStorage: await Effect.runPromise(generated.inventory.containerStorageSnapshot),
+      vitals: await Effect.runPromise(generated.vitals.snapshot),
+      time: { ticks: 0, dayLengthTicks: 24_000 },
+      weather: { weather: 'clear', remainingSecs: 120 },
+      redstone: { levers: [] },
+      furnaces: [],
+      portals: [],
+      crops: await Effect.runPromise(Schema.decodeUnknownEffect(CropSnapshotSchema)({
+        crops: [
+          { dimension: 'overworld', position: { x: 1, y: 65, z: 2 }, crop: 'potato_crop', growthSecs: 120 },
+          { dimension: 'nether', position: { x: -3, y: 40, z: 4 }, crop: 'nether_wart_crop', growthSecs: NETHER_WART_MATURITY_SECS },
+        ],
+      })),
+      entities: EMPTY_ENTITY_ROSTERS,
+      villagers: EMPTY_VILLAGER_STATE,
+      brewing: Result.getOrThrow(emptyBrewingState()),
+      statusEffects: emptyStatusEffectState(),
+      end: EMPTY_END_STATE,
+    }
+    const generatedState = {
+      pose: await Effect.runPromise(generated.player.pose),
+      dimension: await Effect.runPromise(generated.player.dimension),
+      storage: await Effect.runPromise(generated.inventory.storageSnapshot),
+      vitals: await Effect.runPromise(generated.vitals.snapshot),
+    }
+    const roster = { entities: [], nextSerial: EntitySerial(0) }
+    const makeRestoredCoordinator = (state: SessionState) => Effect.gen(function* () {
+      const initial = yield* Effect.fromResult(gameplayOwnerInitialState(state, generatedState, roster))
+      const owners = yield* Effect.fromResult(gameplayOwnerRegistrations(initial))
+      return yield* makeWorldCommitCoordinator({
+        world: yield* Schema.decodeEffect(WorldIdSchema)('crop-roundtrip'),
+        owners,
+      })
+    })
+    const coordinator = await Effect.runPromise(makeRestoredCoordinator(loaded))
+    const publication: Array<SessionSavePublication<SessionState>> = []
+    const saves = createSessionSaveCoordinator<SessionState>({
+      initialKnownChunks: [],
+      snapshotResidents: async () => [],
+      currentGeneration: () => 0,
+      snapshotState: async () => {
+        const owned = await Effect.runPromise(
+          snapshotOwnedSessionState(coordinator, ownerIds, () => EMPTY_ENTITY_ROSTERS),
+        )
+        expect(owned.crops).toEqual(loaded.crops)
+        return { ...loaded, ...owned }
+      },
+      publish: async (value) => { publication.push(value) },
+    })
+    await saves.requestSave()
+    expect(publication).toHaveLength(1)
+    const saved = publication[0]
+    assert.isDefined(saved)
+    expect(saved.state.crops).toEqual(loaded.crops)
+    const head: SessionHead = {
+      sessionId: 'crop-roundtrip',
+      revision: 'crop-roundtrip-revision',
+      metadata: { name: 'Crop roundtrip', mode: 'survival' },
+      state: saved.state,
+      chunks: [],
+    }
+    const encoded = await Effect.runPromise(Schema.encodeEffect(SESSION_FORMAT.schema)(head))
+    const decoded = await Effect.runPromise(Schema.decodeUnknownEffect(SESSION_FORMAT.schema)(encoded))
+    expect(SESSION_FORMAT_VERSION).toBe(18)
+    expect(decoded.state.crops).toEqual(loaded.crops)
+    const restored = await Effect.runPromise(makeRestoredCoordinator(decoded.state))
+    expect((await Effect.runPromise(restored.snapshot(GAMEPLAY_CROPS_OWNER_ID, CropSnapshotSchema))).state)
+      .toEqual(loaded.crops)
+  })
+
+  it.each(['missing', 'invalid'] as const)('rejects a save when the crop owner is %s without publishing a fallback', async (kind) => {
+    const registrations = gameplayOwnerRegistrations()
+    const owners = kind === 'missing'
+      ? registrations.filter(({ ownerId }) => ownerId !== GAMEPLAY_CROPS_OWNER_ID)
+      : registrations.map((registration) => registration.ownerId === GAMEPLAY_CROPS_OWNER_ID
+          ? { ...registration, schema: Schema.Unknown, initialState: { crops: 'invalid' } }
+          : registration)
+    const coordinator = await Effect.runPromise(makeWorldCommitCoordinator({
+      world: await Effect.runPromise(Schema.decodeEffect(WorldIdSchema)('crop-save-failure')),
+      owners,
+    }))
+    const snapshot = snapshotOwnedSessionState(coordinator, ownerIds, () => EMPTY_ENTITY_ROSTERS)
+    const result = await Effect.runPromise(Effect.result(snapshot))
+    expect(Result.isFailure(result)).toBe(true)
+    if (Result.isFailure(result)) {
+      expect(result.failure._tag).toBe(kind === 'missing' ? 'ReplicatedOwnerUnknown' : 'SchemaError')
+    }
+    const publish = vi.fn(async () => undefined)
+    const onFailure = vi.fn()
+    const saves = createSessionSaveCoordinator({
+      initialKnownChunks: [],
+      snapshotResidents: async () => [],
+      currentGeneration: () => 0,
+      snapshotState: () => Effect.runPromise(snapshot),
+      publish,
+      onFailure,
+    })
+    await expect(saves.requestSave()).rejects.toThrow()
+    expect(publish).not.toHaveBeenCalled()
+    expect(onFailure).toHaveBeenCalledTimes(1)
   })
 
   it('publishes what the owners hold after view writes, with entities split per dimension', async () => {

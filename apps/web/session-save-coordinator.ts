@@ -1,6 +1,7 @@
 import { Effect, type Schema } from 'effect'
 import { chunkSnapshotOf } from '@nerima-games/mc-worldgen'
 import {
+  CropSnapshotSchema,
   PlayerServiceSnapshotSchema,
   PlayerStorageSnapshotSchema,
   type ReplicatedOwnerUnknown,
@@ -8,6 +9,7 @@ import {
 } from '@nerima-games/mc-sim'
 import {
   ExperienceOrbVitalsOwnerSnapshotSchema,
+  GAMEPLAY_CROPS_OWNER_ID,
   GameplayEntityRosterSchema,
   type GameplayEntityRoster,
 } from '@nerima-games/mx-gameplay'
@@ -16,7 +18,7 @@ import { poseOfPlayerOwner, type OwnerBackedOwnerIds } from './owner-backed-serv
 import type { DimensionChunk, SessionState } from './session-persistence'
 
 /** The saved fields whose source of truth is a coordinator owner. */
-export type OwnedSessionState = Pick<SessionState, 'dimension' | 'player' | 'storage' | 'vitals' | 'entities'>
+export type OwnedSessionState = Pick<SessionState, 'dimension' | 'player' | 'storage' | 'vitals' | 'entities' | 'crops'>
 
 /**
  * Read the owner-held part of a save straight from the owners, so a save
@@ -33,12 +35,14 @@ export const snapshotOwnedSessionState = (
     const storage = yield* coordinator.snapshot(ownerIds.playerStorage, PlayerStorageSnapshotSchema)
     const vitals = yield* coordinator.snapshot(ownerIds.vitals, ExperienceOrbVitalsOwnerSnapshotSchema)
     const entities = yield* coordinator.snapshot(ownerIds.entities, GameplayEntityRosterSchema)
+    const crops = yield* coordinator.snapshot(GAMEPLAY_CROPS_OWNER_ID, CropSnapshotSchema)
     return {
       dimension: player.pose.feetPosition.dimension,
       player: poseOfPlayerOwner(player),
       storage: storage.state,
       vitals: vitals.state.vitals,
       entities: entityRostersOf(entities.state),
+      crops: crops.state,
     }
   })
 

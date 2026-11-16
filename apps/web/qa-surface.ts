@@ -61,10 +61,12 @@ import {
 } from '@nerima-games/mc-render'
 import {
   addExperience as addVitalsExperience,
+  cropLocationKey,
+  CropSnapshotSchema,
+  isMatureCrop,
   totalExperienceAtLevel,
   POTATO_MATURITY_SECS,
   type CropLocation,
-  type CropServiceApi,
   type SimFrameState,
   type Vehicle,
   type VehicleServiceApi,
@@ -99,6 +101,7 @@ import {
   weatherLightScale,
   SkyLightLevel,
   gameplayStages,
+  GAMEPLAY_CROPS_OWNER_ID,
   GAMEPLAY_VILLAGER_TRADES_OWNER_ID,
   GameplayVillagerTradeSnapshotSchema,
   type Damage,
@@ -306,7 +309,6 @@ type QaSurfaceDeps = {
     readonly simState: SimFrameState
     readonly playerApi: OwnerBackedWorld['player']
     readonly currentChunkStore: ChunkStoreApi
-    readonly crops: CropServiceApi
     readonly weather: WeatherServiceApi
     readonly vehicleService: VehicleServiceApi
     readonly saveCoordinator: SessionSaveCoordinator
@@ -1040,7 +1042,6 @@ export const makeQaSurface = (
     simState,
     playerApi,
     currentChunkStore,
-    crops,
     weather,
     vehicleService,
     saveCoordinator,
@@ -1156,7 +1157,9 @@ export const makeQaSurface = (
     )
     const farmSoilReading = Effect.runSync(currentChunkStore.getBlock(KNOWN_TARGET_BLOCK))
     const farmCropReading = Effect.runSync(currentChunkStore.getBlock(QA_FARM_CROP_BLOCK))
-    const cropSnapshot = Effect.runSync(crops.snapshot)
+    const cropSnapshot = Effect.runSync(commit.coordinator.snapshot(GAMEPLAY_CROPS_OWNER_ID, CropSnapshotSchema)).state
+    const farmCropKey = cropLocationKey({ dimension, position: QA_FARM_CROP_BLOCK })
+    const farmCrop = cropSnapshot.crops.find((crop) => cropLocationKey(crop) === farmCropKey)
     const storage = Effect.runSync(world.inventory.storageSnapshot)
     const containerStorage = Effect.runSync(world.inventory.containerStorageSnapshot)
     const inventory = storage.inventory
@@ -1273,13 +1276,7 @@ export const makeQaSurface = (
         soilBlock: farmSoilReading._tag === 'Block' ? farmSoilReading.block : null,
         cropBlock: farmCropReading._tag === 'Block' ? farmCropReading.block : null,
         crops: cropSnapshot.crops,
-        cropStage: cropSnapshot.crops.some(
-          (crop) => crop.dimension === dimension
-            && crop.position.x === QA_FARM_CROP_BLOCK.x
-            && crop.position.y === QA_FARM_CROP_BLOCK.y
-            && crop.position.z === QA_FARM_CROP_BLOCK.z
-            && crop.growthSecs >= POTATO_MATURITY_SECS,
-        ) ? 'mature' : cropSnapshot.crops.length > 0 ? 'growing' : 'empty',
+        cropStage: farmCrop === undefined ? 'empty' : isMatureCrop(farmCrop) ? 'mature' : 'growing',
       },
       portals: [...portalStates.values()],
       activePortal: activePortal === undefined
@@ -1696,14 +1693,20 @@ export const makeQaSurface = (
     Effect.runSync(world.inventory.add('potato', 1))
     Effect.runSync(currentChunkStore.setBlock(KNOWN_TARGET_BLOCK, FARMLAND_BLOCK_ID))
     Effect.runSync(currentChunkStore.setBlock(QA_FARM_CROP_BLOCK, POTATO_CROP_BLOCK_ID))
-    Effect.runSync(crops.restore({
-      crops: [{
-        dimension,
-        position: QA_FARM_CROP_BLOCK,
-        crop: 'potato_crop',
-        growthSecs: POTATO_MATURITY_SECS - 0.1,
-      }],
-    }))
+    Effect.runSync(commit.coordinator.commitFromSnapshot(GAMEPLAY_CROPS_OWNER_ID, CropSnapshotSchema, (snapshot) =>
+      Effect.succeed({
+        expectedRevision: snapshot.revision,
+        expectedDimensions: [],
+        changes: [{
+          ownerId: GAMEPLAY_CROPS_OWNER_ID,
+          state: { crops: [{
+            dimension,
+            position: QA_FARM_CROP_BLOCK,
+            crop: 'potato_crop',
+            growthSecs: POTATO_MATURITY_SECS - 0.1,
+          }] },
+        }],
+      })))
     setSelectedHotbarIndex(0)
     setInventoryFocus({ kind: 'slot', region: 'hotbar', index: getSelectedHotbarIndex() })
     inventoryInteraction.reset()
@@ -1717,10 +1720,9 @@ export const makeQaSurface = (
   const harvestFarmingCrop = () => {
     const dimension = Effect.runSync(playerApi.dimension)
     const location: CropLocation = { dimension, position: QA_FARM_CROP_BLOCK }
-    const ripe = Effect.runSync(crops.matureYieldsAt(location)) !== null
-    if (!ripe) return gameplaySnapshot()
-    Effect.runSync(currentChunkStore.setBlock(QA_FARM_CROP_BLOCK, blockIdOf('air')))
-    Effect.runSync(crops.remove(location))
+    const cropSnapshot = Effect.runSync(commit.coordinator.snapshot(GAMEPLAY_CROPS_OWNER_ID, CropSnapshotSchema)).state
+    const crop = cropSnapshot.crops.find((candidate) => cropLocationKey(candidate) === cropLocationKey(location))
+    if (crop === undefined || !isMatureCrop(crop)) return gameplaySnapshot()
     setNextItemUseRequestId(getNextItemUseRequestId() + 1)
     const requestId = `item-use-${String(getNextItemUseRequestId())}`
     Effect.runSync(
