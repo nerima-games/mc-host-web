@@ -171,11 +171,11 @@ describe('debug overlay runtime', () => {
     { ...unavailable, loadedChunkCount: -1 },
     { ...unavailable, faultCount: 0.5 },
     { ...unavailable, latestGpuTimeMs: NaN },
-  ])('rejects invalid diagnostics through the published model validator', async (state) => {
+  ])('rejects invalid diagnostics through the published schemas', async (state) => {
     const runtime = createDebugOverlayRuntime(factory, new Element(), Effect.succeed(state))
     runtime.setVisible(true)
     const result = await Effect.runPromise(Effect.result(runtime.update(0.01)))
-    expect(result).toMatchObject({ _tag: 'Failure', failure: { _tag: 'InvalidDebugOverlayState' } })
+    expect(result).toMatchObject({ _tag: 'Failure', failure: { _tag: 'SchemaError' } })
     expect(runtime.root.textContent).toBe('')
   })
 

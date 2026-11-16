@@ -7,18 +7,16 @@ import {
 import {
   createDebugOverlayView,
   debugOverlayModel,
+  FaultCountSchema,
   FramesPerSecondSchema,
+  GpuTimeMillisecondsSchema,
+  LoadedChunkCountSchema,
   type DebugOverlaySnapshot,
   type DomElement,
   type DomElementFactory,
   type DomNode,
 } from '@nerima-games/mx-ui'
-import { type Brand, Effect, Result, Schema } from 'effect'
-
-export type InvalidDebugOverlayState = Readonly<{
-  _tag: 'InvalidDebugOverlayState'
-  field: string
-}>
+import { type Brand, Effect, Schema } from 'effect'
 
 export type DebugOverlayRuntime<Error, Requirements> = Readonly<{
   root: DomElement
@@ -26,7 +24,7 @@ export type DebugOverlayRuntime<Error, Requirements> = Readonly<{
   toggle: () => boolean
   update: (rawDeltaSecs: number | undefined) => Effect.Effect<
     void,
-    Error | InvalidDebugOverlayState | CoordinateConversionFailure | Brand.BrandError | Schema.SchemaError,
+    Error | CoordinateConversionFailure | Brand.BrandError | Schema.SchemaError,
     Requirements
   >
   dispose: () => void
@@ -61,15 +59,24 @@ export const createDebugOverlayRuntime = <Error, Requirements>(
     const chunk = camera === undefined
       ? undefined
       : chunkCoordOfBlock(yield* Effect.fromResult(blockPositionOfPosition(camera.position)))
-    const snapshot: unknown = {
+    const loadedChunkCount = state.loadedChunkCount === undefined
+      ? undefined
+      : yield* Schema.decodeUnknownEffect(LoadedChunkCountSchema)(state.loadedChunkCount)
+    const faultCount = state.faultCount === undefined
+      ? undefined
+      : yield* Schema.decodeUnknownEffect(FaultCountSchema)(state.faultCount)
+    const latestGpuTimeMs = state.latestGpuTimeMs === undefined
+      ? undefined
+      : yield* Schema.decodeUnknownEffect(GpuTimeMillisecondsSchema)(state.latestGpuTimeMs)
+    const snapshot: DebugOverlaySnapshot = {
       ...state,
+      loadedChunkCount,
+      faultCount,
+      latestGpuTimeMs,
       frame: undefined,
       chunk: chunk === undefined ? undefined : { chunkX: chunk.cx, chunkZ: chunk.cz },
     }
-    const derived = debugOverlayModel(snapshot)
-    const model = yield* Effect.fromResult(Result.isResult(derived) ? derived : Result.succeed(derived)).pipe(
-      Effect.mapError((error): InvalidDebugOverlayState => ({ _tag: 'InvalidDebugOverlayState', field: error.field })),
-    )
+    const model = debugOverlayModel(snapshot)
     const deltaSecs = rawDeltaSecs === undefined
       ? null
       : yield* Effect.fromResult(DeltaTimeSecs.result(rawDeltaSecs))
