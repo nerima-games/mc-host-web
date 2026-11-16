@@ -97,6 +97,7 @@ import {
   chunkCoordOfBlock,
   isEmpty,
   PositionAxis,
+  position as worldPosition,
   propertyOfBlockId,
   resolvedBlockOfId,
   StageId,
@@ -966,8 +967,22 @@ const bootGame = async (
     restoreStorage: (state) => Effect.runPromise(world.inventory.restoreStorage(state.storage)),
     restoreContainerStorage: (state) =>
       Effect.runPromise(world.inventory.restoreContainerStorage(state.containerStorage)),
+    // The session stores plain coordinates; PlayerPose needs finite PositionAxis
+    // values. A failed check rejects like a failed restore and reaches failBoot.
     restorePlayer: (state) =>
-      Effect.runPromise(world.player.restore(state.player, state.dimension)),
+      Effect.runPromise(Effect.flatMap(
+        Effect.fromResult(Result.gen(function* () {
+          return {
+            ...state.player,
+            feetPosition: worldPosition(
+              yield* PositionAxis.result(state.player.feetPosition.x),
+              yield* PositionAxis.result(state.player.feetPosition.y),
+              yield* PositionAxis.result(state.player.feetPosition.z),
+            ),
+          }
+        })),
+        (pose) => world.player.restore(pose, state.dimension),
+      )),
     restoreVitals: (state) => Effect.runPromise(world.vitals.restore(state.vitals)),
     addCreativeStartingItems: async () => {
       await Effect.runPromise(world.inventory.add('redstone_dust', 16))
@@ -1714,7 +1729,7 @@ const bootGame = async (
     )
   }
   const environmentalContactCellsForPose = (
-    pose: { readonly feetPosition: Vec3 },
+    pose: { readonly feetPosition: SessionPosition },
   ): ReadonlyArray<EnvironmentalContactCell> => {
     const minX = pose.feetPosition.x - PLAYER_HALF_WIDTH
     const maxX = pose.feetPosition.x + PLAYER_HALF_WIDTH
@@ -1771,7 +1786,7 @@ const bootGame = async (
     return contacts
   }
   const environmentalContactsForPose = (
-    pose: { readonly feetPosition: Vec3 },
+    pose: { readonly feetPosition: SessionPosition },
   ): ReadonlyArray<EnvironmentalContact> => {
     const contactsByBlock = new Map<EnvironmentalContact['block'], EnvironmentalContact>()
     for (const { block, contactDamage } of environmentalContactCellsForPose(pose)) {
@@ -3330,8 +3345,8 @@ const bootGame = async (
         _tag: 'PlayerLeave',
         player: multiplayer.query.player,
       })
-      const close = multiplayer.transport.state() === 'open' && leave._tag === 'Right'
-        ? multiplayer.transport.send(leave.right).pipe(
+      const close = multiplayer.transport.state() === 'open' && Result.isSuccess(leave)
+        ? multiplayer.transport.send(leave.success).pipe(
             Effect.matchEffect({ onFailure: () => Effect.void, onSuccess: () => Effect.void }),
             Effect.andThen(multiplayer.transport.close),
           )
