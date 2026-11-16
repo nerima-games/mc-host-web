@@ -204,7 +204,7 @@
     "text": "Effect.runSync(Queue.clear(clientContext.multiplayer.transport.witherInbound))"
   },
   {
-    "count": 2,
+    "count": 1,
     "file": "apps/web/multiplayer-client.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(clientContext.callbacks.getInventoryInteraction().confirmCraftOnce())"
@@ -213,7 +213,7 @@
     "count": 1,
     "file": "apps/web/multiplayer-client.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(clientContext.multiplayer.host.drainInbound)"
+    "text": "Effect.runSync(Effect.flatMap(multiplayer.host.drainInbound, (messages) => Effect.forEach(messages, (message) => applyNetworkMessage(multiplayer, message), { discard: true })))"
   },
   {
     "count": 1,
@@ -238,12 +238,6 @@
     "file": "apps/web/multiplayer-client.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(clientContext.multiplayer.host.enqueueOutbound({ _tag: 'AuthoritativeResyncRequest', world: WorldId.make(Effect.runSync(clientContext.services.playerApi.dimension)), lastKnownRevision: multiplayerRevision, }))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/multiplayer-client.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(clientContext.multiplayer.host.enqueueOutbound({ _tag: 'AuthoritativeResyncRequest', world: message.world, lastKnownRevision: multiplayerRevision }))"
   },
   {
     "count": 1,
@@ -324,70 +318,10 @@
     "text": "Effect.runSync(clientContext.services.playerApi.pose)"
   },
   {
-    "count": 2,
-    "file": "apps/web/multiplayer-client.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(clientContext.services.playerApi.restore({ feetPosition: feet.success, yawRadians: message.facing.yawRadians, pitchRadians: message.facing.pitchRadians, }, dimension))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/multiplayer-client.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(clientContext.services.time.setTimeOfDay(timeOfDay.success))"
-  },
-  {
     "count": 1,
     "file": "apps/web/multiplayer-client.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(clientContext.services.vehicleService.despawn(existingVehicle.id))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/multiplayer-client.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(clientContext.services.weather.applyTransition(nextWeather))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/multiplayer-client.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(clientContext.services.world.inventory.containerStorageSnapshot)"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/multiplayer-client.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(clientContext.services.world.inventory.restoreContainerStorage({ version: 2, containers: states.map((state) => ({ id: state.containerId, kind: state.kind, slots: state.slots.map((stack) => { return stack == null ? null : { item: stack.item as ItemStack['item'], count: stack.count, durability: stack.durability ?? null, } }), })), }))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/multiplayer-client.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(clientContext.services.world.inventory.restoreStorage({ ...storage, inventory: { slots }, inventoryDurability: slots.map((stack, index) => { const durability = state.slots[index]?.durability ?? state.durability?.[index] if (durability !== undefined) return durability const previous = storage.inventory.slots[index] return previous?.item === stack?.item ? storage.inventoryDurability[index] : stack === undefined ? null : durabilityForItem(stack.item) }), equipment: { slots: equipmentSlots }, }))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/multiplayer-client.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(clientContext.services.world.inventory.storageSnapshot)"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/multiplayer-client.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(clientContext.services.world.vitals.restore({ ...current, ...vitals.success }))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/multiplayer-client.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(clientContext.services.world.vitals.snapshot)"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/multiplayer-client.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(context.chunkStore.setBlock(edit.success.cell, edit.success.id))"
   },
   {
     "count": 1,
@@ -406,12 +340,6 @@
     "file": "apps/web/multiplayer-client.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(restoreStatusEffects(clientContext.services.gameplayState, message.state, clientContext.services.gameplayCommit))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/multiplayer-client.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(clientContext.services.gameplayCommit.coordinator.commitFromSnapshot( GAMEPLAY_VILLAGER_TRADES_OWNER_ID, GameplayVillagerTradeSnapshotSchema, (snapshot) => Effect.sync(() => ({ expectedRevision: snapshot.revision, expectedDimensions: [], changes: [{ ownerId: GAMEPLAY_VILLAGER_TRADES_OWNER_ID, state: { ...snapshot.state, villagers: snapshot.state.villagers.map((villager) => villager.id !== state.villagerId ? villager : { ...villager, offers: villager.offers.map((offer) => { const networkOffer = decodedOffers.success.get(offer.id) return networkOffer === undefined ? offer : { ...offer, ...networkOffer } }), }), }, }], })), ))"
   },
   {
     "count": 2,
