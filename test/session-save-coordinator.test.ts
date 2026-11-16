@@ -1,15 +1,48 @@
 import { describe, expect, it } from 'vitest'
-import { ChunkAxis, CHUNK_SIZE_XZ, chunkCoord } from '@nerima-games/mc-kernel'
+import { Effect, Option, Result, Schema } from 'effect'
 import {
+  ChunkAxis,
+  CHUNK_SIZE_XZ,
+  chunkCoord,
+  EntityHealthPoints,
+  EntityKind,
+  position,
+  PositionAxis,
+  WorldIdSchema,
+} from '@nerima-games/mc-kernel'
+import { EntitySerial, PlayerStorageSnapshotSchema } from '@nerima-games/mc-sim'
+import {
+  ChunkCapacity,
   CHUNK_VOLUME,
+  generatedChunkSource,
+  makeChunkStore,
+  NoiseSeed,
   type ChunkWithBlockStates,
   type Dimension,
 } from '@nerima-games/mc-worldgen'
+import {
+  GAMEPLAY_ENTITIES_OWNER_ID,
+  GAMEPLAY_PLAYER_OWNER_ID,
+  GAMEPLAY_PLAYER_STORAGE_OWNER_ID,
+  GAMEPLAY_VITALS_OWNER_ID,
+  gameplayOwnerRegistrations,
+  hostileMobSnapshot,
+  makeGeneratedWorld,
+  mintEntityId,
+  type MobBehaviour,
+  type MobEntity,
+} from '@nerima-games/mx-gameplay'
 
 import type { DimensionChunk } from '../apps/web/session-persistence'
+import { createDroppedItemLifetimeTracker } from '../apps/web/dropped-item-lifetime'
+import { makeOwnerBackedHost } from '../apps/web/owner-backed-services'
+import { initializeSessionWorld } from '../apps/web/session-world'
+import { makeHostWorldWrite } from '../apps/web/world-write-port'
 
 import {
   createSessionSaveCoordinator,
+  snapshotOwnedSessionState,
+  type OwnedSessionState,
   type SessionSavePublication,
 } from '../apps/web/session-save-coordinator'
 
@@ -349,5 +382,92 @@ describe('session save coordinator', () => {
     expect(publication!.chunks).toHaveLength(2)
     expect(markerOf(publication!, 'overworld', 3, -4)).toBe(2)
     expect(markerOf(publication!, 'nether', 3, -4)).toBe(8)
+  })
+})
+
+describe('owner-backed save state', () => {
+  const ownerIds = {
+    player: GAMEPLAY_PLAYER_OWNER_ID,
+    playerStorage: GAMEPLAY_PLAYER_STORAGE_OWNER_ID,
+    vitals: GAMEPLAY_VITALS_OWNER_ID,
+    entities: GAMEPLAY_ENTITIES_OWNER_ID,
+  }
+  const zombieAt = (serial: number, dimension: Dimension): MobEntity => ({
+    id: mintEntityId(EntityKind('zombie'), serial),
+    kind: EntityKind('zombie'),
+    feetPosition: position(PositionAxis(serial), PositionAxis(65), PositionAxis(0)),
+    healthPoints: EntityHealthPoints(20),
+    behaviour: hostileMobSnapshot(undefined),
+    dimension,
+  })
+
+  it('publishes what the owners hold after view writes, with entities split per dimension', async () => {
+    const generated = await Effect.runPromise(makeGeneratedWorld<MobBehaviour>({ dimension: 'overworld' }))
+    const owners = Result.getOrThrow(gameplayOwnerRegistrations({
+      playerPose: await Effect.runPromise(generated.player.pose),
+      dimension: 'overworld',
+      entities: { entities: [zombieAt(0, 'overworld'), zombieAt(1, 'nether')], nextSerial: EntitySerial(2) },
+    }))
+    const chunkStore = await Effect.runPromise(makeChunkStore(generatedChunkSource(NoiseSeed(1)), ChunkCapacity(4)))
+    const { coordinator } = await Effect.runPromise(Effect.flatMap(
+      Schema.decodeEffect(WorldIdSchema)('session-save-coordinator-test'),
+      (world) => makeHostWorldWrite({ world, owners, chunkStores: { forDimension: () => chunkStore } }),
+    ))
+    const host = await Effect.runPromise(makeOwnerBackedHost({ coordinator, world: generated, ownerIds }))
+    const sessionWorld = Result.getOrThrow(await initializeSessionWorld({
+      loadedSession: Option.none(),
+      initialDimension: 'overworld',
+      worldSeed: 1,
+      loadSavedChunks: async () => ({ chunks: [] }),
+      makeWorld: async () => ({}),
+      restoreEntities: () => undefined,
+      snapshotEntities: () => ({ entities: [], nextSerial: EntitySerial(0) }),
+      droppedItemLifetime: createDroppedItemLifetimeTracker(),
+      droppedItemMetadata: new Map(),
+      droppedItemMetadataKey: (dimension, entityId) => `${dimension}:${entityId}`,
+      droppedItemMetadataFromBehaviour: () => ({}),
+    }))
+
+    const destination = position(PositionAxis(8.5), PositionAxis(72), PositionAxis(-1.5))
+    await Effect.runPromise(host.views.player.moveTo(destination))
+    await Effect.runPromise(host.views.inventory.add('stone', 5))
+    const vitals = await Effect.runPromise(host.views.vitals.snapshot)
+    await Effect.runPromise(host.views.vitals.restore({ ...vitals, healthPoints: EntityHealthPoints(9) }))
+    const spawned = await Effect.runPromise(host.views.entities.spawn({
+      kind: EntityKind('zombie'),
+      feetPosition: position(PositionAxis(4), PositionAxis(65), PositionAxis(4)),
+      healthPoints: EntityHealthPoints(20),
+      behaviour: hostileMobSnapshot(undefined),
+    }))
+
+    const published: Array<SessionSavePublication<OwnedSessionState>> = []
+    const saves = createSessionSaveCoordinator<OwnedSessionState>({
+      initialKnownChunks: [],
+      snapshotResidents: async () => [],
+      currentGeneration: () => 0,
+      snapshotState: () => Effect.runSync(
+        snapshotOwnedSessionState(coordinator, ownerIds, sessionWorld.snapshotEntityRosters),
+      ),
+      publish: async (publication) => { published.push(publication) },
+    })
+    await saves.requestSave()
+
+    const state = published[0]?.state
+    expect(state?.dimension).toBe('overworld')
+    expect(state?.player).toEqual({ feetPosition: { x: 8.5, y: 72, z: -1.5 }, yawRadians: 0, pitchRadians: 0 })
+    expect(state?.storage).toEqual(
+      (await Effect.runPromise(coordinator.snapshot(GAMEPLAY_PLAYER_STORAGE_OWNER_ID, PlayerStorageSnapshotSchema))).state,
+    )
+    expect(state?.storage.inventory.slots.find((slot) => slot?.item === 'stone')?.count).toBe(5)
+    expect(state?.vitals.healthPoints).toBe(9)
+    const idsOf = (dimension: Dimension) => state?.entities[dimension].entities.map(({ id }) => id)
+    expect(idsOf('overworld')).toEqual([zombieAt(0, 'overworld').id, spawned.id])
+    expect(idsOf('nether')).toEqual([zombieAt(1, 'nether').id])
+    expect(idsOf('end')).toEqual([])
+    expect(spawned.id).toBe(mintEntityId(EntityKind('zombie'), 2))
+    const dimensions: ReadonlyArray<Dimension> = ['overworld', 'nether', 'end']
+    for (const dimension of dimensions) {
+      expect(state?.entities[dimension].nextSerial).toBe(3)
+    }
   })
 })

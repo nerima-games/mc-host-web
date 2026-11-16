@@ -40,6 +40,7 @@ import {
   type WeatherState,
 } from '@nerima-games/mx-gameplay'
 import { validateMultiplayerUrl } from './multiplayer-url'
+import type { OwnerBackedWorld } from './owner-backed-services'
 import {
   initialSleepRuntimeState,
   enterSleep,
@@ -284,9 +285,9 @@ export type MultiplayerClientContext = {
     } | undefined
   }
   readonly services: {
-    readonly world: World
+    readonly world: Pick<OwnerBackedWorld, 'inventory' | 'vitals'>
     readonly gameplayState: GameplayFrameState
-    readonly playerApi: World['player']
+    readonly playerApi: OwnerBackedWorld['player']
     readonly time: TimeService
     readonly weather: WeatherService
     readonly currentChunkContext: () => ClientChunkContext

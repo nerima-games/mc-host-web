@@ -213,7 +213,7 @@ import {
   insertBrewingFuel,
   insertBrewingIngredient,
   INITIAL_ENVIRONMENTAL_CONTACT_DAMAGE_STATE,
-  makeGameplayFrameState,
+  makeGameplayFrameStateForOwner,
   makeGeneratedWorld,
   isDroppedItemBehaviour,
   isHoeItem,
@@ -327,8 +327,7 @@ import {
 } from './native-input-queue'
 import { selectedHotbarAfterInput } from './player-experience'
 import { createDroppedItemLifetimeTracker } from './dropped-item-lifetime'
-import { createSessionSaveCoordinator } from './session-save-coordinator'
-import { makeSurvivalHungerCoordinator } from './survival-hunger-runtime'
+import { createSessionSaveCoordinator, snapshotOwnedSessionState } from './session-save-coordinator'
 import {
   advanceFootstepRuntime,
   initialFootstepRuntimeState,
@@ -357,7 +356,6 @@ import {
 import {
   makeSessionChunkSource,
   saveSession,
-  EMPTY_ENTITY_ROSTER,
   snapshotResidentChunks,
   type DimensionChunk,
   type PersistedFurnaceState,
@@ -369,10 +367,12 @@ import {
   type SessionState,
 } from './session-persistence'
 import {
+  gameplayOwnerInitialState,
   restoreInitialWorld,
   restoreLoadedSessionServices,
 } from './session-restoration'
 import { initializeSessionWorld } from './session-world'
+import { makeOwnerBackedHost, type OwnerBackedOwnerIds } from './owner-backed-services'
 import {
   readSessionRoute,
   type SessionRoute,
@@ -927,7 +927,7 @@ const bootGame = async (
     return
   }
   respawnLocation = restoredRespawnLocation.success
-  const sessionWorld = await initializeSessionWorld({
+  const sessionWorldResult = await initializeSessionWorld({
     loadedSession,
     initialDimension,
     worldSeed: WORLD_SEED,
@@ -946,75 +946,46 @@ const bootGame = async (
     droppedItemMetadataKey,
     droppedItemMetadataFromBehaviour,
   })
+  if (Result.isFailure(sessionWorldResult)) {
+    failBoot('saved entity rosters could not be merged', sessionWorldResult.failure)
+    return
+  }
   const {
     activeSeed,
     initialKnownChunks,
     restored,
-    world,
+    world: generatedWorld,
     chunkSourceFor,
-    entityRosters,
-    rosterWithDroppedItemLifetimes,
-    snapshotEntityRosters: snapshotEntityRostersFor,
-  } = sessionWorld
+    entities: initialEntities,
+    snapshotEntityRosters,
+  } = sessionWorldResult.success
   enchantmentSeed = restoredWorkstations?.enchantmentSeed ?? activeSeed
-  const snapshotEntityRosters = (): SessionState['entities'] =>
-    snapshotEntityRostersFor(
-      currentChunkContext.dimension,
-      Effect.runSync(world.entities.snapshot),
-    )
-  const survivalHunger = makeSurvivalHungerCoordinator(world.vitals)
-  const initialSpawnPose = await Effect.runPromise(world.player.pose)
-  const initialSpawnDimension = await Effect.runPromise(world.player.dimension)
+  // Read before the owners exist: the generated spawn seeds a new session's
+  // player owner and stays the respawn fallback.
+  const initialSpawnPose = await Effect.runPromise(generatedWorld.player.pose)
+  const initialSpawnDimension = await Effect.runPromise(generatedWorld.player.dimension)
   const loadedSessionState = Option.isSome(loadedSession) ? loadedSession.value.state : undefined
-  await restoreInitialWorld(loadedSessionState, isCreativeMode, {
-    restoreEntities: () => Effect.runPromise(
-      world.entities.restore(
-        (entityRosters.get(initialDimension) ?? EMPTY_ENTITY_ROSTER) as Parameters<
-          typeof world.entities.restore
-        >[0],
-      ),
-    ),
-    restoreStorage: (state) => Effect.runPromise(world.inventory.restoreStorage(state.storage)),
-    restoreContainerStorage: (state) =>
-      Effect.runPromise(world.inventory.restoreContainerStorage(state.containerStorage)),
-    // The session stores plain coordinates; PlayerPose needs finite PositionAxis
-    // values. A failed check rejects like a failed restore and reaches failBoot.
-    restorePlayer: (state) =>
-      Effect.runPromise(Effect.flatMap(
-        Effect.fromResult(Result.gen(function* () {
-          return {
-            ...state.player,
-            feetPosition: worldPosition(
-              yield* PositionAxis.result(state.player.feetPosition.x),
-              yield* PositionAxis.result(state.player.feetPosition.y),
-              yield* PositionAxis.result(state.player.feetPosition.z),
-            ),
-          }
-        })),
-        (pose) => world.player.restore(pose, state.dimension),
-      )),
-    restoreVitals: (state) => Effect.runPromise(world.vitals.restore(state.vitals)),
-    addCreativeStartingItems: async () => {
-      await Effect.runPromise(world.inventory.add('redstone_dust', 16))
-      await Effect.runPromise(world.inventory.add('lever', 4))
-      await Effect.runPromise(world.inventory.add('redstone_lamp', 8))
-      await Effect.runPromise(world.inventory.add('piston', 4))
-    },
-  })
   const time = await Effect.runPromise(makeTimeService())
   const weather = await Effect.runPromise(makeWeatherService())
   const crops = await Effect.runPromise(makeCropService())
-  // Villager trades and the brewing stand exist only as owners, so the loaded
-  // session seeds them here and nothing restores them later; chunk streaming
-  // updates the trades through the coordinator.
-  // `gameplayOwnerRegistrations(undefined)` is a typed failure, so a fresh
-  // session passes an object without those fields.
-  const gameplayOwners = gameplayOwnerRegistrations({
-    ...(loadedSessionState === undefined ? {} : {
-      villagerTrades: loadedSessionState.villagers.trades,
-      brewing: loadedSessionState.brewing,
-    }),
-  })
+  // The owners are the only store of the player, its storage, vitals,
+  // entities, villager trades and the brewing stand, so the loaded session (or
+  // the generated world) seeds them here and nothing restores them later.
+  const ownerInitialState = gameplayOwnerInitialState(
+    loadedSessionState,
+    {
+      pose: initialSpawnPose,
+      dimension: initialSpawnDimension,
+      storage: await Effect.runPromise(generatedWorld.inventory.storageSnapshot),
+      vitals: await Effect.runPromise(generatedWorld.vitals.snapshot),
+    },
+    initialEntities,
+  )
+  if (Result.isFailure(ownerInitialState)) {
+    failBoot('saved player pose decoding failed', ownerInitialState.failure)
+    return
+  }
+  const gameplayOwners = gameplayOwnerRegistrations(ownerInitialState.success)
   if (Result.isFailure(gameplayOwners)) {
     failBoot('gameplay owner registration failed', gameplayOwners.failure)
     return
@@ -1039,6 +1010,36 @@ const bootGame = async (
     return
   }
   const hostWorldWrite = hostWorldWriteExit.value
+  const ownerIds: OwnerBackedOwnerIds = {
+    player: GAMEPLAY_PLAYER_OWNER_ID,
+    playerStorage: GAMEPLAY_PLAYER_STORAGE_OWNER_ID,
+    vitals: GAMEPLAY_VITALS_OWNER_ID,
+    entities: GAMEPLAY_ENTITIES_OWNER_ID,
+  }
+  // From here on the generated world's player, inventory, vitals and entities
+  // are reached only through these (I1): the views for host code, the stage
+  // adapters for the registration Context.
+  const ownerBacked = await Effect.runPromise(makeOwnerBackedHost({
+    coordinator: hostWorldWrite.coordinator,
+    world: generatedWorld,
+    ownerIds,
+  }))
+  const world = {
+    chunkStore: generatedWorld.chunkStore,
+    worldgenChunkStore: generatedWorld.worldgenChunkStore,
+    ...ownerBacked.views,
+  }
+  // Containers are not owner state, so they are still restored locally.
+  await restoreInitialWorld(loadedSessionState, isCreativeMode, {
+    restoreContainerStorage: (state) =>
+      Effect.runPromise(world.inventory.restoreContainerStorage(state.containerStorage)),
+    addCreativeStartingItems: async () => {
+      await Effect.runPromise(world.inventory.add('redstone_dust', 16))
+      await Effect.runPromise(world.inventory.add('lever', 4))
+      await Effect.runPromise(world.inventory.add('redstone_lamp', 8))
+      await Effect.runPromise(world.inventory.add('piston', 4))
+    },
+  })
   // A WorldWriteBatch names its dimension by the branded DimensionId. Every
   // host Dimension is a DimensionIdSchema input, so the three ids are decoded
   // once here and a decode failure stops the boot like any other.
@@ -1087,7 +1088,12 @@ const bootGame = async (
     .pipe(Effect.map(({ state }) => state))
   const snapshotGameplayBrewing = gameplayBrewingService.snapshot
     .pipe(Effect.provideService(WorldCommitCoordinator, gameplayCommit.coordinator))
-  const gameplayState = await Effect.runPromise(makeGameplayFrameState)
+  // The survival-hunger stage ticks the vitals owner itself (I4); host code
+  // reaches the same runtime through `gameplayState.survivalHunger`.
+  const gameplayState = await Effect.runPromise(makeGameplayFrameStateForOwner({
+    coordinator: hostWorldWrite.coordinator,
+    vitalsOwnerId: GAMEPLAY_VITALS_OWNER_ID,
+  }))
   const villagerResidents = new Map<string, PersistedVillager>(
     (Option.isSome(loadedSession) ? loadedSession.value.state.villagers.residents : [])
       .map((villager) => [villager.id, villager]),
@@ -1207,7 +1213,7 @@ const bootGame = async (
   // holds each context once, so no store is attached twice.
   const makeDimensionChunkContext = (
     dimension: Dimension,
-    dimensionWorld: typeof world,
+    dimensionWorld: Pick<typeof generatedWorld, 'chunkStore' | 'worldgenChunkStore'>,
   ) => {
     const lighting = trackChunkLightColor((chunk, quads) =>
       makeChunkStoreLightColor(dimensionWorld.worldgenChunkStore, chunk, quads),
@@ -1396,18 +1402,14 @@ const bootGame = async (
     currentGeneration: () => dirtyGeneration,
     snapshotState: () => ({
       seed: activeSeed,
-      dimension: Effect.runSync(world.player.dimension),
-      player: Effect.runSync(world.player.pose),
-      storage: Effect.runSync(world.inventory.storageSnapshot),
+      ...Effect.runSync(snapshotOwnedSessionState(hostWorldWrite.coordinator, ownerIds, snapshotEntityRosters)),
       containerStorage: Effect.runSync(world.inventory.containerStorageSnapshot),
-      vitals: Effect.runSync(world.vitals.snapshot),
       time: Effect.runSync(time.snapshot),
       weather: Effect.runSync(weather.snapshot),
       redstone: { levers: [...leverStates.values()] },
       furnaces: [...furnaceStates.values()],
       portals: [...portalStates.values()],
       crops: Effect.runSync(crops.snapshot),
-      entities: snapshotEntityRosters(),
       villagers: {
         residents: [...villagerResidents.values()],
         trades: Effect.runSync(snapshotGameplayVillagerTrades),
@@ -1533,7 +1535,7 @@ const bootGame = async (
 
   const redstoneContainerRuntime = makeRedstoneContainerRuntime({
     dimensionContexts,
-    world,
+    world: { inventory: world.inventory, entities: ownerBacked.entityManager },
     writeBlocks: writeBlocksThroughPort,
     leverStates,
     comparatorModes,
@@ -1829,21 +1831,8 @@ const bootGame = async (
   const alignActiveDimension = (dimension: Dimension): boolean => {
     if (currentChunkContext.dimension === dimension) return false
     Effect.runSync(retainDimensionResidents(currentChunkContext))
-    entityRosters.set(
-      currentChunkContext.dimension,
-      rosterWithDroppedItemLifetimes(
-        currentChunkContext.dimension,
-        Effect.runSync(world.entities.snapshot),
-      ),
-    )
-    Effect.runSync(
-      world.entities.restore(
-        (entityRosters.get(dimension) ?? EMPTY_ENTITY_ROSTER) as Parameters<
-          typeof world.entities.restore
-        >[0],
-      ),
-    )
-    entityRosters.set(dimension, Effect.runSync(world.entities.snapshot))
+    // The entities owner holds every dimension and the entities view shows the
+    // player's current one, so no roster is swapped here.
     currentChunkContext = getOrCreateDimensionChunkContext(dimension)
     Effect.runSync(clearRenderedChunks(worldRenderer))
     redstoneDirty = true
@@ -2386,11 +2375,10 @@ const bootGame = async (
 
   const services = makeHostServiceContext({
     time,
-    player: playerApi,
+    player: ownerBacked.stagePlayer,
     crops,
-    inventory: world.inventory,
     vehicles: vehicleService,
-    entities: world.entities,
+    entities: ownerBacked.entityManager,
     chunkStore: currentChunkStore,
     worldWrite: hostWorldWrite.port,
     inputContext: adapters.inputContext,
@@ -2857,7 +2845,7 @@ const bootGame = async (
     writeBlocks: writeBlocksThroughPort,
     resolveExplosionEffects: (effects) => {
       for (const effect of effects) {
-        Effect.runSync(resolveBowHits(world.entities, [{
+        Effect.runSync(resolveBowHits(ownerBacked.entityManager, [{
           id: SimEntityId(effect.id),
           damage: effect.damage,
         }]))
@@ -3019,7 +3007,7 @@ const bootGame = async (
     customNames,
     enchantedItems,
     getFramesTotal: () => framesTotal,
-    spawnDroppedItems: (drops) => Effect.runSync(spawnDroppedItems(world.entities, drops)),
+    spawnDroppedItems: (drops) => Effect.runSync(spawnDroppedItems(ownerBacked.entityManager, drops)),
     getPlayerDimension: () => Effect.runSync(world.player.dimension),
     droppedItemMetadataKey,
     droppedItemMetadata,
@@ -3063,7 +3051,7 @@ const bootGame = async (
         presentSwimmingState()
       },
       respawnVitals: () => {
-        if (multiplayer === undefined) survivalHunger.respawn()
+        if (multiplayer === undefined) Effect.runSync(gameplayState.survivalHunger.respawn)
         else sendVitalsCommand('respawn')
       },
       clearGameplayDeathState: () => {
@@ -3291,7 +3279,7 @@ const bootGame = async (
       endDragonPosition,
       vehicleList,
       nearestVillagerForTrade,
-      survivalHunger,
+      survivalHunger: gameplayState.survivalHunger,
       setTradeOpen,
       setBrewingOpen,
       setInventoryOpen,
@@ -3447,8 +3435,9 @@ const bootGame = async (
       syncRedstoneSnapshot: () => syncRedstoneSnapshot(currentChunkContext),
       currentChunkContext: () => currentChunkContext,
       world,
+      entityManager: ownerBacked.entityManager,
       isCreativeMode,
-      survivalHunger,
+      survivalHunger: gameplayState.survivalHunger,
       playerIsDead,
       handleLocalPlayerDeath,
       markSessionDirty,

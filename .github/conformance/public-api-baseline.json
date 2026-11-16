@@ -1837,6 +1837,12 @@
   },
   {
     "count": 1,
+    "file": "apps/web/qa-surface.ts",
+    "ruleId": "no-effect-run-outside-entrypoints",
+    "text": "Effect.runSync(survivalHunger.eat(4, 0.3))"
+  },
+  {
+    "count": 1,
     "file": "apps/web/redstone-container-runtime.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync( spawnDroppedItems(world.entities, [ { ...extracted.stack, at: worldPosition(PositionAxis(position.x + 0.5), PositionAxis(position.y + 0.5), PositionAxis(position.z - 0.25)), ...(metadata.customName === undefined && metadata.enchantedItem === undefined ? {} : { eligibleFromFrame: getFramesTotal() + 1 }), }, ]), )"
@@ -1909,81 +1915,9 @@
   },
   {
     "count": 1,
-    "file": "apps/web/survival-hunger-runtime.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(makeSurvivalHungerRuntime())"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/survival-hunger-runtime.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(runtime.eat(foodPoints, saturationModifier))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/survival-hunger-runtime.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(runtime.respawn)"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/survival-hunger-runtime.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(runtime.restore({ version: 1, difficulty, vitals: Effect.runSync(vitals.snapshot), }))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/survival-hunger-runtime.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(runtime.snapshot)"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/survival-hunger-runtime.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(runtime.submit(activity))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/survival-hunger-runtime.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(runtime.tick(dt))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/survival-hunger-runtime.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(vitals.restore(next))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/survival-hunger-runtime.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(vitals.restore(next.vitals))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/survival-hunger-runtime.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(vitals.restore(outcome.vitals))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/survival-hunger-runtime.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(vitals.snapshot)"
-  },
-  {
-    "count": 1,
     "file": "apps/web/tick/frame-input.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(context.playerApi.look( -lookDelta.x * context.lookSensitivity * context.playerSettings.sensitivity, -lookDelta.y * context.lookSensitivity * context.playerSettings.sensitivity, ))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/frame-input.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(context.world.vitals.view)"
   },
   {
     "count": 1,
@@ -2014,6 +1948,12 @@
     "file": "apps/web/tick/frame-input.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(inputApi.wasActionJustTriggered(action))"
+  },
+  {
+    "count": 1,
+    "file": "apps/web/tick/frame-input.ts",
+    "ruleId": "no-effect-run-outside-entrypoints",
+    "text": "Effect.runSync(context.survivalHunger.submit({ _tag: 'attack', count: 1 }))"
   },
   {
     "count": 1,
@@ -2164,6 +2104,12 @@
     "file": "apps/web/tick/player-movement.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(multiplayer.host.transitionConnection({ _tag: 'PeerClosed' }))"
+  },
+  {
+    "count": 2,
+    "file": "apps/web/tick/player-movement.ts",
+    "ruleId": "no-effect-run-outside-entrypoints",
+    "text": "Effect.runSync(context.world.vitals.snapshot)"
   },
   {
     "count": 2,
@@ -2337,24 +2283,6 @@
     "count": 1,
     "file": "apps/web/tick/post-frame-gameplay.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(spawnDroppedItems(world.entities, [{ item: event.item, count: event.count, at: endDragonWorldPosition(), }]))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/post-frame-gameplay.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(spawnMobDrops(world.entities, mobDrops))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/post-frame-gameplay.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(useBucket( currentChunkStore, world.inventory, gameplayState.fluidFrontier, { activeDimension: dimension, targetDimension: dimension, position: (specialSelected.item === 'bucket' ? blockPosition(target.position.x, target.position.y, target.position.z) : blockPosition(target.adjacentPosition.x, target.adjacentPosition.y, target.adjacentPosition.z)), heldItem: specialSelected.item, }, ))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/post-frame-gameplay.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(vehicleService.dismount(vehicle.id, localVehicleOccupant))"
   },
   {
@@ -2452,6 +2380,24 @@
     "file": "apps/web/tick/post-frame-gameplay.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(world.vitals.snapshot)"
+  },
+  {
+    "count": 1,
+    "file": "apps/web/tick/post-frame-gameplay.ts",
+    "ruleId": "no-effect-run-outside-entrypoints",
+    "text": "Effect.runSync(spawnDroppedItems(entityManager, [{ item: event.item, count: event.count, at: endDragonWorldPosition(), }]))"
+  },
+  {
+    "count": 1,
+    "file": "apps/web/tick/post-frame-gameplay.ts",
+    "ruleId": "no-effect-run-outside-entrypoints",
+    "text": "Effect.runSync(spawnMobDrops(entityManager, mobDrops))"
+  },
+  {
+    "count": 1,
+    "file": "apps/web/tick/post-frame-gameplay.ts",
+    "ruleId": "no-effect-run-outside-entrypoints",
+    "text": "Effect.runSync(useBucket( targeting.coordinator, gameplayState.fluidFrontier, { activeDimension: dimension, targetDimension: dimension, position: (specialSelected.item === 'bucket' ? blockPosition(target.position.x, target.position.y, target.position.z) : blockPosition(target.adjacentPosition.x, target.adjacentPosition.y, target.adjacentPosition.z)), heldItem: specialSelected.item, playerStorageOwnerId: GAMEPLAY_PLAYER_STORAGE_OWNER_ID, }, ))"
   },
   {
     "count": 1,
@@ -2583,36 +2529,6 @@
     "count": 1,
     "file": "apps/web/tick/post-frame.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(resolveBowHits(world.entities, [{ id: target.id, damage: impact.damage }]))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/post-frame.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(spawnDroppedItems( world.entities, drained.items.map((stack, index) => ({ ...stack, at, ...(slotMetadata[index]?.customName === undefined && slotMetadata[index]?.enchantedItem === undefined ? {} : { eligibleFromFrame: framesTotal + 1 }), })), ))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/post-frame.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(spawnDroppedItems(world.entities, [{ item: 'eye_of_ender', count: 1, at: position(PositionAxis(settlement.position.x), PositionAxis(settlement.position.y), PositionAxis(settlement.position.z)), }]))"
-  },
-  {
-    "count": 2,
-    "file": "apps/web/tick/post-frame.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(spawnDroppedItems(world.entities, [{ item: result.death.drop.item, count: result.death.drop.count, at: result.death.drop.position, }]))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/post-frame.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(spawnDroppedItems(world.entities, contents))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/tick/post-frame.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(world.entities.despawn(entity.id))"
   },
   {
@@ -2692,6 +2608,54 @@
     "file": "apps/web/tick/post-frame.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(world.vitals.view)"
+  },
+  {
+    "count": 1,
+    "file": "apps/web/tick/post-frame.ts",
+    "ruleId": "no-effect-run-outside-entrypoints",
+    "text": "Effect.runSync(resolveBowHits(entityManager, [{ id: target.id, damage: impact.damage }]))"
+  },
+  {
+    "count": 1,
+    "file": "apps/web/tick/post-frame.ts",
+    "ruleId": "no-effect-run-outside-entrypoints",
+    "text": "Effect.runSync(spawnDroppedItems( entityManager, drained.items.map((stack, index) => ({ ...stack, at, ...(slotMetadata[index]?.customName === undefined && slotMetadata[index]?.enchantedItem === undefined ? {} : { eligibleFromFrame: framesTotal + 1 }), })), ))"
+  },
+  {
+    "count": 1,
+    "file": "apps/web/tick/post-frame.ts",
+    "ruleId": "no-effect-run-outside-entrypoints",
+    "text": "Effect.runSync(spawnDroppedItems(entityManager, [{ item: 'eye_of_ender', count: 1, at: position(PositionAxis(settlement.position.x), PositionAxis(settlement.position.y), PositionAxis(settlement.position.z)), }]))"
+  },
+  {
+    "count": 2,
+    "file": "apps/web/tick/post-frame.ts",
+    "ruleId": "no-effect-run-outside-entrypoints",
+    "text": "Effect.runSync(spawnDroppedItems(entityManager, [{ item: result.death.drop.item, count: result.death.drop.count, at: result.death.drop.position, }]))"
+  },
+  {
+    "count": 1,
+    "file": "apps/web/tick/post-frame.ts",
+    "ruleId": "no-effect-run-outside-entrypoints",
+    "text": "Effect.runSync(spawnDroppedItems(entityManager, contents))"
+  },
+  {
+    "count": 1,
+    "file": "apps/web/tick/post-frame.ts",
+    "ruleId": "no-effect-run-outside-entrypoints",
+    "text": "Effect.runSync(survivalHunger.submit(h5aState.swimmingState.get().active ? { _tag: 'swim', distance: horizontalDistance } : sprinting ? { _tag: 'sprint', distance: horizontalDistance } : { _tag: 'walk', distance: horizontalDistance }))"
+  },
+  {
+    "count": 1,
+    "file": "apps/web/tick/post-frame.ts",
+    "ruleId": "no-effect-run-outside-entrypoints",
+    "text": "Effect.runSync(survivalHunger.submit({ _tag: 'jump', count: 1, sprinting }))"
+  },
+  {
+    "count": 1,
+    "file": "apps/web/tick/post-frame.ts",
+    "ruleId": "no-effect-run-outside-entrypoints",
+    "text": "Effect.runSync(survivalHunger.submit({ _tag: 'mine', blocks: 1 }))"
   },
   {
     "count": 1,

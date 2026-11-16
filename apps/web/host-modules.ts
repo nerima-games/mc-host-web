@@ -4,7 +4,6 @@ import { renderModule, InputService, type ChunkSyncPort, type DrawPort, type Gra
 import {
   CropService,
   entityManagerTag,
-  InventoryService,
   PlayerService,
   simStages,
   TimeService,
@@ -12,7 +11,6 @@ import {
   type CropServiceApi,
   type EntityManager,
   type EntityManagerApi,
-  type InventoryServiceApi,
   type PlayerServiceApi,
   type SimFrameState,
   type TimeServiceApi,
@@ -44,7 +42,6 @@ export type HostServices =
   | TimeService
   | PlayerService
   | CropService
-  | InventoryService
   | VehicleService
   | EntityManager
   | ChunkStore
@@ -58,12 +55,16 @@ export type HostServices =
  * reach the same instances the host reads and writes. The `layers` of
  * mc-sim, mc-render and mx-redstone build a new instance on every provide, so
  * no module Layer is built here.
+ *
+ * `player` and `entities` are the owner-backed adapters
+ * (`makeOwnerBackedStagePlayer`, `makeOwnerBackedEntityManager`), never the
+ * in-memory services behind the host's views (I1). No registered module reads
+ * an `InventoryService`, so none is provided.
  */
 export type HostServiceInstances = {
   readonly time: TimeServiceApi
   readonly player: PlayerServiceApi
   readonly crops: CropServiceApi
-  readonly inventory: InventoryServiceApi
   readonly vehicles: VehicleServiceApi
   readonly entities: EntityManagerApi<MobBehaviour>
   readonly chunkStore: ChunkStoreApi
@@ -79,7 +80,6 @@ export const makeHostServiceContext = (instances: HostServiceInstances): Context
     Context.make(TimeService, instances.time),
     Context.make(PlayerService, instances.player),
     Context.make(CropService, instances.crops),
-    Context.make(InventoryService, instances.inventory),
     Context.make(VehicleService, instances.vehicles),
     Context.make(MobEntityManager, instances.entities),
     Context.make(ChunkStore, instances.chunkStore),
@@ -194,16 +194,16 @@ export const registerHostModules = (deps: HostModulesDeps): Effect.Effect<Readon
     frameStages: Effect.gen(function* () {
       const store = yield* ChunkStore
       const roster = yield* MobEntityManager
-      const inventory = yield* InventoryService
-      const player = yield* PlayerService
       const time = yield* TimeService
       const vehicles = yield* VehicleService
+      // mx-gameplay 0.11.0 drops `_inventory` and `_player` without reading
+      // them, so no inventory or player service needs to reach the stages here.
       return gameplayStages(
         gameplayState,
         store,
         roster,
-        inventory,
-        player,
+        undefined,
+        undefined,
         time,
         vehicles,
         {

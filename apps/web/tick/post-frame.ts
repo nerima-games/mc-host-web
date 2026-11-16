@@ -99,6 +99,7 @@ export const runTickPostFrame = (
   } = context
   const {
     world,
+    entityManager,
     playerApi,
     simState,
     currentChunkContext: getCurrentChunkContext,
@@ -353,7 +354,7 @@ export const runTickPostFrame = (
           )
           if (drained.items.length > 0) {
             const dropped = Effect.runSync(spawnDroppedItems(
-              world.entities,
+              entityManager,
               drained.items.map((stack, index) => ({
                 ...stack,
                 at,
@@ -403,7 +404,7 @@ export const runTickPostFrame = (
           )
           .map((stack) => ({ ...stack, at }))
         if (contents.length > 0) {
-          Effect.runSync(spawnDroppedItems(world.entities, contents))
+          Effect.runSync(spawnDroppedItems(entityManager, contents))
         }
         furnaceStates.delete(key)
         markSessionDirty()
@@ -708,7 +709,7 @@ export const runTickPostFrame = (
           const result = damageRuntimeWither(witherRuntimeState, hitWither.id, impact.damage, 'ranged')
           witherRuntimeState = result.state
           if (result.death !== undefined) {
-            Effect.runSync(spawnDroppedItems(world.entities, [{
+            Effect.runSync(spawnDroppedItems(entityManager, [{
               item: result.death.drop.item,
               count: result.death.drop.count,
               at: result.death.drop.position,
@@ -719,7 +720,7 @@ export const runTickPostFrame = (
         }
         const target = projectileEntities.find(({ id }) => String(id) === entityId)
         if (target === undefined) continue
-        Effect.runSync(resolveBowHits(world.entities, [{ id: target.id, damage: impact.damage }]))
+        Effect.runSync(resolveBowHits(entityManager, [{ id: target.id, damage: impact.damage }]))
         const horizontalSpeed = Math.hypot(impact.velocity.x, impact.velocity.z)
         if (horizontalSpeed > 0 && impact.knockback > 0) {
           Effect.runSync(world.entities.sweep((entity) => ({
@@ -762,7 +763,7 @@ export const runTickPostFrame = (
       eyeOfEnderRuntimeState = advancedEyes.state
       for (const settlement of advancedEyes.settlements) {
         if (!settlement.breaks && multiplayer === undefined) {
-          Effect.runSync(spawnDroppedItems(world.entities, [{
+          Effect.runSync(spawnDroppedItems(entityManager, [{
             item: 'eye_of_ender',
             count: 1,
             at: position(PositionAxis(settlement.position.x), PositionAxis(settlement.position.y), PositionAxis(settlement.position.z)),
@@ -895,11 +896,11 @@ export const runTickPostFrame = (
         position: postFramePose.feetPosition,
       }, audio)
       if (!isCreativeMode && horizontalDistance > 0) {
-        if (multiplayer === undefined) survivalHunger.submit(h5aState.swimmingState.get().active
+        if (multiplayer === undefined) Effect.runSync(survivalHunger.submit(h5aState.swimmingState.get().active
           ? { _tag: 'swim', distance: horizontalDistance }
           : sprinting
             ? { _tag: 'sprint', distance: horizontalDistance }
-            : { _tag: 'walk', distance: horizontalDistance })
+            : { _tag: 'walk', distance: horizontalDistance }))
         // mx-multiplayer's PlayerVitalsCommand has no 'sprint' activity
         // literal (protocol.d.ts: Schema.Literal<['walk','swim','jump',
         // 'attack','mine']>), so the network path folds sprinting into
@@ -911,7 +912,7 @@ export const runTickPostFrame = (
         !isCreativeMode && groundedBeforeFrame &&
         !groundedAfterFrame && held('jump') > 0
       ) {
-        if (multiplayer === undefined) survivalHunger.submit({ _tag: 'jump', count: 1, sprinting })
+        if (multiplayer === undefined) Effect.runSync(survivalHunger.submit({ _tag: 'jump', count: 1, sprinting }))
           else sendVitalsCommand({ _tag: 'activity', activity: 'jump', amount: 1 })
       }
     } else {
@@ -951,7 +952,7 @@ export const runTickPostFrame = (
           )
           witherRuntimeState = result.state
           if (result.death !== undefined) {
-            Effect.runSync(spawnDroppedItems(world.entities, [{
+            Effect.runSync(spawnDroppedItems(entityManager, [{
               item: result.death.drop.item,
               count: result.death.drop.count,
               at: result.death.drop.position,
@@ -1081,7 +1082,7 @@ export const runTickPostFrame = (
           const shouldBreak = isCreativeMode ? attackTriggered : advancement.shouldBreak
           if (shouldBreak && target !== null) {
             if (!isCreativeMode) {
-              if (multiplayer === undefined) survivalHunger.submit({ _tag: 'mine', blocks: 1 })
+              if (multiplayer === undefined) Effect.runSync(survivalHunger.submit({ _tag: 'mine', blocks: 1 }))
               else sendVitalsCommand({ _tag: 'activity', activity: 'mine', amount: 1 })
             }
             const dimension = Effect.runSync(playerApi.dimension)

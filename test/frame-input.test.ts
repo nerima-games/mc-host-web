@@ -10,13 +10,6 @@ import { consumeNativeInput, EMPTY_NATIVE_INPUT_QUEUE, type NativeInputQueueStat
 import { selectedHotbarAfterInput } from '../apps/web/player-experience'
 import { TOUCH_LOOK_CONTROLLER_IDLE } from '../apps/web/touch-input'
 
-type HungerOutcome = {
-  readonly exhaustionAdded: number
-  readonly foodTicks: number
-  readonly regeneratedHealth: number
-  readonly starvationDamage: number
-}
-
 type FrameInputFixtureOptions = {
   readonly paused?: boolean
   readonly escapePressed?: boolean
@@ -33,19 +26,9 @@ type FrameInputFixtureOptions = {
   readonly activeActions?: ReadonlyArray<InputAction>
   readonly wheelSteps?: number
   readonly playerDead?: boolean
-  readonly deadAfterHunger?: boolean
-  readonly healthPoints?: number
-  readonly hungerOutcome?: HungerOutcome
   readonly isCreativeMode?: boolean
   readonly pointerLocked?: boolean
   readonly bowInteractionLocked?: boolean
-}
-
-const NO_HUNGER_CHANGE: HungerOutcome = {
-  exhaustionAdded: 0,
-  foodTicks: 0,
-  regeneratedHealth: 0,
-  starvationDamage: 0,
 }
 
 const makeFrameInputFixture = (options: FrameInputFixtureOptions = {}) => {
@@ -58,7 +41,7 @@ const makeFrameInputFixture = (options: FrameInputFixtureOptions = {}) => {
   let brewingOpen = options.brewingOpen ?? false
   let selectedHotbarIndex = options.selectedHotbarIndex ?? 0
   let nativeInputQueue = options.nativeInputQueue ?? EMPTY_NATIVE_INPUT_QUEUE
-  let playerDead = options.playerDead ?? false
+  const playerDead = options.playerDead ?? false
   const observerPulses = new Map(options.observerPulses ?? [])
   const triggeredActions = new Set(options.triggeredActions ?? [])
   const activeActions = new Set(options.activeActions ?? [])
@@ -108,19 +91,11 @@ const makeFrameInputFixture = (options: FrameInputFixtureOptions = {}) => {
     observerPulses,
     multiplayer: undefined,
     syncRedstoneSnapshot: () => { calls.push('redstone-sync') },
-    world: { vitals: { view: Effect.succeed({ healthPoints: options.healthPoints ?? 20 }) } },
     isCreativeMode: options.isCreativeMode ?? false,
     survivalHunger: {
-      tick: (deltaSecs) => {
-        calls.push(`hunger:${deltaSecs}`)
-        if (options.deadAfterHunger) playerDead = true
-        return options.hungerOutcome ?? NO_HUNGER_CHANGE
-      },
-      submit: (activity) => { calls.push(`submit:${activity._tag}`) },
+      submit: (activity) => Effect.sync(() => { calls.push(`submit:${activity._tag}`) }),
     },
     playerIsDead: () => playerDead,
-    handleLocalPlayerDeath: () => { calls.push('local-death') },
-    markSessionDirty: () => { calls.push('session-dirty') },
     syncTouchControls: () => { calls.push('touch-sync') },
     setInventoryOpen: (open, mode) => {
       calls.push(`inventory:${open}:${mode ?? 'default'}`)
@@ -231,15 +206,11 @@ describe('tick frame timing', () => {
       observerPulses: new Map(),
       multiplayer: undefined,
       syncRedstoneSnapshot: () => undefined,
-      world: { vitals: { view: Effect.succeed({ healthPoints: 20 }) } },
       isCreativeMode: false,
       survivalHunger: {
-        tick: () => ({ exhaustionAdded: 0, foodTicks: 0, regeneratedHealth: 0, starvationDamage: 0 }),
-        submit: () => undefined,
+        submit: () => Effect.void,
       },
       playerIsDead: () => false,
-      handleLocalPlayerDeath: () => undefined,
-      markSessionDirty: () => undefined,
       syncTouchControls: () => undefined,
       setInventoryOpen: () => undefined,
       setBrewingOpen: () => undefined,
@@ -287,15 +258,16 @@ describe('tick frame input branches', () => {
     expect(fixture.calls).toEqual(['consume-touch', 'crosshair:10', 'store:10'])
   })
 
-  it('ticks hunger with clamped time and handles starvation death before closing player UI', () => {
+  // Hunger and its starvation death moved into the frame (the survival-hunger
+  // stage, handled after `runFrame` in player-movement.test.ts), so frame input
+  // only closes the player UI of a player who is already dead.
+  it('advances clamped time and closes player UI for a dead player without ticking hunger', () => {
     const fixture = makeFrameInputFixture({
       simulationElapsedSecs: 3,
       inventoryOpen: true,
       brewingOpen: true,
       pointerLocked: true,
-      healthPoints: 1,
-      deadAfterHunger: true,
-      hungerOutcome: { exhaustionAdded: 0, foodTicks: 0, regeneratedHealth: 0, starvationDamage: 1 },
+      playerDead: true,
     })
 
     const frame = runTickFrameInput(fixture.context, MonotonicTimeSecs(10), fixture.frameInput)
@@ -311,24 +283,12 @@ describe('tick frame input branches', () => {
       'consume-touch',
       'store:10',
       'clamp:0.125',
-      'hunger:0.05',
-      'local-death',
-      'session-dirty',
       'touch-sync',
       'inventory:false:default',
       'brewing:false',
       'pointer-exit',
       'reset-attack',
     ])
-  })
-
-  it('does not report a local death transition when health was already zero', () => {
-    const fixture = makeFrameInputFixture({ playerDead: true, healthPoints: 0 })
-
-    const frame = runTickFrameInput(fixture.context, MonotonicTimeSecs(10), fixture.frameInput)
-
-    expect(frame?.dead).toBe(true)
-    expect(fixture.calls).not.toContain('local-death')
   })
 
   it('expires observer pulses at the elapsed-time boundary and syncs redstone once', () => {
@@ -348,7 +308,6 @@ describe('tick frame input branches', () => {
       'store:10',
       'clamp:0.125',
       'redstone-sync',
-      'hunger:0.05',
       'touch-sync',
       'reset-attack',
     ])
@@ -365,7 +324,6 @@ describe('tick frame input branches', () => {
       'consume-touch',
       'store:10',
       'clamp:0.125',
-      'hunger:0.05',
       'touch-sync',
       'inventory:true:player',
       'reset-attack',
@@ -387,7 +345,6 @@ describe('tick frame input branches', () => {
       'consume-touch',
       'store:10',
       'clamp:0.125',
-      'hunger:0.05',
       'touch-sync',
       'reset-attack',
     ])
@@ -411,7 +368,6 @@ describe('tick frame input branches', () => {
       'consume-touch',
       'store:10',
       'clamp:0.125',
-      'hunger:0.05',
       'touch-sync',
       'wrap:2:-1:9',
       'reset-attack',
@@ -433,7 +389,6 @@ describe('tick frame input branches', () => {
       'consume-touch',
       'store:10',
       'clamp:0.125',
-      'hunger:0.05',
       'touch-sync',
       'reset-attack',
       'submit:attack',

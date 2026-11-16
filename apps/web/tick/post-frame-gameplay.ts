@@ -8,6 +8,7 @@ import {
   drainBlockUseResults,
   drainBowKnockbacks,
   drainItemUseResults,
+  GAMEPLAY_PLAYER_STORAGE_OWNER_ID,
   drainMobDrops,
   drainMobExperience,
   isBucketItem,
@@ -109,6 +110,7 @@ export const runTickPostFrameGameplay = (
   })
   const {
     world,
+    entityManager,
     playerApi,
     currentChunkStore,
     blockPosition,
@@ -370,9 +372,11 @@ export const runTickPostFrameGameplay = (
         const target = yield* targetedBlock()
         if (target !== undefined) {
           const dimension = Effect.runSync(playerApi.dimension)
+          // The player storage owner is the inventory's only store, so the
+          // bucket exchange commits to it and the block in one coordinator
+          // commit; the inventory view reloads from the owner afterwards.
           const result = Effect.runSync(useBucket(
-            currentChunkStore,
-            world.inventory,
+            targeting.coordinator,
             gameplayState.fluidFrontier,
             {
               activeDimension: dimension,
@@ -381,6 +385,7 @@ export const runTickPostFrameGameplay = (
                 ? blockPosition(target.position.x, target.position.y, target.position.z)
                 : blockPosition(target.adjacentPosition.x, target.adjacentPosition.y, target.adjacentPosition.z)),
               heldItem: specialSelected.item,
+              playerStorageOwnerId: GAMEPLAY_PLAYER_STORAGE_OWNER_ID,
             },
           ))
           document.body.setAttribute('data-bucket-result', result._tag)
@@ -1103,7 +1108,7 @@ export const runTickPostFrameGameplay = (
     ? Effect.runSync(drainMobDrops(gameplayState))
     : []
   if (mobDrops.length > 0) {
-    Effect.runSync(spawnMobDrops(world.entities, mobDrops))
+    Effect.runSync(spawnMobDrops(entityManager, mobDrops))
     markSessionDirty()
   }
   for (const drop of mobDrops) {
@@ -1142,7 +1147,7 @@ export const runTickPostFrameGameplay = (
       }
       case 'DragonEggRewarded':
         if (!state.dragonEggRewarded.get()) {
-          Effect.runSync(spawnDroppedItems(world.entities, [{
+          Effect.runSync(spawnDroppedItems(entityManager, [{
             item: event.item,
             count: event.count,
             at: endDragonWorldPosition(),

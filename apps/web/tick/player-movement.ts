@@ -4,7 +4,21 @@ import { WorldId } from '@nerima-games/mx-multiplayer'
 import { Effect, Exit, Option, Ref, Result } from 'effect'
 
 import type { InputAction } from '@nerima-games/mc-render'
+import type { Vitals } from '@nerima-games/mc-sim'
 import type { H5aMovementContext, H5aMovementFrameInput, H5aMovementResult } from './h5a-context'
+
+/**
+ * Whether the vitals moved the way the survival-hunger tick reports work:
+ * exhaustion added (exhaustion, saturation or hunger changes), regeneration or
+ * starvation (health changes), or a completed food tick (the timer wraps).
+ * Only the timer advancing is not a change worth saving.
+ */
+export const vitalsChangedByHunger = (before: Vitals, after: Vitals): boolean =>
+  after.healthPoints !== before.healthPoints
+  || after.hungerPoints !== before.hungerPoints
+  || after.saturation !== before.saturation
+  || after.exhaustion !== before.exhaustion
+  || after.foodTimerSecs < before.foodTimerSecs
 
 export const movementInput = (
   mounted: boolean,
@@ -196,7 +210,9 @@ export const runTickPlayerMovement = (
   // WIRING, NOT A RULE. mx-gameplay owns vehicle motion and collision; this
   // loop supplies input intent before the frame and mirrors its authoritative state after.
   const pearlOutcomesBeforeFrame = yield* Ref.get(context.gameplayState.enderPearlOutcomes)
+  const vitalsBeforeFrame = Effect.runSync(context.world.vitals.snapshot)
   const outcome = yield* Effect.exit(context.runFrame(deltaSecs))
+  const vitalsAfterFrame = Effect.runSync(context.world.vitals.snapshot)
   const pearlOutcomesAfterFrame = yield* Ref.get(context.gameplayState.enderPearlOutcomes)
   // The stage appends an outcome only after committing the teleport.
   // Post-frame gameplay drains it later; old outcomes do not suppress movement.
@@ -236,6 +252,12 @@ export const runTickPlayerMovement = (
   // render:chunk-sync cannot fail the frame, so mc-render queues meshing
   // faults on the attachment; they leave the tick here as a typed failure.
   yield* context.drainChunkRenderFaults()
+  // Inside `runFrame` only stages change the vitals owner; today that is the
+  // survival-hunger stage alone (I4). A death there has no other handler.
+  if (multiplayer === undefined) {
+    if (vitalsBeforeFrame.healthPoints > 0 && vitalsAfterFrame.healthPoints <= 0) context.handleLocalPlayerDeath()
+    if (vitalsChangedByHunger(vitalsBeforeFrame, vitalsAfterFrame)) context.markSessionDirty()
+  }
 
   const activeEntities = Effect.runSync(context.world.entities.entities)
   const droppedEntitiesById = new Map(

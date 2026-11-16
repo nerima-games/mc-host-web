@@ -65,7 +65,6 @@ import {
   POTATO_MATURITY_SECS,
   type CropLocation,
   type CropServiceApi,
-  type PlayerServiceApi,
   type SimFrameState,
   type Vehicle,
   type VehicleServiceApi,
@@ -109,12 +108,11 @@ import {
   type EnderDragonEncounterSnapshot,
   type FishingSession,
   type GameplayFrameState,
-  type GeneratedWorld,
   type HoeItemType,
   type IgnitionItemType,
   type ItemUseResult,
-  type MobBehaviour,
   type MobDropEvent,
+  type SurvivalHungerRuntimeApi,
 } from '@nerima-games/mx-gameplay'
 import {
   WorldId,
@@ -211,7 +209,7 @@ import {
   type SessionMetadata,
   type SessionPosition,
 } from './session-persistence'
-import { type SurvivalHungerCoordinator } from './survival-hunger-runtime'
+import type { OwnerBackedWorld } from './owner-backed-services'
 import { type SessionSaveCoordinator } from './session-save-coordinator'
 import { type AudioRuntime } from './audio-runtime'
 
@@ -302,11 +300,11 @@ type QaSurfaceDeps = {
     readonly commit: NonNullable<Parameters<typeof gameplayStages>[9]>
     readonly targetingEntitiesOwnerId: NonNullable<Parameters<typeof requestTargetedBlockBreak>[2]['entitiesOwnerId']>
     readonly brewingService: BrewingServiceApi
-    readonly world: GeneratedWorld<MobBehaviour>
+    readonly world: OwnerBackedWorld
     readonly worldRenderer: WorldRenderer
     readonly gameplayState: GameplayFrameState
     readonly simState: SimFrameState
-    readonly playerApi: PlayerServiceApi
+    readonly playerApi: OwnerBackedWorld['player']
     readonly currentChunkStore: ChunkStoreApi
     readonly crops: CropServiceApi
     readonly weather: WeatherServiceApi
@@ -369,7 +367,7 @@ type QaSurfaceDeps = {
     readonly endDragonPosition: () => SessionPosition
     readonly vehicleList: () => ReadonlyArray<Vehicle>
     readonly nearestVillagerForTrade: (position: SessionPosition, dimension: Dimension) => PersistedVillager | undefined
-    readonly survivalHunger: SurvivalHungerCoordinator
+    readonly survivalHunger: Pick<SurvivalHungerRuntimeApi, 'eat'>
     readonly setTradeOpen: (open: boolean, villagerId?: string) => void
     readonly setBrewingOpen: (open: boolean) => void
     readonly setInventoryOpen: (open: boolean, mode?: InventoryMode) => void
@@ -796,7 +794,7 @@ export const makeQaSurface = (
           return gameplaySnapshot()
         }),
         eat: makeQaOperation('eat', Schema.Null, () => {
-          survivalHunger.eat(4, 0.3)
+          Effect.runSync(survivalHunger.eat(4, 0.3))
           markSessionDirty()
           renderPlayerUi()
           return gameplaySnapshot()

@@ -48,9 +48,7 @@ import {
   itemStack,
   maxStackCountForItem,
   type PlayerStorage,
-  type InventoryServiceApi,
   type ItemStackFailure,
-  type PlayerServiceInputError,
   type PlayerStorageFailure,
   type Slot,
   type Vitals as PlayerVitals,
@@ -126,14 +124,21 @@ import {
   type InventoryInteractionError,
   type InventoryInteractionInventory,
 } from './inventory-interaction'
+import type {
+  OwnerBackedInventory,
+  OwnerBackedInventorySyncError,
+  OwnerBackedInventoryWriteError,
+  OwnerBackedPlayerSyncError,
+  OwnerBackedPlayerWriteError,
+} from './owner-backed-services'
 
 type FailureOf<R> = R extends Result.Result<unknown, infer E> ? E : never
 type BlockTargetFailure = FailureOf<ReturnType<typeof targetBlockFromPlayerPose>>
 type ChunkLoadFailure = Effect.Error<ReturnType<DimensionChunkContext['chunkStore']['load']>>
 type WorldWriteFailure = Effect.Error<ReturnType<WorldWritePort['Service']['applyBatch']>>
-type EndArrivalFailure = ChunkLoadFailure | WorldWriteFailure | PlayerServiceInputError
+type EndArrivalFailure = ChunkLoadFailure | WorldWriteFailure | OwnerBackedPlayerWriteError
 type BlockReadingFailure = Brand.BrandError | BlockRegistryResolutionFailure
-type TargetedBlockFailure = BlockTargetFailure | CoordinateConversionFailure
+type TargetedBlockFailure = BlockTargetFailure | CoordinateConversionFailure | OwnerBackedPlayerSyncError
 type FishingEnvironmentFailure = CoordinateConversionFailure | BlockReadingFailure
 type EndFeatureFailure =
   | Brand.BrandError
@@ -142,11 +147,13 @@ type EndFeatureFailure =
   | EndArrivalFailure
   | ItemStackFailure
   | PlayerStorageFailure
+  | OwnerBackedInventoryWriteError
 type WorldExplosionFailure =
   | Brand.BrandError
   | ExplosionValidationFailure
   | BlockRegistryResolutionFailure
   | WorldWriteFailure
+  | OwnerBackedPlayerSyncError
 
 // The kernel vocabulary always registers 'air', so the registry lookup cannot be empty.
 const AIR_BLOCK = Option.getOrThrow(blockIdOf('air'))
@@ -216,8 +223,8 @@ type FishingEnvironment = {
 }
 
 type InventoryRemoval = { readonly _tag: 'Removed'; readonly removed: number } | { readonly _tag: 'Unavailable' }
-type InventoryRemoveFailure = Effect.Error<ReturnType<InventoryServiceApi['removeAt']>>
-type InventoryAddFailure = Effect.Error<ReturnType<InventoryServiceApi['add']>>
+type InventoryRemoveFailure = Effect.Error<ReturnType<OwnerBackedInventory['removeAt']>>
+type InventoryAddFailure = Effect.Error<ReturnType<OwnerBackedInventory['add']>>
 
 export type PlayerUiRuntimeContext = {
   readonly document: Document
@@ -235,14 +242,17 @@ export type PlayerUiRuntimeContext = {
   readonly anvilView: ReturnType<typeof createAnvilView>
   readonly enchantingView: ReturnType<typeof createEnchantingTableView>
   readonly inventoryService: InventoryInteractionInventory
-  readonly worldInventory: InventoryServiceApi
-  readonly inventoryStorageSnapshot: Effect.Effect<PlayerStorage>
-  readonly getPlayerPose: () => Effect.Effect<Parameters<typeof targetBlockFromPlayerPose>[0]>
-  readonly getPlayerDimension: () => Effect.Effect<Dimension>
+  readonly worldInventory: Pick<
+    OwnerBackedInventory,
+    'removeAt' | 'equipmentSnapshot' | 'damageAt' | 'equipFromInventory' | 'unequipToInventory' | 'restoreStorage'
+  >
+  readonly inventoryStorageSnapshot: Effect.Effect<PlayerStorage, OwnerBackedInventorySyncError>
+  readonly getPlayerPose: () => Effect.Effect<Parameters<typeof targetBlockFromPlayerPose>[0], OwnerBackedPlayerSyncError>
+  readonly getPlayerDimension: () => Effect.Effect<Dimension, OwnerBackedPlayerSyncError>
   readonly restorePlayerForDimension: (
     pose: Parameters<typeof targetBlockFromPlayerPose>[0],
     dimension: Dimension,
-  ) => Effect.Effect<void, PlayerServiceInputError>
+  ) => Effect.Effect<void, OwnerBackedPlayerWriteError>
   readonly getOrCreateDimensionChunkContext: (dimension: Dimension) => DimensionChunkContext
   readonly readBlockAt: (position: BlockPosition) => Effect.Effect<BlockReading>
   readonly getEntitiesForExplosion: () => Parameters<typeof planExplosion>[0]['entities']
@@ -324,7 +334,10 @@ export type PlayerUiRuntimeContext = {
   readonly equipmentMetadataKey: (slot: EquipmentSlotId) => string
   readonly setEnchantmentSeed: (seed: number) => void
   readonly getVitalsSnapshot: () => { readonly totalExperience: number }
-  readonly getInventorySnapshot: () => Effect.Effect<{ readonly slots: ReadonlyArray<ItemStack | undefined> }>
+  readonly getInventorySnapshot: () => Effect.Effect<
+    { readonly slots: ReadonlyArray<ItemStack | undefined> },
+    OwnerBackedInventorySyncError
+  >
   readonly restoreVitalsAtExperience: (totalExperience: number) => Result.Result<void, Brand.BrandError>
   readonly renderHud: (storage: PlayerStorage, durabilityBySlot: ReadonlyMap<number, number>) => void
   readonly getTotalExperience: () => number
@@ -340,7 +353,9 @@ export type PlayerUiRuntimeContext = {
   readonly getFurnaceStatus: () => string
   readonly getInventoryFocus: () => InventoryInteractionTarget
   readonly getActiveChestContainer: (containerId: string) => ContainerSnapshot | null
-  readonly transferContainerItem: (request: ContainerTransferRequest) => Effect.Effect<ContainerTransferResult>
+  readonly transferContainerItem: (
+    request: ContainerTransferRequest,
+  ) => Effect.Effect<ContainerTransferResult, OwnerBackedInventoryWriteError>
   readonly containerMetadataKey: (containerId: string, slot: number) => string
   readonly sameItemMetadata: (left: string, right: string) => boolean
   readonly copyItemMetadata: (source: string, destination: string) => void
@@ -1738,7 +1753,7 @@ export const createPlayerUiRuntime = (
   const removeInventoryItem = (
     item: ItemStack['item'],
     count: number,
-  ): Result.Result<boolean, ItemStackFailure | PlayerStorageFailure> => {
+  ): Result.Result<boolean, ItemStackFailure | PlayerStorageFailure | OwnerBackedInventoryWriteError> => {
     if (!Number.isSafeInteger(count) || count < 0) return Result.succeed(false)
     if (count === 0) return Result.succeed(true)
     const slots = Effect.runSync(context.getInventorySnapshot()).slots

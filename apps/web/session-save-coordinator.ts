@@ -1,6 +1,46 @@
+import { Effect, type Schema } from 'effect'
 import { chunkSnapshotOf } from '@nerima-games/mc-worldgen'
+import {
+  PlayerServiceSnapshotSchema,
+  PlayerStorageSnapshotSchema,
+  type ReplicatedOwnerUnknown,
+  type WorldCommitCoordinatorApi,
+} from '@nerima-games/mc-sim'
+import {
+  ExperienceOrbVitalsOwnerSnapshotSchema,
+  GameplayEntityRosterSchema,
+  type GameplayEntityRoster,
+} from '@nerima-games/mx-gameplay'
 
-import type { DimensionChunk } from './session-persistence'
+import { poseOfPlayerOwner, type OwnerBackedOwnerIds } from './owner-backed-services'
+import type { DimensionChunk, SessionState } from './session-persistence'
+
+/** The saved fields whose source of truth is a coordinator owner. */
+export type OwnedSessionState = Pick<SessionState, 'dimension' | 'player' | 'storage' | 'vitals' | 'entities'>
+
+/**
+ * Read the owner-held part of a save straight from the owners, so a save
+ * records what the stages and the host views committed. Entities are split
+ * back into the saved per-dimension rosters by `entityRostersOf`.
+ */
+export const snapshotOwnedSessionState = (
+  coordinator: Pick<WorldCommitCoordinatorApi, 'snapshot'>,
+  ownerIds: OwnerBackedOwnerIds,
+  entityRostersOf: (owner: GameplayEntityRoster) => SessionState['entities'],
+): Effect.Effect<OwnedSessionState, Schema.SchemaError | ReplicatedOwnerUnknown> =>
+  Effect.gen(function* () {
+    const player = (yield* coordinator.snapshot(ownerIds.player, PlayerServiceSnapshotSchema)).state
+    const storage = yield* coordinator.snapshot(ownerIds.playerStorage, PlayerStorageSnapshotSchema)
+    const vitals = yield* coordinator.snapshot(ownerIds.vitals, ExperienceOrbVitalsOwnerSnapshotSchema)
+    const entities = yield* coordinator.snapshot(ownerIds.entities, GameplayEntityRosterSchema)
+    return {
+      dimension: player.pose.feetPosition.dimension,
+      player: poseOfPlayerOwner(player),
+      storage: storage.state,
+      vitals: vitals.state.vitals,
+      entities: entityRostersOf(entities.state),
+    }
+  })
 
 export type SessionSavePublication<State> = {
   readonly state: State

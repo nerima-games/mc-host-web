@@ -73,7 +73,17 @@ export type PressurePlateOccupancy = {
 
 export type RedstoneContainerRuntimeContext = {
   readonly dimensionContexts: ReadonlyMap<Dimension, RedstoneDimensionChunkContext>
-  readonly world: World
+  /**
+   * Containers stay in the local inventory store; dropper drops go through the
+   * owner-backed entity manager (`spawnDroppedItems` takes the exact type).
+   */
+  readonly world: {
+    readonly inventory: Pick<
+      World['inventory'],
+      'containerSnapshotAt' | 'createContainer' | 'containerSnapshot' | 'moveContainerItem' | 'extractContainerItem'
+    >
+    readonly entities: World['entities']
+  }
   readonly writeBlocks: (
     dimension: Dimension,
     edits: ReadonlyArray<WorldWriteBlockEdit>,

@@ -239,7 +239,7 @@ type PlayerOwnerState = ReplicatedSnapshot<typeof PlayerServiceSnapshotSchema>['
 
 // The player services keep every key of the pose they are given, so the
 // owner's dimension must not stay inside `feetPosition`.
-const poseOfPlayerOwner = ({ pose }: PlayerOwnerState): PlayerPose => ({
+export const poseOfPlayerOwner = ({ pose }: PlayerOwnerState): PlayerPose => ({
   feetPosition: { x: pose.feetPosition.x, y: pose.feetPosition.y, z: pose.feetPosition.z },
   yawRadians: pose.yawRadians,
   pitchRadians: pose.pitchRadians,
@@ -533,6 +533,44 @@ const makeEntitiesView = (
 }
 
 /**
+ * An exact `EntityManagerApi` over the entities view, for the places whose
+ * type admits nothing wider: the registration Context's `EntityManager`, and
+ * mx-gameplay's `spawnDroppedItems` and `resolveBowHits`, which take the
+ * roster by that type.
+ *
+ * mx-gameplay 0.11.0's `gameplayStages` requires a roster but only stores it
+ * in the stage context; no stage reads `context.roster`
+ * (`dist/stages/gameplay-stages.js`). The type cannot carry the view's
+ * failures, so they become defects, under the same invariants as
+ * `makeOwnerBackedStagePlayer`: the entities and player owners are always
+ * registered and read with their registration schemas, and every world write
+ * happens inside the frame fiber or through the frame-boundary queue, so no
+ * commit conflicts. Id collisions and roster repairs cannot occur either:
+ * session load renumbers cross-dimension duplicates, the view keeps one
+ * `nextSerial` for all dimensions, and the 0.11.0 stages mint only namespaced
+ * ids (`mx-gameplay:experience-orb/...`), never `<kind>-<serial>`.
+ * `EntitySerialExhausted` is part of the type and stays typed.
+ */
+export const makeOwnerBackedEntityManager = (entities: OwnerBackedEntities): MobEntityManagerApi => {
+  const keepSerialExhausted = <A>(
+    effect: Effect.Effect<A, OwnerBackedEntitiesWriteError>,
+  ): Effect.Effect<A, EntitySerialExhausted> =>
+    Effect.catch(effect, (error) => error._tag === 'EntitySerialExhausted' ? Effect.fail(error) : Effect.die(error))
+  return {
+    spawn: (request) => keepSerialExhausted(entities.spawn(request)),
+    despawn: (id) => Effect.orDie(entities.despawn(id)),
+    entities: Effect.orDie(entities.entities),
+    find: (id) => Effect.orDie(entities.find(id)),
+    count: Effect.orDie(entities.count),
+    countOfKind: (kind) => Effect.orDie(entities.countOfKind(kind)),
+    sweep: (step) => Effect.orDie(entities.sweep(step)),
+    snapshot: Effect.orDie(entities.snapshot),
+    restore: (roster) => keepSerialExhausted(entities.restore(roster)),
+    reset: Effect.orDie(entities.reset),
+  }
+}
+
+/**
  * Views over the in-memory services whose source of truth is the coordinator's
  * owners: each operation reloads the owner when the world revision moved, and
  * each write commits the converted local state with the revision it read.
@@ -551,3 +589,27 @@ export const makeOwnerBackedWorld = ({
     vitals: makeVitalsView(coordinator, world.vitals, ownerIds.vitals),
     entities: makeEntitiesView(coordinator, world.entities, ownerIds),
   })
+
+export type OwnerBackedHost = Readonly<{
+  /** For host code. */
+  views: OwnerBackedWorld
+  /** For the registration Context's `PlayerService` and `simStages`. */
+  stagePlayer: PlayerServiceApi
+  /** Where an exact `EntityManagerApi` is required (see `makeOwnerBackedEntityManager`). */
+  entityManager: MobEntityManagerApi
+}>
+
+/**
+ * Everything that reads or writes the player, storage, vitals and entities
+ * owners, built over one coordinator (I5). After this, `world`'s services are
+ * reachable only through these values (I1).
+ */
+export const makeOwnerBackedHost = (options: OwnerBackedWorldOptions): Effect.Effect<OwnerBackedHost> =>
+  Effect.map(makeOwnerBackedWorld(options), (views) => ({
+    views,
+    stagePlayer: makeOwnerBackedStagePlayer({
+      coordinator: options.coordinator,
+      playerOwnerId: options.ownerIds.player,
+    }),
+    entityManager: makeOwnerBackedEntityManager(views.entities),
+  }))

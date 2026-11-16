@@ -8,7 +8,6 @@ import { describe, expect, it, vi } from 'vitest'
 import * as gameplay from '@nerima-games/mx-gameplay'
 import { makeUiFrameState } from '@nerima-games/mx-ui'
 
-import { makeSurvivalHungerCoordinator } from '../apps/web/survival-hunger-runtime'
 import { DEFAULT_PLAYER_SETTINGS } from '../apps/web/settings'
 import { IDLE_BOW_USE } from '../apps/web/bow-use'
 import { enterSleep, initialSleepRuntimeState, type BedRespawnLocation, type SleepLocation } from '../apps/web/sleep-runtime'
@@ -232,6 +231,7 @@ const makeHarness = async (options: HarnessOptions = {}) => {
   }
   const h5a = {
     world,
+    entityManager: world.entities,
     targeting,
     playerApi: world.player,
     eyeLevelOffset: 1.62,
@@ -241,10 +241,7 @@ const makeHarness = async (options: HarnessOptions = {}) => {
     gameplayState,
     multiplayer: undefined,
     isCreativeMode: false,
-    survivalHunger: makeSurvivalHungerCoordinator({
-      snapshot: world.vitals.snapshot,
-      restore: world.vitals.restore,
-    }),
+    survivalHunger: gameplayState.survivalHunger,
     setInventoryOpen: () => undefined,
     setBrewingOpen: () => undefined,
     setFishingResult: (result: string) => fishingResults.push(result),

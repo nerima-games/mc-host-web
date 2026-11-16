@@ -1,31 +1,87 @@
-import { Effect } from 'effect'
+import { Effect, Result, Schema } from 'effect'
 import {
   chunkSnapshotOf,
   type ChunkWithBlockStates,
   type ChunkSource,
   type Dimension,
 } from '@nerima-games/mc-worldgen'
+import { PlayerServiceSnapshotSchema, type PlayerPose, type PlayerStorage } from '@nerima-games/mc-sim'
+import type { GameplayOwnerInitialState, MobRoster, PlayerVitals } from '@nerima-games/mx-gameplay'
+
+import { poseOfPlayerOwner } from './owner-backed-services'
+import type { SessionState } from './session-persistence'
+
+/** What the owners hold before anything is loaded: the generated world's own state. */
+export type GeneratedOwnerState = Readonly<{
+  pose: PlayerPose
+  dimension: Dimension
+  storage: PlayerStorage
+  vitals: PlayerVitals
+}>
+
+/**
+ * The initial state of the owners the host reads through its views. A loaded
+ * session seeds them with its saved values; a new one with the generated
+ * world's spawn, storage and vitals, since mx-gameplay's no-argument
+ * registrations would start the player at the origin rather than on the
+ * generated surface. The entity roster is the one `initializeSessionWorld`
+ * merged from every saved dimension (empty for a new session).
+ *
+ * The saved pose is plain numbers, so it is decoded with the player owner's
+ * schema rather than asserted to be a `PlayerPose`.
+ */
+export const gameplayOwnerInitialState = (
+  loaded: Pick<SessionState, 'dimension' | 'player' | 'storage' | 'vitals' | 'villagers' | 'brewing'> | undefined,
+  generated: GeneratedOwnerState,
+  entities: MobRoster,
+): Result.Result<GameplayOwnerInitialState, Schema.SchemaError> => {
+  if (loaded === undefined) {
+    return Result.succeed({
+      playerPose: generated.pose,
+      dimension: generated.dimension,
+      playerStorage: generated.storage,
+      vitals: generated.vitals,
+      entities,
+    })
+  }
+  return Result.map(
+    Schema.decodeUnknownResult(PlayerServiceSnapshotSchema)({
+      pose: {
+        feetPosition: { dimension: loaded.dimension, ...loaded.player.feetPosition },
+        yawRadians: loaded.player.yawRadians,
+        pitchRadians: loaded.player.pitchRadians,
+      },
+    }),
+    (player) => ({
+      playerPose: poseOfPlayerOwner(player),
+      dimension: player.pose.feetPosition.dimension,
+      playerStorage: loaded.storage,
+      vitals: loaded.vitals,
+      entities,
+      villagerTrades: loaded.villagers.trades,
+      brewing: loaded.brewing,
+    }),
+  )
+}
 
 export type InitialWorldRestoreActions<State> = {
-  readonly restoreEntities: () => Promise<unknown>
-  readonly restoreStorage: (state: State) => Promise<unknown>
   readonly restoreContainerStorage: (state: State) => Promise<unknown>
-  readonly restorePlayer: (state: State) => Promise<unknown>
-  readonly restoreVitals: (state: State) => Promise<unknown>
   readonly addCreativeStartingItems: () => Promise<unknown>
 }
 
+/**
+ * The parts of the initial world that are not owner state. The player, its
+ * storage, vitals and entities start in the owners
+ * (`gameplayOwnerInitialState`), so only the local container storage is
+ * restored here, and the creative starter items go through the inventory view.
+ */
 export const restoreInitialWorld = async <State>(
   state: State | undefined,
   isCreativeMode: boolean,
   actions: InitialWorldRestoreActions<State>,
 ): Promise<void> => {
   if (state !== undefined) {
-    await actions.restoreEntities()
-    await actions.restoreStorage(state)
     await actions.restoreContainerStorage(state)
-    await actions.restorePlayer(state)
-    await actions.restoreVitals(state)
   } else if (isCreativeMode) {
     await actions.addCreativeStartingItems()
   }

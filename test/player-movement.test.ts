@@ -1,17 +1,21 @@
 import { describe, expect, it } from '@effect/vitest'
 import { Effect, Option, Ref, Result, Schema } from 'effect'
 
-import { AngleRadians, BlockAxis, blockIdOf, blockPosition, blockTypeOfId, ChunkAxis, chunkCoord, DeltaTimeSecs, itemStack, InterpolationFraction, MonotonicTimeSecs, position, PositionAxis, StackCount, VehicleVelocityComponent } from '@nerima-games/mc-kernel'
+import { AngleRadians, BlockAxis, blockIdOf, blockPosition, blockTypeOfId, ChunkAxis, chunkCoord, DeltaTimeSecs, EntityHealthPoints, itemStack, InterpolationFraction, MonotonicTimeSecs, position, PositionAxis, StackCount, VehicleVelocityComponent } from '@nerima-games/mc-kernel'
 import { BlockLength, PLAYER_HALF_HEIGHT, PLAYER_HALF_WIDTH } from '@nerima-games/mc-physics'
 import type { InputAction } from '@nerima-games/mc-render'
-import { emptyFurnaceState, makeSimFrameState, makeWeatherService, VehicleId, type FurnaceState, type SimPhysicsConfig, type Vehicle } from '@nerima-games/mc-sim'
+import { emptyFurnaceState, ExhaustionAmount, FoodTimerSecs, makeSimFrameState, makeWeatherService, VehicleId, type FurnaceState, type SimPhysicsConfig, type Vehicle } from '@nerima-games/mc-sim'
 import { BIOMES, CHUNK_SIZE_XZ, CHUNK_VOLUME, type ChunkSource } from '@nerima-games/mc-worldgen'
 import { advanceFishing, cancelFishing, castFishing, enderPearlDisplacement, EnderPearlOutcomeSchema, isDroppedItemBehaviour, makeGameplayFrameState, makeGeneratedWorld, spawnDroppedItems, type FishingSession, type MobBehaviour } from '@nerima-games/mx-gameplay'
 import { PlayerId, PlayerName, WorldId } from '@nerima-games/mx-multiplayer'
 
 import { ChunkRenderFailure } from '../apps/web/chunk-streaming'
 import { createDroppedItemLifetimeTracker, DROPPED_ITEM_LIFETIME_SECS } from '../apps/web/dropped-item-lifetime'
-import { movementInput, runTickPlayerMovement as runTickPlayerMovementEffect } from '../apps/web/tick/player-movement'
+import {
+  movementInput,
+  runTickPlayerMovement as runTickPlayerMovementEffect,
+  vitalsChangedByHunger,
+} from '../apps/web/tick/player-movement'
 import {
   mutableState,
   type H5aFishingWater,
@@ -123,6 +127,7 @@ const makeHarness = async (multiplayer?: H5aMovementContext['multiplayer']) => {
   let frameRunner: H5aMovementContext['runFrame'] = () => Effect.void
   let chunkRenderFaults: H5aMovementContext['drainChunkRenderFaults'] = () => Effect.void
   let dirtyCount = 0
+  let localDeathCount = 0
   let presentedSwimmingStateCount = 0
   let pumpedDamageCount = 0
 
@@ -185,9 +190,11 @@ const makeHarness = async (multiplayer?: H5aMovementContext['multiplayer']) => {
     applyPlayerDamage: (damage) => damageEvents.push(damage),
     failBoot: (message, error) => failureEvents.push({ message, error }),
     markSessionDirty: () => { dirtyCount += 1 },
+    handleLocalPlayerDeath: () => { localDeathCount += 1 },
     canvas: { setAttribute: (name, value) => { canvasAttributes.set(name, value) } },
     world: {
       inventory: { storageSnapshot: Effect.succeed({ inventory: { slots: inventorySlots } }) },
+      vitals: world.vitals,
       entities: world.entities,
     },
     currentChunkContext: () => ({ dimension: 'overworld' }),
@@ -230,6 +237,7 @@ const makeHarness = async (multiplayer?: H5aMovementContext['multiplayer']) => {
     setFrameRunner: (value: H5aMovementContext['runFrame']) => { frameRunner = value },
     setChunkRenderFaults: (value: H5aMovementContext['drainChunkRenderFaults']) => { chunkRenderFaults = value },
     dirtyCount: () => dirtyCount,
+    localDeathCount: () => localDeathCount,
     presentedSwimmingStateCount: () => presentedSwimmingStateCount,
     pumpedDamageCount: () => pumpedDamageCount,
   }
@@ -249,6 +257,57 @@ describe('tick player movement input', () => {
 
   it('suppresses walking input while mounted', () => {
     expect(movementInput(true, () => 1)).toEqual({ forward: 0, strafe: 0 })
+  })
+})
+
+describe('tick player movement hunger outcome', () => {
+  // The survival-hunger stage ticks the vitals owner inside `runFrame`, so the
+  // death and save marking the host tick used to report are read across it.
+  it('handles a death the frame caused and marks the session dirty', async () => {
+    const harness = await makeHarness()
+    const { world } = harness
+    harness.setFrameRunner(() => Effect.flatMap(world.vitals.snapshot, (vitals) =>
+      world.vitals.restore({ ...vitals, healthPoints: EntityHealthPoints(0) })))
+
+    runTickPlayerMovement(harness.context, makeFrame())
+
+    expect(harness.localDeathCount()).toBe(1)
+    expect(harness.dirtyCount()).toBe(1)
+  })
+
+  it('does not report a death for a player who was already dead before the frame', async () => {
+    const harness = await makeHarness()
+    const { world } = harness
+    const vitals = Effect.runSync(world.vitals.snapshot)
+    Effect.runSync(world.vitals.restore({ ...vitals, healthPoints: EntityHealthPoints(0) }))
+
+    runTickPlayerMovement(harness.context, makeFrame())
+
+    expect(harness.localDeathCount()).toBe(0)
+    expect(harness.dirtyCount()).toBe(0)
+  })
+
+  it('leaves death and saving to the server in multiplayer', async () => {
+    const harness = await makeHarness(makeMultiplayer('open').runtime)
+    const { world } = harness
+    harness.setFrameRunner(() => Effect.flatMap(world.vitals.snapshot, (vitals) =>
+      world.vitals.restore({ ...vitals, healthPoints: EntityHealthPoints(0) })))
+
+    runTickPlayerMovement(harness.context, makeFrame())
+
+    expect(harness.localDeathCount()).toBe(0)
+  })
+
+  it('counts a completed food tick but not the food timer advancing alone', async () => {
+    const harness = await makeHarness()
+    const before = Effect.runSync(harness.world.vitals.snapshot)
+    const timerAdvanced = { ...before, foodTimerSecs: FoodTimerSecs(before.foodTimerSecs + 0.5) }
+
+    expect(vitalsChangedByHunger(before, before)).toBe(false)
+    expect(vitalsChangedByHunger(before, timerAdvanced)).toBe(false)
+    expect(vitalsChangedByHunger(timerAdvanced, before)).toBe(true)
+    expect(vitalsChangedByHunger(before, { ...before, exhaustion: ExhaustionAmount(before.exhaustion + 0.1) })).toBe(true)
+    expect(vitalsChangedByHunger(before, { ...before, healthPoints: EntityHealthPoints(before.healthPoints - 1) })).toBe(true)
   })
 })
 
