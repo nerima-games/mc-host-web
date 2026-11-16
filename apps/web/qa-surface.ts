@@ -140,6 +140,7 @@ import {
   QA_GLOBAL_KEY,
   type StageOrderError,
 } from '@nerima-games/mc-compose'
+import type { PlayerUiRuntime } from './player-ui-runtime'
 import {
   FARMLAND_BLOCK_ID,
   KNOWN_TARGET_BLOCK,
@@ -367,7 +368,7 @@ type QaSurfaceDeps = {
       readonly position: SessionPosition
       readonly adjacentPosition: SessionPosition
       readonly block: number
-    } | undefined>
+    } | undefined, Effect.Error<ReturnType<PlayerUiRuntime['targetedBlock']>>>
     readonly presentWeather: (state: WeatherState) => void
     readonly environmentalContactCellsForPose: (pose: { readonly feetPosition: Vec3 }) => ReadonlyArray<EnvironmentalContactCell>
     readonly endDragonSnapshot: () => EnderDragonEncounterSnapshot
