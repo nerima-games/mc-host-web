@@ -1,16 +1,17 @@
 import { Effect, Result } from 'effect'
 import { RecipeGridDimension, splitItemStack, TransferQuantity } from '@nerima-games/mc-kernel'
-import type {
-  CraftGrid,
-  CraftResult,
-  InventoryCarriedSlot,
-  InventoryClickResult,
-  InventoryServiceApi,
-  ItemStack,
-  ItemStackFailure,
-  PlayerStorageFailure,
-  RecipeMatch,
-  Slot,
+import {
+  itemStack,
+  type CraftGrid,
+  type CraftResult,
+  type InventoryCarriedSlot,
+  type InventoryClickResult,
+  type InventoryServiceApi,
+  type ItemStack,
+  type ItemStackFailure,
+  type PlayerStorageFailure,
+  type RecipeMatch,
+  type Slot,
 } from '@nerima-games/mc-sim'
 
 export type InventoryInteractionError = ItemStackFailure | PlayerStorageFailure
@@ -88,15 +89,29 @@ const emptyGrid = (
   cells: Array.from({ length: width * height }, () => undefined),
 })
 
+// mc-kernel's `splitItemStack` accepts only `{ item, count, components }`
+// (item-stack.js `itemStackSnapshot` passes the allowed fields to
+// `snapshotInputRecord`, which rejects any other field). mc-sim carried stacks may
+// add `durability`, so split a canonical projection rebuilt by mc-sim's
+// `itemStack` with the same components. `CraftGrid.cells` are mc-kernel `Slot`s,
+// which have no `durability` field, so draft cells do not keep it.
+const splitOne = (
+  stack: ItemStack,
+): Result.Result<{ readonly taken: ItemStack; readonly remainder: Slot }, ItemStackFailure> =>
+  Result.flatMap(
+    itemStack(stack.item, stack.count, { components: stack.components }),
+    (canonical) => splitItemStack(canonical, ONE_ITEM),
+  )
+
 const oneItem = (stack: ItemStack): Result.Result<ItemStack, ItemStackFailure> =>
-  Result.map(splitItemStack(stack, ONE_ITEM), ({ taken }) => taken)
+  Result.map(splitOne(stack), ({ taken }) => taken)
 
 const consumeOneFromEachCell = (grid: CraftGrid): Result.Result<CraftGrid, ItemStackFailure> =>
   Result.map(
     Result.all(grid.cells.map((cell): Result.Result<Slot, ItemStackFailure> =>
       cell === undefined
         ? Result.succeed(undefined)
-        : Result.map(splitItemStack(cell, ONE_ITEM), ({ remainder }) => remainder))),
+        : Result.map(splitOne(cell), ({ remainder }) => remainder))),
     (cells) => ({ ...grid, cells }),
   )
 

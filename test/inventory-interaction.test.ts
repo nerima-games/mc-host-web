@@ -12,6 +12,7 @@ import {
   type RecipeMatch,
 } from '@nerima-games/mc-sim'
 import {
+  itemComponentPatch,
   RecipeGridDimension,
   RecipeId,
   shapelessRecipe,
@@ -30,6 +31,11 @@ import {
 // crafting draft cells come from `splitItemStack`, whose `ItemStack` carries
 // `components` (@nerima-games/mc-kernel@0.17.0 dist/domain/item/item-stack.d.ts).
 const stackOf = (item: ItemType, count: number) => Result.getOrThrow(itemStack(item, count))
+
+// A stack whose components differ from the item defaults, so preservation is observable.
+const repairedLogs = Result.getOrThrow(itemStack('oak_log', 2, {
+  componentPatch: Result.getOrThrow(itemComponentPatch({ 'minecraft:repair_cost': 3 })),
+}))
 
 const planksRecipe = Result.getOrThrow(
   shapelessRecipe(RecipeId('oak_planks'), ['oak_log'], stackOf('oak_planks', 4)),
@@ -703,5 +709,68 @@ describe('inventory interaction', () => {
     const swapped = interaction.interactCraftingCell(0)
     expect(swapped.grid.cells[0]).toEqual(stackOf('stone', 1))
     expect(swapped.carried).toEqual(stackOf('oak_log', 1))
+  })
+  it('drafts one durable tool carried from the real inventory and keeps its components', () => {
+    const pickaxe = stackOf('wooden_pickaxe', 1)
+    const service = Effect.runSync(makeInventoryService({
+      slots: [pickaxe, repairedLogs, ...emptyInventory().slots.slice(2)],
+    }))
+    const interaction = createInventoryInteraction(service)
+
+    // mc-sim adds `durability` to a damageable carried stack on pickup
+    // (@nerima-games/mc-sim@0.11.1 dist/application/inventory-service.js `click`).
+    expect(Effect.runSync(interaction.clickInventoryItem(0, 'left')).inventoryCarried)
+      .toHaveProperty('durability')
+    const toolDrafted = Effect.runSync(interaction.interactCraftingCellFromInventory(0))
+
+    expect(toolDrafted.inventoryCarried).toBeUndefined()
+    expect(toolDrafted.grid.cells[0]).toEqual(pickaxe)
+    expect(toolDrafted.grid.cells[0]?.components).toEqual(pickaxe.components)
+    expect(Effect.runSync(service.snapshot).slots[0]).toEqual(pickaxe)
+
+    Effect.runSync(interaction.clickInventoryItem(1, 'left'))
+    const logDrafted = Effect.runSync(interaction.interactCraftingCellFromInventory(1))
+
+    expect(logDrafted.grid.cells[1]).toEqual({ ...repairedLogs, count: 1 })
+    expect(logDrafted.grid.cells[1]?.components).toEqual(repairedLogs.components)
+    expect(logDrafted.grid.cells[1]?.components.repairCost).toBe(3)
+    expect(Effect.runSync(service.snapshot).slots[1]).toEqual(repairedLogs)
+  })
+
+  it('consumes one item from each cell per craft and passes the cell components to craft', () => {
+    const pickaxe = stackOf('wooden_pickaxe', 1)
+    const service = Effect.runSync(makeInventoryService({
+      slots: [pickaxe, repairedLogs, ...emptyInventory().slots.slice(2)],
+    }))
+    const crafted: CraftResult = {
+      _tag: 'Crafted',
+      recipeId: planksRecipe.id,
+      output: stackOf('oak_planks', 4),
+    }
+    const craftCalls: Array<CraftGrid> = []
+    let dirtyCount = 0
+    const interaction = createInventoryInteraction({
+      ...service,
+      craft: (grid) => Effect.sync((): CraftResult => {
+        craftCalls.push(grid)
+        return crafted
+      }),
+    }, {
+      consumeCraftingGrid: true,
+      onCrafted: () => { dirtyCount += 1 },
+    })
+    Effect.runSync(interaction.clickInventoryItem(0, 'left'))
+    Effect.runSync(interaction.interactCraftingCellFromInventory(0))
+    Effect.runSync(interaction.clickInventoryItem(1, 'left'))
+    Effect.runSync(interaction.interactCraftingCellFromInventory(1))
+
+    const result = Effect.runSync(interaction.craftOnce())
+
+    expect(craftCalls).toHaveLength(1)
+    expect(craftCalls[0]?.cells[0]?.components).toEqual(pickaxe.components)
+    expect(craftCalls[0]?.cells[1]?.components).toEqual(repairedLogs.components)
+    expect(result.status).toEqual(crafted)
+    expect(result.grid.cells).toEqual([undefined, undefined, undefined, undefined])
+    expect(dirtyCount).toBe(1)
   })
 })
