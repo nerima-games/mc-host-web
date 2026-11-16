@@ -11,7 +11,9 @@ type SwimmingSnapshot = {
     readonly active: boolean
     readonly fullySubmerged: boolean
     readonly oxygenSecs: number
+    readonly drowningElapsedSecs: number
   }
+  readonly environmentalContact: { readonly simulationElapsedSecs: number }
   readonly vitals: { readonly healthPoints: number }
 }
 
@@ -71,9 +73,26 @@ test('consumes oxygen, applies drowning damage, and recovers after surfacing', a
   )
   await expect(page.locator('[data-testid="swimming"]')).toBeHidden()
 
-  const surfaced = await snapshot(page)
-  await page.waitForTimeout(1_200)
-  expect((await snapshot(page)).vitals.healthPoints).toBe(surfaced.vitals.healthPoints)
+  const surfaced = await snapshotWithFrames(page)
+  let previousHealth = surfaced.value.vitals.healthPoints
+  await waitForSimulationProgress(
+    page,
+    async () => {
+      const current = await snapshotWithFrames(page)
+      expect(current.value.swimming.active).toBe(false)
+      expect(current.value.swimming.fullySubmerged).toBe(false)
+      expect(current.value.swimming.oxygenSecs).toBeGreaterThanOrEqual(surfaced.value.swimming.oxygenSecs)
+      expect(current.value.swimming.drowningElapsedSecs).toBe(0)
+      // Passive regeneration may heal the player while drowning stays stopped.
+      expect(current.value.vitals.healthPoints).toBeGreaterThanOrEqual(previousHealth)
+      previousHealth = current.value.vitals.healthPoints
+      return { frames: current.frames, value: current }
+    },
+    (current) => current.frames > surfaced.frames
+      && current.value.environmentalContact.simulationElapsedSecs
+        - surfaced.value.environmentalContact.simulationElapsedSecs > 1.2,
+    { description: 'no new drowning across a full damage interval after surfacing' },
+  )
   expect(pageErrors).toEqual([])
   expect(consoleErrors).toEqual([])
 })

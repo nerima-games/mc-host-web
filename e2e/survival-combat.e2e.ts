@@ -34,6 +34,10 @@ type EquipmentSnapshotEntry = {
   } | null
 }
 type GameplaySnapshot = {
+  readonly environmentalContact: {
+    readonly lastDamageElapsedSecs: number | null
+    readonly cells: ReadonlyArray<{ readonly block: string; readonly contactDamage: number }>
+  }
   readonly dimension: 'overworld' | 'nether' | 'end'
   readonly pose: Pose
   readonly vitals: {
@@ -152,7 +156,42 @@ test('reduces player damage with equipped iron armor', async ({ page }) => {
   await startGameSession(page)
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
 
-  const equipped = await callQa<GameplaySnapshot>(page, 'gameplay.seedIronArmor')
+  const firstLavaContact = (armored: boolean) => page.evaluate(async (equipArmor) => {
+    const transport = window.__NERIMA_GAMES_QA__
+    if (transport === undefined) throw new Error('missing QA transport')
+    const dispatch = async (operation: string): Promise<GameplaySnapshot> => {
+      const result = await transport.dispatch('gameplay', operation, null)
+      if (result._tag === 'Failure') throw new Error(JSON.stringify(result.error))
+      return result.value as GameplaySnapshot
+    }
+    // Queue both writes before the frame starts, so contact cannot hit between
+    // restoring the encounter and equipping the armor.
+    const [seeded, armor] = await Promise.all([
+      dispatch('seedDuplicateLavaContact'),
+      equipArmor ? dispatch('seedIronArmor') : Promise.resolve(undefined),
+    ])
+    const equipped = armor ?? seeded
+    for (;;) {
+      // Each dispatch reads the next frame boundary, before another tick can
+      // hide the first hit behind passive regeneration or a second contact.
+      const damaged = await dispatch('snapshot')
+      if (damaged.environmentalContact.lastDamageElapsedSecs !== null) {
+        return { equipped, damaged }
+      }
+    }
+  }, armored)
+
+  const control = await firstLavaContact(false)
+  expect(control.equipped.vitals.healthPoints).toBe(20)
+  expect(control.damaged.vitals.healthPoints).toBe(16)
+  expect(control.damaged.vitals.lastDamageCause).toBeUndefined()
+
+  const { equipped, damaged } = await firstLavaContact(true)
+  expect(equipped.environmentalContact.cells.map(({ block, contactDamage }) => ({ block, contactDamage }))).toEqual([
+    { block: 'lava', contactDamage: 4 },
+    { block: 'lava', contactDamage: 4 },
+  ])
+  expect(damaged.environmentalContact.cells).toEqual(equipped.environmentalContact.cells)
   expect(equipped.inventory.equipment).toMatchObject({
     head: {
       item: 'iron_helmet',
@@ -177,8 +216,10 @@ test('reduces player damage with equipped iron armor', async ({ page }) => {
   })
   expect(equipped.vitals.healthPoints).toBe(20)
 
-  const damaged = await callQa<GameplaySnapshot>(page, 'gameplay.damage')
-  expect(damaged.vitals.healthPoints).toBeCloseTo(18.4, 5)
+  // Java armor/toughness: iron's 15 points and zero toughness leave 13
+  // effective points against a 4-point hit: 4 * (1 - 13 / 25) = 1.92.
+  expect(damaged.vitals.healthPoints).toBeCloseTo(18.08, 5)
+  expect(damaged.vitals.healthPoints).toBeGreaterThan(control.damaged.vitals.healthPoints)
   expect(damaged.vitals.lastDamageCause).toBeUndefined()
   expect(damaged.inventory.equipment).toMatchObject({
     head: { durability: { current: 164, max: 165 } },
