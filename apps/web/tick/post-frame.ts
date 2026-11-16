@@ -1,6 +1,6 @@
 import { WorldId } from '@nerima-games/mx-multiplayer'
 import { Effect, Option, Ref, Result } from 'effect'
-import { AngleRadians, blockIdOf, blockPositionKeyOf, EnchantmentLevel, EntityId, position, PositionAxis, StackCount } from '@nerima-games/mc-kernel'
+import { AngleRadians, blockIdOf, blockPositionKeyOf, EnchantmentLevel, EntityHealthPoints, EntityId, position, PositionAxis, StackCount } from '@nerima-games/mc-kernel'
 import { BlocksPerSecond, DeltaTimeSecs, PLAYER_HALF_HEIGHT, PLAYER_HALF_WIDTH } from '@nerima-games/mc-physics'
 import { changed, type ItemStack, UNCHANGED } from '@nerima-games/mc-sim'
 import { DEFAULT_BLOCK_REACH, INITIAL_ENVIRONMENTAL_CONTACT_DAMAGE_STATE, enchantmentLevel, resolveEnvironmentalContactDamage } from '@nerima-games/mx-gameplay'
@@ -16,7 +16,7 @@ export const runTickPostFrame = (
 ): Effect.Effect<H5bPostFrameResult, Effect.Error<
   | ReturnType<H5bPostFrameContext['resolveTargetedPrimaryAttack']>
   | ReturnType<H5bPostFrameContext['applyPortalTravels']>
->> => Effect.gen(function* () {
+> | Result.Result.Failure<ReturnType<H5bPostFrameContext['applyWorldExplosion']>>> => Effect.gen(function* () {
   const { frame, movement, framesTotal } = input
   const h5a = context.h5a
   const targeting = h5a.targeting
@@ -443,10 +443,11 @@ export const runTickPostFrame = (
 
     const playerDamages = Effect.runSync(drainPlayerDamages(gameplayState))
     for (const event of playerDamages) {
-      applyPlayerDamage(
-        event.damage,
-        event._tag === 'StatusEffect' ? event.minimumHealthPoints : 0,
-      )
+      if (event._tag === 'StatusEffect') {
+        applyPlayerDamage(event.damage, EntityHealthPoints(event.minimumHealthPoints))
+      } else {
+        applyPlayerDamage(event.damage)
+      }
     }
     const playerHeals = Effect.runSync(drainPlayerHeals(gameplayState))
     if (multiplayer === undefined) {
@@ -574,12 +575,14 @@ export const runTickPostFrame = (
         applyPlayerDamage({ amount: advancedWither.meleeDamage, cause: 'generic' })
       }
       for (const explosion of advancedWither.explosions) {
-        applyWorldExplosion(
+        const result = applyWorldExplosion(
           explosion.position,
           explosion.power,
           Math.floor(h5aState.simulationElapsedSecs.get() * 20),
           explosion.destroysResistantBlocks,
         )
+        if (Result.isFailure(result)) console.warn('Unable to apply wither explosion', result.failure)
+        yield* Effect.fromResult(result)
       }
       if (advancedWither.explosions.length > 0 || advancedWither.meleeDamage > 0) markSessionDirty()
     }

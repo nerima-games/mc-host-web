@@ -20,7 +20,7 @@ import {
 } from '@nerima-games/mx-gameplay'
 import * as gameplay from '@nerima-games/mx-gameplay'
 import { Effect, Option, Ref, Result } from 'effect'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import { BlocksPerSecond } from '@nerima-games/mc-physics'
 import { makeBudgetedDirtySource } from '../apps/web/chunk-sync-budget'
@@ -260,7 +260,7 @@ const makeContext = async (primaryAttackConsumed: ReturnType<typeof cell<boolean
     pressurePlateOccupancy: new Map(),
     environmentalContactsForPose: () => [],
     isGameplayBlockSolid: () => false,
-    applyWorldExplosion: () => undefined,
+    applyWorldExplosion: () => Result.succeed(undefined),
     resetBowUse: () => bowUseState.state.set(IDLE_BOW_USE),
     projectileHud: { textContent: '', hidden: true },
     projectedInventoryEnchantedItem: () => null,
@@ -529,7 +529,7 @@ describe('tick post-frame processing', () => {
         ...base.h5a,
         playerIsDead: () => Effect.runSync(world.vitals.view).healthPoints === 0,
       },
-      applyPlayerDamage: (damage, minimumHealthPoints = 0) => {
+      applyPlayerDamage: (damage, minimumHealthPoints = EntityHealthPoints(0)) => {
         applied.push({ ...damage, minimumHealthPoints })
         Effect.runSync(world.vitals.damage(damage))
       },
@@ -554,6 +554,35 @@ describe('tick post-frame processing', () => {
     expect(harness.inventoryOpenEvents).toEqual([false])
     expect(harness.sessionDirtyCount()).toBe(1)
     expect(result?.deadAfterFrame).toBe(true)
+  })
+
+  it('reports a wither explosion failure and stops later explosions', async () => {
+    const harness = await makeContext(cell(false))
+    const failure = { _tag: 'ExplosionValidationFailure', path: 'power', reason: 'fixture rejection' } as const
+    const advanced = initialWitherRuntimeState()
+    const explosion = { position: { x: 0, y: 64, z: 0 }, power: 5, destroysResistantBlocks: false }
+    let calls = 0
+    const context: H5bPostFrameContext = {
+      ...inOverworld(harness.context),
+      advanceWitherRuntime: () => ({ state: advanced, meleeDamage: 0, explosions: [explosion, explosion] }),
+      applyWorldExplosion: () => { calls += 1; return Result.fail(failure) },
+    }
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    try {
+      const result = Effect.runSync(Effect.result(runTickPostFrameEffect(context, {
+        frame: harness.input,
+        movement: inOverworldMovement(harness.movement),
+        framesTotal: 5,
+      })))
+
+      expect(Result.isFailure(result)).toBe(true)
+      if (Result.isFailure(result)) expect(result.failure).toBe(failure)
+      expect(warning).toHaveBeenCalledWith('Unable to apply wither explosion', failure)
+      expect(calls).toBe(1)
+      expect(context.state.witherRuntimeState.get()).toBe(advanced)
+    } finally {
+      warning.mockRestore()
+    }
   })
 
   it('persists advanced projectile state when targeting fails with a typed error', async () => {

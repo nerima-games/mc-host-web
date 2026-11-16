@@ -3,8 +3,8 @@ import { type InputSnapshot } from '@nerima-games/mc-render'
 import { CropSnapshotSchema, PlayerServiceSnapshotSchema, PlayerStorageSnapshotSchema, makeTimeService, makeWeatherService, makeWorldCommitCoordinator, HungerPoints, POTATO_MATURITY_SECS, type CropSnapshot } from '@nerima-games/mc-sim'
 import { CHUNK_SIZE_XZ, CHUNK_VOLUME, BIOMES, type ChunkSource } from '@nerima-games/mc-worldgen'
 import { type ItemUseResult, type MobBehaviour } from '@nerima-games/mx-gameplay'
-import { Effect, Option, Ref, Schema } from 'effect'
-import { describe, expect, it } from 'vitest'
+import { Effect, Option, Ref, Result, Schema } from 'effect'
+import { describe, expect, it, vi } from 'vitest'
 import * as gameplay from '@nerima-games/mx-gameplay'
 import { makeUiFrameState } from '@nerima-games/mx-ui'
 
@@ -71,11 +71,7 @@ type HarnessOptions = Readonly<{
   nearbyVillager?: PersistedVillager
   endFeatureResult?: boolean
   deadAfterFrame?: boolean
-  targetedBlock?: {
-    readonly position: SessionPosition
-    readonly adjacentPosition: SessionPosition
-    readonly block: number
-  }
+  targetedBlock?: Effect.Success<ReturnType<H5cTickContext['services']['targetedBlock']>>
   fishingHasWater?: boolean
   fullInventory?: boolean
   hungry?: boolean
@@ -270,7 +266,7 @@ const makeHarness = async (options: HarnessOptions = {}) => {
     },
     inventoryMode: () => 'player',
     applyPlayerDamage: (damage: unknown) => { damageCalls.push(damage) },
-    applyWorldExplosion: () => undefined,
+    applyWorldExplosion: () => Result.succeed(undefined),
     endDragonPosition: () => ({ x: 0, y: 64, z: 0 }),
     spawnDroppedItems: gameplay.spawnDroppedItems,
     spawnMobDrops: () => Effect.void,
@@ -631,8 +627,8 @@ describe('tick post-frame gameplay processing', () => {
 
   it('casts a local fishing rod into water and records the fishing session', async () => {
     const target = {
-      position: { x: 2, y: 64, z: -3 },
-      adjacentPosition: { x: 2, y: 65, z: -3 },
+      position: position(PositionAxis(2), PositionAxis(64), PositionAxis(-3)),
+      adjacentPosition: position(PositionAxis(2), PositionAxis(65), PositionAxis(-3)),
       block: Option.getOrThrow(blockIdOf('water')),
     }
     await withHarness({
@@ -755,6 +751,107 @@ describe('tick post-frame gameplay processing', () => {
         _tag: 'Block',
         block: Option.getOrThrow(blockIdOf('redstone_lamp_lit')),
       })
+    })
+  })
+
+  it.each(['target', 'environment'])('propagates a fishing %s failure before casting', async (stage) => {
+    await withHarness({
+      useTriggered: true,
+      selectedItem: 'fishing_rod',
+      targetedBlock: {
+        position: position(PositionAxis(2), PositionAxis(64), PositionAxis(-3)),
+        adjacentPosition: position(PositionAxis(2), PositionAxis(65), PositionAxis(-3)),
+        block: Option.getOrThrow(blockIdOf('water')),
+      },
+    }, (harness) => {
+      const failure = {
+        _tag: 'CoordinateConversionFailure', reason: 'block-axis-out-of-range', axis: 'x', kind: 'RangeError',
+      } as const
+      const context: H5cTickContext = {
+        ...harness.context,
+        services: {
+          ...harness.context.services,
+          ...(stage === 'target'
+            ? { targetedBlock: () => Effect.fail(failure) }
+            : { fishingEnvironmentAt: () => Effect.fail(failure) }),
+        },
+      }
+      const result = Effect.runSync(Effect.result(runTickPostFrameGameplayEffect(context, {
+        frame: harness.frame,
+        movement: harness.movement,
+        postFrame: harness.postFrame,
+        nowSecs: MonotonicTimeSecs(2),
+      })))
+
+      expect(Result.isFailure(result)).toBe(true)
+      if (Result.isFailure(result)) expect(result.failure).toBe(failure)
+      expect(harness.fishingResults).toEqual([])
+      expect(context.h5a.state.fishingSession.get()).toBeUndefined()
+      expect(harness.streamCalls).toEqual([])
+    })
+  })
+
+  it('reports an End feature failure and stops later use routing', async () => {
+    await withHarness({ useTriggered: true, selectedItem: 'eye_of_ender' }, (harness) => {
+      const failure = new RangeError('fixture End feature rejection')
+      const context: H5cTickContext = {
+        ...harness.context,
+        services: { ...harness.context.services, useEndFeature: () => Effect.fail(failure) },
+      }
+      const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+      try {
+        const result = Effect.runSync(Effect.result(runTickPostFrameGameplayEffect(context, {
+          frame: harness.frame,
+          movement: harness.movement,
+          postFrame: harness.postFrame,
+          nowSecs: MonotonicTimeSecs(2),
+        })))
+
+        expect(Result.isFailure(result)).toBe(true)
+        if (Result.isFailure(result)) expect(result.failure).toBe(failure)
+        expect(warning).toHaveBeenCalledWith('Unable to use End feature', failure)
+        expect(harness.playerUiCalls.get()).toBe(0)
+        expect(harness.streamCalls).toEqual([])
+      } finally {
+        warning.mockRestore()
+      }
+    })
+  })
+
+  it('reports a bed explosion failure before announcing its completion', async () => {
+    await withHarness({ useTriggered: true, dimension: 'end' }, (harness) => {
+      Effect.runSync(harness.world.chunkStore.load(chunkCoord(0, -1)))
+      const failure = { _tag: 'ExplosionValidationFailure', path: 'power', reason: 'fixture rejection' } as const
+      const context: H5cTickContext = {
+        ...harness.context,
+        h5a: {
+          ...harness.context.h5a,
+          currentChunkStore: {
+            ...harness.world.chunkStore,
+            getBlock: () => Effect.succeed({ _tag: 'Block', block: Option.getOrThrow(blockIdOf('bed')) }),
+          },
+        },
+        h5b: { ...harness.context.h5b, applyWorldExplosion: () => Result.fail(failure) },
+      }
+      const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+      try {
+        const result = Effect.runSync(Effect.result(runTickPostFrameGameplayEffect(context, {
+          frame: harness.frame,
+          movement: harness.movement,
+          postFrame: harness.postFrame,
+          nowSecs: MonotonicTimeSecs(2),
+        })))
+
+        expect(Result.isFailure(result)).toBe(true)
+        if (Result.isFailure(result)) expect(result.failure).toBe(failure)
+        expect(warning).toHaveBeenCalledWith('Unable to apply bed explosion', failure)
+        expect(harness.worldWriteBatches).toHaveLength(1)
+        expect(harness.attributes.has('data-bed-explosion-request')).toBe(false)
+        expect(harness.attributes.has('data-sleep-result')).toBe(false)
+        expect(harness.streamCalls).toEqual([])
+      } finally {
+        warning.mockRestore()
+      }
     })
   })
 

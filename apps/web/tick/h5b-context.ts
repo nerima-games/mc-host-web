@@ -1,12 +1,17 @@
 import type { MonotonicTimeSecs } from '@nerima-games/mc-kernel'
 import type { ItemStack } from '@nerima-games/mc-sim'
 import type { GameplayFrameState } from '@nerima-games/mx-gameplay'
-import type { Effect } from 'effect'
+import type { Effect, Result } from 'effect'
 
 import type { H5aFrameInputResult, H5aMovementResult, H5aTickContext, MutableState } from './h5a-context'
 
 type EffectValue<T> = T extends Effect.Effect<infer A, infer _E, infer _R> ? A : never
 type LegacyGameplayItemType = Exclude<ItemStack['item'], 'arrow' | 'bow'>
+type WorldExplosionFailure =
+  | import('effect').Brand.BrandError
+  | Result.Result.Failure<ReturnType<typeof import('@nerima-games/mc-sim').planExplosion>>
+  | import('@nerima-games/mc-kernel').BlockRegistryResolutionFailure
+  | Effect.Error<ReturnType<import('@nerima-games/mc-kernel').WorldWritePort['Service']['applyBatch']>>
 
 export type H5bPostFrameInput = Readonly<{
   readonly frame: H5aFrameInputResult
@@ -132,7 +137,7 @@ export type H5bPostFrameContext = {
   >
   readonly applyPlayerDamage: (
     damage: Parameters<H5aTickContext['world']['vitals']['damage']>[0],
-    minimumHealthPoints?: number,
+    minimumHealthPoints?: import('@nerima-games/mc-kernel').EntityHealthPoints,
   ) => void
   readonly settleMeleeAttackResults: () => void
   readonly alignActiveDimension: (dimension: import('../session-persistence').SessionState['dimension']) => boolean
@@ -158,7 +163,7 @@ export type H5bPostFrameContext = {
     radius: number,
     seed: number,
     destroysResistantBlocks: boolean,
-  ) => void
+  ) => Result.Result<void, WorldExplosionFailure>
   readonly resetBowUse: () => void
   readonly projectileHud: Pick<HTMLElement, 'textContent' | 'hidden'>
   readonly projectedInventoryEnchantedItem: (slotIndex: number) => import('@nerima-games/mx-gameplay').EnchantedItem | null

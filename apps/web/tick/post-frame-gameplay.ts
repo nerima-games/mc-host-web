@@ -70,7 +70,10 @@ type TickGameplayFailure = Effect.Error<
   | H5cTickContext['services']['time']['timeOfDay']
   | ReturnType<H5cTickContext['services']['worldWrite']['applyBatch']>
   | ReturnType<H5cTickContext['services']['streamAround']>
->
+  | ReturnType<H5cTickContext['services']['useEndFeature']>
+  | ReturnType<H5cTickContext['services']['targetedBlock']>
+  | ReturnType<H5cTickContext['services']['fishingEnvironmentAt']>
+> | Result.Result.Failure<ReturnType<H5cTickContext['h5b']['applyWorldExplosion']>>
 
 export const runTickPostFrameGameplay = (
   context: H5cTickContext,
@@ -268,14 +271,14 @@ export const runTickPostFrameGameplay = (
       fishingDurability !== null &&
       fishingDurability !== undefined
     ) {
-      const target = Effect.runSync(targetedBlock())
+      const target = yield* targetedBlock()
       const dimension = Effect.runSync(playerApi.dimension)
       const environment = target === undefined
         ? { hasWater: false, hasSkyAccess: false, isRaining: false, isOpenWater: false }
-        : Effect.runSync(fishingEnvironmentAt(
+        : yield* fishingEnvironmentAt(
             target.position,
             weatherBeforeFrame.weather === 'rain' || weatherBeforeFrame.weather === 'thunder',
-          ))
+          )
       const serial = takeThenIncrement(state.nextFishingRoll)
       const cast = castFishing({
         ...fishingHeld,
@@ -332,7 +335,7 @@ export const runTickPostFrameGameplay = (
           y: pose.feetPosition.y + EYE_LEVEL_OFFSET,
           z: pose.feetPosition.z,
         }
-        const target = Effect.runSync(targetedBlock())
+        const target = yield* targetedBlock()
         const hitDistance = target === undefined
           ? undefined
           : Math.hypot(
@@ -362,7 +365,7 @@ export const runTickPostFrameGameplay = (
         sendEntityCommand({ _tag: 'BucketUseCommand' })
         usedSpecialItem = true
       } else {
-        const target = Effect.runSync(targetedBlock())
+        const target = yield* targetedBlock()
         if (target !== undefined) {
           const dimension = Effect.runSync(playerApi.dimension)
           const result = Effect.runSync(useBucket(
@@ -392,7 +395,7 @@ export const runTickPostFrameGameplay = (
       if (multiplayer !== undefined && h5aState.multiplayerHandshakeComplete.get()) {
         sendEntityCommand({ _tag: 'VehicleUseCommand' })
       } else {
-        const target = Effect.runSync(targetedBlock())
+        const target = yield* targetedBlock()
         if (target !== undefined) {
           const type = specialSelected.item === 'oak_boat' ? 'boat' : 'minecart'
           const item = specialSelected.item
@@ -437,7 +440,7 @@ export const runTickPostFrameGameplay = (
       usedSpecialItem = true
     }
     const portalTarget = !usedSpecialItem && multiplayer !== undefined && h5aState.multiplayerHandshakeComplete.get()
-      ? Effect.runSync(targetedBlock())
+      ? yield* targetedBlock()
       : undefined
     const portalBlock = portalTarget === undefined ? undefined : typeOfBlock(portalTarget.block)
     const usedMultiplayerPortal = portalTarget !== undefined
@@ -452,10 +455,13 @@ export const runTickPostFrameGameplay = (
     const shouldAttemptEndFeature = currentChunkContext().dimension === 'end'
       || endPortalComplete()
       || specialSelected?.item === 'eye_of_ender'
-    const usedEndFeature = usedSpecialItem
-      || usedMultiplayerPortal
-      || (shouldAttemptEndFeature && Effect.runSync(useEndFeature()))
-    const brewingTarget = usedEndFeature || usedMultiplayerLever ? undefined : Effect.runSync(targetedBlock())
+    let usedEndFeature = usedSpecialItem || usedMultiplayerPortal
+    if (!usedEndFeature && shouldAttemptEndFeature) {
+      const result = yield* Effect.result(useEndFeature())
+      if (Result.isFailure(result)) console.warn('Unable to use End feature', result.failure)
+      usedEndFeature = yield* Effect.fromResult(result)
+    }
+    const brewingTarget = usedEndFeature || usedMultiplayerLever ? undefined : yield* targetedBlock()
     const opensBrewing = brewingTarget !== undefined && typeOfBlock(brewingTarget.block) === 'brewing_stand'
     const routeResult = usedEndFeature || usedMultiplayerLever || opensBrewing
       ? undefined
@@ -490,12 +496,14 @@ export const runTickPostFrameGameplay = (
       } else if (currentDimension !== 'overworld') {
         state.sleepRuntimeState.set(leaveSleep(state.sleepRuntimeState.get(), multiplayer?.query.player ?? 'local'))
         yield* writeBlocks(asDimensionId(currentDimension), [{ position: bedPosition, block: Option.getOrThrow(blockIdOf('air')) }])
-        applyWorldExplosion(
+        const explosion = applyWorldExplosion(
           { x: bedPosition.x + 0.5, y: bedPosition.y + 0.5, z: bedPosition.z + 0.5 },
           5,
           Math.floor(h5aState.simulationElapsedSecs.get() * 20),
           false,
         )
+        if (Result.isFailure(explosion)) console.warn('Unable to apply bed explosion', explosion.failure)
+        yield* Effect.fromResult(explosion)
         document.body.setAttribute(
           'data-bed-explosion-request',
           `${currentDimension}:${bedPosition.x},${bedPosition.y},${bedPosition.z}`,
