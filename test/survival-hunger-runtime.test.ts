@@ -28,7 +28,8 @@ describe('survival hunger web coordinator', () => {
 
     const outcome = hunger.tick(DeltaTimeSecs(4))
 
-    expect(outcome.exhaustionAdded).toBe(0.1)
+    // mx-gameplay 0.11.0 SURVIVAL_EXHAUSTION.walkPerBlock = 0 (dist/domain/survival-hunger.js), so a 10-block walk adds no exhaustion.
+    expect(outcome.exhaustionAdded).toBe(0)
     expect(outcome.foodTicks).toBe(1)
     expect(Effect.runSync(canonical.snapshot)).toEqual(outcome.vitals)
   })

@@ -96,7 +96,11 @@ describe('browser preview', () => {
       yield* Effect.yieldNow
       animation.runNext(1_000)
       yield* Effect.yieldNow
-      expect(frames).toStrictEqual([0.016, 0.016, 0.05])
+      // mc-sim 0.11.1 GameLoop (dist/application/game-loop.js): the handler runs only when a 0.05 s tick
+      // (mc-kernel 0.17.0 tickDuration) completes, as PHYSICS_SUBSTEPS_PER_TICK = 2 calls of
+      // physicsSubstepDuration = 0.025 s each (dist/domain/time/frame-timing.js).
+      // Accumulated 0.016 + 0.016 + 0.05 (clamped by MAX_FRAME_DELTA_SECS) = 0.082 s: one tick.
+      expect(frames).toStrictEqual([0.025, 0.025])
 
       const second = yield* preview.restart
       expect(second).not.toBe(first)
@@ -137,18 +141,24 @@ describe('browser preview', () => {
       yield* preview.start
       animation.runNext(100)
       yield* Effect.yieldNow
-      expect(frames).toStrictEqual([0.016])
+      animation.runNext(150)
+      yield* Effect.yieldNow
+      // mc-sim 0.11.1 GameLoop (dist/application/game-loop.js): the handler runs only when a 0.05 s tick
+      // (mc-kernel 0.17.0 tickDuration) completes, as PHYSICS_SUBSTEPS_PER_TICK = 2 calls of
+      // physicsSubstepDuration = 0.025 s each (dist/domain/time/frame-timing.js).
+      expect(frames).toStrictEqual([0.025])
       expect(animation.callbacks.size).toBe(1)
 
-      animation.runNext(116)
+      animation.runNext(200)
       yield* Effect.yieldNow
-      expect(frames).toStrictEqual([0.016])
+      expect(frames).toStrictEqual([0.025])
       yield* Deferred.succeed(firstFrame, undefined)
       yield* Effect.yieldNow
       expect(animation.callbacks.size).toBe(1)
-      animation.runNext(132)
+      animation.runNext(250)
       yield* Effect.yieldNow
-      expect(frames).toStrictEqual([0.016, 0.016])
+      // Frames at 150, 200 and 250 each complete one tick: three ticks, two substeps each.
+      expect(frames).toStrictEqual([0.025, 0.025, 0.025, 0.025, 0.025, 0.025])
       yield* preview.stop
     }),
   )
@@ -175,10 +185,13 @@ describe('browser preview', () => {
       yield* preview.start
       animation.runNext(100)
       yield* Effect.yieldNow
-      animation.runNext(116)
+      animation.runNext(150)
       yield* Effect.yieldNow
 
-      expect(frames).toStrictEqual([0.016, 0.016])
+      // mc-sim 0.11.1 GameLoop (dist/application/game-loop.js): the handler runs only when a 0.05 s tick
+      // (mc-kernel 0.17.0 tickDuration) completes, as PHYSICS_SUBSTEPS_PER_TICK = 2 calls of
+      // physicsSubstepDuration = 0.025 s each (dist/domain/time/frame-timing.js).
+      expect(frames).toStrictEqual([0.025, 0.025])
       expect(frameReads).toBe(1)
       yield* preview.stop
     }),
@@ -206,6 +219,9 @@ describe('browser preview', () => {
 
       const handle = yield* preview.start
       animation.runNext(100)
+      yield* Effect.yieldNow
+      // A 50 ms gap completes a tick, so the handler starts (mc-sim 0.11.1 GameLoop, see above).
+      animation.runNext(150)
       yield* Effect.yieldNow
       yield* handle.stop
       expect(events).toStrictEqual(['frame:start', 'frame:release', 'runtime:stop'])
@@ -359,6 +375,9 @@ describe('browser preview', () => {
 
       const handle = yield* preview.start
       animation.runNext(100)
+      yield* Effect.yieldNow
+      // A 50 ms gap completes a tick, so the handler runs (mc-sim 0.11.1 GameLoop, see above).
+      animation.runNext(150)
       yield* Effect.yieldNow
       yield* Effect.yieldNow
       expect(yield* handle.isRunning).toBe(false)

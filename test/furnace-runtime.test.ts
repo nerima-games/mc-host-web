@@ -31,8 +31,9 @@ describe('furnace web runtime', () => {
 
     expect(outcome._tag).toBe('Applied')
     expect(outcome.changed).toBe(true)
-    expect(outcome.state.input).toBeNull()
-    expect(outcome.state.fuel).toBeNull()
+    // mc-kernel 0.17.0 ItemSlot = ItemStack | undefined (dist/domain/item/item-stack.d.ts): FurnaceState.input/fuel empty slots are `undefined`, not `null`.
+    expect(outcome.state.input).toBeUndefined()
+    expect(outcome.state.fuel).toBeUndefined()
     expect(outcome.state.output).toEqual(stackOf('iron_ingot', 1))
   })
 
