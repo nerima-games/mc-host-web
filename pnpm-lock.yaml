@@ -189,8 +189,8 @@ importers:
         specifier: 0.6.0
         version: 0.6.0
       '@nerima-games/mc-render':
-        specifier: 0.11.0
-        version: 0.11.0
+        specifier: 0.12.0
+        version: 0.12.0
       '@nerima-games/mc-save':
         specifier: 0.8.0
         version: 0.8.0
@@ -595,6 +595,10 @@ packages:
 
   '@nerima-games/mc-render@0.11.0':
     resolution: {integrity: sha512-Yps21De6Wwc9I7rhGeZX6BJ01ZYrOeqcQh55KW86+Ki5XZmHkhLTiXVILGsJJM62Qmhnyv+IpyfCw+mVj5gzMA==, tarball: https://npm.pkg.github.com/download/@nerima-games/mc-render/0.11.0/e4c3498cc166e9fe1812897e14f8fdcc278b1bea}
+    engines: {node: '>=24.0.0', pnpm: '>=11.24.0'}
+
+  '@nerima-games/mc-render@0.12.0':
+    resolution: {integrity: sha512-0JVFDGx4PCaFuCK/QEJ0bGEK6hvdN/qoHqF2n6Wf/Tk2MInNHOTpgMzVeeKZcpALXnuHEMVGMb+MjNiqHNFGnQ==, tarball: https://npm.pkg.github.com/download/@nerima-games/mc-render/0.12.0/8ac4b3036276d149f114ffeb917f7d111770182a}
     engines: {node: '>=24.0.0', pnpm: '>=11.24.0'}
 
   '@nerima-games/mc-save@0.4.1':
@@ -1631,6 +1635,16 @@ snapshots:
       effect: 4.0.5
 
   '@nerima-games/mc-render@0.11.0':
+    dependencies:
+      '@nerima-games/mc-kernel': 0.17.0
+      '@nerima-games/mc-meshing': 0.7.0
+      '@nerima-games/mc-sim': 0.11.1
+      '@nerima-games/mc-worldgen': 0.9.1
+      '@types/three': 0.186.0(patch_hash=f24dd792bcb58f32a179ae994bc14b1945dbbb990a5bf76a6ae1a0b4fcef9460)
+      effect: 4.0.5
+      three: 0.186.1
+
+  '@nerima-games/mc-render@0.12.0':
     dependencies:
       '@nerima-games/mc-kernel': 0.17.0
       '@nerima-games/mc-meshing': 0.7.0
