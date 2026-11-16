@@ -54,7 +54,6 @@ import {
   type ChunkStoreApi,
   type ChunkStoreError,
   type Dimension,
-  type InvalidNaturalStructureCoordinate,
 } from '@nerima-games/mc-worldgen'
 import {
   type ChunkMesher,
@@ -80,7 +79,6 @@ import {
   WorldCommitCoordinator,
   type BrewingServiceApi,
   type WorldCommitCoordinatorApi,
-  type WorldCommitCoordinatorError,
 } from '@nerima-games/mc-sim'
 import {
   BLAZE_KIND,
@@ -196,6 +194,7 @@ import {
   QA_WATER_PLACEMENT_POSE,
   QA_WATER_SIZE,
 } from './qa-fixtures'
+import { type ChunkStreamingFailure } from './chunk-streaming'
 import { type RenderLightingSnapshot } from './render-lighting'
 import {
   initialPlayerSwimmingRuntimeState,
@@ -345,7 +344,7 @@ type QaSurfaceDeps = {
     readonly applyPlayerDamage: (damage: Damage) => void
     readonly streamAround: (context: QaChunkContext, x: number, z: number) => Effect.Effect<
       void,
-      WorldCommitCoordinatorError | InvalidNaturalStructureCoordinate
+      ChunkStreamingFailure
     >
     readonly getOrCreateDimensionChunkContext: (dimension: Dimension) => QaChunkContext
     readonly materializePortal: (dimension: Dimension, layout: PortalLayout) => Effect.Effect<
