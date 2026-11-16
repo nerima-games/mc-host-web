@@ -145,6 +145,14 @@ const makePauseMenu = (locked = true) => {
   const requestFlush = vi.fn<() => Promise<void>>().mockResolvedValue()
   const drainSettingsWrites = vi.fn<() => Promise<void>>().mockResolvedValue()
   const assign = vi.fn()
+  // The real settings view's close() hides the dialog, calls its onClose, which
+  // the host wires to closeSettings, and then restores focus.
+  const closeSettings = (): void => {
+    if (!settingsVisible) return
+    settingsVisible = false
+    menu.closeSettings()
+    settingsReturnFocus?.focus()
+  }
   const menu = installPlayerPauseMenu({
     document, parent, canvas, gameShell,
     window: { location: { assign } },
@@ -153,7 +161,7 @@ const makePauseMenu = (locked = true) => {
     setPaused,
     canPause: () => canPause,
     clearGameplayInput,
-    settingsView: { isOpen: () => settingsVisible, open: onOpenSettings },
+    settingsView: { isOpen: () => settingsVisible, open: onOpenSettings, close: closeSettings },
     getPlayerSettings: () => DEFAULT_PLAYER_SETTINGS,
     isBrewingOpen: () => brewingOpen,
     closeBrewing: () => { brewingOpen = false; order.push('close:brewing') },
@@ -176,11 +184,9 @@ const makePauseMenu = (locked = true) => {
     getFocused: () => focused,
     setCanPause: (next: boolean) => { canPause = next },
     openModals: () => { brewingOpen = true; tradeOpen = true; inventoryOpen = true },
-    closeSettings: () => {
-      settingsVisible = false
-      menu.closeSettings()
-      settingsReturnFocus?.focus()
-    },
+    // A keyboard Escape or the Close button: the dialog closes itself, and the
+    // key never reaches the frame's Escape handling.
+    closeSettings,
     frame: () => { for (const work of deferred.splice(0)) work() },
     lockChanged: () => emit(events, 'pointerlockchange', new Event('pointerlockchange')),
     lockFailed: () => emit(events, 'pointerlockerror', new Event('pointerlockerror')),
@@ -363,16 +369,52 @@ describe('pointer lock pause menu', () => {
     expect(state.onOpenSettings).not.toHaveBeenCalled()
     state.frame()
     expect(state.onOpenSettings).toHaveBeenCalledExactlyOnceWith(DEFAULT_PLAYER_SETTINGS, state.parent.findAction('settings'))
-    state.menu.handleEscape()
+    state.closeSettings()
     state.frame()
     expect(state.getPaused()).toBe(true)
-    state.closeSettings()
     expect(state.parent.inert).toBe(false)
     expect(state.getFocused()).toBe(state.parent.findAction('settings'))
     state.menu.reportError('Settings could not be saved.')
     expect(state.errorText()).toBe('Settings could not be saved.')
     state.menu.clearError()
     expect(state.errorText()).toBe('')
+  })
+
+  it.each([
+    { name: 'unlocked', locked: false },
+    { name: 'pointer-locked', locked: true },
+  ])('closes only settings on one gamepad Escape in a $name session', ({ locked }) => {
+    const state = makePauseMenu(locked)
+    state.menu.handleEscape()
+    state.frame()
+    state.click('settings')
+    state.frame()
+    expect(state.onOpenSettings).toHaveBeenCalledOnce()
+    state.menu.handleEscape()
+    state.frame()
+    expect(state.getPaused()).toBe(true)
+    expect(state.parent.inert).toBe(false)
+    expect(state.parent.hidden).toBe(false)
+    expect(state.parent.findAction('resume').attributes.has('hidden')).toBe(false)
+    expect(state.getFocused()).toBe(state.parent.findAction('settings'))
+    expect(state.onOpenSettings).toHaveBeenCalledOnce()
+    state.click('settings')
+    state.frame()
+    expect(state.onOpenSettings).toHaveBeenCalledTimes(2)
+  })
+
+  it('resumes an unlocked session on the Escape after the one that closed settings', () => {
+    const state = makePauseMenu(false)
+    state.menu.handleEscape()
+    state.frame()
+    state.click('settings')
+    state.frame()
+    state.menu.handleEscape()
+    state.frame()
+    expect(state.getPaused()).toBe(true)
+    state.menu.handleEscape()
+    state.frame()
+    expect(state.getPaused()).toBe(false)
   })
 
   it('waits for both save queues, prevents duplicate quit, and skips the busy action in the focus trap', async () => {

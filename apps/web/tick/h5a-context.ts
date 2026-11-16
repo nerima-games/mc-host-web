@@ -137,7 +137,7 @@ export type H5aTickContext = {
     readonly triggered: boolean
     readonly state: NativeInputQueueState
   }
-  readonly playerSettings: PlayerSettingsV1
+  readonly playerSettings: () => PlayerSettingsV1
   readonly lookSensitivity: number
   readonly playerApi: OwnerBackedWorld['player']
   readonly simState: SimFrameState
@@ -239,7 +239,7 @@ export type H5aFrameInputContext = {
   readonly resetPrimaryAttackGesture: H5aTickContext['resetPrimaryAttackGesture']
   readonly sendVitalsCommand: H5aTickContext['sendVitalsCommand']
   readonly consumeNativeInput: H5aTickContext['consumeNativeInput']
-  readonly playerSettings: Pick<PlayerSettingsV1, 'sensitivity'>
+  readonly playerSettings: () => Pick<PlayerSettingsV1, 'sensitivity'>
   readonly lookSensitivity: number
   readonly playerApi: Pick<OwnerBackedWorld['player'], 'look'>
 }

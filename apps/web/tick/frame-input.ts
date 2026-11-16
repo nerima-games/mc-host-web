@@ -2,6 +2,7 @@ import { ESCAPE_KEY_CODE, type InputAction, type InputSnapshot } from '@nerima-g
 import type { DeltaTimeSecs, MonotonicTimeSecs } from '@nerima-games/mc-kernel'
 import { Effect, Result } from 'effect'
 
+import { gamepadLookDelta } from '../gamepad-input'
 import type { H5aFrameInputContext, H5aFrameInputResult } from './h5a-context'
 
 export type FrameTiming = {
@@ -135,16 +136,18 @@ export const runTickFrameInput = (
   const useTriggered = canUse
     && (Effect.runSync(inputApi.wasActionJustTriggered('use')) || nativeUse.triggered)
   const useHeld = held('use') > 0
+  const gamepadLook = gamepadLookDelta(walk.gamepadAxes, timing.deltaSecs)
   const lookDelta = {
-    x: walk.pointerDelta.x + consumedTouchLook.delta.positionX,
-    y: walk.pointerDelta.y + consumedTouchLook.delta.positionY,
+    x: walk.pointerDelta.x + consumedTouchLook.delta.positionX + gamepadLook.x,
+    y: walk.pointerDelta.y + consumedTouchLook.delta.positionY + gamepadLook.y,
   }
   const looked = !dead && !state.inventoryOpen.get() && !state.tradeOpen.get() && !state.brewingOpen.get()
     && (lookDelta.x !== 0 || lookDelta.y !== 0)
   if (!dead && !state.inventoryOpen.get() && !state.tradeOpen.get() && !state.brewingOpen.get()) {
+    const { sensitivity } = context.playerSettings()
     Effect.runSync(context.playerApi.look(
-      -lookDelta.x * context.lookSensitivity * context.playerSettings.sensitivity,
-      -lookDelta.y * context.lookSensitivity * context.playerSettings.sensitivity,
+      -lookDelta.x * context.lookSensitivity * sensitivity,
+      -lookDelta.y * context.lookSensitivity * sensitivity,
     ))
   }
 

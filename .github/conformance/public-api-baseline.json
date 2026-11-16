@@ -1809,7 +1809,7 @@
     "count": 1,
     "file": "apps/web/tick/frame-input.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(context.playerApi.look( -lookDelta.x * context.lookSensitivity * context.playerSettings.sensitivity, -lookDelta.y * context.lookSensitivity * context.playerSettings.sensitivity, ))"
+    "text": "Effect.runSync(context.playerApi.look( -lookDelta.x * context.lookSensitivity * sensitivity, -lookDelta.y * context.lookSensitivity * sensitivity, ))"
   },
   {
     "count": 1,
@@ -2553,7 +2553,7 @@
     "count": 1,
     "file": "apps/web/title-menu.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runPromise( Effect.provide(loadPlayerSettings(), storageContext), )"
+    "text": "Effect.runPromise( Effect.provide(loadPlayerSettingsForSession(), storageContext), )"
   },
   {
     "count": 1,

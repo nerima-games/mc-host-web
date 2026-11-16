@@ -7,7 +7,12 @@ import {
   DEFAULT_PLAYER_SETTINGS,
   PLAYER_SETTINGS_FORMAT_NAME,
   PLAYER_SETTINGS_KEY,
+  initialPlayerSettingsWrites,
   loadPlayerSettings,
+  loadPlayerSettingsForSession,
+  playerSettingsWriteFailed,
+  playerSettingsWriteSucceeded,
+  queuePlayerSettingsWrite,
   rebindPlayerSettings,
   savePlayerSettings,
   updatePlayerSettings,
@@ -153,6 +158,78 @@ describe('player settings v2 storage', () => {
       expect(duplicate._tag).toBe('SaveDecodeError')
       expect(yield* loadPlayerSettings()).toEqual(STORED_V2)
     }).pipe(Effect.provide(InMemoryStorageLayer)))
+})
+
+describe('loadPlayerSettingsForSession', () => {
+  it.effect('starts with the stored settings and no failure', () =>
+    Effect.gen(function* () {
+      yield* storeRaw(2, STORED_V2)
+      expect(yield* loadPlayerSettingsForSession()).toEqual({ settings: STORED_V2, failure: undefined })
+    }).pipe(Effect.provide(InMemoryStorageLayer)))
+
+  it.effect('starts with the defaults and keeps the failure for an unreadable record, which it leaves stored', () =>
+    Effect.gen(function* () {
+      yield* storeRaw(2, { ...STORED_V2, sensitivity: 99 })
+      const loaded = yield* loadPlayerSettingsForSession()
+      expect(loaded.settings).toBe(DEFAULT_PLAYER_SETTINGS)
+      expect(loaded.failure?._tag).toBe('SaveDecodeError')
+      expect(yield* loadFailureTag).toBe('SaveDecodeError')
+    }).pipe(Effect.provide(InMemoryStorageLayer)))
+})
+
+describe('player settings write settlement', () => {
+  const initial = settingsWith({ sensitivity: 1 })
+  const first = settingsWith({ sensitivity: 1.5 })
+  const second = settingsWith({ sensitivity: 2 })
+
+  it('records a successful latest write as saved', () => {
+    const queued = queuePlayerSettingsWrite(initialPlayerSettingsWrites(initial), first)
+    expect(queued).toEqual({ applied: first, saved: initial })
+    expect(playerSettingsWriteSucceeded(queued, first)).toEqual({
+      writes: { applied: first, saved: first },
+      latest: true,
+    })
+  })
+
+  it('restores the saved value after the latest write fails', () => {
+    const saved = playerSettingsWriteSucceeded(
+      queuePlayerSettingsWrite(initialPlayerSettingsWrites(initial), first),
+      first,
+    ).writes
+    const queued = queuePlayerSettingsWrite(saved, second)
+    expect(playerSettingsWriteFailed(queued, second)).toEqual({
+      writes: { applied: first, saved: first },
+      latest: true,
+    })
+  })
+
+  it('restores the starting value when no write has succeeded yet', () => {
+    const queued = queuePlayerSettingsWrite(initialPlayerSettingsWrites(initial), first)
+    expect(playerSettingsWriteFailed(queued, first).writes).toEqual({ applied: initial, saved: initial })
+  })
+
+  it('keeps a newer queued value when an older write fails, and saves it when it succeeds', () => {
+    const queued = queuePlayerSettingsWrite(
+      queuePlayerSettingsWrite(initialPlayerSettingsWrites(initial), first),
+      second,
+    )
+    const olderFailed = playerSettingsWriteFailed(queued, first)
+    expect(olderFailed).toEqual({ writes: queued, latest: false })
+    expect(playerSettingsWriteSucceeded(olderFailed.writes, second)).toEqual({
+      writes: { applied: second, saved: second },
+      latest: true,
+    })
+  })
+
+  it('records an older success as saved without reporting it as the latest', () => {
+    const queued = queuePlayerSettingsWrite(
+      queuePlayerSettingsWrite(initialPlayerSettingsWrites(initial), first),
+      second,
+    )
+    const olderSaved = playerSettingsWriteSucceeded(queued, first)
+    expect(olderSaved).toEqual({ writes: { applied: second, saved: first }, latest: false })
+    expect(playerSettingsWriteFailed(olderSaved.writes, second).writes).toEqual({ applied: first, saved: first })
+  })
 })
 
 describe('player settings v1 migration', () => {

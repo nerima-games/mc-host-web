@@ -175,7 +175,21 @@ import {
   createFurnaceView,
   createHudView,
   createInventoryView,
+  createLoadingStatus,
+  createLoadingView,
+  createSaveIndicator,
+  IDLE_SAVE_STATUS,
+  loadingScreenView,
+  loadingStatus,
   makeUiFrameState,
+  saveStatus,
+  saveStatusMessage,
+  UiMessageTextSchema,
+  type LoadingStageProgress,
+  type LoadingStatus,
+  type LoadingView,
+  type SaveState,
+  type SaveStatus,
   type ChestStorageSlotTarget,
   type FurnaceSlotId,
   type InventoryInteractionTarget,
@@ -343,10 +357,15 @@ import {
 import {
   DEFAULT_PLAYER_SETTINGS,
   PLAYER_BINDING_ACTIONS,
+  initialPlayerSettingsWrites,
+  playerSettingsWriteFailed,
+  playerSettingsWriteSucceeded,
+  queuePlayerSettingsWrite,
   savePlayerSettings,
   type PlayerSettingsV1,
 } from './settings'
-import { createSettingsView } from './settings-view'
+import { createSettingsView, PLAYER_SETTINGS_LOAD_FAILURE_MESSAGE } from './settings-view'
+import { browserGamepadSource, makeHostGamepadInput } from './gamepad-input'
 import {
   advanceTouchLook,
   consumeTouchLook,
@@ -647,7 +666,21 @@ const requireCanvas = (id: string): HTMLCanvasElement => {
  * looks exactly like a page that booted and drew nothing — which is precisely
  * the confusion a smoke test exists to remove.
  */
+let sessionLoading: { readonly view: LoadingView; status: LoadingStatus } | undefined
+const reportLoading = (progress: LoadingStageProgress): void => {
+  if (sessionLoading === undefined) return
+  const next = createLoadingStatus(progress, sessionLoading.status.startedAtSecs)
+  if (Result.isFailure(next)) {
+    console.error('[mc-compose] invalid loading progress', next.failure)
+    return
+  }
+  sessionLoading.status = next.success
+  sessionLoading.view.render(loadingScreenView(next.success, Effect.runSync(browserClock.monotonicSecs)))
+}
+
 const failBoot = (reason: string, detail?: unknown): void => {
+  // UiMessageTextSchema is an unchecked string brand, so decoding a string cannot fail.
+  reportLoading({ kind: 'failed', reason: Result.getOrThrow(Schema.decodeUnknownResult(UiMessageTextSchema)(reason)) })
   document.body.setAttribute('data-mc-compose-boot', 'failed')
   const banner = requireElement('boot-status')
   banner.textContent = `boot failed: ${reason}`
@@ -679,6 +712,12 @@ const bootGame = async (
   const settingsRoot = requireElement('settings-root')
   gameShell.hidden = false
   document.body.setAttribute('data-mc-compose-route', 'session')
+  // The minimum visible time is measured from here, when the screen appears.
+  sessionLoading = {
+    view: createLoadingView(document, requireElement('loading-root')),
+    status: loadingStatus({ kind: 'preparing' }, Effect.runSync(browserClock.monotonicSecs)),
+  }
+  reportLoading({ kind: 'preparing', stage: 'reading', progress: 0 })
   document.body.setAttribute('data-session-id', sessionId)
   const canvas = requireCanvas('game-canvas')
   // Starting the download is all the browser lets the page observe; it cannot
@@ -710,6 +749,12 @@ const bootGame = async (
   }
   canvas.addEventListener('keydown', handleScreenshotKey)
   const hudParent = requireElement('hud-root')
+  const saveIndicator = createSaveIndicator(document, requireElement('save-indicator-root'))
+  let saveIndicatorStatus: SaveStatus = IDLE_SAVE_STATUS
+  const enterSaveState = (state: SaveState): void => {
+    saveIndicatorStatus = saveStatus(state, Effect.runSync(browserClock.monotonicSecs))
+    saveIndicator.render(saveStatusMessage(saveIndicatorStatus, saveIndicatorStatus.sinceSecs))
+  }
   const captionsParent = requireElement('sound-captions')
   const inventoryParent = requireElement('inventory-root')
   const tradeParent = requireElement('trade-root')
@@ -840,7 +885,8 @@ const bootGame = async (
     softwareRenderer,
     worldRenderer,
   } = adapters
-  let playerSettings = adapters.playerSettings
+  reportLoading({ kind: 'preparing', stage: 'generation', progress: 0.25 })
+  let playerSettingsWrites = initialPlayerSettingsWrites(adapters.playerSettings)
   const onboardingParent = document.createElement('div')
   const onboardingStatus = document.createElement('p')
   onboardingStatus.setAttribute('role', 'status')
@@ -853,8 +899,8 @@ const bootGame = async (
     document,
     parent: onboardingParent,
     getStorage: () => window.localStorage,
-    getQuickControls: () => playerControlHints(playerSettings.bindings).quickControls,
-    getAllControls: () => playerControlHints(playerSettings.bindings).allControls,
+    getQuickControls: () => playerControlHints(playerSettingsWrites.applied.bindings).quickControls,
+    getAllControls: () => playerControlHints(playerSettingsWrites.applied.bindings).allControls,
     onFailure: reportOnboardingFailure,
   })
   if (Result.isFailure(onboarding)) {
@@ -1609,6 +1655,7 @@ const bootGame = async (
     applyPoweredPistonTransition,
   } = redstoneContainerRuntime
 
+  reportLoading({ kind: 'preparing', stage: 'generation', progress: 0.5 })
   const initialStreamExit = await Effect.runPromiseExit(
     streamAround(currentChunkContext, spawnPose.feetPosition.x, spawnPose.feetPosition.z),
   )
@@ -1616,6 +1663,7 @@ const bootGame = async (
     failBoot('initial chunk streaming failed', Cause.squash(initialStreamExit.cause))
     return
   }
+  reportLoading({ kind: 'preparing', stage: 'render-preparation', progress: 0.75 })
 
   const uiFrameState = Effect.runSync(makeUiFrameState)
 
@@ -1644,6 +1692,7 @@ const bootGame = async (
     Result.getOrThrow(AngleRadians.result(Effect.runSync(playerApi.pose).yawRadians)),
   ))
   const inputApi = Context.get(inputContext, InputService)
+  const hostGamepad = makeHostGamepadInput(inputApi, browserGamepadSource(navigator))
   const applyBindings = (bindings: PlayerSettingsV1['bindings']): void => {
     for (const action of PLAYER_BINDING_ACTIONS) {
       Effect.runSync(inputApi.rebind(action, `PlayerSettingsTemporary:${action}`))
@@ -2928,7 +2977,10 @@ const bootGame = async (
     getPaused: () => paused,
     getTouchLookState: () => touchLookState,
     setTouchLookState: (state) => { touchLookState = state },
-    clearHeldInput: () => Effect.runSync(inputApi.clearHeld),
+    clearHeldInput: () => {
+      Effect.runSync(hostGamepad.reset)
+      Effect.runSync(inputApi.clearHeld)
+    },
     getSwimmingState: () => swimmingState,
     getFishingSession: () => fishingSession,
     setFishingResultState: (result) => { fishingResult = result },
@@ -3037,7 +3089,19 @@ const bootGame = async (
     setDebounceTimer: (timer) => { debounceTimer = timer },
     scheduleDebounce: (callback, delayMs) => window.setTimeout(callback, delayMs),
     clearDebounce: (timer) => window.clearTimeout(timer),
-    saveSession: () => saveCoordinator.requestSave(),
+    saveSession: () => {
+      // The autosave runs even when nothing changed; only a dirty session's
+      // save is shown, so the indicator does not stay up forever.
+      const indicate = dirtyGeneration !== savedGeneration
+      if (indicate) enterSaveState('saving')
+      return saveCoordinator.requestSave().then(
+        () => { if (indicate || saveIndicatorStatus.state === 'failed') enterSaveState('saved') },
+        (error: unknown) => {
+          enterSaveState('failed')
+          throw error
+        },
+      )
+    },
     saveDebounceMs: SAVE_DEBOUNCE_MS,
     renderCrosshair: () => renderCrosshair(),
   })
@@ -3167,25 +3231,39 @@ const bootGame = async (
   const { requestFlush, requestBackgroundFlush, markSessionDirty: runtimeMarkSessionDirty } = inventoryRuntime
   markSessionDirty = runtimeMarkSessionDirty
 
+  const applyPlayerSettings = (settings: PlayerSettingsV1): void => {
+    applyBindings(settings.bindings)
+    if (Result.isSuccess(onboarding)) onboarding.success.render()
+    audio.configure(settings)
+  }
   let settingsView: ReturnType<typeof createSettingsView>
   settingsView = createSettingsView(document, settingsRoot, {
     onChange: (next) => {
-      playerSettings = next
-      applyBindings(next.bindings)
-      if (Result.isSuccess(onboarding)) onboarding.success.render()
-      audio.configure(next)
+      playerSettingsWrites = queuePlayerSettingsWrite(playerSettingsWrites, next)
+      applyPlayerSettings(next)
       document.body.setAttribute('data-player-settings-persistence', 'dirty')
       pauseMenu.clearError()
       settingsView.clearPersistenceError()
+      settingsView.reportPersistenceSaving()
       enqueueSettingsWrite(
         settingsWrites,
         () => runStorage(Effect.provide(savePlayerSettings(next), storageContext)),
         () => {
-          if (playerSettings === next) {
+          const settled = playerSettingsWriteSucceeded(playerSettingsWrites, next)
+          playerSettingsWrites = settled.writes
+          if (settled.latest) {
             document.body.setAttribute('data-player-settings-persistence', 'saved')
+            pauseMenu.clearError()
+            settingsView.reportPersistenceSaved()
           }
         },
         (error) => {
+          const settled = playerSettingsWriteFailed(playerSettingsWrites, next)
+          playerSettingsWrites = settled.writes
+          if (settled.latest) {
+            applyPlayerSettings(settled.writes.applied)
+            settingsView.replaceSettings(settled.writes.applied)
+          }
           document.body.setAttribute('data-player-settings-persistence', 'error')
           const message = 'Settings could not be saved.'
           pauseMenu.reportError(message)
@@ -3207,7 +3285,7 @@ const bootGame = async (
     canvas,
     gameShell,
     settingsView,
-    getPlayerSettings: () => playerSettings,
+    getPlayerSettings: () => playerSettingsWrites.applied,
     getPaused: () => paused,
     setPaused: (next) => {
       paused = next
@@ -3236,6 +3314,15 @@ const bootGame = async (
     },
     onFailure: (failure) => console.error('[mc-compose] pause menu failed', failure),
   })
+  // The session runs with the defaults, and the next change replaces the
+  // unreadable record. The settings dialog repeats the warning on every open
+  // until that replacement is saved.
+  if (adapters.playerSettingsLoadFailure !== undefined) {
+    settingsView.reportLoadFailure()
+    pauseMenu.reportError(PLAYER_SETTINGS_LOAD_FAILURE_MESSAGE)
+    document.body.setAttribute('data-player-settings-persistence', 'error')
+    console.error('[mc-compose] player settings could not be read', adapters.playerSettingsLoadFailure)
+  }
 
   // -------------------------------------------------------------------------
   // 5. QA surface
@@ -3520,7 +3607,7 @@ const bootGame = async (
       resetPrimaryAttackGesture,
       sendVitalsCommand,
       consumeNativeInput,
-      playerSettings,
+      playerSettings: () => playerSettingsWrites.applied,
       lookSensitivity: LOOK_SENSITIVITY,
       playerApi,
       simState,
@@ -3712,7 +3799,7 @@ const bootGame = async (
         targetedBlock,
         fishingEnvironmentAt,
         networkFishingPhase: () => networkFishingState.phase,
-        playerSettings: () => playerSettings,
+        playerSettings: () => playerSettingsWrites.applied,
         vehicleService,
         vehicleList,
         localVehicleOccupant,
@@ -3779,6 +3866,19 @@ const bootGame = async (
     // since the previous frame (see `frameBoundary`).
     return frameBoundary.frame(Effect.gen(function* () {
       const nowSecs = readNow()
+      if (sessionLoading !== undefined) {
+        if (sessionLoading.status.progress.kind === 'preparing') reportLoading({ kind: 'ready' })
+        const loadingView = loadingScreenView(sessionLoading.status, nowSecs)
+        sessionLoading.view.render(loadingView)
+        if (loadingView === undefined) sessionLoading = undefined
+      }
+      saveIndicator.render(saveStatusMessage(saveIndicatorStatus, nowSecs))
+      // A rejected axis reading has already released the gamepad's held input;
+      // the frame goes on without it rather than stopping the game loop.
+      const gamepadPolled = yield* Effect.result(hostGamepad.poll)
+      if (Result.isFailure(gamepadPolled)) {
+        console.error('[gamepad] axes rejected; gamepad input released', gamepadPolled.failure)
+      }
       const frameInput = yield* inputApi.snapshot
       yield* Effect.gen(function* () {
         const frame = runTickFrameInput(h5aTickContext, nowSecs, frameInput)
@@ -3799,7 +3899,7 @@ const bootGame = async (
             combat: false,
             creative: isCreativeMode,
           },
-          musicEnabled: playerSettings.audioEnabled,
+          musicEnabled: playerSettingsWrites.applied.audioEnabled,
           musicVolume: MUSIC_VOLUME,
           ambient: null,
         })

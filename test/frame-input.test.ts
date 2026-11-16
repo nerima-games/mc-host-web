@@ -29,6 +29,7 @@ type FrameInputFixtureOptions = {
   readonly isCreativeMode?: boolean
   readonly pointerLocked?: boolean
   readonly bowInteractionLocked?: boolean
+  readonly gamepadAxes?: InputSnapshot['gamepadAxes']
 }
 
 const makeFrameInputFixture = (options: FrameInputFixtureOptions = {}) => {
@@ -45,6 +46,8 @@ const makeFrameInputFixture = (options: FrameInputFixtureOptions = {}) => {
   const observerPulses = new Map(options.observerPulses ?? [])
   const triggeredActions = new Set(options.triggeredActions ?? [])
   const activeActions = new Set(options.activeActions ?? [])
+  let sensitivity = 1
+  const looks: Array<readonly [number, number]> = []
   const playerPose = {
     feetPosition: position(PositionAxis(0), PositionAxis(64), PositionAxis(0)),
     yawRadians: 0,
@@ -113,9 +116,14 @@ const makeFrameInputFixture = (options: FrameInputFixtureOptions = {}) => {
     resetPrimaryAttackGesture: () => { calls.push('reset-attack') },
     sendVitalsCommand: (command) => { calls.push(`vitals:${command.activity}:${command.amount}`) },
     consumeNativeInput,
-    playerSettings: { sensitivity: 1 },
+    playerSettings: () => ({ sensitivity }),
     lookSensitivity: 1,
-    playerApi: { look: () => Effect.succeed(playerPose) },
+    playerApi: {
+      look: (yaw, pitch) => {
+        looks.push([yaw, pitch])
+        return Effect.succeed(playerPose)
+      },
+    },
   }
   const frameInput: InputSnapshot = {
     pressed: new Set(),
@@ -128,10 +136,13 @@ const makeFrameInputFixture = (options: FrameInputFixtureOptions = {}) => {
     pointerLocked: false,
     pointerLockState: 'unlocked',
     keyboardFocus: undefined,
-    gamepadAxes: { leftX: 0, leftY: 0, rightX: 0, rightY: 0 },
+    gamepadAxes: options.gamepadAxes ?? { leftX: 0, leftY: 0, rightX: 0, rightY: 0 },
   }
 
-  return { calls, context, frameInput, observerPulses }
+  return {
+    calls, context, frameInput, observerPulses, looks,
+    setSensitivity: (next: number) => { sensitivity = next },
+  }
 }
 
 describe('tick frame timing', () => {
@@ -222,7 +233,7 @@ describe('tick frame timing', () => {
       resetPrimaryAttackGesture: () => undefined,
       sendVitalsCommand: () => undefined,
       consumeNativeInput,
-      playerSettings: { sensitivity: 1 },
+      playerSettings: () => ({ sensitivity: 1 }),
       lookSensitivity: 1,
       playerApi: { look: () => Effect.succeed(playerPose) },
     }
@@ -248,6 +259,17 @@ describe('tick frame timing', () => {
 })
 
 describe('tick frame input branches', () => {
+  it('adds the right stick to the look delta and reads the current sensitivity', () => {
+    const fixture = makeFrameInputFixture({ gamepadAxes: { leftX: 0, leftY: 0, rightX: 0.5, rightY: -0.25 } })
+    fixture.setSensitivity(2)
+
+    const frame = runTickFrameInput(fixture.context, MonotonicTimeSecs(10), fixture.frameInput)
+
+    // deltaSecs is clamped to 0.05: 0.5 * 1400 * 0.05 = 35 and -0.25 * 1400 * 0.05 = -17.5.
+    expect(frame?.looked).toBe(true)
+    expect(fixture.looks).toEqual([[-70, 35]])
+  })
+
   it('stores the time and skips simulation while already paused', () => {
     const fixture = makeFrameInputFixture({ paused: true, previousSecs: 4 })
 

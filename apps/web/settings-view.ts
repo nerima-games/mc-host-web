@@ -19,6 +19,9 @@ export type SettingsView = {
   readonly close: () => void
   readonly isOpen: () => boolean
   readonly settings: () => PlayerSettingsV1
+  // Shows `settings` without publishing them, for a host that takes the
+  // session back to its saved settings after a failed write.
+  readonly replaceSettings: (settings: PlayerSettingsV1) => void
   readonly reportPersistenceSaving: () => void
   readonly reportPersistenceSaved: () => void
   readonly reportPersistenceError: (message: string) => void
@@ -294,6 +297,10 @@ export const createSettingsView = (
     close,
     isOpen: () => !root.hidden,
     settings: () => current,
+    replaceSettings: (settings) => {
+      current = settings
+      render()
+    },
     reportPersistenceSaving: () => {
       saveIndicator.render('saving')
     },

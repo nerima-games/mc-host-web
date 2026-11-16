@@ -46,7 +46,11 @@ import {
   type AudioRuntime,
   type PlacementAudioLatch,
 } from './audio-runtime'
-import { DEFAULT_PLAYER_SETTINGS, loadPlayerSettings, type PlayerSettingsV1 } from './settings'
+import {
+  loadPlayerSettingsForSession,
+  type PlayerSettingsPersistenceError,
+  type PlayerSettingsV1,
+} from './settings'
 import { loadSession, type SessionHead, type SessionMetadata, type SessionState } from './session-persistence'
 import type { SessionRoute } from './session-navigation'
 
@@ -108,6 +112,10 @@ export type PlatformAdapters = {
   readonly storageContext: Context.Context<StoragePort>
   readonly runStorage: <A, E>(effect: Effect.Effect<A, E, never>) => Promise<A>
   readonly playerSettings: PlayerSettingsV1
+  // Set when the stored settings could not be read; `playerSettings` then holds
+  // the defaults, and the host must warn the player before a change replaces
+  // the stored record.
+  readonly playerSettingsLoadFailure: PlayerSettingsPersistenceError | undefined
   readonly settingsWrites: SettingsWriteQueue
   readonly setReadAudioListener: (listener: () => Vec3) => void
   readonly setReadAudioListenerForward: (listener: () => Vec3) => void
@@ -157,9 +165,9 @@ export const makePlatformAdapters = async (deps: {
   )
   const runStorage = <A, E>(effect: Effect.Effect<A, E, never>): Promise<A> =>
     Effect.runPromise(effect)
-  let playerSettings: PlayerSettingsV1 = await runStorage(
-    Effect.provide(loadPlayerSettings(), storageContext),
-  ).catch(() => DEFAULT_PLAYER_SETTINGS)
+  const { settings: playerSettings, failure: playerSettingsLoadFailure } = await runStorage(
+    Effect.provide(loadPlayerSettingsForSession(), storageContext),
+  )
   const settingsWrites = makeSettingsWriteQueue()
   let readAudioListener = (): Vec3 => ({ x: PositionAxis(0), y: PositionAxis(0), z: PositionAxis(0) })
   let readAudioListenerForward = (): Vec3 => horizontalListenerForward(AngleRadians(0))
@@ -426,6 +434,7 @@ export const makePlatformAdapters = async (deps: {
     storageContext,
     runStorage,
     playerSettings,
+    playerSettingsLoadFailure,
     settingsWrites,
     setReadAudioListener: (listener: () => Vec3): void => { readAudioListener = listener },
     setReadAudioListenerForward: (listener: () => Vec3): void => { readAudioListenerForward = listener },

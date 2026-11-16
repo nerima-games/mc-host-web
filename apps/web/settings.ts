@@ -216,6 +216,69 @@ export const loadPlayerSettings = (): Effect.Effect<
   Effect.map(Option.getOrElse(() => DEFAULT_PLAYER_SETTINGS)),
 )
 
+export type PlayerSettingsLoad = {
+  readonly settings: PlayerSettingsV1
+  readonly failure: PlayerSettingsPersistenceError | undefined
+}
+
+// A session whose stored settings cannot be read starts with the defaults, but
+// keeps the failure beside them: the host warns the player, and the stored
+// record stays untouched until a change the player makes replaces it.
+export const loadPlayerSettingsForSession = (): Effect.Effect<PlayerSettingsLoad, never, StoragePort> =>
+  loadPlayerSettings().pipe(Effect.match({
+    onSuccess: (settings): PlayerSettingsLoad => ({ settings, failure: undefined }),
+    onFailure: (failure): PlayerSettingsLoad => ({ settings: DEFAULT_PLAYER_SETTINGS, failure }),
+  }))
+
+/**
+ * The settings a session runs with and the settings storage holds.
+ *
+ * `applied` is the value of the newest queued write: the dialog and the runtime
+ * show it as soon as it is queued. `saved` is the value of the newest write that
+ * succeeded, or the value the session started with before any write succeeded.
+ * Writes run one at a time in queue order, so each write settles after every
+ * write queued before it.
+ */
+export type PlayerSettingsWrites = {
+  readonly applied: PlayerSettingsV1
+  readonly saved: PlayerSettingsV1
+}
+
+export const initialPlayerSettingsWrites = (settings: PlayerSettingsV1): PlayerSettingsWrites => ({
+  applied: settings,
+  saved: settings,
+})
+
+export const queuePlayerSettingsWrite = (
+  writes: PlayerSettingsWrites,
+  next: PlayerSettingsV1,
+): PlayerSettingsWrites => ({ applied: next, saved: writes.saved })
+
+export type PlayerSettingsWriteSettled = {
+  readonly writes: PlayerSettingsWrites
+  // No newer write was queued after this one. Only the latest write reports
+  // its outcome as the session's settings state.
+  readonly latest: boolean
+}
+
+export const playerSettingsWriteSucceeded = (
+  writes: PlayerSettingsWrites,
+  written: PlayerSettingsV1,
+): PlayerSettingsWriteSettled => ({
+  writes: { applied: writes.applied, saved: written },
+  latest: writes.applied === written,
+})
+
+// A failed latest write takes the session back to the saved value. A failed
+// older write changes nothing: a newer write is queued after it and settles
+// later, so restoring here would undo a value the player chose after it.
+export const playerSettingsWriteFailed = (
+  writes: PlayerSettingsWrites,
+  written: PlayerSettingsV1,
+): PlayerSettingsWriteSettled => writes.applied === written
+  ? { writes: { applied: writes.saved, saved: writes.saved }, latest: true }
+  : { writes, latest: false }
+
 export const savePlayerSettings = (
   settings: PlayerSettingsV1,
 ): Effect.Effect<void, StorageError | SaveDecodeError, StoragePort> =>

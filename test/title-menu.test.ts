@@ -1,13 +1,26 @@
-import { Brand, Result } from 'effect'
+import { Brand, Effect, Layer, Result, Schema } from 'effect'
 import { InputAction, KeyCode } from '@nerima-games/mc-kernel'
+import { defineFormat, makeInMemoryStorage, saveTo, StoragePort } from '@nerima-games/mc-save'
 import type { DomNode } from '@nerima-games/mx-ui'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { bootTitleMenu, installPlayerOnboarding, playerControlHints } from '../apps/web/title-menu'
-import { DEFAULT_PLAYER_SETTINGS } from '../apps/web/settings'
+import {
+  bootTitleMenu,
+  installPlayerOnboarding,
+  playerControlHints,
+  type TitleMenuContext,
+} from '../apps/web/title-menu'
+import {
+  DEFAULT_PLAYER_SETTINGS,
+  loadPlayerSettings,
+  PLAYER_SETTINGS_FORMAT_NAME,
+  PLAYER_SETTINGS_KEY,
+  type PlayerSettingsV1,
+} from '../apps/web/settings'
 
 const mocks = vi.hoisted(() => ({
   sessions: [{ sessionId: 'saved-world', metadata: { name: 'Saved World' } }],
+  storage: { layer: undefined as Layer.Layer<StoragePort> | undefined },
   createMainMenuView: vi.fn(() => ({ render: vi.fn() })),
   createSettingsView: vi.fn((
     _document: Document,
@@ -15,8 +28,12 @@ const mocks = vi.hoisted(() => ({
     _callbacks: Parameters<typeof import('../apps/web/settings-view')['createSettingsView']>[2],
   ) => ({
     open: vi.fn(),
+    replaceSettings: vi.fn(),
     clearPersistenceError: vi.fn(),
     reportPersistenceError: vi.fn(),
+    reportPersistenceSaving: vi.fn(),
+    reportPersistenceSaved: vi.fn(),
+    reportLoadFailure: vi.fn(),
     dispose: vi.fn(),
   })),
 }))
@@ -25,7 +42,7 @@ vi.mock('@nerima-games/mc-save', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@nerima-games/mc-save')>()
   return {
     ...actual,
-    indexedDbStorageLayer: () => actual.InMemoryStorageLayer,
+    indexedDbStorageLayer: () => mocks.storage.layer ?? actual.InMemoryStorageLayer,
   }
 })
 
@@ -186,7 +203,7 @@ const makeTitleMenuContext = () => {
         if (element === undefined) throw new Error(`missing fake element: ${id}`)
         return element as unknown as HTMLElement
       },
-      enqueueSettingsWrite: vi.fn(),
+      enqueueSettingsWrite: vi.fn<TitleMenuContext['enqueueSettingsWrite']>(),
       drainSettingsWrites: vi.fn(async () => {}),
       multiplayerRegistrationTokenKey: vi.fn(() => 'registration-key'),
       hot: { dispose },
@@ -212,6 +229,7 @@ const makeTitleMenuContext = () => {
 describe('title menu boot', () => {
   afterEach(() => {
     mocks.sessions.splice(1)
+    mocks.storage.layer = undefined
     vi.restoreAllMocks()
     vi.clearAllMocks()
   })
@@ -319,6 +337,72 @@ describe('title menu boot', () => {
       bindings: { ...DEFAULT_PLAYER_SETTINGS.bindings, jump: 'KeyJ' },
     })
     expect(jump?.children[1]?.textContent).toBe('J')
+  })
+})
+
+describe('title menu player settings persistence', () => {
+  afterEach(() => {
+    mocks.storage.layer = undefined
+    vi.clearAllMocks()
+  })
+
+  const settingsWithJump = (jump: string): PlayerSettingsV1 => ({
+    ...DEFAULT_PLAYER_SETTINGS,
+    bindings: { ...DEFAULT_PLAYER_SETTINGS.bindings, jump },
+  })
+
+  it('warns in the settings dialog when the stored settings cannot be read, and leaves the record alone', async () => {
+    const storage = Effect.runSync(makeInMemoryStorage)
+    const unreadable = Result.getOrThrow(defineFormat({ name: PLAYER_SETTINGS_FORMAT_NAME, version: 2, schema: Schema.Unknown }))
+    await Effect.runPromise(saveTo(unreadable, PLAYER_SETTINGS_KEY, { sensitivity: 99 }).pipe(
+      Effect.provideService(StoragePort, storage),
+    ))
+    mocks.storage.layer = Layer.succeed(StoragePort, storage)
+    const state = makeTitleMenuContext()
+
+    await bootTitleMenu(state.context)
+
+    const view = mocks.createSettingsView.mock.results.at(-1)?.value
+    expect(view?.reportLoadFailure).toHaveBeenCalledOnce()
+    const stored = await Effect.runPromise(Effect.flip(loadPlayerSettings()).pipe(
+      Effect.provideService(StoragePort, storage),
+    ))
+    expect(stored._tag).toBe('SaveDecodeError')
+    expect(state.context.enqueueSettingsWrite).not.toHaveBeenCalled()
+  })
+
+  it('restores the last saved settings when the latest write fails, never after an older failure', async () => {
+    const state = makeTitleMenuContext()
+    const settled: Array<{ readonly succeed: () => void; readonly fail: () => void }> = []
+    state.context.enqueueSettingsWrite.mockImplementation((_queue, _write, onSuccess, onFailure) => {
+      settled.push({ succeed: onSuccess, fail: () => onFailure(new Error('write failed')) })
+    })
+    await bootTitleMenu(state.context)
+    const view = mocks.createSettingsView.mock.results.at(-1)?.value
+    const callbacks = mocks.createSettingsView.mock.calls.at(-1)?.[2]
+    const jump = state.titleScreen.find('data-onboarding-control-action', 'jump')
+    const first = settingsWithJump('KeyJ')
+    const second = settingsWithJump('KeyK')
+    const third = settingsWithJump('KeyL')
+
+    callbacks?.onChange(first)
+    callbacks?.onChange(second)
+    expect(view?.reportPersistenceSaving).toHaveBeenCalledTimes(2)
+    settled[0]?.fail()
+    expect(view?.replaceSettings).not.toHaveBeenCalled()
+    expect(jump?.children[1]?.textContent).toBe('K')
+    settled[1]?.succeed()
+    expect(view?.reportPersistenceSaved).toHaveBeenCalledOnce()
+    expect(state.body.attributes.get('data-player-settings-persistence')).toBe('saved')
+
+    callbacks?.onChange(third)
+    expect(jump?.children[1]?.textContent).toBe('L')
+    settled[2]?.fail()
+    expect(view?.replaceSettings).toHaveBeenCalledExactlyOnceWith(second)
+    expect(view?.reportPersistenceError).toHaveBeenLastCalledWith('Settings could not be saved.')
+    expect(view?.reportPersistenceSaved).toHaveBeenCalledOnce()
+    expect(state.body.attributes.get('data-player-settings-persistence')).toBe('error')
+    expect(jump?.children[1]?.textContent).toBe('K')
   })
 })
 

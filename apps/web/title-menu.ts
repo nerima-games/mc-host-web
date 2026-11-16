@@ -18,9 +18,12 @@ import {
 
 import { validateMultiplayerUrl } from './multiplayer-url'
 import {
-  DEFAULT_PLAYER_SETTINGS,
   PLAYER_BINDING_ACTIONS,
-  loadPlayerSettings,
+  initialPlayerSettingsWrites,
+  loadPlayerSettingsForSession,
+  playerSettingsWriteFailed,
+  playerSettingsWriteSucceeded,
+  queuePlayerSettingsWrite,
   savePlayerSettings,
   type PlayerSettingsV1,
 } from './settings'
@@ -180,23 +183,35 @@ export const bootTitleMenu = async (context: TitleMenuContext): Promise<void> =>
     ),
   )
   const sessions = await Effect.runPromise(Effect.provide(listSessions(), storageContext))
-  let playerSettings = await Effect.runPromise(
-    Effect.provide(loadPlayerSettings(), storageContext),
-  ).catch(() => DEFAULT_PLAYER_SETTINGS)
+  const playerSettingsLoad = await Effect.runPromise(
+    Effect.provide(loadPlayerSettingsForSession(), storageContext),
+  )
+  let playerSettingsWrites = initialPlayerSettingsWrites(playerSettingsLoad.settings)
   const settingsWrites = makeSettingsWriteQueue()
   let settingsView: ReturnType<typeof createSettingsView>
   const persistPlayerSettings = (next: PlayerSettingsV1): void => {
+    playerSettingsWrites = queuePlayerSettingsWrite(playerSettingsWrites, next)
     document.body.setAttribute('data-player-settings-persistence', 'dirty')
     settingsView.clearPersistenceError()
+    settingsView.reportPersistenceSaving()
     enqueueSettingsWrite(
       settingsWrites,
       () => Effect.runPromise(Effect.provide(savePlayerSettings(next), storageContext)),
       () => {
-        if (playerSettings === next) {
+        const settled = playerSettingsWriteSucceeded(playerSettingsWrites, next)
+        playerSettingsWrites = settled.writes
+        if (settled.latest) {
           document.body.setAttribute('data-player-settings-persistence', 'saved')
+          settingsView.reportPersistenceSaved()
         }
       },
       (error) => {
+        const settled = playerSettingsWriteFailed(playerSettingsWrites, next)
+        playerSettingsWrites = settled.writes
+        if (settled.latest) {
+          settingsView.replaceSettings(settled.writes.applied)
+          if (Result.isSuccess(onboarding)) onboarding.success.render()
+        }
         document.body.setAttribute('data-player-settings-persistence', 'error')
         const message = 'Settings could not be saved.'
         titleStatus.textContent = message
@@ -238,8 +253,8 @@ export const bootTitleMenu = async (context: TitleMenuContext): Promise<void> =>
     document,
     parent: onboardingParent,
     getStorage: () => window.localStorage,
-    getQuickControls: () => playerControlHints(playerSettings.bindings).quickControls,
-    getAllControls: () => playerControlHints(playerSettings.bindings).allControls,
+    getQuickControls: () => playerControlHints(playerSettingsWrites.applied.bindings).quickControls,
+    getAllControls: () => playerControlHints(playerSettingsWrites.applied.bindings).allControls,
     onFailure: reportOnboardingFailure,
   })
   if (Result.isFailure(onboarding)) {
@@ -254,14 +269,17 @@ export const bootTitleMenu = async (context: TitleMenuContext): Promise<void> =>
   }
   settingsView = createSettingsView(document, settingsRoot, {
     onChange: (next) => {
-      playerSettings = next
-      if (Result.isSuccess(onboarding)) onboarding.success.render()
       persistPlayerSettings(next)
+      if (Result.isSuccess(onboarding)) onboarding.success.render()
     },
     onClose: () => {
       titleScreen.inert = false
     },
   })
+  if (playerSettingsLoad.failure !== undefined) {
+    settingsView.reportLoadFailure()
+    console.error('[mc-compose] player settings could not be read', playerSettingsLoad.failure)
+  }
 
   let titleNavigationPending = false
   const setTitleNavigationPending = (pending: boolean): void => {
@@ -351,7 +369,7 @@ export const bootTitleMenu = async (context: TitleMenuContext): Promise<void> =>
         : menuParent
       titleStatus.textContent = ''
       titleScreen.inert = true
-      settingsView.open(playerSettings, returnFocus)
+      settingsView.open(playerSettingsWrites.applied, returnFocus)
     },
   })
   menuView.render(mainMenuViewModel(menuState, savedWorlds))

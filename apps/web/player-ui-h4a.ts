@@ -242,6 +242,7 @@ export type PlayerPauseContext<Button extends PauseButton> = {
   readonly settingsView: {
     readonly isOpen: () => boolean
     readonly open: (settings: PlayerSettingsV1, returnFocusTo: Button) => void
+    readonly close: () => void
   }
   readonly canPause: () => boolean
   readonly clearGameplayInput: () => void
@@ -433,7 +434,15 @@ export const installPlayerPauseMenu = <Button extends PauseButton>(context: Play
   render()
   return {
     handleEscape: () => {
-      if (disposed || context.settingsView.isOpen()) return
+      if (disposed) return
+      // Keyboard Escape never gets here while settings is open: the dialog's
+      // capture listener stops it before the input service's window listener.
+      // A gamepad Escape does, and closes the dialog; its onClose calls
+      // closeSettings, so the dialog and the pause view change together.
+      if (context.settingsView.isOpen()) {
+        context.settingsView.close()
+        return
+      }
       // Escape has no browser user activation. Desktop resume belongs to the native Resume click.
       if (context.getPaused() && pointerLockUsed && !settingsOpen) return
       if (!context.getPaused() && hasGameplayModal()) {

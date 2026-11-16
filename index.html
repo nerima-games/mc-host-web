@@ -244,6 +244,25 @@
         pointer-events: auto;
       }
 
+      #save-indicator-root [data-mx-ui="save-indicator"] {
+        position: fixed;
+        right: 10px;
+        bottom: 10px;
+        z-index: 30;
+        pointer-events: none;
+      }
+
+      /* mx-ui keeps the loading screen up for a minimum time even after the
+         world is ready, so it must not take clicks meant for the game. */
+      #loading-root [data-mx-ui="loading"] {
+        position: fixed;
+        inset: 0;
+        z-index: 40;
+        display: grid;
+        place-content: center;
+        pointer-events: none;
+      }
+
       #inventory-root {
         position: fixed;
         top: 50%;
@@ -690,6 +709,7 @@
         </div>
       </div>
       <div id="hud-root"></div>
+      <div id="save-indicator-root"></div>
       <div id="inventory-root" hidden></div>
       <div id="trade-root" hidden></div>
       <div id="brewing-root" hidden></div>
@@ -714,6 +734,7 @@
     </div>
     <div id="pause-root" hidden></div>
     <div id="settings-root" data-testid="settings-root" hidden></div>
+    <div id="loading-root"></div>
     <div id="boot-status" role="status" aria-live="polite"></div>
     <script type="module" src="/apps/web/main.ts"></script>
   </body>
