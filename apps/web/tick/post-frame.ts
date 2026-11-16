@@ -1,5 +1,5 @@
 import { WorldId } from '@nerima-games/mx-multiplayer'
-import { Effect, Option, Ref, Result } from 'effect'
+import { Cause, Effect, Exit, Option, Ref, Result } from 'effect'
 import { AngleRadians, blockIdOf, blockPositionKeyOf, EnchantmentLevel, EntityHealthPoints, EntityId, position, PositionAxis, StackCount } from '@nerima-games/mc-kernel'
 import { BlocksPerSecond, DeltaTimeSecs, PLAYER_HALF_HEIGHT, PLAYER_HALF_WIDTH } from '@nerima-games/mc-physics'
 import { changed, type ItemStack, UNCHANGED } from '@nerima-games/mc-sim'
@@ -301,9 +301,18 @@ export const runTickPostFrame = (
       enqueueMultiplayerPlayerMove(nowSecs)
     }
 
-    // Portal travel has already updated the player. Make its destination world
-    // concrete before dimension alignment streams or renders that world.
-    if (multiplayer === undefined) yield* applyPortalTravels()
+    // The stage commits the destination before its world batch. Restore through
+    // the owner-backed view and keep the batch failure first if restoration fails.
+    if (multiplayer === undefined) yield* Effect.uninterruptibleMask((restore) =>
+      restore(applyPortalTravels()).pipe(
+        Effect.catchCause((batchCause) => Effect.gen(function* () {
+          const restored = yield* Effect.exit(playerApi.restore(poseBeforeFrame, dimensionBeforeFrame))
+          return yield* Effect.failCause(Exit.isFailure(restored)
+            ? Cause.combine(batchCause, restored.cause)
+            : batchCause)
+        })),
+      ),
+    )
 
     const retryingHarvestPositions = new Set(
       (yield* Ref.get(gameplayState.pendingItemUses))

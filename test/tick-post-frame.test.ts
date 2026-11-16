@@ -1,4 +1,4 @@
-import { AngleRadians, AttackRangeDistance, BlockAxis, blockIdOf, blockPosition, blockPositionKeyOf, blockTypeOfId, ChunkAxis, chunkCoord, DeltaTimeSecs, EntityHealthPoints, EntityId, FixedDurationSecs, MonotonicTimeSecs, position, PositionAxis, WorldId } from '@nerima-games/mc-kernel'
+import { AngleRadians, AttackRangeDistance, BlockAxis, blockIdOf, blockPosition, blockPositionKeyOf, blockTypeOfId, ChunkAxis, chunkCoord, DeltaTimeSecs, EntityHealthPoints, EntityId, FixedDurationSecs, MonotonicTimeSecs, position, PositionAxis, WorldId, WorldWriteBatchSchema } from '@nerima-games/mc-kernel'
 import { EMPTY_SYNC_REPORT, makeChunkStoreLightColor, type InputAction, type InputSnapshot } from '@nerima-games/mc-render'
 import {
   makeSimFrameState,
@@ -8,6 +8,8 @@ import {
   witherSkullProjectile,
   itemStack,
   EntityKind,
+  PlayerServiceSnapshotSchema,
+  WorldRevisionConflict,
   type ItemStack,
 } from '@nerima-games/mc-sim'
 import {
@@ -20,7 +22,7 @@ import {
   type MobBehaviour,
 } from '@nerima-games/mx-gameplay'
 import * as gameplay from '@nerima-games/mx-gameplay'
-import { Effect, Option, Ref, Result } from 'effect'
+import { Cause, Deferred, Effect, Exit, Fiber, Option, Ref, Result, Schema } from 'effect'
 import { describe, expect, it, vi } from 'vitest'
 
 import { BlocksPerSecond } from '@nerima-games/mc-physics'
@@ -39,6 +41,7 @@ import {
   recoverProjectile,
 } from '../apps/web/projectile-runtime'
 import { makeOwnerBackedHost } from '../apps/web/owner-backed-services'
+import { makeWorldWritePortFromCoordinator } from '../apps/web/world-write-port'
 import { initialPlayerSwimmingRuntimeState } from '../apps/web/player-swimming-runtime'
 import { type DimensionChunkContext } from '../apps/web/chunk-streaming'
 import { mutableState, type H5aFrameInputResult, type H5aMovementResult } from '../apps/web/tick/h5a-context'
@@ -339,6 +342,7 @@ const makeContext = async (primaryAttackConsumed: ReturnType<typeof cell<boolean
 
   return {
     context,
+    coordinator,
     generated,
     input,
     movement,
@@ -351,6 +355,57 @@ const makeContext = async (primaryAttackConsumed: ReturnType<typeof cell<boolean
     inventoryOpenEvents,
     canvasAttributes,
     sessionDirtyCount: () => sessionDirtyCount,
+  }
+}
+
+const makePortalContext = async () => {
+  const harness = await makeContext(cell(true))
+  const playerApi = harness.context.h5a.world.player
+  await Effect.runPromise(playerApi.restore({
+    feetPosition: position(PositionAxis(17), PositionAxis(70), PositionAxis(-9)),
+    yawRadians: AngleRadians(0.7),
+    pitchRadians: AngleRadians(-0.3),
+  }, 'overworld'))
+  const poseBeforeFrame = await Effect.runPromise(playerApi.pose)
+  const ownerBeforeFrame = await Effect.runPromise(harness.coordinator.snapshot(
+    gameplay.GAMEPLAY_PLAYER_OWNER_ID, PlayerServiceSnapshotSchema,
+  ))
+  // Match the portal stage: commit the destination to the owner, without
+  // writing the generated world's private player service.
+  await Effect.runPromise(harness.coordinator.commit({
+    expectedRevision: ownerBeforeFrame.revision,
+    expectedDimensions: [],
+    changes: [{
+      ownerId: gameplay.GAMEPLAY_PLAYER_OWNER_ID,
+      state: {
+        pose: {
+          ...ownerBeforeFrame.state.pose,
+          feetPosition: { dimension: 'nether', x: 2, y: 64, z: -2 },
+        },
+      },
+    }],
+  }))
+  const port = makeWorldWritePortFromCoordinator(harness.coordinator)
+  const write = (x: number) => Effect.gen(function* () {
+    const batch = yield* Schema.decodeUnknownEffect(WorldWriteBatchSchema)({
+      world: harness.coordinator.worldId,
+      expectedWorldRevision: yield* harness.coordinator.revision,
+      dimension: 'nether',
+      expectedDimensionRevision: yield* harness.coordinator.dimensionRevision('nether'),
+      edits: [{ position: { x, y: 64, z: 0 }, block: Option.getOrThrow(blockIdOf('stone')) }],
+    })
+    return yield* port.applyBatch(batch)
+  })
+  const context: H5bPostFrameContext = {
+    ...harness.context,
+    h5a: { ...harness.context.h5a, playerApi },
+  }
+  return {
+    ...harness,
+    context,
+    movement: { ...harness.movement, poseBeforeFrame, dimensionBeforeFrame: 'overworld' } satisfies H5aMovementResult,
+    ownerBeforeFrame,
+    write,
   }
 }
 
@@ -484,6 +539,131 @@ describe('tick post-frame processing', () => {
     expect(context.state.tradeStatus.get()).toBe('Trade complete')
     expect(renderedTradeUi).toBe(1)
     expect(harness.sessionDirtyCount()).toBe(1)
+  })
+
+  it.each([false, true])('rolls the player owner and view back when a portal batch fails (yield=%s)', async (yieldBeforeFailure) => {
+    const harness = await makePortalContext()
+    const alignActiveDimension = vi.fn(() => true)
+    let batchFailure: unknown
+    const context: H5bPostFrameContext = {
+      ...harness.context,
+      alignActiveDimension,
+      applyPortalTravels: () => Effect.gen(function* () {
+        if (yieldBeforeFailure) yield* Effect.yieldNow
+        yield* harness.write(32).pipe(Effect.tapError((error) => Effect.sync(() => { batchFailure = error })))
+      }),
+    }
+
+    const exit = await Effect.runPromiseExit(runTickPostFrameEffect(context, {
+      frame: harness.input, movement: harness.movement, framesTotal: 5,
+    }))
+
+    expect(batchFailure).toMatchObject({ _tag: 'WorldWriteChunkUnavailable', dimension: 'nether', chunk: '2,0' })
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (Exit.isFailure(exit)) {
+      const failures = exit.cause.reasons.filter(Cause.isFailReason)
+      expect(failures).toHaveLength(1)
+      expect(failures[0]?.error).toBe(batchFailure)
+    }
+    expect(await Effect.runPromise(context.h5a.playerApi.pose)).toEqual(harness.movement.poseBeforeFrame)
+    expect(await Effect.runPromise(context.h5a.playerApi.dimension)).toBe('overworld')
+    const owner = await Effect.runPromise(harness.coordinator.snapshot(
+      gameplay.GAMEPLAY_PLAYER_OWNER_ID, PlayerServiceSnapshotSchema,
+    ))
+    expect(owner.state).toEqual(harness.ownerBeforeFrame.state)
+    expect(owner.revision).toBeGreaterThan(harness.ownerBeforeFrame.revision)
+    expect(alignActiveDimension).not.toHaveBeenCalled()
+  })
+
+  it('restores the player owner and view when a suspended portal application is interrupted', async () => {
+    const harness = await makePortalContext()
+    const exit = await Effect.runPromise(Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>()
+      const context: H5bPostFrameContext = {
+        ...harness.context,
+        applyPortalTravels: () => Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+      }
+      const fiber = yield* Effect.forkChild(runTickPostFrameEffect(context, {
+        frame: harness.input, movement: harness.movement, framesTotal: 5,
+      }))
+      yield* Deferred.await(entered)
+      yield* Fiber.interrupt(fiber)
+      return yield* Fiber.await(fiber)
+    }))
+
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (Exit.isFailure(exit)) expect(Cause.hasInterrupts(exit.cause)).toBe(true)
+    expect(await Effect.runPromise(harness.context.h5a.playerApi.pose)).toEqual(harness.movement.poseBeforeFrame)
+    expect(await Effect.runPromise(harness.context.h5a.playerApi.dimension)).toBe('overworld')
+    const owner = await Effect.runPromise(harness.coordinator.snapshot(
+      gameplay.GAMEPLAY_PLAYER_OWNER_ID, PlayerServiceSnapshotSchema,
+    ))
+    expect(owner.state).toEqual(harness.ownerBeforeFrame.state)
+  })
+
+  it('keeps the portal batch failure first when restoring the player also fails', async () => {
+    const harness = await makePortalContext()
+    const revision = await Effect.runPromise(harness.coordinator.revision)
+    const rollbackFailure = new WorldRevisionConflict({ expected: harness.ownerBeforeFrame.revision, actual: revision })
+    const restore = vi.fn(() => Effect.fail(rollbackFailure))
+    let batchFailure: unknown
+    const context: H5bPostFrameContext = {
+      ...harness.context,
+      h5a: { ...harness.context.h5a, playerApi: { ...harness.context.h5a.playerApi, restore } },
+      applyPortalTravels: () => harness.write(32).pipe(
+        Effect.tapError((error) => Effect.sync(() => { batchFailure = error })),
+        Effect.asVoid,
+      ),
+    }
+
+    const exit = await Effect.runPromiseExit(runTickPostFrameEffect(context, {
+      frame: harness.input, movement: harness.movement, framesTotal: 5,
+    }))
+
+    expect(batchFailure).toMatchObject({ _tag: 'WorldWriteChunkUnavailable' })
+    expect(restore).toHaveBeenCalledExactlyOnceWith(harness.movement.poseBeforeFrame, 'overworld')
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (Exit.isFailure(exit)) {
+      const failures = exit.cause.reasons.filter(Cause.isFailReason)
+      expect(failures).toHaveLength(2)
+      expect(failures[0]?.error).toBe(batchFailure)
+      expect(failures[1]?.error).toBe(rollbackFailure)
+    }
+  })
+
+  it('rolls the player back after a later portal batch fails while retaining earlier committed blocks', async () => {
+    const harness = await makePortalContext()
+    await Effect.runPromise(harness.generated.worldgenChunkStore.load(chunkCoord(ChunkAxis(0), ChunkAxis(0))))
+    const attempted: Array<number> = []
+    const context: H5bPostFrameContext = {
+      ...harness.context,
+      applyPortalTravels: () => Effect.gen(function* () {
+        for (const x of [1, 32, 48]) {
+          attempted.push(x)
+          yield* harness.write(x)
+        }
+      }),
+    }
+
+    const exit = await Effect.runPromiseExit(runTickPostFrameEffect(context, {
+      frame: harness.input, movement: harness.movement, framesTotal: 5,
+    }))
+
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (Exit.isFailure(exit)) {
+      expect(exit.cause.reasons.filter(Cause.isFailReason).map((failure) => failure.error))
+        .toMatchObject([{ _tag: 'WorldWriteChunkUnavailable', chunk: '2,0' }])
+    }
+    expect(attempted).toEqual([1, 32])
+    expect(await Effect.runPromise(harness.generated.worldgenChunkStore.getBlock(
+      blockPosition(BlockAxis(1), BlockAxis(64), BlockAxis(0)),
+    ))).toEqual({ _tag: 'Block', block: Option.getOrThrow(blockIdOf('stone')) })
+    expect(await Effect.runPromise(context.h5a.playerApi.pose)).toEqual(harness.movement.poseBeforeFrame)
+    expect(await Effect.runPromise(context.h5a.playerApi.dimension)).toBe('overworld')
+    const owner = await Effect.runPromise(harness.coordinator.snapshot(
+      gameplay.GAMEPLAY_PLAYER_OWNER_ID, PlayerServiceSnapshotSchema,
+    ))
+    expect(owner.state).toEqual(harness.ownerBeforeFrame.state)
   })
 
   it('applies portal completion before aligning the destination dimension', async () => {
