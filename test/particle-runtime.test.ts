@@ -15,6 +15,7 @@ const frame: Render.ParticleFrameSnapshot = {
 const broken = decodeEvent({ _tag: 'BlockBroken', tick: 1, actor: 'actor', address, block: 1 })
 const hurt = decodeEvent({ _tag: 'EntityDamaged', tick: 1, entity: 'actor', position: at, amount: 1, cause: 'mob' })
 const healed = decodeEvent({ _tag: 'EntityHealed', tick: 1, entity: 'actor', amount: 1, cause: 'regeneration' })
+const missingHealed = decodeEvent({ _tag: 'EntityHealed', tick: 1, entity: 'missing', amount: 1, cause: 'regeneration' })
 const achievement = decodeEvent({ _tag: 'AchievementUnlocked', tick: 1, player: 'actor', achievement: 'minecraft:story/root' })
 const invalid = decodeEvent({ _tag: 'EntityDied', tick: 1, entity: 'actor', kind: 'zombie', position: { ...at, x: Number.MAX_VALUE }, cause: 'mob' })
 
@@ -45,11 +46,24 @@ describe('particle runtime', () => {
     expect(pool.followEntityIds).toEqual(reference.followEntityIds)
   })
 
-  it('ignores UI and vehicle events and missing entity positions without spawning', () => {
+  it('ignores intentional UI and vehicle events without spawning', () => {
     const pool = Result.getOrThrow(Render.makeParticlePool())
-    const events = [achievement, decodeEvent({ _tag: 'VehicleTransition', tick: 1, actor: 'actor', vehicle: 'boat', transition: 'mounted' }), healed]
+    const events = [achievement, decodeEvent({ _tag: 'VehicleTransition', tick: 1, actor: 'actor', vehicle: 'boat', transition: 'mounted' })]
     const runtime = makeParticleRuntime(pool, { renderContext: () => ({ dimension: 'nether', entities: [] }) })
     expect(Effect.runSync(runtime.spawnEvents(events))).toEqual(events.map((event) => ({ event, result: Result.succeed('ignored') })))
+    expect(pool.activeCount()).toBe(0)
+  })
+
+  it('fails the batch when an entity position lookup misses its snapshot target', () => {
+    const pool = Result.getOrThrow(Render.makeParticlePool())
+    const runtime = makeParticleRuntime(pool, { renderContext: () => frame })
+    const result = Effect.runSync(Effect.result(runtime.spawnEvents([missingHealed])))
+    const failure = Option.getOrThrow(Result.getFailure(result))
+    const missing = { _tag: 'ParticleEntityMissing', entityId: 'missing' }
+    expect(failure).toEqual({
+      _tag: 'ParticleEventBatchFailure', failures: [{ event: missingHealed, failure: missing }],
+      outcomes: [{ event: missingHealed, result: Result.fail(missing) }],
+    })
     expect(pool.activeCount()).toBe(0)
   })
 
@@ -88,17 +102,19 @@ describe('particle runtime', () => {
   it('aggregates real failures in event order after processing later successes', () => {
     const pool = Result.getOrThrow(Render.makeParticlePool())
     const rejected = decodeEvent({ _tag: 'EntityDamaged', tick: 1, entity: 'missing', position: at, amount: 1, cause: 'mob' })
-    const events = [invalid, rejected, achievement, broken]
+    const events = [invalid, rejected, missingHealed, achievement, broken]
     const result = Effect.runSync(Effect.result(makeParticleRuntime(pool, { renderContext: () => frame }).spawnEvents(events)))
     const failure = Option.getOrThrow(Result.getFailure(result))
     const spawnFailure = { _tag: 'ParticlePoolInputError', operation: 'request', reason: 'invalid-request' }
     const rejection = { _tag: 'ParticleRequestRejected', request: Render.particleRequestForDomainEvent(rejected) }
+    const missing = { _tag: 'ParticleEntityMissing', entityId: 'missing' }
     expect(failure).toEqual({
       _tag: 'ParticleEventBatchFailure',
-      failures: [{ event: invalid, failure: spawnFailure }, { event: rejected, failure: rejection }],
+      failures: [{ event: invalid, failure: spawnFailure }, { event: rejected, failure: rejection }, { event: missingHealed, failure: missing }],
       outcomes: [
         { event: invalid, result: Result.fail(spawnFailure) },
         { event: rejected, result: Result.fail(rejection) },
+        { event: missingHealed, result: Result.fail(missing) },
         { event: achievement, result: Result.succeed('ignored') },
         { event: broken, result: Result.succeed('spawned') },
       ],

@@ -1,4 +1,4 @@
-import { type DomainEvent, WorldPositionSchema } from '@nerima-games/mc-kernel'
+import { type DomainEvent, type EntityId, WorldPositionSchema } from '@nerima-games/mc-kernel'
 import {
   ParticleFrameSnapshotSchema, ParticleService, ParticleServiceForPool,
   particleRequestForDomainEvent,
@@ -12,10 +12,16 @@ export type ParticleRequestRejected = Readonly<{
   request: ParticleRequest
 }>
 
+export type ParticleEntityMissing = Readonly<{
+  _tag: 'ParticleEntityMissing'
+  entityId: EntityId
+}>
+
 export type ParticleEventFailure =
   | UnhandledParticleEvent
   | ParticlePoolInputError
   | ParticleRequestRejected
+  | ParticleEntityMissing
 
 export type ParticleEventOutcome = Readonly<{
   event: DomainEvent
@@ -63,16 +69,26 @@ export const makeParticleRuntime = (pool: ParticlePool, options: ParticleRuntime
     const outcomes = yield* Effect.forEach(events, (event) => Effect.gen(function* () {
       const result = yield* Effect.result(Effect.gen(function* () {
         const frame = yield* readFrame(options.renderContext)
+        let missingEntityId: EntityId | undefined
         const request = particleRequestForDomainEvent(event, {
           positionOfEntity: (id) => {
             const entity = frame.entities.find((target) => target.id === id)
+            if (entity === undefined) {
+              missingEntityId = id
+              return undefined
+            }
             // The validated frame restricts dimension and finite coordinates more tightly than WorldPositionSchema.
-            return entity === undefined ? undefined : Schema.decodeUnknownSync(WorldPositionSchema)({
+            return Schema.decodeUnknownSync(WorldPositionSchema)({
               dimension: frame.dimension, ...entity.feetPosition,
             })
           },
         })
-        if (request === undefined) return yield* Effect.succeed<'ignored'>('ignored')
+        if (request === undefined) {
+          if (missingEntityId !== undefined) {
+            return yield* Effect.fail<ParticleEntityMissing>({ _tag: 'ParticleEntityMissing', entityId: missingEntityId })
+          }
+          return yield* Effect.succeed<'ignored'>('ignored')
+        }
         if ('_tag' in request) return yield* Effect.fail(request)
         return yield* Effect.gen(function* () {
           const particles = yield* ParticleService
