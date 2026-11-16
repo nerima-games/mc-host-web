@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { hudViewModel } from '@nerima-games/mx-ui'
+import { hudViewModel, type DomNode } from '@nerima-games/mx-ui'
 import { Result } from 'effect'
 import { MonotonicTimeSecs, position, PositionAxis } from '@nerima-games/mc-kernel'
 import {
@@ -28,6 +28,7 @@ vi.mock('@nerima-games/mx-ui', async (importOriginal) => {
 import {
   handleLocalPlayerDeath,
   installPauseControls,
+  installPlayerPauseMenu,
   renderCrosshair,
   renderPlayerHud,
   respawnPlayer,
@@ -35,6 +36,10 @@ import {
 } from '../apps/web/player-ui-h4a'
 
 class FakeElement {
+  value = ''
+  readonly nodeType = 1
+  readonly style = { setProperty: vi.fn(), removeProperty: vi.fn() }
+  readonly children: Array<FakeElement> = []
   hidden = false
   inert = false
   textContent = ''
@@ -48,6 +53,33 @@ class FakeElement {
 
   addEventListener(type: string, listener: EventListenerOrEventListenerObject): void {
     this.listeners.set(type, listener)
+  }
+
+  removeEventListener(type: string): void {
+    this.listeners.delete(type)
+  }
+
+  appendChild(child: DomNode): void {
+    if (!(child instanceof FakeElement)) throw new Error('expected fake element')
+    this.children.push(child)
+  }
+
+  findAction(action: string): FakeElement {
+    if (this.attributes.get('data-pause-action') === action) return this
+    for (const child of this.children) {
+      const found = child.findActionOrUndefined(action)
+      if (found !== undefined) return found
+    }
+    throw new Error(`missing pause action ${action}`)
+  }
+
+  private findActionOrUndefined(action: string): FakeElement | undefined {
+    if (this.attributes.get('data-pause-action') === action) return this
+    for (const child of this.children) {
+      const found = child.findActionOrUndefined(action)
+      if (found !== undefined) return found
+    }
+    return undefined
   }
 
   setAttribute(name: string, value: string): void {
@@ -76,6 +108,180 @@ const emit = (target: FakeElement, type: string, event: Event): void => {
   if (typeof listener === 'function') listener.call(target, event)
   else listener?.handleEvent(event)
 }
+
+const makePauseMenu = (locked = true) => {
+  const events = new FakeElement()
+  const parent = new FakeElement()
+  const canvas = Object.assign(new FakeElement(), { requestPointerLock: vi.fn<() => void | Promise<void>>() })
+  const document = {
+    createElement: () => new FakeElement(),
+    pointerLockElement: locked ? canvas : null,
+    addEventListener: events.addEventListener.bind(events),
+    removeEventListener: events.removeEventListener.bind(events),
+    exitPointerLock: vi.fn(() => { document.pointerLockElement = null }),
+  }
+  let paused = false
+  let canPause = true
+  const deferred: Array<() => void> = []
+  const clearGameplayInput = vi.fn()
+  const setPaused = vi.fn((next: boolean) => { paused = next })
+  const onFailure = vi.fn()
+  const onOpenSettings = vi.fn()
+  const onSaveQuit = vi.fn()
+  const menu = installPlayerPauseMenu({
+    document, parent, canvas,
+    deferToFrameBoundary: (work) => { deferred.push(work) },
+    getPaused: () => paused,
+    setPaused,
+    canPause: () => canPause,
+    clearGameplayInput,
+    onOpenSettings,
+    onSaveQuit,
+    onFailure,
+  })
+  return {
+    menu, document, parent, canvas, clearGameplayInput, setPaused, onFailure, onOpenSettings, onSaveQuit,
+    getPaused: () => paused,
+    setCanPause: (next: boolean) => { canPause = next },
+    frame: () => { for (const work of deferred.splice(0)) work() },
+    lockChanged: () => emit(events, 'pointerlockchange', new Event('pointerlockchange')),
+    lockFailed: () => emit(events, 'pointerlockerror', new Event('pointerlockerror')),
+    click: (action: string) => emit(parent.findAction(action), 'click', new Event('click')),
+  }
+}
+
+describe('pointer lock pause menu', () => {
+  it('pauses once on lock loss and clears gameplay input at the frame boundary', () => {
+    const state = makePauseMenu()
+    state.document.pointerLockElement = null
+    state.lockChanged()
+    state.lockChanged()
+    expect(state.getPaused()).toBe(false)
+    expect(state.clearGameplayInput).not.toHaveBeenCalled()
+    state.frame()
+    expect(state.getPaused()).toBe(true)
+    expect(state.setPaused).toHaveBeenCalledExactlyOnceWith(true)
+    expect(state.clearGameplayInput).toHaveBeenCalledOnce()
+    expect(state.parent.findAction('resume').attributes.has('hidden')).toBe(false)
+  })
+
+  it('ignores initial unlocked state and intentional modal or death unlocks', () => {
+    const initial = makePauseMenu(false)
+    initial.lockChanged()
+    initial.frame()
+    expect(initial.setPaused).not.toHaveBeenCalled()
+    const modal = makePauseMenu()
+    modal.setCanPause(false)
+    modal.document.pointerLockElement = null
+    modal.lockChanged()
+    modal.setCanPause(true)
+    modal.frame()
+    expect(modal.setPaused).not.toHaveBeenCalled()
+  })
+
+  it('requests lock from the resume gesture and resumes only after lock acquisition', () => {
+    const state = makePauseMenu()
+    state.menu.handleEscape()
+    state.frame()
+    expect(state.getPaused()).toBe(true)
+    state.click('resume')
+    expect(state.canvas.requestPointerLock).toHaveBeenCalledOnce()
+    state.frame()
+    expect(state.getPaused()).toBe(true)
+    state.document.pointerLockElement = state.canvas
+    state.lockChanged()
+    expect(state.getPaused()).toBe(true)
+    state.frame()
+    expect(state.getPaused()).toBe(false)
+    expect(state.clearGameplayInput).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps pause open after a rejected lock request and allows retry', async () => {
+    const state = makePauseMenu()
+    const cause = new Error('lock denied')
+    state.canvas.requestPointerLock.mockRejectedValueOnce(cause)
+    state.menu.handleEscape()
+    state.frame()
+    state.click('resume')
+    await Promise.resolve()
+    state.frame()
+    expect(state.getPaused()).toBe(true)
+    expect(state.onFailure).toHaveBeenCalledExactlyOnceWith({ _tag: 'PointerLockPauseFailure', cause })
+    state.click('resume')
+    expect(state.canvas.requestPointerLock).toHaveBeenCalledTimes(2)
+    state.lockFailed()
+    expect(state.getPaused()).toBe(true)
+    expect(state.onFailure).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not resume if the acquired lock is lost again before the frame boundary', () => {
+    const state = makePauseMenu()
+    state.menu.handleEscape()
+    state.frame()
+    state.click('resume')
+    state.document.pointerLockElement = state.canvas
+    state.lockChanged()
+    state.document.pointerLockElement = null
+    state.lockChanged()
+    state.frame()
+    expect(state.getPaused()).toBe(true)
+    state.click('resume')
+    expect(state.canvas.requestPointerLock).toHaveBeenCalledTimes(2)
+  })
+
+  it('cancels a pending resume when settings is opened before lock acquisition', () => {
+    const state = makePauseMenu()
+    state.menu.handleEscape()
+    state.frame()
+    state.click('resume')
+    state.click('settings')
+    state.document.exitPointerLock.mockImplementation(() => {
+      state.document.pointerLockElement = null
+      state.lockChanged()
+    })
+    state.document.pointerLockElement = state.canvas
+    state.lockChanged()
+    state.frame()
+    expect(state.onOpenSettings).toHaveBeenCalledOnce()
+    expect(state.getPaused()).toBe(true)
+    expect(state.setPaused).toHaveBeenCalledTimes(1)
+    expect(state.document.exitPointerLock).toHaveBeenCalledTimes(2)
+    expect(state.document.pointerLockElement).toBeNull()
+    state.menu.closeSettings()
+    state.click('resume')
+    state.document.pointerLockElement = state.canvas
+    state.lockChanged()
+    state.frame()
+    expect(state.getPaused()).toBe(false)
+  })
+
+  it('closes settings before resume and forwards save-and-quit once', () => {
+    const state = makePauseMenu(false)
+    state.menu.handleEscape()
+    state.frame()
+    state.click('settings')
+    state.frame()
+    expect(state.onOpenSettings).toHaveBeenCalledOnce()
+    state.menu.closeSettings()
+    state.click('save-and-quit')
+    expect(state.onSaveQuit).toHaveBeenCalledOnce()
+    state.menu.handleEscape()
+    state.frame()
+    expect(state.getPaused()).toBe(false)
+    expect(state.canvas.requestPointerLock).not.toHaveBeenCalled()
+  })
+
+  it('removes listeners and cancels queued transitions on destroy', () => {
+    const state = makePauseMenu()
+    state.document.pointerLockElement = null
+    state.lockChanged()
+    state.menu.destroy()
+    state.frame()
+    state.lockChanged()
+    state.menu.handleEscape()
+    expect(state.setPaused).not.toHaveBeenCalled()
+  })
+})
 
 describe('H4a player UI', () => {
   afterEach(() => vi.clearAllMocks())

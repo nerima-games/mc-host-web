@@ -3,7 +3,11 @@ import { type BlockRegistryResolutionFailure, type MonotonicTimeSecs } from '@ne
 import { addExperience as addVitalsExperience, EQUIPMENT_SLOTS, ExperienceDelta } from '@nerima-games/mc-sim'
 import {
   crosshairViewModel,
+  createPauseMenuView,
   hudViewModel,
+  pauseMenuViewModel,
+  type DomElement,
+  type DomElementFactory,
 } from '@nerima-games/mx-ui'
 import {
   miningProgressFraction,
@@ -312,4 +316,124 @@ export const installPauseControls = (context: H4aPauseContext): (() => void) => 
   })
 
   return handlePauseRequest
+}
+
+export type PointerLockPauseFailure = {
+  readonly _tag: 'PointerLockPauseFailure'
+  readonly cause: unknown
+}
+
+export const installPlayerPauseMenu = (context: {
+  readonly document: DomElementFactory & {
+    readonly pointerLockElement: unknown
+    addEventListener(type: string, listener: EventListener): void
+    removeEventListener(type: string, listener: EventListener): void
+    exitPointerLock(): void
+  }
+  readonly parent: DomElement
+  readonly canvas: DomElement & { focus(): void; requestPointerLock(): void | Promise<void> }
+  readonly deferToFrameBoundary: (work: () => void) => void
+  readonly getPaused: () => boolean
+  readonly setPaused: (paused: boolean) => void
+  readonly canPause: () => boolean
+  readonly clearGameplayInput: () => void
+  readonly onOpenSettings: () => void
+  readonly onSaveQuit: () => void
+  readonly onFailure: (failure: PointerLockPauseFailure) => void
+}): { readonly handleEscape: () => void; readonly closeSettings: () => void; readonly destroy: () => void } => {
+  let disposed = false
+  let pointerLockUsed = context.document.pointerLockElement === context.canvas
+  let resumePending = false
+  let settingsOpen = false
+  const render = (): void => view.render(pauseMenuViewModel(
+    context.getPaused() ? settingsOpen ? ['pause', 'settings'] : ['pause'] : [],
+  ))
+  const pause = (): void => {
+    if (disposed || context.getPaused() || !context.canPause()) return
+    resumePending = false
+    settingsOpen = false
+    context.clearGameplayInput()
+    context.setPaused(true)
+    render()
+    if (context.document.pointerLockElement === context.canvas) context.document.exitPointerLock()
+  }
+  const finishResume = (): void => {
+    if (disposed || !resumePending || !context.getPaused() || settingsOpen) return
+    if (pointerLockUsed && context.document.pointerLockElement !== context.canvas) return
+    resumePending = false
+    settingsOpen = false
+    context.clearGameplayInput()
+    context.setPaused(false)
+    render()
+    context.canvas.focus()
+  }
+  const failResume = (cause: unknown): void => {
+    if (disposed || !resumePending) return
+    resumePending = false
+    render()
+    context.onFailure({ _tag: 'PointerLockPauseFailure', cause })
+  }
+  const resume = (): void => {
+    render()
+    if (resumePending || !context.getPaused()) return
+    resumePending = true
+    if (!pointerLockUsed || context.document.pointerLockElement === context.canvas) {
+      context.deferToFrameBoundary(finishResume)
+      return
+    }
+    // The native request must stay in the button's user gesture, before the frame boundary.
+    const requested = Result.try(() => context.canvas.requestPointerLock())
+    if (Result.isFailure(requested)) failResume(requested.failure)
+    else if (requested.success !== undefined) void requested.success.catch(failResume)
+  }
+  const view = createPauseMenuView(context.document, context.parent, {
+    onModalStackChange: (stack) => {
+      if (stack.length === 0) {
+        resume()
+      } else if (stack.includes('settings')) {
+        resumePending = false
+        settingsOpen = true
+        context.deferToFrameBoundary(() => { if (!disposed) context.onOpenSettings() })
+      } else if (settingsOpen) {
+        settingsOpen = false
+      } else {
+        context.deferToFrameBoundary(pause)
+      }
+    },
+    onHostIntent: () => context.onSaveQuit(),
+  })
+  const pointerLockChanged: EventListener = () => {
+    if (context.document.pointerLockElement === context.canvas) {
+      pointerLockUsed = true
+      if (context.getPaused() && !resumePending) {
+        context.document.exitPointerLock()
+        return
+      }
+      if (resumePending) context.deferToFrameBoundary(finishResume)
+    } else if (pointerLockUsed && context.canPause()) {
+      resumePending = false
+      context.deferToFrameBoundary(() => {
+        if (context.document.pointerLockElement !== context.canvas) pause()
+      })
+    }
+  }
+  const pointerLockFailed: EventListener = (event) => failResume(event)
+  context.document.addEventListener('pointerlockchange', pointerLockChanged)
+  context.document.addEventListener('pointerlockerror', pointerLockFailed)
+  render()
+  return {
+    handleEscape: () => {
+      if (!disposed && (context.getPaused() || context.canPause())) view.handleEscape()
+    },
+    closeSettings: () => {
+      settingsOpen = false
+      render()
+    },
+    destroy: () => {
+      disposed = true
+      context.document.removeEventListener('pointerlockchange', pointerLockChanged)
+      context.document.removeEventListener('pointerlockerror', pointerLockFailed)
+      view.destroy()
+    },
+  }
 }

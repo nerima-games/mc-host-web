@@ -1,12 +1,19 @@
-import { Brand } from 'effect'
+import { Brand, Result } from 'effect'
+import { InputAction, KeyCode } from '@nerima-games/mc-kernel'
+import type { DomNode } from '@nerima-games/mx-ui'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { bootTitleMenu } from '../apps/web/title-menu'
+import { bootTitleMenu, installPlayerOnboarding } from '../apps/web/title-menu'
+import { DEFAULT_PLAYER_SETTINGS } from '../apps/web/settings'
 
 const mocks = vi.hoisted(() => ({
   sessions: [{ sessionId: 'saved-world', metadata: { name: 'Saved World' } }],
   createMainMenuView: vi.fn(() => ({ render: vi.fn() })),
-  createSettingsView: vi.fn(() => ({
+  createSettingsView: vi.fn((
+    _document: Document,
+    _root: HTMLElement,
+    _callbacks: Parameters<typeof import('../apps/web/settings-view')['createSettingsView']>[2],
+  ) => ({
     open: vi.fn(),
     clearPersistenceError: vi.fn(),
     reportPersistenceError: vi.fn(),
@@ -41,6 +48,9 @@ vi.mock('../apps/web/settings-view', () => ({
 }))
 
 class FakeElement {
+  focusCount = 0
+  readonly nodeType = 1
+  readonly style = { setProperty: vi.fn(), removeProperty: vi.fn() }
   hidden = false
   inert = false
   disabled = false
@@ -64,6 +74,28 @@ class FakeElement {
 
   addEventListener(type: string, listener: EventListenerOrEventListenerObject): void {
     this.listeners.set(type, listener)
+  }
+
+  appendChild(child: DomNode): void {
+    if (!(child instanceof FakeElement)) throw new Error('expected fake element')
+    this.children.push(child)
+  }
+
+  focus(): void { this.focusCount += 1 }
+
+  find(attribute: string, value: string): FakeElement | undefined {
+    if (this.attributes.get(attribute) === value) return this
+    for (const child of this.children) {
+      const found = child.find(attribute, value)
+      if (found !== undefined) return found
+    }
+    return undefined
+  }
+
+  click(): void {
+    const listener = this.listeners.get('click')
+    if (typeof listener === 'function') listener.call(this, new Event('click'))
+    else listener?.handleEvent(new Event('click'))
   }
 
   replaceChildren(...children: Array<FakeElement>): void {
@@ -133,6 +165,7 @@ const makeTitleMenuContext = () => {
   const window = {
     location,
     sessionStorage,
+    localStorage: { getItem: vi.fn(() => null), setItem: vi.fn() },
     addEventListener: vi.fn(),
     removeEventListener: vi.fn(),
     HTMLFormElement: FakeFormElement,
@@ -233,5 +266,107 @@ describe('title menu boot', () => {
       '[mc-compose] saved session has an invalid world id',
       expect.any(Brand.BrandError),
     )
+  })
+
+  it('shows current bindings on the first visit and hides them after dismissal', async () => {
+    const state = makeTitleMenuContext()
+    await bootTitleMenu(state.context)
+    const root = state.titleScreen.find('data-mx-ui', 'onboarding')
+    expect(root?.attributes.has('hidden')).toBe(false)
+    expect(root?.find('data-onboarding-control-action', 'moveForward')).toBeDefined()
+    expect(root?.find('data-onboarding-control-action', 'escape')).toBeDefined()
+    const dismiss = root?.find('data-onboarding-action', 'PersistQuickControlsDismissal')
+    expect(dismiss).toBeDefined()
+    dismiss?.click()
+    expect(state.window.localStorage.setItem).toHaveBeenCalledExactlyOnceWith('mc-host-web/quick-controls-dismissed', 'true')
+    expect(root?.attributes.has('hidden')).toBe(true)
+  })
+
+  it('reports inaccessible browser storage instead of treating it as a first visit', async () => {
+    const state = makeTitleMenuContext()
+    const cause = new Error('storage denied')
+    state.window.localStorage.getItem.mockImplementation(() => { throw cause })
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    await bootTitleMenu(state.context)
+    expect(state.titleStatus.textContent).toBe('Controls preferences could not be loaded.')
+    expect(error).toHaveBeenCalledExactlyOnceWith('[mc-compose] controls persistence failed', {
+      _tag: 'OnboardingPersistenceFailure', operation: 'read', cause,
+    })
+    expect(state.titleScreen.find('data-mx-ui', 'onboarding')).toBeUndefined()
+  })
+
+  it('updates the displayed controls after rebinding a key in title settings', async () => {
+    const state = makeTitleMenuContext()
+    await bootTitleMenu(state.context)
+    const jump = state.titleScreen.find('data-onboarding-control-action', 'jump')
+    expect(jump?.children[1]?.textContent).toBe('Space')
+    const callbacks = mocks.createSettingsView.mock.calls.at(-1)?.[2]
+    expect(callbacks).toBeDefined()
+    callbacks?.onChange({
+      ...DEFAULT_PLAYER_SETTINGS,
+      bindings: { ...DEFAULT_PLAYER_SETTINGS.bindings, jump: 'KeyJ' },
+    })
+    expect(jump?.children[1]?.textContent).toBe('J')
+  })
+})
+
+describe('player onboarding', () => {
+  const quickControls = [{ action: InputAction('jump'), keys: KeyCode('KeyJ') }]
+  const allControls = [...quickControls, { action: InputAction('openInventory'), keys: KeyCode('KeyI') }]
+  const makeOnboarding = (storage: Pick<Storage, 'getItem' | 'setItem'>) => {
+    const parent = new FakeElement()
+    const onFailure = vi.fn()
+    const installed = installPlayerOnboarding({
+      document: { createElement: () => new FakeElement() },
+      parent, getStorage: () => storage,
+      getQuickControls: () => quickControls, getAllControls: () => allControls, onFailure,
+    })
+    return { parent, onFailure, installed }
+  }
+
+  it('remembers dismissal across mounts and can explicitly reopen the controls', () => {
+    const values = new Map<string, string>()
+    const storage = {
+      getItem: (key: string) => values.has(key) ? values.get(key)! : null,
+      setItem: (key: string, value: string) => { values.set(key, value) },
+    }
+    const first = makeOnboarding(storage)
+    expect(Result.isSuccess(first.installed)).toBe(true)
+    first.parent.find('data-onboarding-action', 'PersistQuickControlsDismissal')?.click()
+    expect(values.get('mc-host-web/quick-controls-dismissed')).toBe('true')
+    const second = makeOnboarding(storage)
+    const root = second.parent.find('data-mx-ui', 'onboarding')
+    expect(root?.attributes.has('hidden')).toBe(true)
+    Result.getOrThrow(second.installed).showControls()
+    expect(root?.attributes.has('hidden')).toBe(false)
+  })
+
+  it('expands how-to-play to all current controls without dismissing or persisting', () => {
+    const storage = { getItem: () => null, setItem: vi.fn() }
+    const state = makeOnboarding(storage)
+    expect(state.parent.find('data-onboarding-control-action', 'openInventory')).toBeUndefined()
+    state.parent.find('data-onboarding-action', 'OpenHowToPlay')?.click()
+    expect(state.parent.find('data-onboarding-control-action', 'openInventory')).toBeDefined()
+    expect(storage.setItem).not.toHaveBeenCalled()
+  })
+
+  it('retains the controls after a failed dismissal write and persists a retry', () => {
+    const cause = new Error('quota exceeded')
+    const storage = { getItem: () => null, setItem: vi.fn().mockImplementationOnce(() => { throw cause }) }
+    const state = makeOnboarding(storage)
+    const dismiss = state.parent.find('data-onboarding-action', 'PersistQuickControlsDismissal')
+    expect(dismiss).toBeDefined()
+    dismiss?.click()
+    expect(state.onFailure).toHaveBeenCalledExactlyOnceWith({ _tag: 'OnboardingPersistenceFailure', operation: 'write', cause })
+    expect(state.parent.find('data-mx-ui', 'onboarding')?.attributes.has('hidden')).toBe(false)
+    dismiss?.click()
+    expect(storage.setItem).toHaveBeenCalledTimes(2)
+    expect(state.parent.find('data-mx-ui', 'onboarding')?.attributes.has('hidden')).toBe(true)
+  })
+
+  it('returns malformed stored dismissal as a typed read failure', () => {
+    const state = makeOnboarding({ getItem: () => 'false', setItem: vi.fn() })
+    expect(state.installed).toEqual(Result.fail({ _tag: 'OnboardingPersistenceFailure', operation: 'read', cause: 'false' }))
+    expect(state.parent.children).toHaveLength(0)
   })
 })
