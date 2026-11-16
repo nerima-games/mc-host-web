@@ -1,11 +1,11 @@
 import { describe, expect, it } from '@effect/vitest'
-import { Effect, Option, Ref } from 'effect'
+import { Effect, Option, Ref, Result } from 'effect'
 
-import { blockIdOf, blockPosition, blockTypeOfId, chunkCoord, DeltaTimeSecs, MonotonicTimeSecs, StackCount } from '@nerima-games/mc-kernel'
-import { PLAYER_HALF_HEIGHT, PLAYER_HALF_WIDTH } from '@nerima-games/mc-physics'
+import { AngleRadians, BlockAxis, blockIdOf, blockPosition, blockTypeOfId, ChunkAxis, chunkCoord, DeltaTimeSecs, itemStack, MonotonicTimeSecs, position, PositionAxis, StackCount, VehicleVelocityComponent } from '@nerima-games/mc-kernel'
+import { BlockLength, PLAYER_HALF_HEIGHT, PLAYER_HALF_WIDTH } from '@nerima-games/mc-physics'
 import type { InputAction } from '@nerima-games/mc-render'
 import { emptyFurnaceState, makeSimFrameState, makeWeatherService, VehicleId, type FurnaceState, type SimPhysicsConfig, type Vehicle } from '@nerima-games/mc-sim'
-import { CHUNK_SIZE_XZ, CHUNK_VOLUME, FALLBACK_BIOME, type ChunkSource } from '@nerima-games/mc-worldgen'
+import { BIOMES, CHUNK_SIZE_XZ, CHUNK_VOLUME, type ChunkSource } from '@nerima-games/mc-worldgen'
 import { advanceFishing, cancelFishing, castFishing, isDroppedItemBehaviour, makeGameplayFrameState, makeGeneratedWorld, spawnDroppedItems, type FishingSession, type MobBehaviour } from '@nerima-games/mx-gameplay'
 import { PlayerId, PlayerName, WorldId } from '@nerima-games/mx-multiplayer'
 
@@ -25,8 +25,8 @@ import {
 
 const allAirChunkSource: ChunkSource = (coord) => Effect.succeed({
   coord,
-  blocks: new Uint8Array(CHUNK_VOLUME).fill(blockIdOf('air')),
-  biomes: Array.from({ length: CHUNK_SIZE_XZ * CHUNK_SIZE_XZ }, () => FALLBACK_BIOME),
+  blocks: new Uint16Array(CHUNK_VOLUME).fill(Option.getOrThrow(blockIdOf('air'))),
+  biomes: Array.from({ length: CHUNK_SIZE_XZ * CHUNK_SIZE_XZ }, () => BIOMES[0]),
 })
 
 const cell = <Value,>(initial: Value) => {
@@ -76,7 +76,7 @@ const makeHarness = async (multiplayer?: H5aMovementContext['multiplayer']) => {
   Effect.runSync(Ref.set(simState.isGrounded, true))
 
   const pose = {
-    feetPosition: { x: 1.2, y: 64.3, z: -2.1 },
+    feetPosition: position(PositionAxis(1.2), PositionAxis(64.3), PositionAxis(-2.1)),
     yawRadians: 0,
     pitchRadians: 0,
   }
@@ -105,10 +105,11 @@ const makeHarness = async (multiplayer?: H5aMovementContext['multiplayer']) => {
   const multiplayerStatus = { textContent: 'idle', hidden: true }
   const simPhysicsConfig: SimPhysicsConfig = {
     resolve: {
-      blockPropertiesAt: () => null,
+      blockPropertiesAt: () => Result.succeed(null),
+      environment: { blockAt: () => Result.succeed(null) },
       halfWidth: PLAYER_HALF_WIDTH,
       halfHeight: PLAYER_HALF_HEIGHT,
-      stepHeight: 0.6,
+      stepHeight: BlockLength(0.6),
     },
     walkSpeed: 2,
     jumpSpeed: 1,
@@ -142,7 +143,7 @@ const makeHarness = async (multiplayer?: H5aMovementContext['multiplayer']) => {
     },
     simState,
     currentChunkStore: world.chunkStore,
-    blockPosition,
+    blockPosition: (x, y, z) => blockPosition(BlockAxis(x), BlockAxis(y), BlockAxis(z)),
     eyeLevelOffset: 1.62,
     blockTypeOfId,
     advanceSwimming: advancePlayerSwimmingRuntime,
@@ -254,11 +255,11 @@ describe('tick player movement branches', () => {
       oxygenSecs: 0.5,
       drowningElapsedSecs: 0.75,
     })
-    await Effect.runPromise(world.worldgenChunkStore.load(chunkCoord(0, -1)))
+    await Effect.runPromise(world.worldgenChunkStore.load(chunkCoord(ChunkAxis(0), ChunkAxis(-1))))
     for (const y of [64, 65]) {
-      const position = blockPosition(1, y, -3)
-      await Effect.runPromise(world.worldgenChunkStore.setBlock(position, blockIdOf('water')))
-      await Effect.runPromise(world.chunkStore.setBlock(position, blockIdOf('water')))
+      const position = blockPosition(BlockAxis(1), BlockAxis(y), BlockAxis(-3))
+      await Effect.runPromise(world.worldgenChunkStore.setBlock(position, Option.getOrThrow(blockIdOf('water'))))
+      await Effect.runPromise(world.chunkStore.setBlock(position, Option.getOrThrow(blockIdOf('water'))))
     }
 
     runTickPlayerMovement(context, makeFrame(1))
@@ -279,8 +280,7 @@ describe('tick player movement branches', () => {
   it('clears a fishing session with the fixed lost-water result', async () => {
     const harness = await makeHarness()
     const cast = castFishing({
-      item: 'fishing_rod',
-      count: StackCount(1),
+      ...Result.getOrThrow(itemStack('fishing_rod', StackCount(1))),
       durability: { current: 64, max: 64 },
     }, { hasWater: true, hasSkyAccess: true, isRaining: false, isOpenWater: true }, {
       wait: 0.25,
@@ -350,7 +350,7 @@ describe('tick player movement branches', () => {
   it('requests furnace progress with deferred time and a stable request id', async () => {
     const harness = await makeHarness()
     const key = 'overworld:0,64,0'
-    const state = emptyFurnaceState()
+    const state = Result.getOrThrow(emptyFurnaceState())
     harness.furnaceStates.set(key, { dimension: 'overworld', position: { x: 0, y: 64, z: 0 }, state })
     harness.deferredFurnaceAdvanceSecs.set(key, 0.125)
 
@@ -371,7 +371,7 @@ describe('tick player movement branches', () => {
     expect(result).toBeUndefined()
     expect(harness.failureEvents).toHaveLength(1)
     expect(harness.failureEvents[0]?.message).toBe('a frame stage defected')
-    expect(harness.failureEvents[0]?.error).toMatchObject({ _tag: 'Die', defect: { message: 'fixture frame defect' } })
+    expect(harness.failureEvents[0]?.error).toMatchObject({ reasons: [{ _tag: 'Die', defect: { message: 'fixture frame defect' } }] })
   })
 
   it('repositions a mounted player from the vehicle pose after the frame', async () => {
@@ -381,13 +381,13 @@ describe('tick player movement branches', () => {
       id: vehicleId,
       type: 'boat',
       dimension: 'overworld',
-      position: { x: 0, y: 64, z: 0 },
-      velocity: { x: 0, y: 0, z: 0 },
-      yawRadians: 0,
+      position: position(PositionAxis(0), PositionAxis(64), PositionAxis(0)),
+      velocity: { x: VehicleVelocityComponent(0), y: VehicleVelocityComponent(0), z: VehicleVelocityComponent(0) },
+      yawRadians: AngleRadians(0),
     }
     const after: Vehicle = {
       ...before,
-      position: { x: 4.5, y: 66, z: -3.25 },
+      position: position(PositionAxis(4.5), PositionAxis(66), PositionAxis(-3.25)),
     }
     harness.setMountedVehicleId('v:1')
     harness.setVehicle(before)

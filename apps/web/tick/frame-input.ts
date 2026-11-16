@@ -1,6 +1,6 @@
 import { ESCAPE_KEY_CODE, type InputAction, type InputSnapshot } from '@nerima-games/mc-render'
 import type { DeltaTimeSecs, MonotonicTimeSecs } from '@nerima-games/mc-kernel'
-import { Effect } from 'effect'
+import { Effect, Result } from 'effect'
 
 import type { H5aFrameInputContext, H5aFrameInputResult } from './h5a-context'
 
@@ -100,7 +100,8 @@ export const runTickFrameInput = (
       state.selectedHotbarIndex.get(),
       walk.wheelSteps,
       (action) => Effect.runSync(inputApi.wasActionJustTriggered(action)),
-      context.wrapHotbarSelection,
+      // Selection and wheel steps come from validated local input; nine slots is fixed.
+      (current, steps, size) => Result.getOrThrow(context.wrapHotbarSelection(current, steps, size)),
     )
     if (nextHotbarIndex !== state.selectedHotbarIndex.get()) {
       // Optimistic: the selection is purely local UI focus (which slot

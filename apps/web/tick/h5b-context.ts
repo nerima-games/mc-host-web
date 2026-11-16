@@ -64,7 +64,7 @@ export type H5bPostFrameContext = {
   }
   readonly state: {
     readonly blockBreakCounters: MutableState<import('../mining-completion').BlockBreakCounters>
-    readonly environmentalContactDamageState: MutableState<ReturnType<typeof import('@nerima-games/mx-gameplay').resolveEnvironmentalContactDamage>['state']>
+    readonly environmentalContactDamageState: MutableState<import('@nerima-games/mx-gameplay').EnvironmentalContactDamageState>
     readonly witherRuntimeState: MutableState<ReturnType<typeof import('@nerima-games/mc-server/shared').restoreWitherRuntime>>
     readonly projectileRuntimeState: MutableState<ReturnType<typeof import('../projectile-runtime').initialProjectileRuntimeState>>
     readonly eyeOfEnderRuntimeState: MutableState<ReturnType<typeof import('../eye-of-ender-runtime').initialEyeOfEnderRuntimeState>>

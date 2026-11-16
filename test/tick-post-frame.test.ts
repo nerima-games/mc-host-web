@@ -1,4 +1,4 @@
-import { blockIdOf, blockPosition, blockPositionKeyOf, blockTypeOfId, chunkCoord, DeltaTimeSecs, MonotonicTimeSecs } from '@nerima-games/mc-kernel'
+import { AngleRadians, AttackRangeDistance, BlockAxis, blockIdOf, blockPosition, blockPositionKeyOf, blockTypeOfId, ChunkAxis, chunkCoord, DeltaTimeSecs, EntityHealthPoints, EntityId, FixedDurationSecs, MonotonicTimeSecs, position, PositionAxis } from '@nerima-games/mc-kernel'
 import { makeChunkStoreLightColor, makeChunkStoreMesher, type InputAction, type InputSnapshot } from '@nerima-games/mc-render'
 import {
   makeSimFrameState,
@@ -11,7 +11,6 @@ import {
 import {
   CHUNK_SIZE_XZ,
   CHUNK_VOLUME,
-  FALLBACK_BIOME,
   type ChunkSource,
 } from '@nerima-games/mc-worldgen'
 import {
@@ -19,9 +18,10 @@ import {
   type MobBehaviour,
 } from '@nerima-games/mx-gameplay'
 import * as gameplay from '@nerima-games/mx-gameplay'
-import { Effect, Ref } from 'effect'
+import { Effect, Option, Ref } from 'effect'
 import { describe, expect, it } from 'vitest'
 
+import { BlocksPerSecond } from '@nerima-games/mc-physics'
 import { makeBudgetedDirtySource } from '../apps/web/chunk-sync-budget'
 import { trackChunkLightColor } from '../apps/web/render-lighting'
 import { isDroppedItemPickupEligible } from '../apps/web/dropped-item-pickup'
@@ -53,8 +53,8 @@ type LegacyGameplayItemType = Exclude<ItemStack['item'], 'arrow' | 'bow'>
 
 const allAirChunkSource: ChunkSource = (coord) => Effect.succeed({
   coord,
-  blocks: new Uint8Array(CHUNK_VOLUME).fill(blockIdOf('air')),
-  biomes: Array.from({ length: CHUNK_SIZE_XZ * CHUNK_SIZE_XZ }, () => FALLBACK_BIOME),
+  blocks: new Uint16Array(CHUNK_VOLUME).fill(Option.getOrThrow(blockIdOf('air'))),
+  biomes: Array.from({ length: CHUNK_SIZE_XZ * CHUNK_SIZE_XZ }, () => 'PLAINS'),
 })
 
 const cell = <Value,>(initial: Value) => {
@@ -135,7 +135,7 @@ const makeContext = async (primaryAttackConsumed: ReturnType<typeof cell<boolean
     simState,
     currentChunkContext: () => currentChunkContext,
     currentChunkStore: world.chunkStore,
-    blockPosition,
+    blockPosition: (x, y, z) => blockPosition(BlockAxis(x), BlockAxis(y), BlockAxis(z)),
     blockTypeOfId,
     gameplayState,
     multiplayer: undefined,
@@ -178,13 +178,13 @@ const makeContext = async (primaryAttackConsumed: ReturnType<typeof cell<boolean
       witherRuntimeState: cell(initialWitherRuntimeState()).state,
       projectileRuntimeState: cell(launchRuntimeProjectile(initialProjectileRuntimeState(), {
         dimension: 'overworld',
-        position: { x: 0, y: 65, z: 0 },
-        yawRadians: 0,
-        pitchRadians: 0,
-        speed: 10,
+        position: position(PositionAxis(0), PositionAxis(65), PositionAxis(0)),
+        yawRadians: AngleRadians(0),
+        pitchRadians: AngleRadians(0),
+        speed: BlocksPerSecond(10),
         damage: 5,
         knockback: 1,
-        shooterId: 'player',
+        shooterId: EntityId('player'),
       })).state,
       eyeOfEnderRuntimeState: cell(initialEyeOfEnderRuntimeState()).state,
       bowUseState: bowUseState.state,
@@ -496,11 +496,11 @@ describe('tick post-frame processing', () => {
     const harness = await makeContext(cell(false))
     const world = harness.context.h5a.world
     const startingVitals = Effect.runSync(world.vitals.snapshot)
-    await Effect.runPromise(world.vitals.restore({ ...startingVitals, healthPoints: 5, lastDamageCause: undefined }))
+    await Effect.runPromise(world.vitals.restore({ ...startingVitals, healthPoints: EntityHealthPoints(5), lastDamageCause: undefined }))
     const damageEvent = {
       _tag: 'FireContact' as const,
-      at: { x: 0.5, y: 64, z: 0.5 },
-      damage: { amount: 6, cause: 'fire' as const },
+      at: position(PositionAxis(0.5), PositionAxis(64), PositionAxis(0.5)),
+      damage: { amount: 6, cause: 'in_fire' as const },
     }
     Effect.runSync(Ref.set(harness.context.h5a.gameplayState.playerDamages, [damageEvent]))
 
@@ -532,8 +532,8 @@ describe('tick post-frame processing', () => {
       else Object.defineProperty(globalThis, 'document', priorDocument)
     }
 
-    expect(applied).toEqual([{ amount: 6, cause: 'fire', minimumHealthPoints: 0 }])
-    expect(Effect.runSync(world.vitals.snapshot)).toMatchObject({ healthPoints: 0, lastDamageCause: 'fire' })
+    expect(applied).toEqual([{ amount: 6, cause: 'in_fire', minimumHealthPoints: 0 }])
+    expect(Effect.runSync(world.vitals.snapshot)).toMatchObject({ healthPoints: 0, lastDamageCause: 'in_fire' })
     expect(harness.inventoryOpenEvents).toEqual([false])
     expect(harness.sessionDirtyCount()).toBe(1)
     expect(result?.deadAfterFrame).toBe(true)
@@ -614,14 +614,14 @@ describe('tick post-frame processing', () => {
     Effect.runSync(world.inventory.add('wooden_sword', 1))
     const target = Effect.runSync(world.entities.spawn({
       kind: EntityKind('zombie'),
-      feetPosition: { x: 0.5, y: 64, z: -2 },
-      healthPoints: 10,
+      feetPosition: position(PositionAxis(0.5), PositionAxis(64), PositionAxis(-2)),
+      healthPoints: EntityHealthPoints(10),
       behaviour: gameplay.hostileMobSnapshot(undefined),
     }))
     const request = {
-      origin: { x: 0.5, y: 65.62, z: 0.5 },
-      direction: { x: 0, y: 0, z: -1 },
-      reach: 3,
+      origin: position(PositionAxis(0.5), PositionAxis(65.62), PositionAxis(0.5)),
+      direction: position(PositionAxis(0), PositionAxis(0), PositionAxis(-1)),
+      reach: AttackRangeDistance(3),
       damage: 4,
     }
     const context: H5bPostFrameContext = {
@@ -649,11 +649,11 @@ describe('tick post-frame processing', () => {
   it('records and completes a fixed creative block-break request', async () => {
     const harness = await makeContext(cell(false))
     const world = harness.context.h5a.world
-    const position = blockPosition(0, 64, 1)
-    await Effect.runPromise(world.worldgenChunkStore.load(chunkCoord(0, 0)))
-    await Effect.runPromise(world.chunkStore.load(chunkCoord(0, 0)))
-    await Effect.runPromise(world.worldgenChunkStore.setBlock(position, blockIdOf('stone')))
-    await Effect.runPromise(world.chunkStore.setBlock(position, blockIdOf('stone')))
+    const position = blockPosition(BlockAxis(0), BlockAxis(64), BlockAxis(1))
+    await Effect.runPromise(world.worldgenChunkStore.load(chunkCoord(ChunkAxis(0), ChunkAxis(0))))
+    await Effect.runPromise(world.chunkStore.load(chunkCoord(ChunkAxis(0), ChunkAxis(0))))
+    await Effect.runPromise(world.worldgenChunkStore.setBlock(position, Option.getOrThrow(blockIdOf('stone'))))
+    await Effect.runPromise(world.chunkStore.setBlock(position, Option.getOrThrow(blockIdOf('stone'))))
     const currentChunkContext = harness.context.h5a.currentChunkContext()
     const context: H5bPostFrameContext = {
       ...inOverworld(harness.context),
@@ -661,7 +661,11 @@ describe('tick post-frame processing', () => {
       dimensionContexts: new Map([['overworld', currentChunkContext] as const]),
       resolveTargetedPrimaryAttack: () => Effect.succeed({
         _tag: 'Block',
-        target: { position, adjacentPosition: position, distance: 1 },
+        target: {
+          position: { x: PositionAxis(position.x), y: PositionAxis(position.y), z: PositionAxis(position.z) },
+          adjacentPosition: { x: PositionAxis(position.x), y: PositionAxis(position.y), z: PositionAxis(position.z) },
+          distance: 1,
+        },
       }),
     }
 
@@ -677,8 +681,8 @@ describe('tick post-frame processing', () => {
     expect(context.pendingBlockBreakConfirmations).toHaveLength(1)
     expect(context.h5a.state.redstoneDirty.get()).toBe(true)
 
-    await Effect.runPromise(world.worldgenChunkStore.setBlock(position, blockIdOf('air')))
-    await Effect.runPromise(world.chunkStore.setBlock(position, blockIdOf('air')))
+    await Effect.runPromise(world.worldgenChunkStore.setBlock(position, Option.getOrThrow(blockIdOf('air'))))
+    await Effect.runPromise(world.chunkStore.setBlock(position, Option.getOrThrow(blockIdOf('air'))))
     runTickPostFrame(context, {
       frame: { ...harness.input, attackTriggered: false, attackHeld: false },
       movement: inOverworldMovement(harness.movement),
@@ -692,8 +696,8 @@ describe('tick post-frame processing', () => {
     const world = harness.context.h5a.world
     const target = Effect.runSync(world.entities.spawn({
       kind: EntityKind('zombie'),
-      feetPosition: { x: 2, y: 64, z: -2 },
-      healthPoints: 10,
+      feetPosition: position(PositionAxis(2), PositionAxis(64), PositionAxis(-2)),
+      healthPoints: EntityHealthPoints(10),
       behaviour: gameplay.hostileMobSnapshot(undefined),
     }))
     harness.context.state.projectileRuntimeState.set(initialProjectileRuntimeState())
@@ -705,10 +709,10 @@ describe('tick post-frame processing', () => {
           projectileId: 'arrow-fixture',
           hit: {
             kind: 'entity',
-            entityId: String(target.id),
-            point: { x: 2, y: 65, z: -2 },
-            normal: { x: 0, y: 0, z: 1 },
-            flightTimeSeconds: 0.05,
+            entityId: target.id,
+            point: position(PositionAxis(2), PositionAxis(65), PositionAxis(-2)),
+            normal: position(PositionAxis(0), PositionAxis(0), PositionAxis(1)),
+            flightTimeSeconds: FixedDurationSecs(0.05),
           },
           damage: 4,
           knockback: 2,

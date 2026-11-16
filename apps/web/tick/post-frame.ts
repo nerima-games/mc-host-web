@@ -1,7 +1,8 @@
+import { AudioGain } from '@nerima-games/mc-audio'
 import { WorldId } from '@nerima-games/mx-multiplayer'
-import { Effect, Option, Ref } from 'effect'
-import { blockIdOf } from '@nerima-games/mc-kernel'
-import { PLAYER_HALF_HEIGHT, PLAYER_HALF_WIDTH } from '@nerima-games/mc-physics'
+import { Effect, Option, Ref, Result } from 'effect'
+import { AngleRadians, blockIdOf, EnchantmentLevel, EntityId, position, PositionAxis, StackCount } from '@nerima-games/mc-kernel'
+import { BlocksPerSecond, DeltaTimeSecs, PLAYER_HALF_HEIGHT, PLAYER_HALF_WIDTH } from '@nerima-games/mc-physics'
 import { changed, type ItemStack, UNCHANGED } from '@nerima-games/mc-sim'
 import { DEFAULT_BLOCK_REACH, INITIAL_ENVIRONMENTAL_CONTACT_DAMAGE_STATE, enchantmentLevel, resolveEnvironmentalContactDamage } from '@nerima-games/mx-gameplay'
 
@@ -183,6 +184,8 @@ export const runTickPostFrame = (
         sprinting,
       } = movement
 
+      // Literal block names below belong to the pinned built-in registry.
+      // Missing ids are a dependency invariant violation, not an air fallback.
       const playerPosition = Effect.runSync(playerApi.pose).feetPosition
       const playerDimension = Effect.runSync(playerApi.dimension)
       if (multiplayer !== undefined) {
@@ -213,7 +216,7 @@ export const runTickPostFrame = (
         const behaviour = entity.behaviour
         if (behaviour === undefined) continue
         const maxCount = maxStackCountForItem(behaviour.item)
-        let remaining = behaviour.count
+        let remaining: number = behaviour.count
         const sameDurability = (slot: number): boolean =>
           JSON.stringify(durability[slot] ?? null)
             === JSON.stringify(behaviour.durability ?? null)
@@ -229,14 +232,16 @@ export const runTickPostFrame = (
           if (current === undefined || current.item !== behaviour.item
             || current.count >= maxCount || !sameDurability(slot) || !metadataMatches(slot)) continue
           const accepted = Math.min(maxCount - current.count, remaining)
-          slots[slot] = itemStack(current.item, current.count + accepted)
+          // Both counts are bounded by this item's stack limit.
+          slots[slot] = Result.getOrThrow(itemStack(current.item, current.count + accepted))
           destinations.push(slot)
           remaining -= accepted
         }
         for (let slot = 0; slot < slots.length && remaining > 0; slot += 1) {
           if (slots[slot] !== undefined) continue
           const accepted = Math.min(maxCount, remaining)
-          slots[slot] = itemStack(entity.behaviour.item, accepted)
+          // Accepted is positive and bounded by this item's stack limit.
+          slots[slot] = Result.getOrThrow(itemStack(entity.behaviour.item, accepted))
           durability[slot] = behaviour.durability ?? null
           destinations.push(slot)
           remaining -= accepted
@@ -264,7 +269,7 @@ export const runTickPostFrame = (
               ? changed({
                   feetPosition: candidate.feetPosition,
                   healthPoints: candidate.healthPoints,
-                  behaviour: { ...candidate.behaviour, count: remaining },
+                  behaviour: { ...candidate.behaviour, count: StackCount(remaining) },
                 })
               : UNCHANGED,
             emit: undefined,
@@ -306,11 +311,11 @@ export const runTickPostFrame = (
         blockBreakCounters = nextBlockBreakCounters
         canvas.setAttribute('data-breaks-completed', String(blockBreakCounters.completed))
         if (
-          pending.blockId === blockIdOf('chest') ||
-          pending.blockId === blockIdOf('shulker_box') ||
-          pending.blockId === blockIdOf('dispenser') ||
-          pending.blockId === blockIdOf('dropper') ||
-          pending.blockId === blockIdOf('hopper')
+          pending.blockId === Option.getOrThrow(blockIdOf('chest')) ||
+          pending.blockId === Option.getOrThrow(blockIdOf('shulker_box')) ||
+          pending.blockId === Option.getOrThrow(blockIdOf('dispenser')) ||
+          pending.blockId === Option.getOrThrow(blockIdOf('dropper')) ||
+          pending.blockId === Option.getOrThrow(blockIdOf('hopper'))
         ) {
           const id = containerIdAt(pending.dimension, pending.position)
           const container = Effect.runSync(world.inventory.containerStorageSnapshot).containers
@@ -323,11 +328,11 @@ export const runTickPostFrame = (
               }]) ?? []
           const drained = Effect.runSync(world.inventory.drainContainer(id))
           if (drained._tag === 'Drained') {
-            const at = {
-              x: pending.position.x + 0.5,
-              y: pending.position.y + 0.5,
-              z: pending.position.z + 0.5,
-            }
+            const at = position(
+              PositionAxis(pending.position.x + 0.5),
+              PositionAxis(pending.position.y + 0.5),
+              PositionAxis(pending.position.z + 0.5),
+            )
             if (drained.items.length > 0) {
               const dropped = Effect.runSync(spawnDroppedItems(
                 world.entities,
@@ -368,15 +373,15 @@ export const runTickPostFrame = (
         const key = furnaceKeyOf(pending)
         const furnace = furnaceStates.get(key)
         if (furnace !== undefined) {
-          const at = {
-            x: pending.position.x + 0.5,
-            y: pending.position.y + 0.5,
-            z: pending.position.z + 0.5,
-          }
+          const at = position(
+            PositionAxis(pending.position.x + 0.5),
+            PositionAxis(pending.position.y + 0.5),
+            PositionAxis(pending.position.z + 0.5),
+          )
           const contents = [furnace.state.input, furnace.state.fuel, furnace.state.output]
             .filter(
               (stack): stack is ItemStack & { readonly item: LegacyGameplayItemType } =>
-                stack !== null && isLegacyGameplayItemType(stack.item),
+                stack !== undefined && isLegacyGameplayItemType(stack.item),
             )
             .map((stack) => ({ ...stack, at }))
           if (contents.length > 0) {
@@ -479,7 +484,8 @@ export const runTickPostFrame = (
 
       const landingImpact = Effect.runSync(Ref.get(simState.landingImpact))
       if (!deadAfterFrame && !dimensionChanged && Option.isSome(landingImpact)) {
-        const fallDamage = resolveFallDamage(landingImpact.value.fallDistance)
+        // Landing impacts contain validated finite fall distances.
+        const fallDamage = Result.getOrThrow(resolveFallDamage(landingImpact.value.fallDistance))
         if (fallDamage !== undefined) {
           applyPlayerDamage(fallDamage)
           markSessionDirty()
@@ -515,11 +521,12 @@ export const runTickPostFrame = (
 
       // Landing damage resolves before block contact in the same frame.
       if (!deadAfterFrame && !dimensionChanged && multiplayer === undefined) {
-        const environmentalDamage = resolveEnvironmentalContactDamage(
+        // Contacts and elapsed time come from the validated host simulation state.
+        const environmentalDamage = Result.getOrThrow(resolveEnvironmentalContactDamage(
           environmentalContactDamageState,
           environmentalContactsForPose(postFramePose),
           h5aState.simulationElapsedSecs.get(),
-        )
+        ))
         environmentalContactDamageState = environmentalDamage.state
         for (const damage of environmentalDamage.damages) applyPlayerDamage(damage)
         if (environmentalDamage.damages.length > 0) {
@@ -577,7 +584,7 @@ export const runTickPostFrame = (
               for (let y = Math.floor(Math.min(start.y, end.y)); y <= Math.floor(Math.max(start.y, end.y)); y += 1) {
                 for (let z = Math.floor(Math.min(start.z, end.z)); z <= Math.floor(Math.max(start.z, end.z)); z += 1) {
                   if (isGameplayBlockSolid({ x, y, z })) {
-                    bounds.push({ minX: x, minY: y, minZ: z, maxX: x + 1, maxY: y + 1, maxZ: z + 1 })
+                    bounds.push({ minX: PositionAxis(x), minY: PositionAxis(y), minZ: PositionAxis(z), maxX: PositionAxis(x + 1), maxY: PositionAxis(y + 1), maxZ: PositionAxis(z + 1) })
                   }
                 }
               }
@@ -588,38 +595,38 @@ export const runTickPostFrame = (
             ...projectileEntities
               .filter(({ kind }) => kind !== 'dropped_item')
               .map((entity) => ({
-                id: String(entity.id),
+                id: entity.id,
                 bounds: {
-                  minX: entity.feetPosition.x - 0.3,
-                  minY: entity.feetPosition.y,
-                  minZ: entity.feetPosition.z - 0.3,
-                  maxX: entity.feetPosition.x + 0.3,
-                  maxY: entity.feetPosition.y + 1.8,
-                  maxZ: entity.feetPosition.z + 0.3,
+                  minX: PositionAxis(entity.feetPosition.x - 0.3),
+                  minY: PositionAxis(entity.feetPosition.y),
+                  minZ: PositionAxis(entity.feetPosition.z - 0.3),
+                  maxX: PositionAxis(entity.feetPosition.x + 0.3),
+                  maxY: PositionAxis(entity.feetPosition.y + 1.8),
+                  maxZ: PositionAxis(entity.feetPosition.z + 0.3),
                 },
               })),
             ...witherRuntimeState.withers
               .filter((wither) => wither.dimension === dimensionAfterFrame)
               .map((wither) => ({
-                id: wither.id,
+                id: EntityId(wither.id),
                 bounds: {
-                  minX: wither.state.feetPosition.x - 0.75,
-                  minY: wither.state.feetPosition.y,
-                  minZ: wither.state.feetPosition.z - 0.75,
-                  maxX: wither.state.feetPosition.x + 0.75,
-                  maxY: wither.state.feetPosition.y + 3.5,
-                  maxZ: wither.state.feetPosition.z + 0.75,
+                  minX: PositionAxis(wither.state.feetPosition.x - 0.75),
+                  minY: PositionAxis(wither.state.feetPosition.y),
+                  minZ: PositionAxis(wither.state.feetPosition.z - 0.75),
+                  maxX: PositionAxis(wither.state.feetPosition.x + 0.75),
+                  maxY: PositionAxis(wither.state.feetPosition.y + 3.5),
+                  maxZ: PositionAxis(wither.state.feetPosition.z + 0.75),
                 },
               })),
             {
-              id: 'player',
+              id: EntityId('player'),
               bounds: {
-                minX: postFramePose.feetPosition.x - PLAYER_HALF_WIDTH,
-                minY: postFramePose.feetPosition.y,
-                minZ: postFramePose.feetPosition.z - PLAYER_HALF_WIDTH,
-                maxX: postFramePose.feetPosition.x + PLAYER_HALF_WIDTH,
-                maxY: postFramePose.feetPosition.y + PLAYER_HALF_HEIGHT * 2,
-                maxZ: postFramePose.feetPosition.z + PLAYER_HALF_WIDTH,
+                minX: PositionAxis(postFramePose.feetPosition.x - PLAYER_HALF_WIDTH),
+                minY: PositionAxis(postFramePose.feetPosition.y),
+                minZ: PositionAxis(postFramePose.feetPosition.z - PLAYER_HALF_WIDTH),
+                maxX: PositionAxis(postFramePose.feetPosition.x + PLAYER_HALF_WIDTH),
+                maxY: PositionAxis(postFramePose.feetPosition.y + PLAYER_HALF_HEIGHT * 2),
+                maxZ: PositionAxis(postFramePose.feetPosition.z + PLAYER_HALF_WIDTH),
               },
             },
           ],
@@ -629,22 +636,22 @@ export const runTickPostFrame = (
               Math.floor(position.y),
               Math.floor(position.z),
             )))
-            return reading._tag === 'Block' && blockTypeOfId(reading.block) === 'water'
+            return reading._tag === 'Block' && Result.getOrThrow(blockTypeOfId(reading.block)) === 'water'
           },
           bounds: {
-            minX: -30_000_000,
-            minY: -64,
-            minZ: -30_000_000,
-            maxX: 30_000_000,
-            maxY: 320,
-            maxZ: 30_000_000,
+            minX: PositionAxis(-30_000_000),
+            minY: PositionAxis(-64),
+            minZ: PositionAxis(-30_000_000),
+            maxX: PositionAxis(30_000_000),
+            maxY: PositionAxis(320),
+            maxZ: PositionAxis(30_000_000),
           },
         }
         const advancedProjectiles = advanceProjectileRuntime(
           projectileRuntimeState,
           projectileWorld,
           dimensionAfterFrame,
-          Math.min(deltaSecs, 0.1),
+          DeltaTimeSecs(Math.min(deltaSecs, 0.1)),
         )
         projectileRuntimeState = advancedProjectiles.state
         for (const impact of advancedProjectiles.impacts) {
@@ -672,11 +679,11 @@ export const runTickPostFrame = (
             Effect.runSync(world.entities.sweep((entity) => ({
               transition: entity.id === target.id
                 ? changed({
-                  feetPosition: {
-                    x: entity.feetPosition.x + impact.velocity.x / horizontalSpeed * impact.knockback,
-                    y: entity.feetPosition.y,
-                    z: entity.feetPosition.z + impact.velocity.z / horizontalSpeed * impact.knockback,
-                  },
+                  feetPosition: position(
+                    PositionAxis(entity.feetPosition.x + impact.velocity.x / horizontalSpeed * impact.knockback),
+                    entity.feetPosition.y,
+                    PositionAxis(entity.feetPosition.z + impact.velocity.z / horizontalSpeed * impact.knockback),
+                  ),
                   healthPoints: entity.healthPoints,
                   behaviour: entity.behaviour,
                 })
@@ -712,7 +719,7 @@ export const runTickPostFrame = (
             Effect.runSync(spawnDroppedItems(world.entities, [{
               item: 'eye_of_ender',
               count: 1,
-              at: settlement.position,
+              at: position(PositionAxis(settlement.position.x), PositionAxis(settlement.position.y), PositionAxis(settlement.position.z)),
             }]))
           }
           markSessionDirty()
@@ -796,19 +803,19 @@ export const runTickPostFrame = (
           const baseDamage = bowDamage(charge)
           projectileRuntimeState = launchRuntimeProjectile(projectileRuntimeState, {
             dimension: dimensionAfterFrame,
-            position: {
-              x: postFramePose.feetPosition.x,
-              y: postFramePose.feetPosition.y + EYE_LEVEL_OFFSET,
-              z: postFramePose.feetPosition.z,
-            },
-            yawRadians: postFramePose.yawRadians,
-            pitchRadians: -postFramePose.pitchRadians,
-            speed: 8 + 24 * charge,
+            position: position(
+              postFramePose.feetPosition.x,
+              PositionAxis(postFramePose.feetPosition.y + EYE_LEVEL_OFFSET),
+              postFramePose.feetPosition.z,
+            ),
+            yawRadians: AngleRadians(postFramePose.yawRadians),
+            pitchRadians: AngleRadians(-postFramePose.pitchRadians),
+            speed: BlocksPerSecond(8 + 24 * charge),
             damage: enchantedBow === null
               ? baseDamage
               : bowDamageWithEnchantments(baseDamage, enchantedBow),
             knockback: 0.35 + 0.65 * charge,
-            shooterId: 'player',
+            shooterId: EntityId('player'),
           })
           markSessionDirty()
         }
@@ -835,14 +842,14 @@ export const runTickPostFrame = (
           horizontalDistance,
           surface: surfaceForBlockType(
             footstepBlock._tag === 'Block' && typeof footstepBlock.block === 'number'
-              ? blockTypeOfId(footstepBlock.block) ?? 'air'
+              ? Result.getOrThrow(blockTypeOfId(footstepBlock.block)) ?? 'air'
               : 'air',
           ),
           sneaking: held('sneak') > 0,
           dead: deadAfterFrame,
           dimensionChanged,
           position: postFramePose.feetPosition,
-          play: (cueId, options) => audio.play(cueId, options),
+          play: (cueId, options) => audio.play(cueId, { ...options, gainScale: AudioGain(options.gainScale) }),
         })
         if (!isCreativeMode && horizontalDistance > 0) {
           if (multiplayer === undefined) survivalHunger.submit(h5aState.swimmingState.get().active
@@ -1012,11 +1019,11 @@ export const runTickPostFrame = (
             if (resolution._tag === 'Block') {
               const reading = Effect.runSync(currentChunkStore.getBlock(blockPosition(resolution.target.position.x, resolution.target.position.y, resolution.target.position.z)))
               if (reading._tag === 'Block') {
-                const position = {
-                  x: Math.floor(resolution.target.position.x),
-                  y: Math.floor(resolution.target.position.y),
-                  z: Math.floor(resolution.target.position.z),
-                } as NonNullable<Parameters<typeof advanceMiningProgress>[0]['target']>['position']
+                const position = blockPosition(
+                  Math.floor(resolution.target.position.x),
+                  Math.floor(resolution.target.position.y),
+                  Math.floor(resolution.target.position.z),
+                )
                 target = { position, blockId: reading.block }
               }
             }
@@ -1026,7 +1033,7 @@ export const runTickPostFrame = (
               isMining: true,
               selectedItem: miningItem,
               efficiencyLevel: enchantedMiningItem === null
-                ? 0
+                ? EnchantmentLevel(0)
                 : enchantmentLevel(enchantedMiningItem, 'efficiency'),
               deltaSecs,
             })
@@ -1048,7 +1055,7 @@ export const runTickPostFrame = (
               } else if (target.blockId === POTATO_CROP_BLOCK_ID) {
                 const location = { dimension, position: target.position }
                 const ripe = Effect.runSync(crops.matureYieldsAt(location)) !== null
-                Effect.runSync(currentChunkStore.setBlock(target.position, blockIdOf('air')))
+                Effect.runSync(currentChunkStore.setBlock(target.position, Option.getOrThrow(blockIdOf('air'))))
                 Effect.runSync(crops.remove(location))
                 h5aState.nextItemUseRequestId.set(h5aState.nextItemUseRequestId.get() + 1)
                 const requestId = `item-use-${String(h5aState.nextItemUseRequestId.get())}`

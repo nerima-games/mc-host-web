@@ -1,9 +1,9 @@
-import { blockIdOf, blockPosition, chunkCoord, DeltaTimeSecs, MonotonicTimeSecs } from '@nerima-games/mc-kernel'
+import { AngleRadians, BlockAxis, blockIdOf, blockTypeOfId, blockPosition as kernelBlockPosition, ChunkAxis, chunkCoord as kernelChunkCoord, DeltaTimeSecs, MonotonicTimeSecs, position, PositionAxis } from '@nerima-games/mc-kernel'
 import { type InputSnapshot } from '@nerima-games/mc-render'
 import { makeTimeService, makeWeatherService } from '@nerima-games/mc-sim'
-import { CHUNK_SIZE_XZ, CHUNK_VOLUME, FALLBACK_BIOME, type ChunkSource } from '@nerima-games/mc-worldgen'
+import { CHUNK_SIZE_XZ, CHUNK_VOLUME, BIOMES, type ChunkSource } from '@nerima-games/mc-worldgen'
 import { type ItemUseResult, type MobBehaviour } from '@nerima-games/mx-gameplay'
-import { Effect, Ref } from 'effect'
+import { Effect, Option, Ref } from 'effect'
 import { describe, expect, it } from 'vitest'
 import * as gameplay from '@nerima-games/mx-gameplay'
 import { makeUiFrameState } from '@nerima-games/mx-ui'
@@ -20,10 +20,13 @@ import type { H5cTickContext } from '../apps/web/tick/h5c-context'
 import { runTickPostFrameGameplay } from '../apps/web/tick/post-frame-gameplay'
 import { type DimensionChunkContext } from '../apps/web/chunk-streaming'
 
+const blockPosition = (x: number, y: number, z: number) => kernelBlockPosition(BlockAxis(x), BlockAxis(y), BlockAxis(z))
+const chunkCoord = (cx: number, cz: number) => kernelChunkCoord(ChunkAxis(cx), ChunkAxis(cz))
+
 const allAirChunkSource: ChunkSource = (coord) => Effect.succeed({
   coord,
-  blocks: new Uint8Array(CHUNK_VOLUME).fill(blockIdOf('air')),
-  biomes: Array.from({ length: CHUNK_SIZE_XZ * CHUNK_SIZE_XZ }, () => FALLBACK_BIOME),
+  blocks: new Uint16Array(CHUNK_VOLUME).fill(Option.getOrThrow(blockIdOf('air'))),
+  biomes: Array.from({ length: CHUNK_SIZE_XZ * CHUNK_SIZE_XZ }, () => BIOMES[0]),
 })
 
 const cell = <Value,>(initial: Value) => {
@@ -108,9 +111,9 @@ const makeHarness = async (options: HarnessOptions = {}) => {
     chunkStore: world.chunkStore,
   } as DimensionChunkContext
   const pose = {
-    feetPosition: { x: 12.346, y: 64.234, z: -7.891 },
-    yawRadians: 0.25,
-    pitchRadians: -0.1,
+    feetPosition: position(PositionAxis(12.346), PositionAxis(64.234), PositionAxis(-7.891)),
+    yawRadians: AngleRadians(0.25),
+    pitchRadians: AngleRadians(-0.1),
   }
   const frame: H5aFrameInputResult = {
     nowSecs: MonotonicTimeSecs(2),
@@ -158,7 +161,7 @@ const makeHarness = async (options: HarnessOptions = {}) => {
     playerApi: world.player,
     currentChunkStore: world.chunkStore,
     blockPosition,
-    blockTypeOfId: (id: number) => id === blockIdOf('air') ? 'air' : undefined,
+    blockTypeOfId,
     gameplayState,
     multiplayer: undefined,
     isCreativeMode: false,
@@ -183,7 +186,7 @@ const makeHarness = async (options: HarnessOptions = {}) => {
     state: {
       activeChestId: cell<string | undefined>(undefined).state,
       activeFurnaceKey: cell<string | undefined>(undefined).state,
-      witherRuntimeState: cell(gameplay.initialWitherRuntimeState()).state,
+      witherRuntimeState: cell((await import('@nerima-games/mc-server/shared')).initialWitherRuntimeState()).state,
     },
     inventoryMode: () => 'player',
     applyPlayerDamage: () => undefined,
@@ -390,7 +393,7 @@ describe('tick post-frame gameplay processing', () => {
       id: 'villager-7',
       profession: 'farmer',
       dimension: 'overworld',
-      feetPosition: { x: 12.346, y: 64.234, z: -7.891 },
+      feetPosition: position(PositionAxis(12.346), PositionAxis(64.234), PositionAxis(-7.891)),
     }
 
     await withHarness({
@@ -414,7 +417,7 @@ describe('tick post-frame gameplay processing', () => {
     const target = {
       position: { x: 2, y: 64, z: -3 },
       adjacentPosition: { x: 2, y: 65, z: -3 },
-      block: blockIdOf('water'),
+      block: Option.getOrThrow(blockIdOf('water')),
     }
     await withHarness({
       useTriggered: true,
@@ -445,16 +448,16 @@ describe('tick post-frame gameplay processing', () => {
       const supportPosition = blockPosition(0, 65, -2)
       Effect.runSync(harness.world.worldgenChunkStore.load(chunkCoord(0, -1)))
       Effect.runSync(harness.world.player.restore({
-        feetPosition: { x: 0.5, y: 64, z: 0.5 },
-        yawRadians: 0,
-        pitchRadians: 0,
+        feetPosition: position(PositionAxis(0.5), PositionAxis(64), PositionAxis(0.5)),
+        yawRadians: AngleRadians(0),
+        pitchRadians: AngleRadians(0),
       }, 'overworld'))
-      Effect.runSync(harness.world.chunkStore.setBlock(supportPosition, blockIdOf('stone')))
+      Effect.runSync(harness.world.chunkStore.setBlock(supportPosition, Option.getOrThrow(blockIdOf('stone'))))
       expect(harness.frame.useTriggered).toBe(true)
       expect(Effect.runSync(harness.world.inventory.snapshot).slots[0]?.item).toBe('stone')
       expect(Effect.runSync(harness.world.chunkStore.getBlock(supportPosition))).toMatchObject({
         _tag: 'Block',
-        block: blockIdOf('stone'),
+        block: Option.getOrThrow(blockIdOf('stone')),
       })
 
       runTickPostFrameGameplay(harness.context, {
@@ -478,11 +481,11 @@ describe('tick post-frame gameplay processing', () => {
       const supportPosition = blockPosition(0, 65, -2)
       Effect.runSync(harness.world.worldgenChunkStore.load(chunkCoord(0, -1)))
       Effect.runSync(harness.world.player.restore({
-        feetPosition: { x: 0.5, y: 64, z: 0.5 },
-        yawRadians: 0,
-        pitchRadians: 0,
+        feetPosition: position(PositionAxis(0.5), PositionAxis(64), PositionAxis(0.5)),
+        yawRadians: AngleRadians(0),
+        pitchRadians: AngleRadians(0),
       }, 'overworld'))
-      Effect.runSync(harness.world.chunkStore.setBlock(supportPosition, blockIdOf('stone')))
+      Effect.runSync(harness.world.chunkStore.setBlock(supportPosition, Option.getOrThrow(blockIdOf('stone'))))
       expect(harness.frame.useTriggered).toBe(true)
       expect(Effect.runSync(harness.world.inventory.snapshot).slots[0]?.item).toBe('flint_and_steel')
 
@@ -522,7 +525,7 @@ describe('tick post-frame gameplay processing', () => {
 
       expect(Effect.runSync(harness.world.chunkStore.getBlock(blockPosition(position.x, position.y, position.z)))).toMatchObject({
         _tag: 'Block',
-        block: blockIdOf('redstone_lamp_lit'),
+        block: Option.getOrThrow(blockIdOf('redstone_lamp_lit')),
       })
     })
   })
@@ -581,7 +584,7 @@ describe('tick post-frame gameplay processing', () => {
       expect(harness.canvasAttributes.get('data-end-dragon-phase')).toBe('dead')
       expect(Effect.runSync(harness.world.chunkStore.getBlock(blockPosition(0, 64, 0)))).toMatchObject({
         _tag: 'Block',
-        block: blockIdOf('end_portal'),
+        block: Option.getOrThrow(blockIdOf('end_portal')),
       })
       expect(harness.endAudioCalls.map(({ cue }) => cue)).toEqual(['dragonHurt', 'dragonReward', 'exitPortal'])
     })
