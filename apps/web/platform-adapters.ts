@@ -12,7 +12,7 @@ import {
   type WeatherLoopKind,
   type WebAudioBackend,
 } from '@nerima-games/mc-audio'
-import { type Position as Vec3 } from '@nerima-games/mc-kernel'
+import { AngleRadians, PositionAxis, type Position as Vec3 } from '@nerima-games/mc-kernel'
 import { indexedDbStorageLayer, StoragePort } from '@nerima-games/mc-save'
 import {
   browserInputLayer,
@@ -128,8 +128,8 @@ export const makePlatformAdapters = async (deps: {
     Effect.provide(loadPlayerSettings(), storageContext),
   ).catch(() => DEFAULT_PLAYER_SETTINGS)
   const settingsWrites = makeSettingsWriteQueue()
-  let readAudioListener = (): Vec3 => ({ x: 0, y: 0, z: 0 })
-  let readAudioListenerForward = (): Vec3 => horizontalListenerForward(0)
+  let readAudioListener = (): Vec3 => ({ x: PositionAxis(0), y: PositionAxis(0), z: PositionAxis(0) })
+  let readAudioListenerForward = (): Vec3 => horizontalListenerForward(AngleRadians(0))
   const sampleManifest = createOriginalSampleManifest()
   const audioBackend = Effect.runSync(makeWebAudioBackend({
     global: globalThis,
@@ -237,6 +237,7 @@ export const makePlatformAdapters = async (deps: {
   // otherwise. Without this, `attack` never fires and no block can be broken.
   const inputLayer = browserInputLayer({
     targets: { window, document },
+    runSync: Effect.runSync,
     canvas,
     bindings: playerSettings.bindings,
     allowsPointerLock,

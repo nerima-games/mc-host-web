@@ -105,37 +105,37 @@
     "count": 1,
     "file": "apps/web/audio-runtime.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runPromise(input.backend.dispose)"
+    "text": "Effect.runPromise(runtime.close())"
   },
   {
     "count": 1,
     "file": "apps/web/audio-runtime.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runPromise(input.backend.preloadSamples())"
+    "text": "Effect.runSync(runtime.snapshot(nowSecs))"
   },
   {
     "count": 1,
     "file": "apps/web/audio-runtime.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runPromise(input.backend.unlock)"
+    "text": "Effect.runPromise(runtime.unlock())"
   },
   {
     "count": 1,
     "file": "apps/web/audio-runtime.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(Ref.modify(captionEvents, (events) => { const retained = pruneExpiredCaptionEvents(events, nowSecs) return [visibleCaptions(retained, nowSecs), retained] }))"
+    "text": "Effect.runSync(runtime.visible(nowSecs))"
   },
   {
     "count": 1,
     "file": "apps/web/audio-runtime.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSyncExit(input.backend.setMasterGain( nextSettings.audioEnabled ? nextSettings.masterVolume : 0, ))"
+    "text": "Effect.runSyncExit(runtime.configure(settings))"
   },
   {
     "count": 1,
     "file": "apps/web/audio-runtime.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSyncExit(service.play(cueId, options))"
+    "text": "Effect.runSyncExit(runtime.play(cueId, options))"
   },
   {
     "count": 1,

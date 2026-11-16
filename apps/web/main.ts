@@ -84,6 +84,7 @@
  */
 import { Cause, Context, Effect, Exit, Option, Ref, Result } from 'effect'
 import {
+  AngleRadians,
   BLOCK_PROPERTY_DEFAULTS,
   BlockAxis,
   BlockId,
@@ -309,7 +310,6 @@ import { makeSurvivalHungerCoordinator } from './survival-hunger-runtime'
 import {
   advanceFootstepRuntime,
   initialFootstepRuntimeState,
-  surfaceForBlockType,
 } from './footstep-runtime'
 import {
   initialSleepRuntimeState,
@@ -1402,8 +1402,12 @@ const bootGame = async (
   //
   const playerApi = world.player
   adapters.setReadAudioListener(() => Effect.runSync(playerApi.pose).feetPosition)
+  // The player's yaw is always finite: makeGeneratedWorld rejects a non-finite
+  // spawn yaw, and mx-gameplay's player rejects one in `look` and `restore`
+  // (saved poses), while `moveTo`, `setDimension` and `reset` keep or zero it.
+  // A failure here is a broken invariant, not a recoverable input.
   adapters.setReadAudioListenerForward(() => horizontalListenerForward(
-    Effect.runSync(playerApi.pose).yawRadians,
+    Result.getOrThrow(AngleRadians.result(Effect.runSync(playerApi.pose).yawRadians)),
   ))
   const inputApi = Context.get(inputContext, InputService)
   const applyBindings = (bindings: PlayerSettingsV1['bindings']): void => {
@@ -3319,7 +3323,6 @@ const bootGame = async (
       bowDamage,
       bowDamageWithEnchantments,
       advanceFootstepRuntime,
-      surfaceForBlockType,
       audio,
       advanceWitherRuntime,
       damageRuntimeWither,
