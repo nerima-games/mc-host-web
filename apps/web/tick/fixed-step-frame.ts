@@ -26,13 +26,16 @@ import { Effect, Ref, Result } from 'effect'
 // input the way vanilla's KeyMapping does.
 // - Level fields (pressed, pointerLocked, pointerLockState, keyboardFocus,
 //   gamepadAxes) come from the current reading for every tick.
-// - Edge fields (justPressed, uiClicks, uiClickLandings, pointerDelta,
-//   wheelSteps) are consumed once, by the frame's first tick. A frame that runs
+// - Edge fields (justPressed, uiClicks, uiClickLandings, wheelSteps) are
+//   consumed once, by the frame's first tick. A frame that runs
 //   no tick carries its edges forward until a tick consumes them, so a key
 //   pressed and released between ticks still fires once (and is not held).
 // - wheelNotches is not summed into the carry: the input service already keeps
 //   the sub-notch remainder in the next reading, so only the whole steps that
 //   were carried are added back. Later ticks of a frame see only that remainder.
+// - pointerDelta is never passed to a tick, carried or not. The frame turns the
+//   camera once from its own reading before the ticks run; a tick that also saw
+//   the delta would turn the player a second time.
 
 export const FIXED_TICK_SECS: DeltaTimeSecs = DeltaTimeSecs(DEFAULT_TICK_DURATION)
 export const HOST_MAX_CATCH_UP_TICKS = 10
@@ -59,7 +62,7 @@ export type FixedStepFrameLoop = {
   readonly simulationTick: Effect.Effect<SimulationTick>
 }
 
-type InputEdges = Pick<InputSnapshot, 'justPressed' | 'uiClicks' | 'uiClickLandings' | 'pointerDelta' | 'wheelSteps'>
+type InputEdges = Pick<InputSnapshot, 'justPressed' | 'uiClicks' | 'uiClickLandings' | 'wheelSteps'>
 
 type LoopState = {
   readonly accumulator: FixedStepAccumulator
@@ -72,18 +75,15 @@ const NO_EDGES: InputEdges = {
   justPressed: new Set(),
   uiClicks: new Set(),
   uiClickLandings: [],
-  pointerDelta: { x: 0, y: 0 },
   wheelSteps: 0,
 }
+
+const NO_POINTER_DELTA: InputSnapshot['pointerDelta'] = { x: 0, y: 0 }
 
 const mergeEdges = (earlier: InputEdges, later: InputEdges): InputEdges => ({
   justPressed: new Set([...earlier.justPressed, ...later.justPressed]),
   uiClicks: new Set([...earlier.uiClicks, ...later.uiClicks]),
   uiClickLandings: [...earlier.uiClickLandings, ...later.uiClickLandings],
-  pointerDelta: {
-    x: earlier.pointerDelta.x + later.pointerDelta.x,
-    y: earlier.pointerDelta.y + later.pointerDelta.y,
-  },
   wheelSteps: earlier.wheelSteps + later.wheelSteps,
 })
 
@@ -91,11 +91,13 @@ const tickInputs = (current: InputSnapshot, carried: InputEdges, ticks: number):
   const first: InputSnapshot = {
     ...current,
     ...mergeEdges(carried, current),
+    pointerDelta: NO_POINTER_DELTA,
     wheelNotches: current.wheelNotches + carried.wheelSteps,
   }
   const rest: InputSnapshot = {
     ...current,
     ...NO_EDGES,
+    pointerDelta: NO_POINTER_DELTA,
     wheelNotches: first.wheelNotches - first.wheelSteps,
   }
   return Array.from({ length: ticks }, (_, index) => (index === 0 ? first : rest))

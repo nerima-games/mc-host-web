@@ -122,7 +122,7 @@ describe('fixed step frame input', () => {
     expect(first?.justPressed).toEqual(new Set(['KeyE']))
     expect(first?.uiClicks).toEqual(new Set(['MouseLeft']))
     expect(first?.uiClickLandings).toEqual([{ button: 'MouseLeft', landing: 'ui' }])
-    expect(first?.pointerDelta).toEqual({ x: 5, y: -2 })
+    expect(first?.pointerDelta).toEqual({ x: 0, y: 0 })
     expect(first?.wheelSteps).toBe(1)
     expect(first?.wheelNotches).toBe(1.5)
     for (const later of [second, third]) {
@@ -185,7 +185,7 @@ describe('fixed step frame input', () => {
       { button: 'MouseLeft', landing: 'elsewhere' },
       { button: 'MouseLeft', landing: 'ui' },
     ])
-    expect(consumed?.pointerDelta).toEqual({ x: 3, y: 0 })
+    expect(consumed?.pointerDelta).toEqual({ x: 0, y: 0 })
     expect(consumed?.wheelSteps).toBe(2)
     expect(consumed?.wheelNotches).toBe(2.25)
 
@@ -253,5 +253,69 @@ describe('fixed step frame getters', () => {
 
     expect(Effect.runSync(loop.partialTick)).toBeCloseTo(0.2, 6)
     expect(Effect.runSync(loop.simulationTick)).toBe(3)
+  })
+})
+
+describe('fixed step frame look input', () => {
+  // The camera turns once per render frame from the frame's own reading, so a
+  // tick that also saw pointerDelta would turn the player a second time.
+  it('passes no pointer delta to any tick of a multi-tick frame', () => {
+    const loop = newLoop()
+    runFrame(loop, 10)
+
+    const { seen } = runFrame(loop, 10.11, reading({
+      justPressed: new Set(['KeyE']),
+      pointerDelta: { x: 5, y: -2 },
+    }))
+
+    expect(seen).toHaveLength(2)
+    expect(seen.map((tick) => tick.input.pointerDelta)).toEqual([{ x: 0, y: 0 }, { x: 0, y: 0 }])
+    expect(seen[0]?.input.justPressed).toEqual(new Set(['KeyE']))
+  })
+
+  it('does not carry pointer delta from a frame without a tick', () => {
+    const loop = newLoop()
+    runFrame(loop, 10)
+
+    const idle = runFrame(loop, 10.016, reading({
+      justPressed: new Set(['KeyE']),
+      pointerDelta: { x: 7, y: 3 },
+    }))
+    expect(idle.seen).toEqual([])
+
+    const { seen } = runFrame(loop, 10.05, reading())
+
+    expect(seen).toHaveLength(1)
+    expect(seen[0]?.input.pointerDelta).toEqual({ x: 0, y: 0 })
+    expect(seen[0]?.input.justPressed).toEqual(new Set(['KeyE']))
+  })
+
+  it('leaves the frame reading unchanged for endFrame', () => {
+    const loop = newLoop()
+    runFrame(loop, 10)
+    runFrame(loop, 10.016, reading({ justPressed: new Set(['KeyQ']), pointerDelta: { x: 1, y: 1 } }))
+
+    const justPressed = new Set(['KeyE'])
+    const uiClicks: InputSnapshot['uiClicks'] = new Set(['MouseLeft'])
+    const uiClickLandings: InputSnapshot['uiClickLandings'] = [{ button: 'MouseLeft', landing: 'ui' }]
+    const pointerDelta = { x: 5, y: -2 }
+    const input = reading({ justPressed, uiClicks, uiClickLandings, pointerDelta, wheelSteps: 1, wheelNotches: 1.5 })
+    const before = reading({
+      justPressed: new Set(justPressed),
+      uiClicks: new Set(uiClicks),
+      uiClickLandings: [...uiClickLandings],
+      pointerDelta: { ...pointerDelta },
+      wheelSteps: 1,
+      wheelNotches: 1.5,
+    })
+
+    const { seen } = runFrame(loop, 10.16, input)
+
+    expect(seen).toHaveLength(3)
+    expect(input).toEqual(before)
+    expect(input.justPressed).toBe(justPressed)
+    expect(input.uiClickLandings).toBe(uiClickLandings)
+    expect(input.pointerDelta).toBe(pointerDelta)
+    expect(seen.every((tick) => tick.input !== input)).toBe(true)
   })
 })
