@@ -744,30 +744,6 @@
     "text": "Effect.runSync(browserClock.monotonicSecs)"
   },
   {
-    "count": 1,
-    "file": "apps/web/qa-surface.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(crops.matureYieldsAt(location))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/qa-surface.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(crops.remove(location))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/qa-surface.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(crops.restore({ crops: [{ dimension, position: QA_FARM_CROP_BLOCK, crop: 'potato_crop', growthSecs: POTATO_MATURITY_SECS - 0.1, }], }))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/qa-surface.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(crops.snapshot)"
-  },
-  {
     "count": 2,
     "file": "apps/web/qa-surface.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
@@ -874,12 +850,6 @@
     "file": "apps/web/qa-surface.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(currentChunkStore.setBlock(QA_FARM_CROP_BLOCK, POTATO_CROP_BLOCK_ID))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/qa-surface.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(currentChunkStore.setBlock(QA_FARM_CROP_BLOCK, blockIdOf('air')))"
   },
   {
     "count": 7,
@@ -2608,5 +2578,17 @@
     "file": "apps/web/title-menu.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(Scope.make())"
+  },
+  {
+    "count": 2,
+    "file": "apps/web/qa-surface.ts",
+    "ruleId": "no-effect-run-outside-entrypoints",
+    "text": "Effect.runSync(commit.coordinator.snapshot(GAMEPLAY_CROPS_OWNER_ID, CropSnapshotSchema))"
+  },
+  {
+    "count": 1,
+    "file": "apps/web/qa-surface.ts",
+    "ruleId": "no-effect-run-outside-entrypoints",
+    "text": "Effect.runSync(commit.coordinator.commitFromSnapshot(GAMEPLAY_CROPS_OWNER_ID, CropSnapshotSchema, (snapshot) => Effect.succeed({ expectedRevision: snapshot.revision, expectedDimensions: [], changes: [{ ownerId: GAMEPLAY_CROPS_OWNER_ID, state: { crops: [{ dimension, position: QA_FARM_CROP_BLOCK, crop: 'potato_crop', growthSecs: POTATO_MATURITY_SECS - 0.1, }] }, }], })))"
   }
 ]
