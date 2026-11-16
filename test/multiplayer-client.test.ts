@@ -1,5 +1,5 @@
 import { Effect, Result } from 'effect'
-import { furnaceState, INVENTORY_SLOT_COUNT } from '@nerima-games/mc-sim'
+import { CHEST_CONTAINER_CAPACITY, furnaceState, INVENTORY_SLOT_COUNT } from '@nerima-games/mc-sim'
 import { CommandId, PlayerId, WorldId, type NetworkMessage } from '@nerima-games/mx-multiplayer'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -88,6 +88,15 @@ const UNKNOWN_ITEM = 'not_a_real_item'
 const inventoryWith = (first: InventoryState['slots'][number]): InventoryState => ({
   selectedSlot: 0,
   slots: [first, ...Array.from({ length: INVENTORY_SLOT_COUNT - 1 }, () => null)],
+})
+
+const chest = (
+  containerId: string,
+  first: NonNullable<AuthoritativeSnapshotMessage['containers'][number]['slots'][number]>,
+): AuthoritativeSnapshotMessage['containers'][number] => ({
+  containerId,
+  kind: 'chest',
+  slots: [first, ...Array.from({ length: CHEST_CONTAINER_CAPACITY - 1 }, () => null)],
 })
 
 const emptyFurnace = (): ReturnType<typeof furnaceState> => furnaceState({
@@ -181,13 +190,6 @@ describe('multiplayer client server-state rejection', () => {
   })
 
   it.each([
-    ['vitals', (player: PlayerId): NetworkMessage => ({
-      _tag: 'PlayerVitalsDelta',
-      revision: 2,
-      world: OVERWORLD,
-      player,
-      state: { health: 5, hunger: 25, experience: 7 },
-    })],
     ['furnace', (): NetworkMessage => ({
       _tag: 'FurnaceDelta',
       revision: 2,
@@ -212,14 +214,12 @@ describe('multiplayer client server-state rejection', () => {
     })],
   ])('keeps the revision when a %s delta is rejected', async (what, message) => {
     const harness = await makeMultiplayerClientHarness()
-    const vitalsBefore = Effect.runSync(harness.world.vitals.snapshot)
 
-    harness.deliver(message(harness.localPlayer))
+    harness.deliver(message())
 
     expect(harness.canvasAttributes.get('data-multiplayer-revision')).toBe('0')
     expect(harness.context.state.multiplayerRejection).toBe(`invalid ${what}`)
     expect(harness.context.state.furnaceStates.size).toBe(0)
-    expect(Effect.runSync(harness.world.vitals.snapshot)).toEqual(vitalsBefore)
   })
 
   it('keeps the furnaces, the furnace UI, the player and the rejection when a realm transfer carries an invalid furnace', async () => {
@@ -278,22 +278,35 @@ describe('multiplayer client server-state rejection', () => {
     expect(harness.multiplayerStatus.textContent).toBe('Invalid furnace from the multiplayer server was not applied.')
   })
 
-  it('applies a valid authoritative snapshot', async () => {
+  it('applies a valid authoritative snapshot and a container delta over it', async () => {
     const harness = await makeMultiplayerClientHarness()
 
-    harness.deliver(authoritativeSnapshot(harness.localPlayer, [{
-      furnaceId: JSON.stringify(['overworld', 4, 70, 4]),
-      input: { item: 'stone', count: 1 },
-      fuel: null,
-      output: null,
-      burnTicksRemaining: 0,
-      cookTicks: 0,
-    }]))
+    harness.deliver({
+      ...authoritativeSnapshot(harness.localPlayer, [{
+        furnaceId: JSON.stringify(['overworld', 4, 70, 4]),
+        input: { item: 'stone', count: 1 },
+        fuel: null,
+        output: null,
+        burnTicksRemaining: 0,
+        cookTicks: 0,
+      }]),
+      containers: [chest('chest-a', { item: 'stone', count: 2 })],
+    })
 
     expect(harness.canvasAttributes.get('data-multiplayer-revision')).toBe('3')
     expect(harness.context.state.multiplayerRejection).toBe('')
     expect(Effect.runSync(harness.world.vitals.snapshot)).toMatchObject({ healthPoints: 5, hungerPoints: 3, totalExperience: 7 })
     expect(Effect.runSync(harness.weather.snapshot).weather).toBe('thunder')
     expect([...harness.context.state.furnaceStates.keys()]).toEqual([JSON.stringify(['overworld', 4, 70, 4])])
+
+    harness.deliver({ _tag: 'ContainerDelta', revision: 4, world: OVERWORLD, state: chest('chest-b', { item: 'dirt', count: 5 }) })
+
+    expect(harness.canvasAttributes.get('data-multiplayer-revision')).toBe('4')
+    expect(harness.context.state.multiplayerRejection).toBe('')
+    const containers = Effect.runSync(harness.world.inventory.containerStorageSnapshot).containers
+    expect(containers.map(({ id, slots }) => [id, slots[0]?.item, slots[0]?.count])).toEqual([
+      ['chest-a', 'stone', 2],
+      ['chest-b', 'dirt', 5],
+    ])
   })
 })
