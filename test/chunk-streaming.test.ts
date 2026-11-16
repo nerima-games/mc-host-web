@@ -16,10 +16,10 @@ import {
   CHUNK_VOLUME,
   ChunkCapacity,
   generatedChunkSource,
-  generatedDimensionChunkSource,
   makeChunkStore,
   NoiseSeed,
   type Chunk,
+  type ChunkSource,
   type ChunkWithBlockStates,
   type Dimension,
 } from '@nerima-games/mc-worldgen'
@@ -408,6 +408,10 @@ describe('chunk streaming', () => {
 })
 
 describe('chunk render attachment wiring', () => {
+  // The wiring under test needs resident chunks to mesh, not terrain. Generating
+  // real noise terrain for both dimensions made the re-entry test ~5x slower
+  // under V8 coverage and time out, so the stores are fed empty chunks.
+  const emptyChunkSource: ChunkSource = (coord) => Effect.succeed(chunk(coord.cx, coord.cz))
   const coords = (chunks: ReadonlyArray<{ readonly cx: number; readonly cz: number }>) =>
     chunks.map(({ cx, cz }) => `${String(cx)},${String(cz)}`)
 
@@ -482,7 +486,10 @@ describe('chunk render attachment wiring', () => {
       const counters = { streamed: 0, dropped: 0 }
       const streaming = makeChunkStreaming({
         streamRadiusChunks: 1,
-        activeSeed: 71,
+        // Overworld streaming always runs the village search, whose sampling
+        // count depends on the seed; this test checks no villagers, so it uses
+        // a seed with a short search (2880 surface samples against 8640 for 71).
+        activeSeed: 2,
         canvas: { setAttribute: () => {} },
         coordinator: yield* makeWorldCommitCoordinator({
           world: WorldId('chunk-streaming-dimension-reentry'),
@@ -501,7 +508,7 @@ describe('chunk render attachment wiring', () => {
       // and one budgeted attachment per dimension, sharing one WorldRenderer.
       const dimensionContext = (dimension: Dimension) =>
         Effect.gen(function* () {
-          const store = yield* makeChunkStore(generatedDimensionChunkSource(NoiseSeed(71), dimension), ChunkCapacity(64))
+          const store = yield* makeChunkStore(emptyChunkSource, ChunkCapacity(64))
           const rendererStore = yield* budgetedRendererStore(store, 4)
           const renderAttachment = yield* attachChunkStoreRenderer(renderer, rendererStore.store)
           return {
