@@ -310,7 +310,7 @@ export type MultiplayerClientContext = {
           readonly cells: ReadonlyArray<{ readonly item: ItemStack['item'] } | undefined>
         }
       }
-      readonly confirmCraftOnce: () => Effect.Effect<unknown>
+      readonly confirmCraftOnce: () => Effect.Effect<unknown, import('@nerima-games/mc-sim').ItemStackFailure>
     }
     readonly renderPlayerUi: () => void
     readonly renderTradeUi: () => void
