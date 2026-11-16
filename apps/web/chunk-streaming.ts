@@ -16,9 +16,8 @@ import {
   makeVillager,
   GAMEPLAY_VILLAGER_TRADES_OWNER_ID,
   GameplayVillagerTradeSnapshotSchema,
-  type GameplayFrameState,
 } from '@nerima-games/mx-gameplay'
-import { Brand, Effect, Exit } from 'effect'
+import { Effect, Exit, Result } from 'effect'
 
 import { snapshotResidentChunks, type PersistedVillager } from './session-persistence'
 import type { SessionSaveCoordinator } from './session-save-coordinator'
@@ -49,7 +48,6 @@ export type ChunkStreamingDependencies = {
   readonly streamRadiusChunks: number
   readonly activeSeed: number
   readonly canvas: Pick<HTMLCanvasElement, 'setAttribute'>
-  readonly gameplayState: GameplayFrameState
   readonly coordinator: WorldCommitCoordinatorApi
   readonly villagerResidents: Map<string, PersistedVillager>
   readonly saveCoordinator: Pick<SessionSaveCoordinator, 'retainChunk'>
@@ -66,7 +64,7 @@ export type ChunkStreamingRuntime = {
     context: ChunkStreamingContext,
     x: number,
     z: number,
-  ) => Effect.Effect<void, WorldCommitCoordinatorError | InvalidNaturalStructureCoordinate | Brand.BrandError>
+  ) => Effect.Effect<void, WorldCommitCoordinatorError | InvalidNaturalStructureCoordinate>
   readonly retainDimensionResidents: (context: ChunkStreamingContext) => Effect.Effect<void>
 }
 
@@ -95,11 +93,13 @@ export const desiredChunksAround = (
 export const makeChunkStreaming = (
   dependencies: ChunkStreamingDependencies,
 ): ChunkStreamingRuntime => {
+  // initializeSessionWorld has already validated the seed returned to the host.
+  const seed = Result.getOrThrow(NoiseSeed.result(dependencies.activeSeed))
   const streamAround = (
     context: ChunkStreamingContext,
     x: number,
     z: number,
-  ): Effect.Effect<void, WorldCommitCoordinatorError | InvalidNaturalStructureCoordinate | Brand.BrandError> =>
+  ): Effect.Effect<void, WorldCommitCoordinatorError | InvalidNaturalStructureCoordinate> =>
     Effect.suspend(() => {
       let streamed = 0
       let dropped = 0
@@ -121,7 +121,6 @@ export const makeChunkStreaming = (
           }))
           let discovered = false
           if (context.dimension === 'overworld') {
-            const seed = yield* Effect.fromResult(NoiseSeed.result(dependencies.activeSeed))
             const initial = yield* dependencies.coordinator.snapshot(
               GAMEPLAY_VILLAGER_TRADES_OWNER_ID,
               GameplayVillagerTradeSnapshotSchema,

@@ -8,7 +8,6 @@ import {
   GAMEPLAY_VILLAGER_TRADES_OWNER_ID,
   GameplayVillagerTradeSnapshotSchema,
   gameplayOwnerRegistrations,
-  makeGameplayFrameState,
   makeVillager,
 } from '@nerima-games/mx-gameplay'
 
@@ -70,7 +69,6 @@ describe('chunk streaming', () => {
     const streaming = makeChunkStreaming({
       streamRadiusChunks: 1,
       activeSeed: 71,
-      gameplayState: await Effect.runPromise(makeGameplayFrameState),
       coordinator,
       canvas: { setAttribute: (name, value) => { attributes.set(name, value) } },
       villagerResidents: new Map(),
@@ -153,7 +151,6 @@ describe('chunk streaming', () => {
     const streaming = makeChunkStreaming({
       streamRadiusChunks: 0,
       activeSeed: 71,
-      gameplayState: await Effect.runPromise(makeGameplayFrameState),
       coordinator,
       canvas: { setAttribute: () => { events.push('attribute') } },
       villagerResidents,
@@ -207,7 +204,6 @@ describe('chunk streaming', () => {
   it('interrupts an in-flight load without queueing or unloading and can retry it', async () => {
     const events: string[] = []
     const started = Deferred.makeUnsafe<void>()
-    const gameplayState = await Effect.runPromise(makeGameplayFrameState)
     const coordinator = await Effect.runPromise(makeWorldCommitCoordinator({
       world: WorldId('chunk-streaming-interruption'),
       owners: gameplayOwnerRegistrations(),
@@ -217,7 +213,6 @@ describe('chunk streaming', () => {
     const streaming = makeChunkStreaming({
       streamRadiusChunks: 0,
       activeSeed: 71,
-      gameplayState,
       coordinator,
       canvas: { setAttribute: (name, value) => { attributes.set(name, value) } },
       villagerResidents: new Map(),
@@ -283,7 +278,6 @@ describe('chunk streaming', () => {
     const attributes = new Map<string, string>()
     const retained: Array<Readonly<{ dimension: string; chunk: Chunk }>> = []
     const counters = { streamed: 0, dropped: 0 }
-    const gameplayState = await Effect.runPromise(makeGameplayFrameState)
     const coordinator = await Effect.runPromise(makeWorldCommitCoordinator({
       world: WorldId('chunk-streaming-test'),
       owners: gameplayOwnerRegistrations(),
@@ -292,7 +286,6 @@ describe('chunk streaming', () => {
       streamRadiusChunks: 0,
       activeSeed: 71,
       canvas: { setAttribute: (name, value) => { attributes.set(name, value) } },
-      gameplayState,
       coordinator,
       villagerResidents: new Map(),
       saveCoordinator: { retainChunk: (value) => { retained.push(value) } },

@@ -20,7 +20,7 @@ import {
   type SessionHead,
   type SessionState,
 } from './session-persistence'
-import { makeSessionChunkSourceFor } from './session-restoration'
+import { makeSessionChunkSourceFor, requireSessionChunkBlockStates } from './session-restoration'
 
 export type SessionWorldInitialization<World> = {
   readonly activeSeed: number
@@ -67,11 +67,10 @@ export const initializeSessionWorld = async <World>(context: {
   const restored = Option.isSome(context.loadedSession)
     ? await context.loadSavedChunks(context.loadedSession.value, context.initialDimension, generatedSource)
     : undefined
-  const initialKnownChunks = (restored?.chunks ?? []).map(({ dimension, chunk }) => {
-    // loadSavedChunks decodes the save format, including its block-state buffer.
-    if (chunk.blockStates === undefined) throw new Error('Persisted chunk has no block states')
-    return { dimension, chunk: chunkSnapshotOf({ ...chunk, blockStates: chunk.blockStates }) }
-  })
+  const initialKnownChunks = (restored?.chunks ?? []).map(({ dimension, chunk }) => ({
+    dimension,
+    chunk: chunkSnapshotOf(requireSessionChunkBlockStates(chunk)),
+  }))
   const persistedChunks = new Map<string, Chunk>(
     (restored?.chunks ?? []).map(({ dimension, chunk }) => [
       `${dimension}:${String(chunk.coord.cx)},${String(chunk.coord.cz)}`,
