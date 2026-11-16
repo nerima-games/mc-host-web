@@ -34,10 +34,10 @@ import {
   activeDimensionChunkSync,
   budgetedRendererStore,
   ChunkRenderFailure,
-  clearRenderedChunks,
   desiredChunksAround,
   drainChunkRenderFaults,
   makeChunkStreaming,
+  showDimensionChunks,
   type ChunkRenderFault,
   type ChunkStreamingContext,
 } from '../apps/web/chunk-streaming'
@@ -414,7 +414,7 @@ describe('chunk render attachment wiring', () => {
     Effect.gen(function* () {
       const store = yield* makeChunkStore(generatedChunkSource(NoiseSeed(1)), ChunkCapacity(16))
       const rendererStore = yield* budgetedRendererStore(store, 2)
-      const subscription = yield* rendererStore.subscribeDirty
+      const subscription = yield* rendererStore.store.subscribeDirty
       // Far apart, so no load also dirties a resident neighbour.
       for (const cx of [0, 10, 20]) yield* store.load(chunkCoord(ChunkAxis(cx), ChunkAxis(0)))
 
@@ -502,13 +502,14 @@ describe('chunk render attachment wiring', () => {
         Effect.gen(function* () {
           const store = yield* makeChunkStore(generatedDimensionChunkSource(NoiseSeed(71), dimension), ChunkCapacity(64))
           const rendererStore = yield* budgetedRendererStore(store, 4)
-          const renderAttachment = yield* attachChunkStoreRenderer(renderer, rendererStore)
+          const renderAttachment = yield* attachChunkStoreRenderer(renderer, rendererStore.store)
           return {
             dimension,
             chunkStore: store,
             worldgenChunkStore: store,
             streamLoaded: new Set<string>(),
             renderAttachment,
+            enqueueRenderUpdate: rendererStore.enqueue,
           }
         })
       const overworld = yield* dimensionContext('overworld')
@@ -528,20 +529,21 @@ describe('chunk render attachment wiring', () => {
         yield* runFrames
         expect(yield* rendered).toEqual(around)
 
-        // main.ts alignActiveDimension: switch the context, then clear the renderer.
+        // main.ts alignActiveDimension: switch the context, then show its chunks.
         active = nether
-        yield* clearRenderedChunks(renderer)
+        yield* showDimensionChunks(renderer, nether)
         yield* streaming.streamAround(nether, 0, 0)
         yield* runFrames
         expect(yield* rendered).toEqual(around)
 
         active = overworld
-        yield* clearRenderedChunks(renderer)
+        yield* showDimensionChunks(renderer, overworld)
         yield* streaming.streamAround(overworld, 0, 0)
         const reentryFrames = yield* runFrames
 
         expect([...overworld.streamLoaded].sort()).toEqual(around)
-        expect(reentryFrames.every((meshed) => meshed <= 4)).toBe(true)
+        // Nine resident chunks under a budget of four per frame.
+        expect(reentryFrames).toEqual([4, 4, 1, 0, 0, 0, 0, 0])
         expect(yield* rendered).toEqual(around)
       }).pipe(Effect.ensuring(renderer.dispose))
     }))

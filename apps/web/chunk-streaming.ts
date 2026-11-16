@@ -3,10 +3,12 @@ import type { WorldCommitCoordinatorApi, WorldCommitCoordinatorError } from '@ne
 import {
   chunkKeyOf,
   makeBudgetedDirtySource,
+  type BudgetedDirtySource,
   type BudgetedDirtySourceInputError,
   type ChunkRef,
   type ChunkSyncPort,
   type RendererChunkStore,
+  type WorldRenderer,
   type WorldRendererAttachment,
 } from '@nerima-games/mc-render'
 import {
@@ -48,6 +50,8 @@ export type ChunkStreamingContext<
 export type DimensionChunkContext = ChunkStreamingContext<ChunkStoreApi, ChunkStoreApi> & {
   /** mc-render's attachment to this dimension's ChunkStore; exactly one per store. */
   readonly renderAttachment: WorldRendererAttachment
+  /** `enqueue` of the budgeted dirty source `renderAttachment` drains. */
+  readonly enqueueRenderUpdate: BudgetedDirtySource['enqueue']
   readonly lightingSnapshot: () => RenderLightingSnapshot
 }
 
@@ -233,9 +237,33 @@ export const clearRenderedChunks = <Key extends string, KeyError, KeyRequirement
   })
 
 /**
+ * Show a dimension's chunks in the shared WorldRenderer after switching to it.
+ *
+ * Clearing removes the previous dimension's meshes. A dimension entered again
+ * keeps its resident chunks, but its attachment drained their dirty entries
+ * when it first meshed them and `streamAround` does not load a chunk it has
+ * already streamed, so nothing marks them dirty again. Enqueueing the store's
+ * resident chunks into the budgeted source makes the attachment mesh them
+ * again, at most the frame budget per frame.
+ */
+export const showDimensionChunks = (
+  worldRenderer: Pick<WorldRenderer, 'chunkKeys' | 'removeChunk'>,
+  context: Pick<DimensionChunkContext, 'worldgenChunkStore' | 'enqueueRenderUpdate'>,
+): Effect.Effect<void> =>
+  Effect.gen(function* () {
+    yield* clearRenderedChunks(worldRenderer)
+    context.enqueueRenderUpdate({ changed: yield* context.worldgenChunkStore.loadedCoords, removed: [] })
+  })
+
+export type BudgetedRendererStore = {
+  readonly store: RendererChunkStore
+  readonly enqueue: BudgetedDirtySource['enqueue']
+}
+
+/**
  * The store `attachChunkStoreRenderer` reads, with the dirty channel throttled
  * by mc-render's `makeBudgetedDirtySource` so one storm of edits does not
- * remesh every dirtied chunk in the same frame.
+ * remesh every dirtied chunk in the same frame, and that source's `enqueue`.
  *
  * The subscription is taken here, once: `attachWorldRenderer` reads
  * `subscribeDirty` exactly once per attachment, so the returned store is meant
@@ -244,17 +272,20 @@ export const clearRenderedChunks = <Key extends string, KeyError, KeyRequirement
 export const budgetedRendererStore = (
   store: RendererChunkStore,
   maxUpdatesPerFrame: number,
-): Effect.Effect<RendererChunkStore, BudgetedDirtySourceInputError> =>
+): Effect.Effect<BudgetedRendererStore, BudgetedDirtySourceInputError> =>
   Effect.gen(function* () {
     const subscription = yield* store.subscribeDirty
     const budgeted = yield* Effect.fromResult(makeBudgetedDirtySource(subscription, maxUpdatesPerFrame)).pipe(
       Effect.onError(() => subscription.unsubscribe),
     )
     return {
-      peek: store.peek,
-      neighbours: store.neighbours,
-      getLight: store.getLight,
-      subscribeDirty: Effect.succeed({ drain: budgeted.drain, unsubscribe: subscription.unsubscribe }),
+      store: {
+        peek: store.peek,
+        neighbours: store.neighbours,
+        getLight: store.getLight,
+        subscribeDirty: Effect.succeed({ drain: budgeted.drain, unsubscribe: subscription.unsubscribe }),
+      },
+      enqueue: budgeted.enqueue,
     }
   })
 
