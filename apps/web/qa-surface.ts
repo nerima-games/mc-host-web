@@ -1157,18 +1157,19 @@ export const makeQaSurface = (
     )
     const farmSoilReading = Effect.runSync(currentChunkStore.getBlock(KNOWN_TARGET_BLOCK))
     const farmCropReading = Effect.runSync(currentChunkStore.getBlock(QA_FARM_CROP_BLOCK))
-    const cropSnapshot = Effect.runSync(commit.coordinator.snapshot(GAMEPLAY_CROPS_OWNER_ID, CropSnapshotSchema)).state
-    const farmCropKey = cropLocationKey({ dimension, position: QA_FARM_CROP_BLOCK })
-    const farmCrop = cropSnapshot.crops.find((crop) => cropLocationKey(crop) === farmCropKey)
     const storage = Effect.runSync(world.inventory.storageSnapshot)
     const containerStorage = Effect.runSync(world.inventory.containerStorageSnapshot)
     const inventory = storage.inventory
     const vitals = Effect.runSync(world.vitals.snapshot)
     const entities = Effect.runSync(world.entities.snapshot).entities
-    const { brewing, statusEffects } = Effect.runSync(Effect.all({
+    const { brewing, statusEffects, crops } = Effect.runSync(Effect.all({
       brewing: observeQaBrewing(brewingService, commit.coordinator),
       statusEffects: snapshotStatusEffects(gameplayState, commit),
+      crops: commit.coordinator.snapshot(GAMEPLAY_CROPS_OWNER_ID, CropSnapshotSchema),
     }))
+    const cropSnapshot = crops.state
+    const farmCropKey = cropLocationKey({ dimension, position: QA_FARM_CROP_BLOCK })
+    const farmCrop = cropSnapshot.crops.find((crop) => cropLocationKey(crop) === farmCropKey)
     const activePortal = [...portalStates.values()].find(
       (portal) => portal.dimension === dimension,
     )
@@ -1692,21 +1693,22 @@ export const makeQaSurface = (
     Effect.runSync(world.inventory.reset)
     Effect.runSync(world.inventory.add('potato', 1))
     Effect.runSync(currentChunkStore.setBlock(KNOWN_TARGET_BLOCK, FARMLAND_BLOCK_ID))
-    Effect.runSync(currentChunkStore.setBlock(QA_FARM_CROP_BLOCK, POTATO_CROP_BLOCK_ID))
-    Effect.runSync(commit.coordinator.commitFromSnapshot(GAMEPLAY_CROPS_OWNER_ID, CropSnapshotSchema, (snapshot) =>
-      Effect.succeed({
-        expectedRevision: snapshot.revision,
-        expectedDimensions: [],
-        changes: [{
-          ownerId: GAMEPLAY_CROPS_OWNER_ID,
-          state: { crops: [{
-            dimension,
-            position: QA_FARM_CROP_BLOCK,
-            crop: 'potato_crop',
-            growthSecs: POTATO_MATURITY_SECS - 0.1,
-          }] },
-        }],
-      })))
+    Effect.runSync(currentChunkStore.setBlock(QA_FARM_CROP_BLOCK, POTATO_CROP_BLOCK_ID).pipe(
+      Effect.andThen(commit.coordinator.commitFromSnapshot(GAMEPLAY_CROPS_OWNER_ID, CropSnapshotSchema, (snapshot) =>
+        Effect.succeed({
+          expectedRevision: snapshot.revision,
+          expectedDimensions: [],
+          changes: [{
+            ownerId: GAMEPLAY_CROPS_OWNER_ID,
+            state: { crops: [{
+              dimension,
+              position: QA_FARM_CROP_BLOCK,
+              crop: 'potato_crop',
+              growthSecs: POTATO_MATURITY_SECS - 0.1,
+            }] },
+          }],
+        }))),
+    ))
     setSelectedHotbarIndex(0)
     setInventoryFocus({ kind: 'slot', region: 'hotbar', index: getSelectedHotbarIndex() })
     inventoryInteraction.reset()
@@ -1720,14 +1722,17 @@ export const makeQaSurface = (
   const harvestFarmingCrop = () => {
     const dimension = Effect.runSync(playerApi.dimension)
     const location: CropLocation = { dimension, position: QA_FARM_CROP_BLOCK }
-    const cropSnapshot = Effect.runSync(commit.coordinator.snapshot(GAMEPLAY_CROPS_OWNER_ID, CropSnapshotSchema)).state
-    const crop = cropSnapshot.crops.find((candidate) => cropLocationKey(candidate) === cropLocationKey(location))
-    if (crop === undefined || !isMatureCrop(crop)) return gameplaySnapshot()
-    setNextItemUseRequestId(getNextItemUseRequestId() + 1)
-    const requestId = `item-use-${String(getNextItemUseRequestId())}`
-    Effect.runSync(
-      requestPotatoHarvest(gameplayState, requestId, QA_FARM_CROP_BLOCK, Math.random()),
+    const requestId = Effect.runSync(
+      commit.coordinator.snapshot(GAMEPLAY_CROPS_OWNER_ID, CropSnapshotSchema).pipe(Effect.flatMap(({ state }) => {
+        const crop = state.crops.find((candidate) => cropLocationKey(candidate) === cropLocationKey(location))
+        if (crop === undefined || !isMatureCrop(crop)) return Effect.succeed(undefined)
+        return Effect.sync(() => {
+          setNextItemUseRequestId(getNextItemUseRequestId() + 1)
+          return `item-use-${String(getNextItemUseRequestId())}`
+        }).pipe(Effect.tap((id) => requestPotatoHarvest(gameplayState, id, QA_FARM_CROP_BLOCK, Math.random())))
+      })),
     )
+    if (requestId === undefined) return gameplaySnapshot()
     pendingItemUses.set(requestId, {
       kind: 'harvest',
       dimension,
