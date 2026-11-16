@@ -120,7 +120,7 @@ describe('resolveMusicScene', () => {
     })
   }
 
-  it('does not mutate the dimension union: overworld is not a scene of its own', () => {
+  it('maps each dimension to its scene: overworld falls through to day', () => {
     const dimensions: ReadonlyArray<Dimension> = ['overworld', 'nether', 'end']
     expect(dimensions.map((dimension) => resolveMusicScene(sceneInput({ dimension })))).toEqual(['day', 'nether', 'end'])
   })
