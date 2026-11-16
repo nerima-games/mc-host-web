@@ -152,6 +152,7 @@ import { BLOCK } from '@nerima-games/mc-worldgen'
 import { makeBudgetedDirtySource } from './chunk-sync-budget'
 import { makeRedstoneContainerRuntime } from './redstone-container-runtime'
 import { makeScreenshotRuntime } from './screenshot'
+import { makeMusicRuntime } from './music-runtime'
 import {
   clearRenderedChunks,
   makeChunkStreaming,
@@ -256,7 +257,13 @@ import {
   WorldId,
   type AuthoritativeEntityState,
 } from '@nerima-games/mx-multiplayer'
-import { AudioVolume } from '@nerima-games/mc-audio'
+import {
+  AudioBackendPort,
+  AudioVolume,
+  decodeMusicScenePlaylistManifest,
+  MinecraftSoundNamespace,
+  parseMinecraftSoundsJson,
+} from '@nerima-games/mc-audio'
 import { makeBrowserPreview } from './browser-preview.js'
 import {
   advanceBowUse,
@@ -830,6 +837,27 @@ const bootGame = async (
     worldRenderer,
   } = adapters
   let playerSettings = adapters.playerSettings
+  // mc-audio ships no production music playlist or ambient sound definition.
+  // Until the host has those assets, the empty manifest and registry keep
+  // music and ambient silent: mc-audio plays nothing for a scene without a
+  // playlist and substitutes no default track.
+  const musicAssets = Result.all({
+    scenePlaylists: decodeMusicScenePlaylistManifest({}),
+    ambientRegistry: parseMinecraftSoundsJson({}, { namespace: MinecraftSoundNamespace('minecraft') }),
+  })
+  if (Result.isFailure(musicAssets)) {
+    failBoot('music asset decoding failed', musicAssets.failure)
+    return
+  }
+  // Built on the same backend instance as `audio`, whose master gain already
+  // applies masterVolume. MUSIC_VOLUME is the music-only level, which no
+  // setting controls yet; passing masterVolume there would apply it twice.
+  const music = Effect.runSync(Effect.provideService(
+    makeMusicRuntime({ ...musicAssets.success, randomSource: Math.random }),
+    AudioBackendPort,
+    adapters.audioBackend,
+  ))
+  const MUSIC_VOLUME = AudioVolume(1)
 
   type Dimension = SessionState['dimension']
 
@@ -3122,6 +3150,10 @@ const bootGame = async (
     getPaused: () => paused,
     setPaused: (next) => {
       paused = next
+      // A paused frame returns before the music update, so the current track
+      // and ambient loop are stopped here; the first frame after resuming
+      // starts them again through music.update.
+      if (next) Effect.runSync(music.stop)
     },
     isBrewingOpen: () => brewingOpen,
     closeBrewing: () => setBrewingOpen(false),
@@ -3335,7 +3367,10 @@ const bootGame = async (
     disposeQaSurface,
     disposeWorldRenderer: () => { Effect.runSync(worldRenderer.dispose) },
     disposeAtlasTexture: () => { atlasTexture.dispose() },
-    closeAudio: () => { audio.close() },
+    closeAudio: () => {
+      Effect.runSync(music.stop)
+      audio.close()
+    },
     registerHotDispose: (callback) => {
       const hot = (import.meta as ImportMeta & {
         readonly hot?: { readonly dispose: (handler: () => void) => void }
@@ -3676,6 +3711,22 @@ const bootGame = async (
         if (movement === undefined) return
         const postFrame = yield* runTickPostFrame(h5bTickContext, { frame, movement, framesTotal })
         yield* runTickPostFrameGameplay(h5cTickContext, { frame, movement, postFrame, nowSecs })
+        yield* music.update({
+          nowSecs,
+          scene: {
+            title: false,
+            dimension: postFrame.dimensionAfterFrame,
+            time: yield* time.snapshot,
+            playerPosition: postFrame.postFramePose.feetPosition,
+            underwater: swimmingState.fullySubmerged,
+            // The host has no combat signal yet, so combat music never starts.
+            combat: false,
+            creative: isCreativeMode,
+          },
+          musicEnabled: playerSettings.audioEnabled,
+          musicVolume: MUSIC_VOLUME,
+          ambient: null,
+        })
       }).pipe(Effect.ensuring(inputApi.endFrame(frameInput)))
     })
   })()
