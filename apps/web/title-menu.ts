@@ -200,6 +200,7 @@ export const bootTitleMenu = async (context: TitleMenuContext): Promise<void> =>
       () => {
         const settled = playerSettingsWriteSucceeded(playerSettingsWrites, next)
         playerSettingsWrites = settled.writes
+        settingsView.reportStoredRecordReplaced()
         if (settled.latest) {
           document.body.setAttribute('data-player-settings-persistence', 'saved')
           settingsView.reportPersistenceSaved()

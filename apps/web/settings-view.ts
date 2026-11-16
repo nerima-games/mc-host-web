@@ -30,6 +30,9 @@ export type SettingsView = {
   // the next successful save replaces the stored record. The warning is shown
   // on every open until reportPersistenceSaved reports that replacement.
   readonly reportLoadFailure: () => void
+  // A write succeeded, so the unreadable record is gone even when a newer
+  // write is still pending or later fails; the load warning no longer applies.
+  readonly reportStoredRecordReplaced: () => void
   readonly dispose: () => void
 }
 
@@ -317,6 +320,10 @@ export const createSettingsView = (
     },
     clearPersistenceError: () => {
       saveError = undefined
+      renderPersistenceError()
+    },
+    reportStoredRecordReplaced: () => {
+      loadFailed = false
       renderPersistenceError()
     },
     reportLoadFailure: () => {

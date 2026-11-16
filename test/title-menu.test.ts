@@ -34,6 +34,7 @@ const mocks = vi.hoisted(() => ({
     reportPersistenceSaving: vi.fn(),
     reportPersistenceSaved: vi.fn(),
     reportLoadFailure: vi.fn(),
+    reportStoredRecordReplaced: vi.fn(),
     dispose: vi.fn(),
   })),
 }))
@@ -392,6 +393,7 @@ describe('title menu player settings persistence', () => {
     expect(view?.replaceSettings).not.toHaveBeenCalled()
     expect(jump?.children[1]?.textContent).toBe('K')
     settled[1]?.succeed()
+    expect(view?.reportStoredRecordReplaced).toHaveBeenCalledOnce()
     expect(view?.reportPersistenceSaved).toHaveBeenCalledOnce()
     expect(state.body.attributes.get('data-player-settings-persistence')).toBe('saved')
 
@@ -403,6 +405,26 @@ describe('title menu player settings persistence', () => {
     expect(view?.reportPersistenceSaved).toHaveBeenCalledOnce()
     expect(state.body.attributes.get('data-player-settings-persistence')).toBe('error')
     expect(jump?.children[1]?.textContent).toBe('K')
+  })
+
+  it('drops the load warning once any write succeeds, even when a newer write then fails', async () => {
+    const state = makeTitleMenuContext()
+    const settled: Array<{ readonly succeed: () => void; readonly fail: () => void }> = []
+    state.context.enqueueSettingsWrite.mockImplementation((_queue, _write, onSuccess, onFailure) => {
+      settled.push({ succeed: onSuccess, fail: () => onFailure(new Error('write failed')) })
+    })
+    await bootTitleMenu(state.context)
+    const view = mocks.createSettingsView.mock.results.at(-1)?.value
+    const callbacks = mocks.createSettingsView.mock.calls.at(-1)?.[2]
+
+    callbacks?.onChange(settingsWithJump('KeyJ'))
+    callbacks?.onChange(settingsWithJump('KeyK'))
+    settled[0]?.succeed()
+    expect(view?.reportStoredRecordReplaced).toHaveBeenCalledOnce()
+    expect(view?.reportPersistenceSaved).not.toHaveBeenCalled()
+    settled[1]?.fail()
+    expect(view?.reportStoredRecordReplaced).toHaveBeenCalledOnce()
+    expect(view?.reportPersistenceError).toHaveBeenLastCalledWith('Settings could not be saved.')
   })
 })
 

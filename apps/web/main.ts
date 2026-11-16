@@ -3251,6 +3251,7 @@ const bootGame = async (
         () => {
           const settled = playerSettingsWriteSucceeded(playerSettingsWrites, next)
           playerSettingsWrites = settled.writes
+          settingsView.reportStoredRecordReplaced()
           if (settled.latest) {
             document.body.setAttribute('data-player-settings-persistence', 'saved')
             pauseMenu.clearError()
