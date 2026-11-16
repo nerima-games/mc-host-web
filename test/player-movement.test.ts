@@ -9,6 +9,7 @@ import { BIOMES, CHUNK_SIZE_XZ, CHUNK_VOLUME, type ChunkSource } from '@nerima-g
 import { advanceFishing, cancelFishing, castFishing, enderPearlDisplacement, EnderPearlOutcomeSchema, isDroppedItemBehaviour, makeGameplayFrameState, makeGeneratedWorld, spawnDroppedItems, type FishingSession, type MobBehaviour } from '@nerima-games/mx-gameplay'
 import { PlayerId, PlayerName, WorldId } from '@nerima-games/mx-multiplayer'
 
+import { ChunkRenderFailure } from '../apps/web/chunk-streaming'
 import { createDroppedItemLifetimeTracker, DROPPED_ITEM_LIFETIME_SECS } from '../apps/web/dropped-item-lifetime'
 import { movementInput, runTickPlayerMovement as runTickPlayerMovementEffect } from '../apps/web/tick/player-movement'
 import {
@@ -120,6 +121,7 @@ const makeHarness = async (multiplayer?: H5aMovementContext['multiplayer']) => {
   let mountedVehicleId: string | undefined
   let vehicle: Vehicle | undefined
   let frameRunner: H5aMovementContext['runFrame'] = () => Effect.void
+  let chunkRenderFaults: H5aMovementContext['drainChunkRenderFaults'] = () => Effect.void
   let dirtyCount = 0
   let presentedSwimmingStateCount = 0
   let pumpedDamageCount = 0
@@ -179,6 +181,7 @@ const makeHarness = async (multiplayer?: H5aMovementContext['multiplayer']) => {
     runFrame: (deltaSecs) => {
       return Effect.flatMap(frameRunner(deltaSecs), () => Effect.void)
     },
+    drainChunkRenderFaults: () => chunkRenderFaults(),
     applyPlayerDamage: (damage) => damageEvents.push(damage),
     failBoot: (message, error) => failureEvents.push({ message, error }),
     markSessionDirty: () => { dirtyCount += 1 },
@@ -225,6 +228,7 @@ const makeHarness = async (multiplayer?: H5aMovementContext['multiplayer']) => {
     setMountedVehicleId: (value: string | undefined) => { mountedVehicleId = value },
     setVehicle: (value: Vehicle | undefined) => { vehicle = value },
     setFrameRunner: (value: H5aMovementContext['runFrame']) => { frameRunner = value },
+    setChunkRenderFaults: (value: H5aMovementContext['drainChunkRenderFaults']) => { chunkRenderFaults = value },
     dirtyCount: () => dirtyCount,
     presentedSwimmingStateCount: () => presentedSwimmingStateCount,
     pumpedDamageCount: () => pumpedDamageCount,
@@ -469,6 +473,30 @@ describe('tick player movement branches', () => {
     expect(harness.failureEvents).toHaveLength(1)
     expect(harness.failureEvents[0]?.message).toBe('a frame stage defected')
     expect(harness.failureEvents[0]?.error).toMatchObject({ reasons: [{ _tag: 'Die', defect: { message: 'fixture frame defect' } }] })
+  })
+
+  it('returns chunk render faults drained after the frame as a typed failure', async () => {
+    const harness = await makeHarness()
+    const events: Array<string> = []
+    const failure = new ChunkRenderFailure({
+      faults: [{
+        dimension: 'overworld',
+        fault: {
+          _tag: 'ChunkRenderFault',
+          chunk: chunkCoord(ChunkAxis(0), ChunkAxis(0)),
+          error: { _tag: 'ChunkMeshGeometryInputFailure', field: 'fluids' },
+          occurrences: 1,
+        },
+      }],
+    })
+    harness.setFrameRunner(() => Effect.sync(() => { events.push('frame') }))
+    harness.setChunkRenderFaults(() => Effect.andThen(Effect.sync(() => { events.push('drain') }), Effect.fail(failure)))
+
+    const result = Effect.runSync(Effect.result(runTickPlayerMovementEffect(harness.context, makeFrame())))
+
+    expect(result).toEqual(Result.fail(failure))
+    expect(events).toEqual(['frame', 'drain'])
+    expect(harness.failureEvents).toEqual([])
   })
 
   it('repositions a mounted player from the vehicle pose after the frame', async () => {

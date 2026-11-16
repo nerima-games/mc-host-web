@@ -101,7 +101,6 @@ import {
   position as worldPosition,
   propertyOfBlockId,
   resolvedBlockOfId,
-  StageId,
   WorldIdSchema,
   type BlockPosition,
   type BlockPositionKey,
@@ -142,21 +141,21 @@ import {
 } from '@nerima-games/mc-sim'
 import {
   InputService,
+  attachChunkStoreRenderer,
   chunkKeyOf,
   makeChunkStoreLightColor,
-  makeChunkStoreMesher,
-  RENDER_STAGE_IDS,
-  syncWorld,
   wrapHotbarSelection,
   type DrawPort,
 } from '@nerima-games/mc-render'
 import { BLOCK } from '@nerima-games/mc-worldgen'
-import { makeBudgetedDirtySource } from './chunk-sync-budget'
 import { makeRedstoneContainerRuntime } from './redstone-container-runtime'
 import { makeScreenshotRuntime } from './screenshot'
 import { makeMusicRuntime } from './music-runtime'
 import {
+  activeDimensionChunkSync,
+  budgetedRendererStore,
   clearRenderedChunks,
+  drainChunkRenderFaults,
   makeChunkStreaming,
   type DimensionChunkContext,
 } from './chunk-streaming'
@@ -303,10 +302,7 @@ import {
 import {
   composeGame,
   EMPTY_MODULE_LAYER,
-  type StageRegistration,
 } from '@nerima-games/mc-compose'
-
-const COMPOSE_CHUNK_SYNC_STAGE = StageId('compose:chunk-sync')
 import { BrowserClockLayer, browserClock } from './clock'
 import {
   connectMultiplayer,
@@ -1207,42 +1203,39 @@ const bootGame = async (
   })
 
   const MAX_CHUNK_UPDATES_PER_FRAME = 4
+  // One mc-render attachment per dimension ChunkStore; `dimensionContexts`
+  // holds each context once, so no store is attached twice.
   const makeDimensionChunkContext = (
     dimension: Dimension,
     dimensionWorld: typeof world,
-  ): DimensionChunkContext => {
+  ) => {
     const lighting = trackChunkLightColor((chunk, quads) =>
       makeChunkStoreLightColor(dimensionWorld.worldgenChunkStore, chunk, quads),
     )
-    const dirtyChunks = makeBudgetedDirtySource(
-      Effect.runSync(dimensionWorld.worldgenChunkStore.subscribeDirty),
-      MAX_CHUNK_UPDATES_PER_FRAME,
+    return Effect.map(
+      Effect.flatMap(
+        budgetedRendererStore(dimensionWorld.worldgenChunkStore, MAX_CHUNK_UPDATES_PER_FRAME),
+        (store) => attachChunkStoreRenderer(worldRenderer, store, { colorForChunk: lighting.colorForChunk }),
+      ),
+      (renderAttachment): DimensionChunkContext => ({
+        dimension,
+        chunkStore: dimensionWorld.chunkStore,
+        worldgenChunkStore: dimensionWorld.worldgenChunkStore,
+        renderAttachment,
+        lightingSnapshot: lighting.snapshot,
+        streamLoaded: new Set<string>(),
+      }),
     )
-    return {
-      dimension,
-      chunkStore: dimensionWorld.chunkStore,
-      worldgenChunkStore: dimensionWorld.worldgenChunkStore,
-      dirtyChunks,
-      queueLoadedChunk: (chunk) => dirtyChunks.enqueue({ changed: [chunk], removed: [] }),
-      meshChunkFromStore: makeChunkStoreMesher(dimensionWorld.worldgenChunkStore),
-      colorForChunk: lighting.colorForChunk,
-      lightingSnapshot: lighting.snapshot,
-      streamLoaded: new Set<string>(),
-    }
   }
   const dimensionContexts = new Map<Dimension, DimensionChunkContext>()
-  const initialChunkContext = makeDimensionChunkContext(initialDimension, world)
+  const initialChunkContextExit = Effect.runSyncExit(makeDimensionChunkContext(initialDimension, world))
+  if (Exit.isFailure(initialChunkContextExit)) {
+    failBoot('chunk renderer attachment failed', Cause.squash(initialChunkContextExit.cause))
+    return
+  }
+  const initialChunkContext = initialChunkContextExit.value
   dimensionContexts.set(initialDimension, initialChunkContext)
   let currentChunkContext = initialChunkContext
-  const chunkSyncStage: StageRegistration = {
-    id: COMPOSE_CHUNK_SYNC_STAGE,
-    after: [RENDER_STAGE_IDS.cameraMirror],
-    run: () => Effect.asVoid(Effect.suspend(() =>
-      syncWorld(worldRenderer, currentChunkContext.dirtyChunks, currentChunkContext.meshChunkFromStore, {
-        colorForChunk: currentChunkContext.colorForChunk,
-      }),
-    )),
-  }
   // The host's redstone positions are plain {x,y,z}; the kernel's BlockPosition
   // brands each axis, so they need this conversion before a chunkStore read or write.
   // Callers pass block-cell coordinates, which are always integers.
@@ -1369,7 +1362,7 @@ const bootGame = async (
         dimension,
       }),
     )
-    const created = makeDimensionChunkContext(dimension, dimensionWorld)
+    const created = Effect.runSync(makeDimensionChunkContext(dimension, dimensionWorld))
     dimensionContexts.set(dimension, created)
     return created
   }
@@ -2429,7 +2422,7 @@ const bootGame = async (
         services,
         renderQuality: adapters.renderQuality,
         draw: screenshotDrawPort,
-        chunkSyncStage,
+        chunkSync: activeDimensionChunkSync(() => currentChunkContext),
         uiFrameState,
         simState,
         gameplayState,
@@ -3511,6 +3504,7 @@ const bootGame = async (
       drainEnchantingInbound,
       drainPlayerDamageInbound,
       runFrame,
+      drainChunkRenderFaults: () => drainChunkRenderFaults([...dimensionContexts.values()]),
       applyPlayerDamage,
       failBoot,
       droppedItemLifetime,

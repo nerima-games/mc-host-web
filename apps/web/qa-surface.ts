@@ -37,7 +37,6 @@ import {
   type WorldWriteConflict,
   type WorldWriteInvalidBatch,
   type BlockPosition,
-  type ChunkCoord,
   type ClockService,
   type Position as Vec3,
 } from '@nerima-games/mc-kernel'
@@ -57,10 +56,8 @@ import {
   type Dimension,
 } from '@nerima-games/mc-worldgen'
 import {
-  type ChunkMesher,
-  type DirtySource,
-  type SyncOptions,
   type WorldRenderer,
+  type WorldRendererAttachment,
 } from '@nerima-games/mc-render'
 import {
   addExperience as addVitalsExperience,
@@ -242,10 +239,7 @@ type QaChunkContext = {
   readonly dimension: Dimension
   readonly chunkStore: ChunkStoreApi
   readonly worldgenChunkStore: ChunkStoreApi
-  readonly dirtyChunks: DirtySource
-  readonly queueLoadedChunk: (chunk: ChunkCoord) => void
-  readonly meshChunkFromStore: ChunkMesher
-  readonly colorForChunk: NonNullable<SyncOptions['colorForChunk']>
+  readonly renderAttachment: WorldRendererAttachment
   readonly lightingSnapshot: () => RenderLightingSnapshot
   readonly streamLoaded: Set<string>
 }

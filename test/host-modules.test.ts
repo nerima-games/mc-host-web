@@ -5,11 +5,10 @@ import {
   EpochMillis,
   FixedClockLayer,
   MonotonicTimeSecs,
-  StageId,
   WorldIdSchema,
   WorldWritePort,
 } from '@nerima-games/mc-kernel'
-import { composeGame, type StageRegistration } from '@nerima-games/mc-compose'
+import { composeGame } from '@nerima-games/mc-compose'
 import {
   CropService,
   InventoryService,
@@ -24,7 +23,7 @@ import {
   TimeService,
   VehicleService,
 } from '@nerima-games/mc-sim'
-import { InputService, InputServiceLayer, NO_DRAW_TARGET } from '@nerima-games/mc-render'
+import { EMPTY_SYNC_REPORT, InputService, InputServiceLayer, NO_CHUNK_SYNC, NO_DRAW_TARGET, type ChunkSyncPort } from '@nerima-games/mc-render'
 import { RedstoneWorldRuntime, RedstoneWorldRuntimeLayer } from '@nerima-games/mx-redstone'
 import { makeUiFrameState } from '@nerima-games/mx-ui'
 import { makeGameplayFrameState, type MobBehaviour } from '@nerima-games/mx-gameplay'
@@ -60,7 +59,6 @@ const SMOKE_STAGE_ORDER = [
   'redstone:effects',
   'gameplay:time-weather',
   'render:camera-mirror',
-  'compose:chunk-sync',
   'render:chunk-sync',
   'render:post-fx',
   'render:draw',
@@ -92,18 +90,13 @@ const makeInstances = Effect.gen(function* () {
   return instances
 })
 
-const makeDeps = (instances: HostServiceInstances) =>
+const makeDeps = (instances: HostServiceInstances, chunkSync: ChunkSyncPort = NO_CHUNK_SYNC) =>
   Effect.gen(function* () {
-    const chunkSyncStage: StageRegistration = {
-      id: StageId('compose:chunk-sync'),
-      after: [StageId('render:camera-mirror')],
-      run: () => Effect.void,
-    }
     const deps: HostModulesDeps = {
       services: makeHostServiceContext(instances),
       renderQuality: undefined,
       draw: NO_DRAW_TARGET,
-      chunkSyncStage,
+      chunkSync,
       uiFrameState: yield* makeUiFrameState,
       simState: yield* makeSimFrameState,
       gameplayState: yield* makeGameplayFrameState,
@@ -169,5 +162,34 @@ describe('host modules', () => {
 
       expect(after.ticks).toBe(before.ticks + 1)
       expect(after.dayLengthTicks).toBe(before.dayLengthTicks)
+    }))
+
+  it.effect('mc-render registers the only chunk-sync stage and it updates the host ChunkSyncPort', () =>
+    Effect.gen(function* () {
+      let updates = 0
+      const chunkSync: ChunkSyncPort = {
+        update: Effect.sync(() => {
+          updates += 1
+          return EMPTY_SYNC_REPORT
+        }),
+      }
+      const modules = yield* registerHostModules(yield* makeDeps(yield* makeInstances, chunkSync))
+      const chunkSyncStages = modules.flatMap((module) =>
+        module.frameStages
+          .filter((stage) => stage.id.endsWith(':chunk-sync'))
+          .map((stage) => ({ module: module.name, stage })),
+      )
+      expect(chunkSyncStages.map(({ module, stage }) => `${module}/${stage.id}`)).toEqual([
+        '@nerima-games/mc-render/render:chunk-sync',
+      ])
+      const [registered] = chunkSyncStages
+      assert.isDefined(registered)
+
+      yield* Effect.provide(
+        registered.stage.run(DeltaTimeSecs(0.05)),
+        FixedClockLayer({ monotonicSecs: MonotonicTimeSecs(0), wallClockEpochMillis: EpochMillis(0) }),
+      )
+
+      expect(updates).toBe(1)
     }))
 })

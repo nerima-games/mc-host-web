@@ -1,5 +1,5 @@
 import { AngleRadians, AttackRangeDistance, BlockAxis, blockIdOf, blockPosition, blockPositionKeyOf, blockTypeOfId, ChunkAxis, chunkCoord, DeltaTimeSecs, EntityHealthPoints, EntityId, FixedDurationSecs, MonotonicTimeSecs, position, PositionAxis, WorldId } from '@nerima-games/mc-kernel'
-import { makeChunkStoreLightColor, makeChunkStoreMesher, type InputAction, type InputSnapshot } from '@nerima-games/mc-render'
+import { EMPTY_SYNC_REPORT, makeChunkStoreLightColor, type InputAction, type InputSnapshot } from '@nerima-games/mc-render'
 import {
   makeSimFrameState,
   makeWorldCommitCoordinator,
@@ -24,7 +24,6 @@ import { Effect, Option, Ref, Result } from 'effect'
 import { describe, expect, it, vi } from 'vitest'
 
 import { BlocksPerSecond } from '@nerima-games/mc-physics'
-import { makeBudgetedDirtySource } from '../apps/web/chunk-sync-budget'
 import { trackChunkLightColor } from '../apps/web/render-lighting'
 import { isDroppedItemPickupEligible } from '../apps/web/dropped-item-pickup'
 import { droppedItemMetadataFromBehaviour } from '../apps/web/dropped-item-metadata'
@@ -130,14 +129,13 @@ const makeContext = async (primaryAttackConsumed: ReturnType<typeof cell<boolean
     dimension: 'overworld',
     chunkStore: world.chunkStore,
     worldgenChunkStore: world.worldgenChunkStore,
-    dirtyChunks: makeBudgetedDirtySource(
-      { drain: Effect.succeed({ changed: [], removed: [] }) },
-      4,
-    ),
-    queueLoadedChunk: () => undefined,
+    renderAttachment: {
+      update: Effect.succeed(EMPTY_SYNC_REPORT),
+      drainFaults: Effect.succeed([]),
+      detach: Effect.void,
+      attached: Effect.succeed(true),
+    },
     streamLoaded: new Set(),
-    meshChunkFromStore: makeChunkStoreMesher(world.worldgenChunkStore),
-    colorForChunk: lighting.colorForChunk,
     lightingSnapshot: lighting.snapshot,
   }
   const environmentalContactDamageState = cell<EnvironmentalContactDamageState>({ lastDamageElapsedSecs: 3 })
