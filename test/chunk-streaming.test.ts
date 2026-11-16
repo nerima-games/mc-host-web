@@ -3,6 +3,7 @@ import { Deferred, Effect, Fiber, Result } from 'effect'
 
 import { ChunkAxis, chunkCoord, CHUNK_SIZE_XZ, WorldId } from '@nerima-games/mc-kernel'
 import { makeWorldCommitCoordinator, ReplicatedOwnerUnknown, type WorldCommitCoordinatorApi } from '@nerima-games/mc-sim'
+import { StorageError } from '@nerima-games/mc-save'
 import { CHUNK_VOLUME, type Chunk, type ChunkWithBlockStates } from '@nerima-games/mc-worldgen'
 import {
   GAMEPLAY_VILLAGER_TRADES_OWNER_ID,
@@ -320,5 +321,64 @@ describe('chunk streaming', () => {
       ['data-chunks-streamed-in', '2'],
       ['data-chunks-dropped', '1'],
     ]))
+  })
+
+  describe('chunk store failures', () => {
+    const streamingFor = async (events: Array<string>, counters: { streamed: number; dropped: number }) =>
+      makeChunkStreaming({
+        streamRadiusChunks: 0,
+        activeSeed: 71,
+        canvas: { setAttribute: () => {} },
+        coordinator: await Effect.runPromise(makeWorldCommitCoordinator({
+          world: WorldId('chunk-streaming-store-failure'),
+          owners: gameplayOwnerRegistrations(),
+        })),
+        villagerResidents: new Map(),
+        saveCoordinator: { retainChunk: () => { events.push('retain') } },
+        getMarkSessionDirty: () => () => { events.push('dirty') },
+        markRedstoneDirty: () => { events.push('redstone-dirty') },
+        getChunksStreamedIn: () => counters.streamed,
+        setChunksStreamedIn: (count) => { counters.streamed = count },
+        getChunksDropped: () => counters.dropped,
+        setChunksDropped: (count) => { counters.dropped = count },
+      })
+
+    it('returns a load failure without queueing or marking the chunk loaded', async () => {
+      const events: Array<string> = []
+      const counters = { streamed: 0, dropped: 0 }
+      const streaming = await streamingFor(events, counters)
+      const failure = { _tag: 'DirtyChunkEvictionError' as const, coord: chunkCoord(ChunkAxis(0), ChunkAxis(0)) }
+      const base = chunkContext(events)
+      const context: ChunkStreamingContext = {
+        ...base,
+        chunkStore: { ...base.chunkStore, load: () => Effect.fail(failure) },
+      }
+
+      expect(await Effect.runPromise(Effect.result(streaming.streamAround(context, 0, 0))))
+        .toEqual(Result.fail(failure))
+      expect(events).toEqual([])
+      expect([...context.streamLoaded]).toEqual([])
+      expect(counters).toEqual({ streamed: 0, dropped: 0 })
+    })
+
+    it('returns an unload failure and keeps the chunk resident for the next attempt', async () => {
+      const events: Array<string> = []
+      const counters = { streamed: 0, dropped: 0 }
+      const streaming = await streamingFor(events, counters)
+      const failure = new StorageError({ operation: 'put', key: 'chunk:5,5' })
+      const base = chunkContext(events)
+      const context: ChunkStreamingContext = {
+        ...base,
+        chunkStore: { ...base.chunkStore, unload: () => Effect.fail(failure) },
+      }
+      context.streamLoaded.add('0,0')
+      context.streamLoaded.add('5,5')
+
+      expect(await Effect.runPromise(Effect.result(streaming.streamAround(context, 0, 0))))
+        .toEqual(Result.fail(failure))
+      expect(events).toEqual(['snapshot:5,5', 'retain', 'dirty'])
+      expect([...context.streamLoaded]).toEqual(['0,0', '5,5'])
+      expect(counters).toEqual({ streamed: 0, dropped: 0 })
+    })
   })
 })

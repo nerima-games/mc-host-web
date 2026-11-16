@@ -7,8 +7,8 @@ import {
   NoiseSeed,
   surfaceHeightAt,
   type ChunkStoreApi,
+  type ChunkStoreError,
   type Dimension,
-  type InvalidNaturalStructureCoordinate,
   villageVillagerSpawnsForChunk,
 } from '@nerima-games/mc-worldgen'
 import {
@@ -59,12 +59,16 @@ export type ChunkStreamingDependencies = {
   readonly setChunksDropped: (count: number) => void
 }
 
+// ChunkStoreError covers the unload's ChunkPersistenceError and the village
+// spawn lookup's InvalidNaturalStructureCoordinate.
+export type ChunkStreamingFailure = WorldCommitCoordinatorError | ChunkStoreError
+
 export type ChunkStreamingRuntime = {
   readonly streamAround: (
     context: ChunkStreamingContext,
     x: number,
     z: number,
-  ) => Effect.Effect<void, WorldCommitCoordinatorError | InvalidNaturalStructureCoordinate>
+  ) => Effect.Effect<void, ChunkStreamingFailure>
   readonly retainDimensionResidents: (context: ChunkStreamingContext) => Effect.Effect<void>
 }
 
@@ -99,7 +103,7 @@ export const makeChunkStreaming = (
     context: ChunkStreamingContext,
     x: number,
     z: number,
-  ): Effect.Effect<void, WorldCommitCoordinatorError | InvalidNaturalStructureCoordinate> =>
+  ): Effect.Effect<void, ChunkStreamingFailure> =>
     Effect.suspend(() => {
       let streamed = 0
       let dropped = 0
@@ -115,10 +119,7 @@ export const makeChunkStreaming = (
           })
 
         for (const chunk of changed) {
-          yield* context.chunkStore.load(chunkCoord(chunk.cx, chunk.cz)).pipe(Effect.matchEffect({
-            onFailure: () => Effect.void,
-            onSuccess: () => Effect.void,
-          }))
+          yield* context.chunkStore.load(chunkCoord(chunk.cx, chunk.cz))
           let discovered = false
           if (context.dimension === 'overworld') {
             const initial = yield* dependencies.coordinator.snapshot(
@@ -187,10 +188,7 @@ export const makeChunkStreaming = (
             dependencies.saveCoordinator.retainChunk({ dimension: context.dimension, chunk: snapshot })
             dependencies.getMarkSessionDirty()()
           }
-          yield* context.chunkStore.unload(chunkCoord(chunk.cx, chunk.cz)).pipe(Effect.matchEffect({
-            onFailure: () => Effect.void,
-            onSuccess: () => Effect.void,
-          }))
+          yield* context.chunkStore.unload(chunkCoord(chunk.cx, chunk.cz))
           context.streamLoaded.delete(chunkKeyOf(chunk))
           dropped += 1
         }
