@@ -11,6 +11,8 @@ import {
   capabilityOfBlockId,
   type BlockPosition,
   type BlockType,
+  type WorldWriteBlockEdit,
+  type WorldWritePort,
 } from '@nerima-games/mc-kernel'
 import { Effect, Option, Result, Schema } from 'effect'
 import { chunkKeyOf } from '@nerima-games/mc-render'
@@ -54,6 +56,7 @@ export type RedstoneBlockPosition = {
 }
 
 type World = GeneratedWorld<MobBehaviour>
+type WorldWriteFailure = Effect.Error<ReturnType<WorldWritePort['Service']['applyBatch']>>
 
 export type RedstoneDimensionChunkContext = {
   readonly dimension: Dimension
@@ -71,6 +74,10 @@ export type PressurePlateOccupancy = {
 export type RedstoneContainerRuntimeContext = {
   readonly dimensionContexts: ReadonlyMap<Dimension, RedstoneDimensionChunkContext>
   readonly world: World
+  readonly writeBlocks: (
+    dimension: Dimension,
+    edits: ReadonlyArray<WorldWriteBlockEdit>,
+  ) => Effect.Effect<void, WorldWriteFailure>
   readonly leverStates: Map<string, PersistedLeverState>
   readonly comparatorModes: Map<string, 'compare' | 'subtract'>
   readonly observerInputs: Map<string, number>
@@ -223,6 +230,7 @@ export const makeRedstoneContainerRuntime = (
   const {
     dimensionContexts,
     world,
+    writeBlocks,
     leverStates,
     comparatorModes,
     observerInputs,
@@ -545,13 +553,22 @@ export const makeRedstoneContainerRuntime = (
               return yield* Effect.die(new Error('piston source changed before commit'))
             }
           }
-          const head = pistonPositionAt(plan.piston, plan.facing, pistonHeadOffset)
-          if (plan.toState === 'retracted') yield* context.chunkStore.setBlock(asBlockPosition(head), blockIdOf('air'))
-          for (const move of plan.moves) {
-            yield* context.chunkStore.setBlock(asBlockPosition(move.to), BlockId(Number(move.block)))
-            yield* context.chunkStore.setBlock(asBlockPosition(move.from), blockIdOf('air'))
+          const edits = new Map<string, WorldWriteBlockEdit>()
+          const setBlock = (position: RedstoneBlockPosition, block: BlockId): void => {
+            edits.set(`${position.x},${position.y},${position.z}`, {
+              position: asBlockPosition(position),
+              block,
+            })
           }
-          if (plan.toState === 'extended') yield* context.chunkStore.setBlock(asBlockPosition(head), blockIdOf('piston_head'))
+          const head = pistonPositionAt(plan.piston, plan.facing, pistonHeadOffset)
+          // Preserve sequential writes when a move source overlaps another destination or the head.
+          if (plan.toState === 'retracted') setBlock(head, blockIdOf('air'))
+          for (const move of plan.moves) {
+            setBlock(move.to, BlockId(Number(move.block)))
+            setBlock(move.from, blockIdOf('air'))
+          }
+          if (plan.toState === 'extended') setBlock(head, blockIdOf('piston_head'))
+          yield* writeBlocks(context.dimension, [...edits.values()])
         }),
       })
     }))

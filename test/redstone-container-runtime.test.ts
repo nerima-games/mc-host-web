@@ -1,15 +1,19 @@
-import { BlockAxis, BlockId, blockIdOf as registeredBlockIdOf, blockPosition as kernelBlockPosition, ChunkAxis, chunkCoord as kernelChunkCoord, DimensionIdSchema, type BlockType, type BlockPosition } from '@nerima-games/mc-kernel'
+import { BlockAxis, BlockId, blockIdOf as registeredBlockIdOf, blockPosition as kernelBlockPosition, ChunkAxis, chunkCoord as kernelChunkCoord, DimensionIdSchema, WorldIdSchema, WorldWriteBatchSchema, capabilityOfBlockId, type WorldWriteBatch, type BlockType, type BlockPosition } from '@nerima-games/mc-kernel'
 import { Context, Effect, Exit, Layer, Option, Result, Schema, Scope } from 'effect'
 import {
   CONTAINER_STORAGE_SNAPSHOT_VERSION,
   containerIdAt,
   containerCapacity,
+  makeWorldCommitCoordinator,
   itemStack as makeItemStack,
   type ItemStack,
 } from '@nerima-games/mc-sim'
 import {
   CHUNK_SIZE_XZ,
   CHUNK_VOLUME,
+  ChunkCapacity,
+  makeChunkStore,
+  type ChunkStoreApi,
   type ChunkSource,
   type Dimension,
 } from '@nerima-games/mc-worldgen'
@@ -22,6 +26,11 @@ import {
 import {
   RedstoneWorldRuntime,
   RedstoneWorldRuntimeLayer,
+  planPistonTransition,
+  pistonPositionAt,
+  PistonBlockOffsetSchema,
+  type PistonFacing,
+  type PistonMovementPlan,
   type PoweredPistonTransition,
   type RedstoneWorldSnapshot,
 } from '@nerima-games/mx-redstone'
@@ -41,6 +50,7 @@ import {
 } from '../apps/web/redstone-container-runtime'
 import type { DroppedItemMetadata } from '../apps/web/dropped-item-metadata'
 import type { PersistedLeverState } from '../apps/web/session-persistence'
+import { makeWorldWritePortFromCoordinator } from '../apps/web/world-write-port'
 
 // Fixtures use registered built-ins and valid stack/coordinate inputs.
 const blockIdOf = (type: BlockType): BlockId => Option.getOrThrow(registeredBlockIdOf(type))
@@ -50,12 +60,15 @@ const itemStack = (...args: Parameters<typeof makeItemStack>): ItemStack => Resu
 const allAirChunkSource: ChunkSource = (coord) => Effect.succeed({
   coord,
   blocks: new Uint16Array(CHUNK_VOLUME).fill(blockIdOf('air')),
-  biomes: Array.from({ length: CHUNK_SIZE_XZ * CHUNK_SIZE_XZ }, () => 'plains'),
+  biomes: Array.from({ length: CHUNK_SIZE_XZ * CHUNK_SIZE_XZ }, () => 'PLAINS'),
 })
 
 const makeRuntimeHarness = async () => {
   const world = await Effect.runPromise(makeGeneratedWorld<MobBehaviour>({
     chunkSource: allAirChunkSource,
+    seed: 0,
+    spawnX: 8,
+    spawnZ: 8,
     dimension: 'overworld',
   }))
   const chunk = kernelChunkCoord(ChunkAxis(0), ChunkAxis(0))
@@ -79,11 +92,30 @@ const makeRuntimeHarness = async () => {
   const dimensionContexts = new Map<Dimension, RedstoneDimensionChunkContext>([
     [dimension, dimensionContext],
   ])
+  const coordinator = await Effect.runPromise(makeWorldCommitCoordinator({
+    world: Schema.decodeUnknownSync(WorldIdSchema)('piston-test'),
+    owners: [],
+    chunkStores: { forDimension: () => world.worldgenChunkStore },
+  }))
+  const batches: Array<WorldWriteBatch> = []
+  const port = makeWorldWritePortFromCoordinator(coordinator)
+  const writeBlocks: RedstoneContainerRuntimeContext['writeBlocks'] = (worldDimension, edits) => Effect.gen(function* () {
+    const batch = Schema.decodeUnknownSync(WorldWriteBatchSchema)({
+      world: coordinator.worldId,
+      expectedWorldRevision: yield* coordinator.revision,
+      dimension: worldDimension,
+      expectedDimensionRevision: yield* coordinator.dimensionRevision(worldDimension),
+      edits,
+    })
+    batches.push(batch)
+    yield* port.applyBatch(batch)
+  })
   const redstoneDirty: Array<boolean> = []
   let sessionDirtyCalls = 0
   const runtimeContext: RedstoneContainerRuntimeContext = {
     dimensionContexts,
     world,
+    writeBlocks,
     leverStates: new Map<string, PersistedLeverState>(),
     comparatorModes: new Map<string, 'compare' | 'subtract'>(),
     observerInputs: new Map<string, number>(),
@@ -116,6 +148,9 @@ const makeRuntimeHarness = async () => {
     world,
     dimension,
     dimensionContext,
+    coordinator,
+    port,
+    batches,
     runtimeContext,
     runtime: makeRedstoneContainerRuntime(runtimeContext),
     redstoneDirty,
@@ -129,7 +164,141 @@ const readWorldBlock = (
   position: RedstoneBlockPosition,
 ) => Effect.runPromise(world.chunkStore.getBlock(blockPosition(position.x, position.y, position.z)))
 
+const pistonCell = (piston: BlockPosition, facing: PistonFacing, distance: number) =>
+  pistonPositionAt(piston, facing, Schema.decodeUnknownSync(PistonBlockOffsetSchema)(distance))
+
+// Preserve the pre-port commit's exact write order as the reference behavior.
+const commitPistonSequentially = (store: ChunkStoreApi, plan: PistonMovementPlan) => Effect.gen(function* () {
+  const head = pistonCell(plan.piston, plan.facing, 1)
+  if (plan.toState === 'retracted') yield* store.setBlock(head, blockIdOf('air'))
+  for (const move of plan.moves) {
+    yield* store.setBlock(move.to, BlockId(Number(move.block)))
+    yield* store.setBlock(move.from, blockIdOf('air'))
+  }
+  if (plan.toState === 'extended') yield* store.setBlock(head, blockIdOf('piston_head'))
+})
+
+const pistonFacings: ReadonlyArray<PistonFacing> = ['down', 'east', 'north', 'south', 'up', 'west']
+const pistonCases = pistonFacings.flatMap((facing) => (['normal', 'sticky'] as const).flatMap((kind) => [
+  ...Array.from({ length: 14 }, (_, length) => ({ facing, kind, length, retract: false, pulled: 'air' as const })),
+  ...(['air', 'stone', 'redstone_wire', 'bedrock'] as const).map((pulled) => ({ facing, kind, length: 0, retract: true, pulled })),
+]))
+
 describe('redstone container runtime', () => {
+  it.each(pistonCases)('piston batch equals sequential writes: $facing $kind retract=$retract length=$length pulled=$pulled', async ({ facing, kind, length, retract, pulled }) => {
+    const harness = await makeRuntimeHarness()
+    try {
+      const piston = blockPosition(8, 64, 8)
+      const positions = Array.from({ length: 15 }, (_, distance) => pistonCell(piston, facing, distance))
+      const reference = await Effect.runPromise(makeChunkStore(allAirChunkSource, ChunkCapacity(16)))
+      const chunkKeys = new Set<string>()
+      for (const position of positions) {
+        const cx = Math.floor(position.x / 16)
+        const cz = Math.floor(position.z / 16)
+        const key = `${String(cx)}:${String(cz)}`
+        if (chunkKeys.has(key)) continue
+        chunkKeys.add(key)
+        const coord = kernelChunkCoord(ChunkAxis(cx), ChunkAxis(cz))
+        await Effect.runPromise(harness.world.worldgenChunkStore.load(coord))
+        await Effect.runPromise(reference.load(coord))
+      }
+      for (const [distance, position] of positions.entries()) {
+        const type: BlockType = distance === 0 ? 'piston'
+          : retract ? distance === 1 ? 'piston_head' : distance === 2 ? pulled : 'air'
+            : distance <= length ? distance % 3 === 1 ? 'stone' : distance % 3 === 2 ? 'dirt' : 'redstone_wire' : 'air'
+        await Effect.runPromise(harness.world.chunkStore.setBlock(position, blockIdOf(type)))
+        await Effect.runPromise(reference.setBlock(position, blockIdOf(type)))
+      }
+      const transition: PoweredPistonTransition = {
+        dimension: harness.dimension, piston, facing, kind,
+        state: retract ? 'extended' : 'retracted', powered: !retract,
+      }
+      const outcome = planPistonTransition(transition, {
+        read: (position) => {
+          const reading = Effect.runSync(reference.getBlock(position))
+          if (reading._tag !== 'Block') return { kind: 'missing' }
+          return reading.block === blockIdOf('air') ? { kind: 'empty' } : { kind: 'block', block: String(reading.block) }
+        },
+      }, { pistonImmovable: (block) => capabilityOfBlockId(BlockId(Number(block)), 'pistonImmovable') })
+      const beforeWorldRevision = Effect.runSync(harness.coordinator.revision)
+      const beforeDimensionRevision = Effect.runSync(harness.coordinator.dimensionRevision(harness.dimension))
+      if (!retract && length === 13) {
+        expect(outcome).toMatchObject({ kind: 'refused', refusal: { reason: 'too-long' } })
+      } else {
+        expect(outcome.kind).toBe('move')
+        if (outcome.kind !== 'move') throw new Error('fixture did not produce a piston movement')
+        expect(outcome.plan.moves).toHaveLength(retract ? kind === 'sticky' && pulled !== 'air' && pulled !== 'bedrock' ? 1 : 0 : length)
+        await Effect.runPromise(commitPistonSequentially(reference, outcome.plan))
+      }
+
+      harness.runtime.applyPoweredPistonTransition(transition)
+
+      const committed = retract || length < 13
+      expect(harness.batches).toHaveLength(committed ? 1 : 0)
+      for (const batch of harness.batches) {
+        expect(new Set(batch.edits.map(({ position }) => `${String(position.x)}:${String(position.y)}:${String(position.z)}`)).size).toBe(batch.edits.length)
+        expect(batch.expectedWorldRevision).toBe(beforeWorldRevision)
+        expect(batch.expectedDimensionRevision).toBe(beforeDimensionRevision)
+      }
+      expect(Effect.runSync(harness.coordinator.revision)).toBe(beforeWorldRevision + Number(committed))
+      expect(Effect.runSync(harness.coordinator.dimensionRevision(harness.dimension))).toBe(beforeDimensionRevision + Number(committed))
+      for (const position of positions) {
+        expect(await readWorldBlock(harness.world, position)).toEqual(await Effect.runPromise(reference.getBlock(position)))
+      }
+      expect(harness.sessionDirtyCalls()).toBe(Number(committed))
+      expect(harness.redstoneDirty).toEqual(committed ? [true] : [])
+    } finally {
+      await harness.close()
+    }
+  })
+
+  it('preserves a typed port conflict and makes no piston writes or retry', async () => {
+    const harness = await makeRuntimeHarness()
+    try {
+      const piston = blockPosition(8, 64, 8)
+      const source = blockPosition(8, 64, 7)
+      const destination = blockPosition(8, 64, 6)
+      const concurrentPosition = blockPosition(9, 64, 8)
+      await Effect.runPromise(harness.world.chunkStore.setBlock(piston, blockIdOf('piston')))
+      await Effect.runPromise(harness.world.chunkStore.setBlock(source, blockIdOf('stone')))
+      const failures: Array<Effect.Error<ReturnType<typeof harness.port.applyBatch>>> = []
+      let calls = 0
+      const runtime = makeRedstoneContainerRuntime({
+        ...harness.runtimeContext,
+        writeBlocks: (dimension, edits) => Effect.gen(function* () {
+          calls += 1
+          const staleBatch = Schema.decodeUnknownSync(WorldWriteBatchSchema)({
+            world: harness.coordinator.worldId,
+            expectedWorldRevision: yield* harness.coordinator.revision,
+            dimension,
+            expectedDimensionRevision: yield* harness.coordinator.dimensionRevision(dimension),
+            edits,
+          })
+          yield* harness.runtimeContext.writeBlocks(dimension, [{ position: concurrentPosition, block: blockIdOf('dirt') }])
+          return yield* harness.port.applyBatch(staleBatch).pipe(Effect.tapError((failure) => Effect.sync(() => failures.push(failure))), Effect.asVoid)
+        }),
+      })
+      expect(() => runtime.applyPoweredPistonTransition({
+        dimension: harness.dimension, piston, facing: 'north', kind: 'normal', state: 'retracted', powered: true,
+      })).toThrow()
+      expect(failures).toHaveLength(1)
+      expect(failures[0]).toMatchObject({
+        _tag: 'WorldWriteConflict', expectedWorldRevision: 0, currentWorldRevision: 1,
+        expectedDimensionRevision: 0, currentDimensionRevision: 1,
+      })
+      expect(calls).toBe(1)
+      expect(await readWorldBlock(harness.world, piston)).toEqual({ _tag: 'Block', block: blockIdOf('piston') })
+      expect(await readWorldBlock(harness.world, source)).toEqual({ _tag: 'Block', block: blockIdOf('stone') })
+      expect(await readWorldBlock(harness.world, destination)).toEqual({ _tag: 'Block', block: blockIdOf('air') })
+      expect(await readWorldBlock(harness.world, concurrentPosition)).toEqual({ _tag: 'Block', block: blockIdOf('dirt') })
+      expect(Effect.runSync(harness.coordinator.dimensionRevision(harness.dimension))).toBe(1)
+      expect(harness.sessionDirtyCalls()).toBe(0)
+      expect(harness.redstoneDirty).toEqual([])
+    } finally {
+      await harness.close()
+    }
+  })
+
   it('maps storage blocks to their container kinds', () => {
     expect(containerKindForStorageBlock('chest')).toBe('chest')
     expect(containerKindForStorageBlock('shulker_box')).toBe('shulker_box')
@@ -720,6 +889,7 @@ describe('redstone container runtime', () => {
       })).toThrow('piston source changed before commit')
 
       expect(sourceReadCount).toBe(2)
+      expect(harness.batches).toEqual([])
       expect(await readWorldBlock(harness.world, piston)).toEqual({
         _tag: 'Block',
         block: blockIdOf('piston'),
