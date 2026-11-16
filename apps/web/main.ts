@@ -93,6 +93,7 @@ import {
   blockPositionKeyOf,
   blockTypeOfId,
   DeltaTimeSecs,
+  DimensionIdSchema,
   chunkCoordOfBlock,
   isEmpty,
   PositionAxis,
@@ -100,7 +101,6 @@ import {
   resolvedBlockOfId,
   StageId,
   WorldIdSchema,
-  WorldWriteBatchSchema,
   type BlockPosition,
   type BlockPositionKey,
   type ChunkCoord,
@@ -173,7 +173,6 @@ import {
   createHudView,
   createInventoryView,
   makeUiFrameState,
-  slotSnapshotOf,
   type ChestStorageSlotTarget,
   type FurnaceSlotId,
   type InventoryInteractionTarget,
@@ -390,7 +389,7 @@ import {
   renderPlayerHud,
   respawnPlayer as respawnPlayerUi,
 } from './player-ui-h4a'
-import { createPlayerUiRuntime } from './player-ui-runtime'
+import { createPlayerUiRuntime, type PlayerUiRuntimeContext } from './player-ui-runtime'
 import {
   createPlayerFramePreparation,
   createPlayerSessionRuntime,
@@ -967,6 +966,35 @@ const bootGame = async (
     return
   }
   const hostWorldWrite = hostWorldWriteExit.value
+  // A WorldWriteBatch names its dimension by the branded DimensionId. Every
+  // host Dimension is a DimensionIdSchema input, so the three ids are decoded
+  // once here and a decode failure stops the boot like any other.
+  const dimensionIdsExit = await Effect.runPromiseExit(Effect.all({
+    overworld: Schema.decodeEffect(DimensionIdSchema)('overworld'),
+    nether: Schema.decodeEffect(DimensionIdSchema)('nether'),
+    end: Schema.decodeEffect(DimensionIdSchema)('end'),
+  }))
+  if (Exit.isFailure(dimensionIdsExit)) {
+    failBoot('dimension id decoding failed', Cause.squash(dimensionIdsExit.cause))
+    return
+  }
+  const dimensionIds = dimensionIdsExit.value
+  // The one host write path into the world: each call is one port batch, and
+  // both revisions are read right before applyBatch. Callers submit unique
+  // positions (the port rejects duplicates as WorldWriteInvalidBatch). A
+  // WorldWriteConflict is returned, not retried: a retry would read the new
+  // revisions and overwrite the write that caused the conflict.
+  const writeBlocksThroughPort: PlayerUiRuntimeContext['writeBlocks'] = (dimension, edits) =>
+    Effect.gen(function* () {
+      const { coordinator, port } = hostWorldWrite
+      yield* port.applyBatch({
+        world: coordinator.worldId,
+        expectedWorldRevision: yield* coordinator.revision,
+        dimension: dimensionIds[dimension],
+        expectedDimensionRevision: yield* coordinator.dimensionRevision(dimension),
+        edits,
+      })
+    })
   const gameplayBrewingService = await Effect.runPromise(makeBrewingService(GAMEPLAY_BREWING_OWNER_ID))
   // The one set of commit services every reader of the gameplay owners shares.
   // Owners the host still simulates in its own services (entities, dropped
@@ -1844,17 +1872,7 @@ const bootGame = async (
   // One port batch: the ChunkStore prepares every edit before it publishes
   // any, so a failed commit leaves none of the edits written.
   const commitPlannedEdits = (dimension: Dimension, edits: PlannedBlockEdits) =>
-    Effect.gen(function* () {
-      const { coordinator, port } = hostWorldWrite
-      const batch = yield* Schema.decodeEffect(WorldWriteBatchSchema)({
-        world: coordinator.worldId,
-        expectedWorldRevision: yield* coordinator.revision,
-        dimension,
-        expectedDimensionRevision: yield* coordinator.dimensionRevision(dimension),
-        edits: [...edits.values()],
-      })
-      yield* port.applyBatch(batch)
-    })
+    writeBlocksThroughPort(dimension, [...edits.values()])
   const plannedPositions = (edits: PlannedBlockEdits): ReadonlyArray<BlockPosition> =>
     [...edits.values()].map(({ position }) => position)
   const materializePortal = (dimension: Dimension, layout: PortalLayout) =>
@@ -2752,8 +2770,9 @@ const bootGame = async (
     setSwimmingState: (state) => { swimmingState = state },
     resetSimState,
     getEntitiesForExplosion: () => Effect.runSync(world.entities.entities),
-    setBlockAt: (position, block) => { Effect.runSync(currentChunkStore.setBlock(position, block)) },
-    setBlockEffect: (position, block) => currentChunkStore.setBlock(position, block),
+    setBlockEffect: (position, block) =>
+      writeBlocksThroughPort(currentChunkContext.dimension, [{ position, block }]),
+    writeBlocks: writeBlocksThroughPort,
     resolveExplosionEffects: (effects) => {
       for (const effect of effects) {
         Effect.runSync(resolveBowHits(world.entities, [{
@@ -2823,15 +2842,16 @@ const bootGame = async (
     setAnvilStatus: (status) => { anvilStatus = status },
     setEnchantingStatus: (status) => { enchantingStatus = status },
     getSelectedHotbarIndex: () => selectedHotbarIndex,
-    renderHud: (storage, durabilityBySlot) => renderPlayerHud({
+    renderHud: (storage, _durabilityBySlot) => renderPlayerHud({
       render: (viewModel) => hud.render(viewModel),
-      getHudInput: () => ({
-        ...Effect.runSync(world.vitals.view),
-        hotbar: storage.inventory.slots
-          .slice(0, 9)
-          .map((slot, slotIndex) => slotSnapshotOf(slot, durabilityBySlot.get(slotIndex))),
+      getHudInput: () => [
+        Effect.runSync(world.vitals.snapshot),
+        storage.inventory.slots.slice(0, 9).map((slot, slotIndex) => {
+          const durability = storage.inventoryDurability[slotIndex] ?? null
+          return slot === undefined ? undefined : durability === null ? slot : { ...slot, durability }
+        }),
         selectedHotbarIndex,
-      }),
+      ],
       getActiveEffects: () => Effect.runSync(snapshotStatusEffects(gameplayState, gameplayCommit)).effects,
       statusEffectsHud,
       documentBody: document.body,

@@ -591,7 +591,7 @@
     "count": 1,
     "file": "apps/web/player-ui-runtime.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(context.getPlayerPose())"
+    "text": "Effect.runSync(Effect.result(explosion))"
   },
   {
     "count": 2,
@@ -609,7 +609,7 @@
     "count": 1,
     "file": "apps/web/player-ui-runtime.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(context.readBlockAt(blockPosition(position.x, position.y, position.z)))"
+    "text": "Effect.runSync(context.readBlockAt(yield* blockCellOf(cell)))"
   },
   {
     "count": 1,
@@ -639,13 +639,13 @@
     "count": 1,
     "file": "apps/web/player-ui-runtime.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(context.worldInventory.removeAt(index, item, removed))"
+    "text": "Effect.runSync(Effect.result(context.worldInventory.removeAt(index, item, removed)))"
   },
   {
     "count": 1,
     "file": "apps/web/player-ui-runtime.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(context.worldInventory.restoreStorage(anvilResult.storage))"
+    "text": "Effect.runSync(Effect.result(context.worldInventory.restoreStorage(anvilResult.storage)))"
   },
   {
     "count": 1,
@@ -657,61 +657,61 @@
     "count": 1,
     "file": "apps/web/player-ui-runtime.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(inventoryInteraction.clickInventoryItem(9 + target.index, button))"
+    "text": "Effect.runSync(Effect.result(inventoryInteraction.clickInventoryItem(9 + target.index, button)))"
   },
   {
     "count": 1,
     "file": "apps/web/player-ui-runtime.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(inventoryInteraction.clickInventoryItem(destination, 'left'))"
+    "text": "Effect.runSync(Effect.result(inventoryInteraction.clickInventoryItem(destination, 'left')))"
   },
   {
     "count": 1,
     "file": "apps/web/player-ui-runtime.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(inventoryInteraction.clickInventoryItem(source, 'left'))"
+    "text": "Effect.runSync(Effect.result(inventoryInteraction.clickInventoryItem(source, 'left')))"
   },
   {
     "count": 1,
     "file": "apps/web/player-ui-runtime.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(inventoryInteraction.clickInventoryItem(sourceSlot, 'left'))"
+    "text": "Effect.runSync(Effect.result(inventoryInteraction.clickInventoryItem(sourceSlot, 'left')))"
   },
   {
     "count": 1,
     "file": "apps/web/player-ui-runtime.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(inventoryInteraction.clickInventoryItem(target.index, button))"
+    "text": "Effect.runSync(Effect.result(inventoryInteraction.clickInventoryItem(target.index, button)))"
   },
   {
     "count": 1,
     "file": "apps/web/player-ui-runtime.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(inventoryInteraction.close())"
+    "text": "Effect.runSync(Effect.result(inventoryInteraction.close()))"
   },
   {
     "count": 1,
     "file": "apps/web/player-ui-runtime.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(inventoryInteraction.craftOnce())"
+    "text": "Effect.runSync(Effect.result(inventoryInteraction.craftOnce()))"
   },
   {
     "count": 1,
     "file": "apps/web/player-ui-runtime.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(inventoryInteraction.interactCraftingCellFromInventory(action.target.index))"
+    "text": "Effect.runSync(Effect.result(inventoryInteraction.interactCraftingCellFromInventory(action.target.index)))"
   },
   {
     "count": 2,
     "file": "apps/web/player-ui-runtime.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(inventoryInteraction.interactCraftingCellFromInventory(target.index))"
+    "text": "Effect.runSync(Effect.result(inventoryInteraction.interactCraftingCellFromInventory(target.index)))"
   },
   {
     "count": 1,
     "file": "apps/web/player-ui-runtime.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(inventoryInteraction.pickupInventoryItem(selection.source))"
+    "text": "Effect.runSync(Effect.result(inventoryInteraction.pickupInventoryItem(selection.source)))"
   },
   {
     "count": 2,
@@ -2931,7 +2931,7 @@
     "count": 1,
     "file": "apps/web/title-menu.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runPromise( Effect.provideService( Layer.build(indexedDbStorageLayer({ factory: indexedDB, databaseName: DATABASE_NAME })), Scope.Scope, scope, ), )"
+    "text": "Effect.runPromise( Effect.provideService( Layer.build(indexedDbStorageLayer({ factory: indexedDB, databaseName })), Scope.Scope, scope, ), )"
   },
   {
     "count": 1,

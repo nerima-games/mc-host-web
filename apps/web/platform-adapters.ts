@@ -14,7 +14,7 @@ import {
   type WebAudioBackend,
 } from '@nerima-games/mc-audio'
 import { AngleRadians, PositionAxis, type Position as Vec3 } from '@nerima-games/mc-kernel'
-import { indexedDbStorageLayer, StoragePort } from '@nerima-games/mc-save'
+import { IndexedDbDatabaseName, indexedDbStorageLayer, StoragePort } from '@nerima-games/mc-save'
 import {
   browserInputLayer,
   generateTerrainAtlas,
@@ -48,7 +48,7 @@ import type { SessionRoute } from './session-navigation'
  * both need. They live here rather than in `main.ts` so that `main.ts` can
  * import the factory without the factory importing `main.ts` back (a cycle).
  */
-export const DATABASE_NAME = 'nerima-games-minecraft'
+export const DATABASE_NAME: IndexedDbDatabaseName = IndexedDbDatabaseName('nerima-games-minecraft')
 export const MISSING_SESSION_ERROR = 'The requested saved world could not be found.'
 export class RequestedSessionNotFoundError extends Error {}
 
