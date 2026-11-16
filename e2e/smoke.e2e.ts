@@ -264,6 +264,7 @@ test.describe('smoke — the composed frame in a real browser', () => {
       'render:draw',
       'ui:hud-sync',
       'ui:overlay-sync',
+      'gameplay:block-state-rules',
     ])
   })
 
