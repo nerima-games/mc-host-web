@@ -3,7 +3,7 @@ import { InputAction, KeyCode } from '@nerima-games/mc-kernel'
 import type { DomNode } from '@nerima-games/mx-ui'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { bootTitleMenu, installPlayerOnboarding } from '../apps/web/title-menu'
+import { bootTitleMenu, installPlayerOnboarding, playerControlHints } from '../apps/web/title-menu'
 import { DEFAULT_PLAYER_SETTINGS } from '../apps/web/settings'
 
 const mocks = vi.hoisted(() => ({
@@ -295,6 +295,18 @@ describe('title menu boot', () => {
     expect(state.titleScreen.find('data-mx-ui', 'onboarding')).toBeUndefined()
   })
 
+  it('reopens dismissed controls from the title Controls button', async () => {
+    const state = makeTitleMenuContext()
+    await bootTitleMenu(state.context)
+    const root = state.titleScreen.find('data-mx-ui', 'onboarding')
+    root?.find('data-onboarding-action', 'PersistQuickControlsDismissal')?.click()
+    expect(root?.attributes.has('hidden')).toBe(true)
+    const controls = state.titleScreen.find('data-title-action', 'show-controls')
+    expect(controls).toBeDefined()
+    controls?.click()
+    expect(root?.attributes.has('hidden')).toBe(false)
+  })
+
   it('updates the displayed controls after rebinding a key in title settings', async () => {
     const state = makeTitleMenuContext()
     await bootTitleMenu(state.context)
@@ -311,6 +323,28 @@ describe('title menu boot', () => {
 })
 
 describe('player onboarding', () => {
+  it('builds quick and complete controls in a fixed action order regardless of binding insertion order', () => {
+    const bindings = Object.fromEntries(Object.entries(DEFAULT_PLAYER_SETTINGS.bindings).reverse())
+    const hints = playerControlHints(bindings)
+    expect(hints.quickControls.map(({ action }) => action)).toEqual([
+      'moveForward', 'moveBackward', 'moveLeft', 'moveRight', 'jump', 'openInventory', 'attack', 'use', 'escape',
+    ])
+    expect(hints.allControls.map(({ action }) => action)).toEqual([
+      'moveForward', 'moveBackward', 'moveLeft', 'moveRight', 'jump', 'sneak', 'sprint',
+      'openInventory', 'openChat', 'attack', 'use', 'pickBlock',
+      'hotbarSlot1', 'hotbarSlot2', 'hotbarSlot3', 'hotbarSlot4', 'hotbarSlot5',
+      'hotbarSlot6', 'hotbarSlot7', 'hotbarSlot8', 'hotbarSlot9', 'escape',
+    ])
+    expect(hints.quickControls.at(-1)).toEqual({ action: 'escape', keys: 'Escape' })
+    expect(hints.allControls.at(-1)).toBe(hints.quickControls.at(-1))
+  })
+
+  it('keeps an unbound action absent without substituting a default key', () => {
+    const hints = playerControlHints({ jump: 'KeyJ' })
+    expect(hints.quickControls).toEqual([{ action: 'jump', keys: 'KeyJ' }, { action: 'escape', keys: 'Escape' }])
+    expect(hints.allControls).toEqual(hints.quickControls)
+  })
+
   const quickControls = [{ action: InputAction('jump'), keys: KeyCode('KeyJ') }]
   const allControls = [...quickControls, { action: InputAction('openInventory'), keys: KeyCode('KeyI') }]
   const makeOnboarding = (storage: Pick<Storage, 'getItem' | 'setItem'>) => {

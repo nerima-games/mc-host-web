@@ -17,6 +17,7 @@ import {
 } from '@nerima-games/mc-sim'
 import type { EnchantedItem } from '@nerima-games/mx-gameplay'
 import type { DroppedItemMetadata } from '../apps/web/dropped-item-metadata'
+import { DEFAULT_PLAYER_SETTINGS } from '../apps/web/settings'
 
 const mocks = vi.hoisted(() => ({ hudViewModel: vi.fn() }))
 
@@ -27,7 +28,6 @@ vi.mock('@nerima-games/mx-ui', async (importOriginal) => {
 
 import {
   handleLocalPlayerDeath,
-  installPauseControls,
   installPlayerPauseMenu,
   renderCrosshair,
   renderPlayerHud,
@@ -110,11 +110,17 @@ const emit = (target: FakeElement, type: string, event: Event): void => {
 }
 
 const makePauseMenu = (locked = true) => {
+  let focused: FakeElement | null = null
+  const focus = (element: FakeElement): void => { focused = element }
   const events = new FakeElement()
   const parent = new FakeElement()
-  const canvas = Object.assign(new FakeElement(), { requestPointerLock: vi.fn<() => void | Promise<void>>() })
+  const body = new FakeElement()
+  const gameShell = new FakeElement()
+  const canvas = Object.assign(new FakeElement(focus), { requestPointerLock: vi.fn<() => void | Promise<void>>() })
   const document = {
-    createElement: () => new FakeElement(),
+    body,
+    get activeElement() { return focused },
+    createElement: () => new FakeElement(focus),
     pointerLockElement: locked ? canvas : null,
     addEventListener: events.addEventListener.bind(events),
     removeEventListener: events.removeEventListener.bind(events),
@@ -122,35 +128,100 @@ const makePauseMenu = (locked = true) => {
   }
   let paused = false
   let canPause = true
+  let brewingOpen = false
+  let tradeOpen = false
+  let inventoryOpen = false
+  let settingsVisible = false
+  let settingsReturnFocus: FakeElement | undefined
+  const order: Array<string> = []
   const deferred: Array<() => void> = []
   const clearGameplayInput = vi.fn()
-  const setPaused = vi.fn((next: boolean) => { paused = next })
+  const setPaused = vi.fn((next: boolean) => { paused = next; order.push(`paused:${String(next)}`) })
   const onFailure = vi.fn()
-  const onOpenSettings = vi.fn()
-  const onSaveQuit = vi.fn()
+  const onOpenSettings = vi.fn((_settings: typeof DEFAULT_PLAYER_SETTINGS, returnFocusTo: FakeElement) => {
+    settingsVisible = true
+    settingsReturnFocus = returnFocusTo
+  })
+  const requestFlush = vi.fn<() => Promise<void>>().mockResolvedValue()
+  const drainSettingsWrites = vi.fn<() => Promise<void>>().mockResolvedValue()
+  const assign = vi.fn()
   const menu = installPlayerPauseMenu({
-    document, parent, canvas,
+    document, parent, canvas, gameShell,
+    window: { location: { assign } },
     deferToFrameBoundary: (work) => { deferred.push(work) },
     getPaused: () => paused,
     setPaused,
     canPause: () => canPause,
     clearGameplayInput,
-    onOpenSettings,
-    onSaveQuit,
+    settingsView: { isOpen: () => settingsVisible, open: onOpenSettings },
+    getPlayerSettings: () => DEFAULT_PLAYER_SETTINGS,
+    isBrewingOpen: () => brewingOpen,
+    closeBrewing: () => { brewingOpen = false; order.push('close:brewing') },
+    isTradeOpen: () => tradeOpen,
+    closeTrade: () => { tradeOpen = false; order.push('close:trade') },
+    isInventoryOpen: () => inventoryOpen,
+    closeInventory: () => { inventoryOpen = false; order.push('close:inventory') },
+    resetPrimaryAttackGesture: () => order.push('reset-attack'),
+    resetBowUse: () => order.push('reset-bow'),
+    renderCrosshair: () => order.push('crosshair'),
+    syncTouchControls: () => order.push('touch'),
+    requestFlush,
+    drainSettingsWrites,
     onFailure,
   })
   return {
-    menu, document, parent, canvas, clearGameplayInput, setPaused, onFailure, onOpenSettings, onSaveQuit,
+    menu, document, parent, canvas, body, gameShell, order,
+    clearGameplayInput, setPaused, onFailure, onOpenSettings, requestFlush, drainSettingsWrites, assign,
     getPaused: () => paused,
+    getFocused: () => focused,
     setCanPause: (next: boolean) => { canPause = next },
+    openModals: () => { brewingOpen = true; tradeOpen = true; inventoryOpen = true },
+    closeSettings: () => {
+      settingsVisible = false
+      menu.closeSettings()
+      settingsReturnFocus?.focus()
+    },
     frame: () => { for (const work of deferred.splice(0)) work() },
     lockChanged: () => emit(events, 'pointerlockchange', new Event('pointerlockchange')),
     lockFailed: () => emit(events, 'pointerlockerror', new Event('pointerlockerror')),
     click: (action: string) => emit(parent.findAction(action), 'click', new Event('click')),
+    tab: (backwards = false) => {
+      const event = Object.assign(new Event('keydown', { cancelable: true }), { code: 'Tab', shiftKey: backwards })
+      emit(events, 'keydown', event)
+      return event
+    },
+    errorText: () => parent.children[0]?.children.at(-1)?.textContent,
   }
 }
 
 describe('pointer lock pause menu', () => {
+  it('keeps a desktop session paused on Escape without requesting pointer lock or reporting failure', () => {
+    const state = makePauseMenu()
+    state.menu.handleEscape()
+    state.frame()
+    state.menu.handleEscape()
+    state.frame()
+    expect(state.getPaused()).toBe(true)
+    expect(state.canvas.requestPointerLock).not.toHaveBeenCalled()
+    expect(state.onFailure).not.toHaveBeenCalled()
+  })
+
+  it('focuses Resume through the published view when pointer lock is lost', () => {
+    const state = makePauseMenu()
+    state.document.pointerLockElement = null
+    state.lockChanged()
+    state.frame()
+    expect(state.getFocused()).toBe(state.parent.findAction('resume'))
+  })
+
+  it('hides the optimistic pause view if pause is no longer allowed at the frame boundary', () => {
+    const state = makePauseMenu(false)
+    state.menu.handleEscape()
+    state.setCanPause(false)
+    state.frame()
+    expect(state.getPaused()).toBe(false)
+    expect(state.parent.children[0]?.children[0]?.attributes.has('hidden')).toBe(true)
+  })
   it('pauses once on lock loss and clears gameplay input at the frame boundary', () => {
     const state = makePauseMenu()
     state.document.pointerLockElement = null
@@ -247,7 +318,7 @@ describe('pointer lock pause menu', () => {
     expect(state.setPaused).toHaveBeenCalledTimes(1)
     expect(state.document.exitPointerLock).toHaveBeenCalledTimes(2)
     expect(state.document.pointerLockElement).toBeNull()
-    state.menu.closeSettings()
+    state.closeSettings()
     state.click('resume')
     state.document.pointerLockElement = state.canvas
     state.lockChanged()
@@ -262,13 +333,89 @@ describe('pointer lock pause menu', () => {
     state.click('settings')
     state.frame()
     expect(state.onOpenSettings).toHaveBeenCalledOnce()
-    state.menu.closeSettings()
+    state.closeSettings()
     state.click('save-and-quit')
-    expect(state.onSaveQuit).toHaveBeenCalledOnce()
+    expect(state.requestFlush).toHaveBeenCalledOnce()
     state.menu.handleEscape()
     state.frame()
     expect(state.getPaused()).toBe(false)
     expect(state.canvas.requestPointerLock).not.toHaveBeenCalled()
+  })
+
+  it('traps Tab at the first and last pause actions and leaves interior navigation native', () => {
+    const state = makePauseMenu(false)
+    state.menu.handleEscape()
+    state.frame()
+    expect(state.tab().defaultPrevented).toBe(false)
+    expect(state.tab(true).defaultPrevented).toBe(true)
+    expect(state.getFocused()).toBe(state.parent.findAction('save-and-quit'))
+    expect(state.tab().defaultPrevented).toBe(true)
+    expect(state.getFocused()).toBe(state.parent.findAction('resume'))
+  })
+
+  it('defers host settings opening, restores Options focus on close, and leaves its Escape to settings', () => {
+    const state = makePauseMenu(false)
+    state.menu.handleEscape()
+    state.frame()
+    state.click('settings')
+    expect(state.parent.inert).toBe(true)
+    expect(state.onOpenSettings).not.toHaveBeenCalled()
+    state.frame()
+    expect(state.onOpenSettings).toHaveBeenCalledExactlyOnceWith(DEFAULT_PLAYER_SETTINGS, state.parent.findAction('settings'))
+    state.menu.handleEscape()
+    state.frame()
+    expect(state.getPaused()).toBe(true)
+    state.closeSettings()
+    expect(state.parent.inert).toBe(false)
+    expect(state.getFocused()).toBe(state.parent.findAction('settings'))
+    state.menu.reportError('Settings could not be saved.')
+    expect(state.errorText()).toBe('Settings could not be saved.')
+    state.menu.clearError()
+    expect(state.errorText()).toBe('')
+  })
+
+  it('waits for both save queues, prevents duplicate quit, and skips the busy action in the focus trap', async () => {
+    const state = makePauseMenu(false)
+    const worldSave = Promise.withResolvers<void>()
+    const settingsSave = Promise.withResolvers<void>()
+    state.requestFlush.mockReturnValueOnce(worldSave.promise)
+    state.drainSettingsWrites.mockReturnValueOnce(settingsSave.promise)
+    state.menu.handleEscape()
+    state.frame()
+    state.click('save-and-quit')
+    state.click('save-and-quit')
+    expect(state.requestFlush).toHaveBeenCalledOnce()
+    expect(state.drainSettingsWrites).toHaveBeenCalledOnce()
+    const quit = state.parent.findAction('save-and-quit')
+    expect(quit.getAttribute('aria-busy')).toBe('true')
+    expect(quit.hasAttribute('disabled')).toBe(true)
+    state.parent.findAction('resume').focus()
+    state.tab(true)
+    expect(state.getFocused()).toBe(state.parent.findAction('settings'))
+    worldSave.resolve()
+    await Promise.resolve()
+    expect(state.assign).not.toHaveBeenCalled()
+    settingsSave.resolve()
+    await vi.waitFor(() => expect(state.assign).toHaveBeenCalledExactlyOnceWith('/'))
+    expect(quit.hasAttribute('aria-busy')).toBe(false)
+    expect(quit.hasAttribute('disabled')).toBe(false)
+  })
+
+  it('keeps the world paused after a failed save and allows a successful retry', async () => {
+    const state = makePauseMenu(false)
+    const cause = new Error('world save failed')
+    state.requestFlush.mockRejectedValueOnce(cause)
+    state.menu.handleEscape()
+    state.frame()
+    state.click('save-and-quit')
+    await vi.waitFor(() => expect(state.onFailure).toHaveBeenCalledExactlyOnceWith({ _tag: 'PauseSaveQuitFailure', cause }))
+    expect(state.errorText()).toBe('Save failed. Your world is still open; please try again.')
+    expect(state.getPaused()).toBe(true)
+    expect(state.assign).not.toHaveBeenCalled()
+    expect(state.parent.findAction('save-and-quit').hasAttribute('disabled')).toBe(false)
+    state.click('save-and-quit')
+    await vi.waitFor(() => expect(state.assign).toHaveBeenCalledExactlyOnceWith('/'))
+    expect(state.errorText()).toBe('')
   })
 
   it('removes listeners and cancels queued transitions on destroy', () => {
@@ -480,112 +627,29 @@ describe('H4a player UI', () => {
   })
 
   it('closes open modals in priority order before toggling pause and restores focus on resume', () => {
-    let activeElement: FakeElement | null = null
-    let pointerLockElement: HTMLElement | null = null
-    let paused = false
-    let inventoryOpen = true
-    let tradeOpen = true
-    let brewingOpen = true
-    const order: Array<string> = []
-    const body = new FakeElement()
-    const documentListeners = new FakeElement()
-    const document: {
-      readonly body: FakeElement
-      activeElement: HTMLElement | null
-      pointerLockElement: HTMLElement | null
-      readonly addEventListener: (type: string, listener: EventListenerOrEventListenerObject) => void
-      readonly exitPointerLock: () => void
-    } = {
-      body,
-      activeElement,
-      pointerLockElement,
-      addEventListener: documentListeners.addEventListener.bind(documentListeners),
-      exitPointerLock: vi.fn(() => { pointerLockElement = null }),
-    }
-    const focus = (element: FakeElement): void => {
-      activeElement = element
-      document.activeElement = element as unknown as HTMLElement
-    }
-    const canvas = new FakeElement(focus)
-    const gameShell = new FakeElement()
-    const pauseOverlay = new FakeElement()
-    const resumeButton = new FakeElement(focus)
-    const settingsButton = new FakeElement(focus)
-    const saveQuitButton = new FakeElement(focus)
-    const pauseError = new FakeElement()
-    const settingsView = { isOpen: () => false, open: vi.fn() }
-    const renderCrosshair = vi.fn(() => order.push('crosshair'))
-    const syncTouchControls = vi.fn(() => order.push('touch'))
-    const deferred: Array<() => void> = []
-    const frameBoundary = (): void => {
-      for (const work of deferred.splice(0)) work()
-    }
-
-    installPauseControls({
-      deferToFrameBoundary: (work) => { deferred.push(work) },
-      document: document as unknown as Document,
-      window: { location: { assign: vi.fn() } } as unknown as Pick<Window, 'location'>,
-      canvas: canvas as unknown as HTMLCanvasElement,
-      gameShell: gameShell as unknown as HTMLElement,
-      pauseOverlay: pauseOverlay as unknown as HTMLElement,
-      resumeButton: resumeButton as unknown as HTMLButtonElement,
-      settingsButton: settingsButton as unknown as HTMLButtonElement,
-      saveQuitButton: saveQuitButton as unknown as HTMLButtonElement,
-      pauseError: pauseError as unknown as HTMLElement,
-      settingsView,
-      getPlayerSettings: () => ({}) as never,
-      getPaused: () => paused,
-      setPaused: (next) => { paused = next; order.push(`paused:${String(next)}`) },
-      isBrewingOpen: () => brewingOpen,
-      closeBrewing: () => { brewingOpen = false; order.push('close:brewing') },
-      isTradeOpen: () => tradeOpen,
-      closeTrade: () => { tradeOpen = false; order.push('close:trade') },
-      isInventoryOpen: () => inventoryOpen,
-      closeInventory: () => { inventoryOpen = false; order.push('close:inventory') },
-      resetPrimaryAttackGesture: () => order.push('reset-attack'),
-      resetBowUse: () => order.push('reset-bow'),
-      renderCrosshair,
-      syncTouchControls,
-      requestFlush: async () => {},
-      drainSettingsWrites: async () => {},
-    })
-
-    const sendEscape = (): void => {
-      const event = {
-        code: 'Escape',
-        repeat: false,
-        shiftKey: false,
-        preventDefault: vi.fn(),
-        stopPropagation: vi.fn(),
-      } as unknown as Event
-      emit(documentListeners, 'keydown', event)
-    }
-
-    sendEscape()
+    const state = makePauseMenu()
+    state.openModals()
+    state.menu.handleEscape()
     // Closing a screen touches the world, so it waits for the frame boundary.
-    expect(order).toEqual([])
-    frameBoundary()
-    expect(order).toEqual(['close:brewing'])
-    sendEscape()
-    frameBoundary()
-    expect(order).toEqual(['close:brewing', 'close:trade'])
-    sendEscape()
-    frameBoundary()
-    expect(order).toEqual(['close:brewing', 'close:trade', 'close:inventory'])
-
-    pointerLockElement = canvas as unknown as HTMLElement
-    document.pointerLockElement = pointerLockElement
-    sendEscape()
-    expect(paused).toBe(false)
-    frameBoundary()
-
-    expect(paused).toBe(true)
-    expect(gameShell.inert).toBe(true)
-    expect(pauseOverlay.hidden).toBe(false)
-    expect(body.attributes.get('data-session-paused')).toBe('true')
-    expect(document.exitPointerLock).toHaveBeenCalledOnce()
-    expect(activeElement).toBe(resumeButton)
-    expect(order.slice(-5)).toEqual([
+    expect(state.order).toEqual([])
+    state.frame()
+    expect(state.order).toEqual(['close:brewing'])
+    state.menu.handleEscape()
+    state.frame()
+    expect(state.order).toEqual(['close:brewing', 'close:trade'])
+    state.menu.handleEscape()
+    state.frame()
+    expect(state.order).toEqual(['close:brewing', 'close:trade', 'close:inventory'])
+    state.menu.handleEscape()
+    expect(state.getPaused()).toBe(false)
+    state.frame()
+    expect(state.getPaused()).toBe(true)
+    expect(state.gameShell.inert).toBe(true)
+    expect(state.parent.hidden).toBe(false)
+    expect(state.body.attributes.get('data-session-paused')).toBe('true')
+    expect(state.document.exitPointerLock).toHaveBeenCalledOnce()
+    expect(state.getFocused()).toBe(state.parent.findAction('resume'))
+    expect(state.order.slice(-5)).toEqual([
       'reset-attack',
       'reset-bow',
       'paused:true',
@@ -593,13 +657,16 @@ describe('H4a player UI', () => {
       'touch',
     ])
 
-    emit(resumeButton, 'click', new Event('click'))
-    expect(paused).toBe(true)
-    frameBoundary()
-    expect(paused).toBe(false)
-    expect(pauseOverlay.hidden).toBe(true)
-    expect(body.attributes.get('data-session-paused')).toBe('false')
-    expect(activeElement).toBe(canvas)
+    state.click('resume')
+    expect(state.getPaused()).toBe(true)
+    state.document.pointerLockElement = state.canvas
+    state.lockChanged()
+    state.frame()
+    expect(state.getPaused()).toBe(false)
+    expect(state.parent.hidden).toBe(true)
+    expect(state.gameShell.inert).toBe(false)
+    expect(state.body.attributes.get('data-session-paused')).toBe('false')
+    expect(state.getFocused()).toBe(state.canvas)
   })
 
   it('checks the bed first, then preserves respawn action order and clears a missing bed before restoring the player', () => {

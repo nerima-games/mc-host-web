@@ -19,6 +19,7 @@ import {
 import { validateMultiplayerUrl } from './multiplayer-url'
 import {
   DEFAULT_PLAYER_SETTINGS,
+  PLAYER_BINDING_ACTIONS,
   loadPlayerSettings,
   savePlayerSettings,
   type PlayerSettingsV1,
@@ -34,6 +35,19 @@ import {
 } from './platform-adapters'
 
 const QUICK_CONTROLS_DISMISSED_KEY = 'mc-host-web/quick-controls-dismissed'
+const QUICK_CONTROL_ACTIONS = new Set(['moveForward', 'moveBackward', 'moveLeft', 'moveRight', 'jump', 'openInventory', 'attack', 'use', 'escape'])
+
+export const playerControlHints = (bindings: PlayerSettingsV1['bindings']): {
+  readonly quickControls: ReadonlyArray<QuickControlHint>
+  readonly allControls: ReadonlyArray<QuickControlHint>
+} => {
+  // The action list is fixed; bound input codes have already passed settings validation.
+  const allControls = PLAYER_BINDING_ACTIONS.flatMap((action): Array<QuickControlHint> => {
+    const keys = bindings[action]
+    return keys === undefined ? [] : [{ action: InputAction(action), keys: KeyCode(keys) }]
+  }).concat({ action: InputAction('escape'), keys: KeyCode('Escape') })
+  return { quickControls: allControls.filter(({ action }) => QUICK_CONTROL_ACTIONS.has(action)), allControls }
+}
 
 export type OnboardingPersistenceFailure = {
   readonly _tag: 'OnboardingPersistenceFailure'
@@ -221,17 +235,20 @@ export const bootTitleMenu = async (context: TitleMenuContext): Promise<void> =>
     document,
     parent: onboardingParent,
     getStorage: () => window.localStorage,
-    // Settings normalization only retains non-blank action names and key codes.
-    getQuickControls: () => Object.entries(playerSettings.bindings)
-      .filter(([action]) => ['moveForward', 'moveBackward', 'moveLeft', 'moveRight', 'jump', 'openInventory', 'attack', 'use'].includes(action))
-      .map(([action, keys]) => ({ action: InputAction(action), keys: KeyCode(keys) }))
-      .concat({ action: InputAction('escape'), keys: KeyCode('Escape') }),
-    getAllControls: () => Object.entries(playerSettings.bindings)
-      .map(([action, keys]) => ({ action: InputAction(action), keys: KeyCode(keys) }))
-      .concat({ action: InputAction('escape'), keys: KeyCode('Escape') }),
+    getQuickControls: () => playerControlHints(playerSettings.bindings).quickControls,
+    getAllControls: () => playerControlHints(playerSettings.bindings).allControls,
     onFailure: reportOnboardingFailure,
   })
-  if (Result.isFailure(onboarding)) reportOnboardingFailure(onboarding.failure)
+  if (Result.isFailure(onboarding)) {
+    reportOnboardingFailure(onboarding.failure)
+  } else {
+    const controlsButton = document.createElement('button')
+    controlsButton.setAttribute('type', 'button')
+    controlsButton.setAttribute('data-title-action', 'show-controls')
+    controlsButton.textContent = 'Controls'
+    controlsButton.addEventListener('click', () => onboarding.success.showControls())
+    titleScreen.appendChild(controlsButton)
+  }
   settingsView = createSettingsView(document, settingsRoot, {
     onChange: (next) => {
       playerSettings = next

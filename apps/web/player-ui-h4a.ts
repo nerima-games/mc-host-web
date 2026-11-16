@@ -7,7 +7,8 @@ import {
   hudViewModel,
   pauseMenuViewModel,
   type DomElement,
-  type DomElementFactory,
+  type DomInputElement,
+  type DomInteractiveElement,
 } from '@nerima-games/mx-ui'
 import {
   miningProgressFraction,
@@ -323,54 +324,120 @@ export type PointerLockPauseFailure = {
   readonly cause: unknown
 }
 
-export const installPlayerPauseMenu = (context: {
-  readonly document: DomElementFactory & {
+export type PauseSaveQuitFailure = {
+  readonly _tag: 'PauseSaveQuitFailure'
+  readonly cause: unknown
+}
+
+type PauseButton = DomInteractiveElement & Pick<HTMLElement, 'getAttribute' | 'hasAttribute'>
+
+export type PlayerPauseContext<Button extends PauseButton> = Omit<H4aPauseContext,
+  'document' | 'window' | 'canvas' | 'gameShell' | 'pauseOverlay' | 'resumeButton' | 'settingsButton'
+  | 'saveQuitButton' | 'pauseError' | 'settingsView'> & {
+  readonly document: {
+    createElement(tag: 'button'): Button
+    createElement(tag: 'input'): DomInputElement
+    createElement(tag: string): DomElement
+    readonly body: Pick<HTMLElement, 'setAttribute'>
+    readonly activeElement: unknown
     readonly pointerLockElement: unknown
     addEventListener(type: string, listener: EventListener): void
     removeEventListener(type: string, listener: EventListener): void
     exitPointerLock(): void
   }
-  readonly parent: DomElement
+  readonly window: { readonly location: Pick<Location, 'assign'> }
+  readonly parent: DomElement & Pick<HTMLElement, 'inert' | 'hidden'>
   readonly canvas: DomElement & { focus(): void; requestPointerLock(): void | Promise<void> }
-  readonly deferToFrameBoundary: (work: () => void) => void
-  readonly getPaused: () => boolean
-  readonly setPaused: (paused: boolean) => void
+  readonly gameShell: Pick<HTMLElement, 'inert'>
+  readonly settingsView: {
+    readonly isOpen: () => boolean
+    readonly open: (settings: PlayerSettingsV1, returnFocusTo: Button) => void
+  }
   readonly canPause: () => boolean
   readonly clearGameplayInput: () => void
-  readonly onOpenSettings: () => void
-  readonly onSaveQuit: () => void
-  readonly onFailure: (failure: PointerLockPauseFailure) => void
-}): { readonly handleEscape: () => void; readonly closeSettings: () => void; readonly destroy: () => void } => {
+  readonly onFailure: (failure: PointerLockPauseFailure | PauseSaveQuitFailure) => void
+}
+
+export const installPlayerPauseMenu = <Button extends PauseButton>(context: PlayerPauseContext<Button>): {
+  readonly handleEscape: () => void
+  readonly closeSettings: () => void
+  readonly reportError: (message: string) => void
+  readonly clearError: () => void
+  readonly destroy: () => void
+} => {
   let disposed = false
   let pointerLockUsed = context.document.pointerLockElement === context.canvas
   let resumePending = false
   let settingsOpen = false
-  const render = (): void => view.render(pauseMenuViewModel(
-    context.getPaused() ? settingsOpen ? ['pause', 'settings'] : ['pause'] : [],
-  ))
-  const pause = (): void => {
-    if (disposed || context.getPaused() || !context.canPause()) return
+  const createdButtons: Array<Button> = []
+  function createElement(tag: 'button'): Button
+  function createElement(tag: 'input'): DomInputElement
+  function createElement(tag: string): DomElement
+  function createElement(tag: string): DomElement {
+    if (tag === 'button') {
+      const button = context.document.createElement('button')
+      createdButtons.push(button)
+      return button
+    }
+    return context.document.createElement(tag)
+  }
+  const render = (): void => {
+    context.parent.hidden = !context.getPaused()
+    view.render(pauseMenuViewModel(context.getPaused() ? settingsOpen ? ['pause', 'settings'] : ['pause'] : []))
+  }
+  const hasGameplayModal = (): boolean => context.isBrewingOpen() || context.isTradeOpen() || context.isInventoryOpen()
+  const closeGameplayModal = (): void => {
+    if (context.isBrewingOpen()) context.closeBrewing()
+    else if (context.isTradeOpen()) context.closeTrade()
+    else if (context.isInventoryOpen()) context.closeInventory()
+  }
+  const applyPaused = (next: boolean): void => {
+    context.clearGameplayInput()
+    context.resetPrimaryAttackGesture()
+    if (next) context.resetBowUse()
+    context.setPaused(next)
+    context.gameShell.inert = next
+    context.parent.hidden = !next
+    context.document.body.setAttribute('data-session-paused', String(next))
+    context.renderCrosshair()
+    context.syncTouchControls()
+    if (!next) {
+      clearError()
+      context.canvas.focus()
+    }
+  }
+  const pause = (fromLockLoss: boolean): void => {
+    if (disposed) return
+    if (context.getPaused() || !context.canPause() || context.settingsView.isOpen() || hasGameplayModal()) {
+      if (!fromLockLoss && !context.getPaused()) closeGameplayModal()
+      render()
+      return
+    }
     resumePending = false
     settingsOpen = false
-    context.clearGameplayInput()
-    context.setPaused(true)
-    render()
+    applyPaused(true)
+    if (fromLockLoss) {
+      // The view owns the entry transition and Resume focus for both entry paths.
+      view.render(pauseMenuViewModel([]))
+      view.handleEscape()
+    } else {
+      render()
+    }
     if (context.document.pointerLockElement === context.canvas) context.document.exitPointerLock()
   }
   const finishResume = (): void => {
-    if (disposed || !resumePending || !context.getPaused() || settingsOpen) return
+    if (disposed || !resumePending || !context.getPaused() || settingsOpen || context.settingsView.isOpen()) return
     if (pointerLockUsed && context.document.pointerLockElement !== context.canvas) return
     resumePending = false
     settingsOpen = false
-    context.clearGameplayInput()
-    context.setPaused(false)
+    applyPaused(false)
     render()
-    context.canvas.focus()
   }
   const failResume = (cause: unknown): void => {
     if (disposed || !resumePending) return
     resumePending = false
     render()
+    reportError('Could not capture the pointer. Select Back to Game to try again.')
     context.onFailure({ _tag: 'PointerLockPauseFailure', cause })
   }
   const resume = (): void => {
@@ -386,22 +453,59 @@ export const installPlayerPauseMenu = (context: {
     if (Result.isFailure(requested)) failResume(requested.failure)
     else if (requested.success !== undefined) void requested.success.catch(failResume)
   }
-  const view = createPauseMenuView(context.document, context.parent, {
+  const saveAndQuit = (): void => {
+    if (disposed || !context.getPaused() || settingsOpen || saveQuitButton.getAttribute('aria-busy') === 'true') return
+    saveQuitButton.setAttribute('aria-busy', 'true')
+    saveQuitButton.setAttribute('disabled', '')
+    clearError()
+    void Promise.all([context.requestFlush(), context.drainSettingsWrites()])
+      .then(() => { if (!disposed) context.window.location.assign('/') })
+      .catch((cause: unknown) => {
+        if (disposed) return
+        reportError('Save failed. Your world is still open; please try again.')
+        context.onFailure({ _tag: 'PauseSaveQuitFailure', cause })
+      })
+      .finally(() => {
+        saveQuitButton.removeAttribute('aria-busy')
+        saveQuitButton.removeAttribute('disabled')
+      })
+  }
+  const view = createPauseMenuView({ createElement }, context.parent, {
     onModalStackChange: (stack) => {
       if (stack.length === 0) {
         resume()
       } else if (stack.includes('settings')) {
         resumePending = false
         settingsOpen = true
-        context.deferToFrameBoundary(() => { if (!disposed) context.onOpenSettings() })
+        context.parent.inert = true
+        context.deferToFrameBoundary(() => {
+          if (!disposed && settingsOpen && context.getPaused()) {
+            context.settingsView.open(context.getPlayerSettings(), settingsButton)
+          }
+        })
       } else if (settingsOpen) {
         settingsOpen = false
-      } else {
-        context.deferToFrameBoundary(pause)
+        context.parent.inert = false
+      } else if (!context.getPaused()) {
+        context.deferToFrameBoundary(() => pause(false))
       }
     },
-    onHostIntent: () => context.onSaveQuit(),
+    onHostIntent: saveAndQuit,
   })
+  // mx-ui 0.11 creates these native controls with stable data-pause-action values.
+  const actionButton = (action: string): Button => Result.getOrThrow(Result.fromNullishOr(
+    createdButtons.find((button) => button.getAttribute('data-pause-action') === action),
+    () => new Error(`mx-ui pause action is missing: ${action}`),
+  ))
+  const resumeButton = actionButton('resume')
+  const settingsButton = actionButton('settings')
+  const saveQuitButton = actionButton('save-and-quit')
+  const pauseError = context.document.createElement('p')
+  pauseError.setAttribute('role', 'status')
+  pauseError.setAttribute('data-pause-error', '')
+  view.root.appendChild(pauseError)
+  const reportError = (message: string): void => { pauseError.textContent = message }
+  const clearError = (): void => reportError('')
   const pointerLockChanged: EventListener = () => {
     if (context.document.pointerLockElement === context.canvas) {
       pointerLockUsed = true
@@ -410,29 +514,60 @@ export const installPlayerPauseMenu = (context: {
         return
       }
       if (resumePending) context.deferToFrameBoundary(finishResume)
-    } else if (pointerLockUsed && context.canPause()) {
+    } else if (pointerLockUsed && context.canPause() && !context.settingsView.isOpen() && !hasGameplayModal()) {
       resumePending = false
       context.deferToFrameBoundary(() => {
-        if (context.document.pointerLockElement !== context.canvas) pause()
+        if (context.document.pointerLockElement !== context.canvas) pause(true)
       })
     }
   }
   const pointerLockFailed: EventListener = (event) => failResume(event)
+  const handleTab: EventListener = (event) => {
+    if (disposed || !context.getPaused() || context.settingsView.isOpen() || settingsOpen
+      || !('code' in event) || event.code !== 'Tab') return
+    const actions = [resumeButton, settingsButton, saveQuitButton].filter((button) => !button.hasAttribute('disabled'))
+    const first = actions[0]
+    const last = actions.at(-1)
+    if (first === undefined || last === undefined) return
+    const active = context.document.activeElement
+    const backwards = 'shiftKey' in event && event.shiftKey === true
+    const isAction = actions.some((button) => button === active)
+    if (isAction && (backwards ? active !== first : active !== last)) return
+    event.preventDefault()
+    event.stopPropagation()
+    ;(backwards ? last : first).focus()
+  }
   context.document.addEventListener('pointerlockchange', pointerLockChanged)
   context.document.addEventListener('pointerlockerror', pointerLockFailed)
+  context.document.addEventListener('keydown', handleTab)
   render()
   return {
     handleEscape: () => {
-      if (!disposed && (context.getPaused() || context.canPause())) view.handleEscape()
+      if (disposed || context.settingsView.isOpen()) return
+      // Escape has no browser user activation. Desktop resume belongs to the native Resume click.
+      if (context.getPaused() && pointerLockUsed && !settingsOpen) return
+      if (!context.getPaused() && hasGameplayModal()) {
+        context.deferToFrameBoundary(() => {
+          if (!disposed) { closeGameplayModal(); render() }
+        })
+        return
+      }
+      if (!context.getPaused() && !context.canPause()) { render(); return }
+      context.parent.hidden = false
+      view.handleEscape()
     },
     closeSettings: () => {
-      settingsOpen = false
-      render()
+      context.parent.inert = false
+      if (settingsOpen) view.handleEscape()
+      else render()
     },
+    reportError,
+    clearError,
     destroy: () => {
       disposed = true
       context.document.removeEventListener('pointerlockchange', pointerLockChanged)
       context.document.removeEventListener('pointerlockerror', pointerLockFailed)
+      context.document.removeEventListener('keydown', handleTab)
       view.destroy()
     },
   }
