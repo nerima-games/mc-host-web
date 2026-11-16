@@ -1,9 +1,9 @@
-import { AngleRadians, BlockAxis, ClockPort, EpochMillis, fixedClock, blockIdOf, blockTypeOfId, blockPosition as kernelBlockPosition, ChunkAxis, chunkCoord as kernelChunkCoord, DeltaTimeSecs, MonotonicTimeSecs, position, PositionAxis, WorldId } from '@nerima-games/mc-kernel'
+import { AngleRadians, BlockAxis, BlockId, ClockPort, EpochMillis, fixedClock, blockIdOf, blockTypeOfId, blockPosition as kernelBlockPosition, ChunkAxis, chunkCoord as kernelChunkCoord, DeltaTimeSecs, MonotonicTimeSecs, position, PositionAxis, WorldId, WorldWriteChunkUnavailableSchema, WorldWriteConflict, WorldWriteInvalidBatch, type WorldWriteBatch, type WorldWritePort } from '@nerima-games/mc-kernel'
 import { type InputSnapshot } from '@nerima-games/mc-render'
 import { CropSnapshotSchema, PlayerServiceSnapshotSchema, PlayerStorageSnapshotSchema, makeTimeService, makeWeatherService, makeWorldCommitCoordinator, HungerPoints, POTATO_MATURITY_SECS, type CropSnapshot } from '@nerima-games/mc-sim'
 import { CHUNK_SIZE_XZ, CHUNK_VOLUME, BIOMES, type ChunkSource } from '@nerima-games/mc-worldgen'
 import { type ItemUseResult, type MobBehaviour } from '@nerima-games/mx-gameplay'
-import { Effect, Option, Ref } from 'effect'
+import { Effect, Option, Ref, Schema } from 'effect'
 import { describe, expect, it } from 'vitest'
 import * as gameplay from '@nerima-games/mx-gameplay'
 import { makeUiFrameState } from '@nerima-games/mx-ui'
@@ -117,6 +117,20 @@ const makeHarness = async (options: HarnessOptions = {}) => {
     dimensions: ['overworld', 'nether', 'end'],
     chunkStores: { forDimension: () => world.chunkStore },
   }))
+  const worldWriteBatches: Array<WorldWriteBatch> = []
+  const worldWrite: WorldWritePort['Service'] = {
+    applyBatch: (batch) => Effect.sync(() => {
+      worldWriteBatches.push(batch)
+      // This harness exercises the actual coordinator publication; adapter failure mapping is covered separately.
+      const committed = Effect.runSync(coordinator.commit({
+        expectedRevision: batch.expectedWorldRevision,
+        expectedDimensions: [{ dimension: batch.dimension, expectedRevision: batch.expectedDimensionRevision }],
+        changes: [],
+        blockWrite: batch,
+      }))
+      return { worldRevision: committed.revision, dimensionRevision: Effect.runSync(coordinator.dimensionRevision(batch.dimension)) }
+    }),
+  }
   const targeting = {
     coordinator,
     playerOwnerId: gameplay.GAMEPLAY_PLAYER_OWNER_ID,
@@ -320,6 +334,7 @@ const makeHarness = async (options: HarnessOptions = {}) => {
     },
     leverKeyOf: () => '',
     asBlockPosition: (position: SessionPosition) => blockPosition(position.x, position.y, position.z),
+    worldWrite,
     streamAround: (context: DimensionChunkContext, x: number, z: number) => {
       streamCalls.push({ dimension: context.dimension, x, z })
       return Effect.void
@@ -387,6 +402,7 @@ const makeHarness = async (options: HarnessOptions = {}) => {
   return {
     context,
     coordinator,
+    worldWriteBatches,
     runInteractions,
     syncPlayerOwner,
     damageCalls,
@@ -715,6 +731,8 @@ describe('tick post-frame gameplay processing', () => {
       lampTransitions: [{ dimension: 'overworld', position, lit: true }],
     }, (harness) => {
       Effect.runSync(harness.world.worldgenChunkStore.load(chunkCoord(0, -1)))
+      const initialRevision = Effect.runSync(harness.coordinator.revision)
+      const initialDimensionRevision = Effect.runSync(harness.coordinator.dimensionRevision('overworld'))
       runTickPostFrameGameplay(harness.context, {
         frame: harness.frame,
         movement: harness.movement,
@@ -722,10 +740,98 @@ describe('tick post-frame gameplay processing', () => {
         nowSecs: MonotonicTimeSecs(2),
       })
 
+      expect(harness.worldWriteBatches).toEqual([{
+        world: harness.coordinator.worldId,
+        expectedWorldRevision: initialRevision,
+        dimension: 'overworld',
+        expectedDimensionRevision: initialDimensionRevision,
+        edits: [{ position: blockPosition(position.x, position.y, position.z), block: Option.getOrThrow(blockIdOf('redstone_lamp_lit')) }],
+      }])
+      expect(Effect.runSync(harness.coordinator.revision)).toBe(initialRevision + 1)
       expect(Effect.runSync(harness.world.chunkStore.getBlock(blockPosition(position.x, position.y, position.z)))).toMatchObject({
         _tag: 'Block',
         block: Option.getOrThrow(blockIdOf('redstone_lamp_lit')),
       })
+    })
+  })
+
+  it('returns an invalid targeted block registry entry as a typed failure', async () => {
+    await withHarness({ useTriggered: true }, (harness) => {
+      const context: H5cTickContext = {
+        ...harness.context,
+        h5a: {
+          ...harness.context.h5a,
+          currentChunkStore: {
+            ...harness.world.chunkStore,
+            getBlock: () => Effect.succeed({ _tag: 'Block', block: BlockId(65535) }),
+          },
+        },
+      }
+      const result = Effect.runSync(Effect.result(runTickPostFrameGameplayEffect(context, {
+        frame: harness.frame,
+        movement: harness.movement,
+        postFrame: harness.postFrame,
+        nowSecs: MonotonicTimeSecs(2),
+      })))
+
+      expect(result).toMatchObject({ _tag: 'Failure', failure: { _tag: 'UnknownTargetBlockId', blockId: 65535 } })
+      expect(harness.streamCalls).toEqual([])
+    })
+  })
+
+  it.each(['conflict', 'invalid', 'unavailable'])('propagates a %s port failure before confirming a lamp', async (kind) => {
+    const at = blockPosition(4, 70, -2)
+    await withHarness({ lampTransitions: [{ dimension: 'overworld', position: at, lit: true }] }, (harness) => {
+      Effect.runSync(harness.world.worldgenChunkStore.load(chunkCoord(0, -1)))
+      const worldRevision = Effect.runSync(harness.coordinator.revision)
+      const dimensionRevision = Effect.runSync(harness.coordinator.dimensionRevision('overworld'))
+      const failure = kind === 'conflict'
+        ? new WorldWriteConflict({
+          expectedWorldRevision: worldRevision, currentWorldRevision: worldRevision,
+          expectedDimensionRevision: dimensionRevision, currentDimensionRevision: dimensionRevision,
+        })
+        : kind === 'invalid'
+          ? Schema.decodeUnknownSync(WorldWriteInvalidBatch)({ _tag: 'WorldWriteInvalidBatch', reason: 'empty' })
+          : Schema.decodeUnknownSync(WorldWriteChunkUnavailableSchema)({
+            _tag: 'WorldWriteChunkUnavailable', dimension: 'overworld', chunk: '0,-1',
+          })
+      const context: H5cTickContext = {
+        ...harness.context,
+        services: { ...harness.context.services, worldWrite: { applyBatch: () => Effect.fail(failure) } },
+      }
+      const result = Effect.runSync(Effect.result(runTickPostFrameGameplayEffect(context, {
+        frame: harness.frame,
+        movement: harness.movement,
+        postFrame: harness.postFrame,
+        nowSecs: MonotonicTimeSecs(2),
+      })))
+
+      expect(result).toMatchObject({ _tag: 'Failure', failure })
+      expect(Effect.runSync(harness.world.chunkStore.getBlock(at))).toMatchObject({
+        _tag: 'Block', block: Option.getOrThrow(blockIdOf('air')),
+      })
+      expect(Effect.runSync(harness.coordinator.revision)).toBe(worldRevision)
+      expect(context.services.redstoneLampTransitionLog.size).toBe(0)
+      expect(harness.streamCalls).toEqual([])
+    })
+  })
+
+  it('propagates streaming owner failures before presenting the frame', async () => {
+    await withHarness({}, (harness) => {
+      const failure = { _tag: 'WorldCommitCoordinatorInvalidOptions', value: 'stream failure' } as const
+      const context: H5cTickContext = {
+        ...harness.context,
+        services: { ...harness.context.services, streamAround: () => Effect.fail(failure) },
+      }
+      const result = Effect.runSync(Effect.result(runTickPostFrameGameplayEffect(context, {
+        frame: harness.frame,
+        movement: harness.movement,
+        postFrame: harness.postFrame,
+        nowSecs: MonotonicTimeSecs(2),
+      })))
+
+      expect(result).toMatchObject({ _tag: 'Failure', failure })
+      expect(harness.canvasAttributes.has('data-player-feet')).toBe(false)
     })
   })
 
@@ -767,7 +873,9 @@ describe('tick post-frame gameplay processing', () => {
 
   it('applies the dragon defeat events to the portal and reward state', async () => {
     await withHarness({ dimension: 'end' }, (harness) => {
-      Effect.runSync(harness.world.worldgenChunkStore.load(chunkCoord(0, 0)))
+      for (const cx of [-1, 0]) {
+        for (const cz of [-1, 0]) Effect.runSync(harness.world.worldgenChunkStore.load(chunkCoord(cx, cz)))
+      }
       const damage = Effect.runSync(harness.context.h5a.gameplayState.enderDragonEncounter.damageByPlayer(200))
       expect(damage).toMatchObject({ _tag: 'Applied', state: { phase: 'dead', health: 0 } })
 
@@ -780,6 +888,15 @@ describe('tick post-frame gameplay processing', () => {
 
       expect(harness.context.state.dragonEggRewarded.get()).toBe(true)
       expect(harness.context.state.exitPortalMaterialized.get()).toBe(true)
+      expect(harness.worldWriteBatches).toHaveLength(1)
+      expect(harness.worldWriteBatches[0]?.edits).toHaveLength(9)
+      for (let x = -1; x <= 1; x += 1) {
+        for (let z = -1; z <= 1; z += 1) {
+          expect(Effect.runSync(harness.world.chunkStore.getBlock(blockPosition(x, 64, z)))).toMatchObject({
+            _tag: 'Block', block: Option.getOrThrow(blockIdOf('end_portal')),
+          })
+        }
+      }
       expect(harness.canvasAttributes.get('data-end-dragon-phase')).toBe('dead')
       expect(Effect.runSync(harness.world.chunkStore.getBlock(blockPosition(0, 64, 0)))).toMatchObject({
         _tag: 'Block',

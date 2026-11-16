@@ -1,4 +1,4 @@
-import { AngleRadians, BlockId, BlockPositionKey, blockOfPlaceableItem, DimensionIdSchema, InterpolationFraction, blockIdOf, encodeBlockState, MonotonicTimeSecs as KernelMonotonicTimeSecs, position, PositionAxis, VehicleVelocityComponent } from '@nerima-games/mc-kernel'
+import { AngleRadians, BlockId, BlockPositionKey, blockOfPlaceableItem, DimensionIdSchema, InterpolationFraction, blockIdOf, encodeBlockState, MonotonicTimeSecs as KernelMonotonicTimeSecs, position, PositionAxis, VehicleVelocityComponent, type BlockEdit } from '@nerima-games/mc-kernel'
 import { addExperience as addVitalsExperience, ExperienceDelta, changed, emptyFurnaceState, UNCHANGED, type WeatherState } from '@nerima-games/mc-sim'
 import { Effect, Option, Ref, Result, Schema } from 'effect'
 import {
@@ -68,6 +68,9 @@ type TickGameplayFailure = Effect.Error<
   | ReturnType<typeof requestEnderPearlThrow>
   | ReturnType<typeof targetedRightClickRoute>
   | H5cTickContext['services']['time']['timeOfDay']
+  | ReturnType<H5cTickContext['services']['worldWrite']['applyBatch']>
+  | ReturnType<H5cTickContext['services']['streamAround']>
+  | Effect.Effect<never, Schema.SchemaError>
 >
 
 export const runTickPostFrameGameplay = (
@@ -88,6 +91,17 @@ export const runTickPostFrameGameplay = (
   } = postFrame
   const { h5a, h5b, services, state } = context
   const targeting = h5a.targeting
+  const writeBlocks = (dimension: Dimension, edits: ReadonlyArray<BlockEdit>) => Effect.gen(function* () {
+    const dimensionId = yield* Schema.decodeEffect(DimensionIdSchema)(dimension)
+    const coordinator = targeting.coordinator
+    yield* services.worldWrite.applyBatch({
+      world: coordinator.worldId,
+      expectedWorldRevision: yield* coordinator.revision,
+      dimension: dimensionId,
+      expectedDimensionRevision: yield* coordinator.dimensionRevision(dimension),
+      edits,
+    })
+  })
   const {
     world,
     playerApi,
@@ -475,7 +489,7 @@ export const runTickPostFrameGameplay = (
         document.body.setAttribute('data-sleep-result', 'unavailable')
       } else if (currentDimension !== 'overworld') {
         state.sleepRuntimeState.set(leaveSleep(state.sleepRuntimeState.get(), multiplayer?.query.player ?? 'local'))
-        Effect.runSync(currentChunkStore.setBlock(bedPosition, Option.getOrThrow(blockIdOf('air'))))
+        yield* writeBlocks(currentDimension, [{ position: bedPosition, block: Option.getOrThrow(blockIdOf('air')) }])
         applyWorldExplosion(
           { x: bedPosition.x + 0.5, y: bedPosition.y + 0.5, z: bedPosition.z + 0.5 },
           5,
@@ -834,9 +848,10 @@ export const runTickPostFrameGameplay = (
           },
         )
         if (match !== undefined && context !== undefined) {
-          for (const position of match.consumedBlocks) {
-            Effect.runSync(context.chunkStore.setBlock(blockPosition(position.x, position.y, position.z), Option.getOrThrow(blockIdOf('air'))))
-          }
+          yield* writeBlocks(pending.dimension, match.consumedBlocks.map((position) => ({
+            position: blockPosition(position.x, position.y, position.z),
+            block: Option.getOrThrow(blockIdOf('air')),
+          })))
           h5bState.witherRuntimeState.set(summonRuntimeWither(
             h5bState.witherRuntimeState.get(),
             pending.dimension,
@@ -879,7 +894,11 @@ export const runTickPostFrameGameplay = (
       const context = dimensionContexts.get(transition.dimension as Dimension)
       if (context === undefined) continue
       const lampPosition = asBlockPosition(transition.position)
-      Effect.runSync(context.chunkStore.setBlock(lampPosition, transition.lit ? Option.getOrThrow(blockIdOf('redstone_lamp_lit')) : Option.getOrThrow(blockIdOf('redstone_lamp'))))
+      const dimension = yield* Schema.decodeEffect(DimensionIdSchema)(transition.dimension)
+      yield* writeBlocks(dimension, [{
+        position: lampPosition,
+        block: transition.lit ? Option.getOrThrow(blockIdOf('redstone_lamp_lit')) : Option.getOrThrow(blockIdOf('redstone_lamp')),
+      }])
       const confirmedRead = Effect.runSync(context.chunkStore.getBlock(lampPosition))
       const transitionKey = leverKeyOf({ dimension: transition.dimension as Dimension, position: transition.position })
       redstoneLampTransitionLog.set(transitionKey, [
@@ -914,7 +933,11 @@ export const runTickPostFrameGameplay = (
         position: transition.position,
       })
       if (transition.kind === 'door') {
-        Effect.runSync(context.chunkStore.setBlock(asBlockPosition(transition.position), transition.powered ? Option.getOrThrow(blockIdOf('door_open')) : Option.getOrThrow(blockIdOf('door'))))
+        const dimension = yield* Schema.decodeEffect(DimensionIdSchema)(transition.dimension)
+        yield* writeBlocks(dimension, [{
+          position: asBlockPosition(transition.position),
+          block: transition.powered ? Option.getOrThrow(blockIdOf('door_open')) : Option.getOrThrow(blockIdOf('door')),
+        }])
       } else if (transition.kind === 'powered-rail') {
         if (transition.powered) poweredRails.add(key)
         else poweredRails.delete(key)
@@ -927,12 +950,10 @@ export const runTickPostFrameGameplay = (
   // Portal stages can replace both dimension and pose. Stream and present
   // only after the frame so the renderer never meshes the destination pose
   // against the source dimension's store.
-  Effect.runSync(
-    streamAround(
-      currentChunkContext(),
-      postFramePose.feetPosition.x,
-      postFramePose.feetPosition.z,
-    ),
+  yield* streamAround(
+    currentChunkContext(),
+    postFramePose.feetPosition.x,
+    postFramePose.feetPosition.z,
   )
   canvas.setAttribute(
     'data-player-feet',
@@ -1124,11 +1145,13 @@ export const runTickPostFrameGameplay = (
       case 'ExitPortalMaterializationRequested':
         if (!state.exitPortalMaterialized.get()) {
           const portalY = 64
+          const edits: Array<BlockEdit> = []
           for (let x = -1; x <= 1; x += 1) {
             for (let z = -1; z <= 1; z += 1) {
-              Effect.runSync(currentChunkStore.setBlock(blockPosition(x, portalY, z), END_PORTAL_BLOCK.PORTAL))
+              edits.push({ position: blockPosition(x, portalY, z), block: END_PORTAL_BLOCK.PORTAL })
             }
           }
+          yield* writeBlocks(dimensionAfterFrame, edits)
           state.exitPortalMaterialized.set(true)
           queueEndAudio('exitPortal', position(PositionAxis(0), PositionAxis(portalY), PositionAxis(0)))
         }

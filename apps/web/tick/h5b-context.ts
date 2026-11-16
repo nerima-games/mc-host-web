@@ -121,7 +121,15 @@ export type H5bPostFrameContext = {
   readonly renderTradeUi: () => void
   readonly enqueueMultiplayerPlayerMove: (nowSecs: MonotonicTimeSecs) => void
   readonly sendEntityCommand: import('../multiplayer-client').MultiplayerClientApi['sendEntityCommand']
-  readonly applyPortalTravels: () => Effect.Effect<void>
+  readonly applyPortalTravels: () => Effect.Effect<void,
+    | import('@nerima-games/mc-sim').PlayerServiceInputError
+    | import('effect').Schema.SchemaError
+    | import('@nerima-games/mc-kernel').WorldWriteChunkUnavailable
+    | import('@nerima-games/mc-kernel').WorldWriteConflict
+    | import('@nerima-games/mc-kernel').BlockRegistryResolutionFailure
+    | import('@nerima-games/mc-worldgen').ChunkStoreError
+    | import('@nerima-games/mc-kernel').WorldWriteInvalidBatch
+  >
   readonly applyPlayerDamage: (
     damage: Parameters<H5aTickContext['world']['vitals']['damage']>[0],
     minimumHealthPoints?: number,

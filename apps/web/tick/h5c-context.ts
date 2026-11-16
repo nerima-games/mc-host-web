@@ -97,7 +97,10 @@ export type H5cTickContext = {
     readonly redstoneRuntime: PlatformAdapters['redstoneRuntime']
     readonly leverKeyOf: (lever: Pick<PersistedLeverState, 'dimension' | 'position'>) => string
     readonly asBlockPosition: (position: Readonly<{ readonly x: number; readonly y: number; readonly z: number }>) => BlockPosition
-    readonly streamAround: ReturnType<typeof import('../chunk-streaming').makeChunkStreaming>['streamAround']
+    readonly worldWrite: import('@nerima-games/mc-kernel').WorldWritePort['Service']
+    readonly streamAround: (
+      ...args: Parameters<ReturnType<typeof import('../chunk-streaming').makeChunkStreaming>['streamAround']>
+    ) => Effect.Effect<void, import('@nerima-games/mc-sim').WorldCommitCoordinatorError | import('@nerima-games/mc-worldgen').InvalidNaturalStructureCoordinate>
     readonly presentWeather: (state: import('@nerima-games/mc-sim').WeatherState) => void
     readonly presentWeatherRuntime: (
       state: import('@nerima-games/mc-sim').WeatherState,

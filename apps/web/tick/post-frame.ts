@@ -14,7 +14,10 @@ type LegacyGameplayItemType = Exclude<ItemStack['item'], 'arrow' | 'bow'>
 export const runTickPostFrame = (
   context: H5bPostFrameContext,
   input: H5bPostFrameInput,
-): Effect.Effect<H5bPostFrameResult, Effect.Error<ReturnType<H5bPostFrameContext['resolveTargetedPrimaryAttack']>>> => Effect.gen(function* () {
+): Effect.Effect<H5bPostFrameResult, Effect.Error<
+  | ReturnType<H5bPostFrameContext['resolveTargetedPrimaryAttack']>
+  | ReturnType<H5bPostFrameContext['applyPortalTravels']>
+>> => Effect.gen(function* () {
   const { frame, movement, framesTotal } = input
   const h5a = context.h5a
   const targeting = h5a.targeting
@@ -295,7 +298,7 @@ export const runTickPostFrame = (
 
     // Portal travel has already updated the player. Make its destination world
     // concrete before dimension alignment streams or renders that world.
-    if (multiplayer === undefined) Effect.runSync(applyPortalTravels())
+    if (multiplayer === undefined) yield* applyPortalTravels()
 
     const retryingHarvestPositions = new Set(
       (yield* Ref.get(gameplayState.pendingItemUses))
