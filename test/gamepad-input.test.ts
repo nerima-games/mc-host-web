@@ -169,6 +169,25 @@ describe('makeHostGamepadInput', () => {
         { action: 'moveBackward', kind: 'gamepadrelease', target: 'window' },
       ])
     }))
+
+  it.effect('a stick held across clearHeld moves again, and a held Start is not a new press', () =>
+    Effect.gen(function* () {
+      const { edges, gamepad, input, pollWith } = yield* fixture
+      const forwardWithStart = pad({ pressed: [START], axes: [0, -1, 0, 0] })
+      yield* pollWith([forwardWithStart])
+      // Pause entry: the host clears the input service, then tells the gamepad.
+      yield* input.clearHeld
+      yield* gamepad.inputCleared
+      expect(yield* input.isActionActive('moveForward')).toBe(false)
+
+      yield* pollWith([forwardWithStart])
+      expect(yield* input.isActionActive('moveForward')).toBe(true)
+      expect(edges()).toEqual([
+        { action: 'escape', kind: 'gamepadpress', target: 'window' },
+        { action: 'moveForward', kind: 'gamepadpress', target: 'window' },
+        { action: 'moveForward', kind: 'gamepadpress', target: 'window' },
+      ])
+    }))
 })
 
 describe('gamepadLookDelta', () => {

@@ -3310,6 +3310,7 @@ const bootGame = async (
     canPause: () => !playerIsDead(),
     clearGameplayInput: () => {
       Effect.runSync(inputApi.clearHeld)
+      Effect.runSync(hostGamepad.inputCleared)
       nativeInputQueue = EMPTY_NATIVE_INPUT_QUEUE
       touchLookState = TOUCH_LOOK_CONTROLLER_IDLE
     },

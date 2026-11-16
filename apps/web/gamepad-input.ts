@@ -18,6 +18,10 @@ import { Effect, Result } from 'effect'
 export type HostGamepadInput = {
   readonly poll: Effect.Effect<void, GamepadAxesInputError>
   readonly reset: Effect.Effect<void>
+  // The input service dropped every held action (InputServiceApi.clearHeld).
+  // Forget the held stick directions so the next poll presses them again,
+  // while keeping the button edges: a Start still held is not a new press.
+  readonly inputCleared: Effect.Effect<void>
 }
 
 export type GamepadLookDelta = {
@@ -107,7 +111,9 @@ export const makeHostGamepadInput = (
     for (const [action, held] of moveActionsHeld(pad, axes.success)) yield* setMoveHeld(action, held)
   }).pipe(Effect.tapError(() => reset))
 
-  return { poll, reset }
+  const inputCleared = Effect.sync(() => heldMoves.clear())
+
+  return { poll, reset, inputCleared }
 }
 
 // DeltaTimeSecs is a validated brand (finite, non-negative), so no re-check.
