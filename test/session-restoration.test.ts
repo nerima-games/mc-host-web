@@ -2,7 +2,7 @@ import { describe, expect, it } from '@effect/vitest'
 import { Effect, Option } from 'effect'
 
 import { ChunkAxis, chunkCoord, CHUNK_SIZE_XZ } from '@nerima-games/mc-kernel'
-import { CHUNK_VOLUME, type Chunk, type ChunkSource } from '@nerima-games/mc-worldgen'
+import { CHUNK_VOLUME, type ChunkSource, type ChunkWithBlockStates } from '@nerima-games/mc-worldgen'
 
 import {
   makeSessionChunkSourceFor,
@@ -12,7 +12,7 @@ import {
 import { createDroppedItemLifetimeTracker } from '../apps/web/dropped-item-lifetime'
 import { initializeSessionWorld } from '../apps/web/session-world'
 
-const chunk = (cx: number, cz: number, marker: number): Chunk => ({
+const chunk = (cx: number, cz: number, marker: number): ChunkWithBlockStates => ({
   coord: chunkCoord(ChunkAxis(cx), ChunkAxis(cz)),
   blocks: new Uint16Array(CHUNK_VOLUME).fill(marker),
   blockStates: new Uint32Array(CHUNK_VOLUME),
@@ -124,8 +124,6 @@ describe('session restoration', () => {
         throw new Error('weather restore failed')
       },
       restoreCrops: async () => { calls.push('crops') },
-      restoreVillagerTrades: async () => { calls.push('trades') },
-      restoreBrewingStand: async () => { calls.push('brewing') },
       restoreStatusEffects: async () => { calls.push('status-effects') },
       restoreEnderDragon: async () => { calls.push('ender-dragon') },
     }
@@ -144,8 +142,6 @@ describe('session restoration', () => {
       restoreTime: async () => { calls.push('time') },
       restoreWeather: async () => { calls.push('weather') },
       restoreCrops: async () => { calls.push('crops') },
-      restoreVillagerTrades: async () => { calls.push('trades') },
-      restoreBrewingStand: async () => { calls.push('brewing') },
       restoreStatusEffects: async () => { calls.push('status-effects') },
       restoreEnderDragon: async () => { calls.push('ender-dragon') },
     }
@@ -156,8 +152,6 @@ describe('session restoration', () => {
       'time',
       'weather',
       'crops',
-      'trades',
-      'brewing',
       'status-effects',
       'ender-dragon',
     ])

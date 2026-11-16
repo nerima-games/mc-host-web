@@ -1,7 +1,6 @@
 import { chunkSnapshotOf } from '@nerima-games/mc-worldgen'
 
 import type { DimensionChunk } from './session-persistence'
-import { requireSessionChunkBlockStates } from './session-restoration'
 
 export type SessionSavePublication<State> = {
   readonly state: State
@@ -30,7 +29,7 @@ const coordId = ({ dimension, chunk }: DimensionChunk): string =>
 
 const dimensionChunkSnapshotOf = ({ dimension, chunk }: DimensionChunk): DimensionChunk => ({
   dimension,
-  chunk: chunkSnapshotOf(requireSessionChunkBlockStates(chunk)),
+  chunk: chunkSnapshotOf(chunk),
 })
 
 export const createSessionSaveCoordinator = <State>(

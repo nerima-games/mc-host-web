@@ -3,7 +3,7 @@ import {
   chunkSnapshotOf,
   generatedChunkSource,
   NoiseSeed,
-  type Chunk,
+  type ChunkWithBlockStates,
   type ChunkSource,
   type Dimension,
 } from '@nerima-games/mc-worldgen'
@@ -20,7 +20,7 @@ import {
   type SessionHead,
   type SessionState,
 } from './session-persistence'
-import { makeSessionChunkSourceFor, requireSessionChunkBlockStates } from './session-restoration'
+import { makeSessionChunkSourceFor } from './session-restoration'
 
 export type SessionWorldInitialization<World> = {
   readonly activeSeed: number
@@ -69,9 +69,9 @@ export const initializeSessionWorld = async <World>(context: {
     : undefined
   const initialKnownChunks = (restored?.chunks ?? []).map(({ dimension, chunk }) => ({
     dimension,
-    chunk: chunkSnapshotOf(requireSessionChunkBlockStates(chunk)),
+    chunk: chunkSnapshotOf(chunk),
   }))
-  const persistedChunks = new Map<string, Chunk>(
+  const persistedChunks = new Map<string, ChunkWithBlockStates>(
     (restored?.chunks ?? []).map(({ dimension, chunk }) => [
       `${dimension}:${String(chunk.coord.cx)},${String(chunk.coord.cz)}`,
       chunk,

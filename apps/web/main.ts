@@ -86,6 +86,7 @@ import { Cause, Context, Effect, Exit, Option, Ref, Result, Schema } from 'effec
 import {
   AngleRadians,
   BLOCK_PROPERTY_DEFAULTS,
+  BREWING_TIME_SECS,
   BlockAxis,
   BlockId,
   blockPosition,
@@ -128,7 +129,9 @@ import {
   maxStackCountForItem,
   resetLandingImpact,
   OccupantId,
+  WorldCommitCoordinator,
   EntityId as SimEntityId,
+  type BrewingState,
   type ItemStack,
   type SimPhysicsConfig,
   type WeatherState,
@@ -200,6 +203,7 @@ import {
   GAMEPLAY_VILLAGER_TRADES_OWNER_ID,
   GAMEPLAY_VITALS_OWNER_ID,
   gameplayOwnerRegistrations,
+  GameplayVillagerTradeSnapshotSchema,
   getPlayerMovementSpeedMultiplier,
   insertBrewingBottle,
   insertBrewingFuel,
@@ -223,14 +227,10 @@ import {
   resolveBowHits,
   resolveFallDamage,
   resolveTargetedPrimaryAttack,
-  restoreVillagerTrades,
-  restoreBrewingStand,
   restoreStatusEffects,
   setPortalCandidates,
   solidityFromStore,
   spawnDroppedItems,
-  snapshotVillagerTrades,
-  snapshotBrewingStand,
   snapshotStatusEffects,
   collectBrewingPotion,
   useBrewingPotion,
@@ -923,16 +923,20 @@ const bootGame = async (
   const crops = await Effect.runPromise(makeCropService())
   // The player, storage and vitals owners start from the state just restored
   // into the host services (or the fresh-world state), so the gameplay stages
-  // begin from the same values the host shows. Villager trades exist only as
-  // an owner; chunk streaming reads and updates them through the coordinator.
-  // `gameplayOwnerRegistrations(undefined)` is a typed failure, so a fresh
-  // session passes an object without the restored-only fields.
+  // begin from the same values the host shows. Villager trades and the brewing
+  // stand exist only as owners, so the loaded session seeds them here and
+  // nothing restores them later; chunk streaming updates the trades through
+  // the coordinator. `gameplayOwnerRegistrations(undefined)` is a typed
+  // failure, so a fresh session passes an object without those fields.
   const gameplayOwners = gameplayOwnerRegistrations({
     playerPose: await Effect.runPromise(world.player.pose),
     dimension: await Effect.runPromise(world.player.dimension),
     playerStorage: await Effect.runPromise(world.inventory.storageSnapshot),
     vitals: await Effect.runPromise(world.vitals.snapshot),
-    ...(loadedSessionState === undefined ? {} : { villagerTrades: loadedSessionState.villagers.trades }),
+    ...(loadedSessionState === undefined ? {} : {
+      villagerTrades: loadedSessionState.villagers.trades,
+      brewing: loadedSessionState.brewing,
+    }),
   })
   if (Result.isFailure(gameplayOwners)) {
     failBoot('gameplay owner registration failed', gameplayOwners.failure)
@@ -972,6 +976,11 @@ const bootGame = async (
     brewingOwnerId: GAMEPLAY_BREWING_OWNER_ID,
     brewingService: gameplayBrewingService,
   }
+  const snapshotGameplayVillagerTrades = gameplayCommit.coordinator
+    .snapshot(GAMEPLAY_VILLAGER_TRADES_OWNER_ID, GameplayVillagerTradeSnapshotSchema)
+    .pipe(Effect.map(({ state }) => state))
+  const snapshotGameplayBrewing = gameplayBrewingService.snapshot
+    .pipe(Effect.provideService(WorldCommitCoordinator, gameplayCommit.coordinator))
   const gameplayState = await Effect.runPromise(makeGameplayFrameStateForOwner({
     coordinator: hostWorldWrite.coordinator,
     vitalsOwnerId: GAMEPLAY_VITALS_OWNER_ID,
@@ -984,12 +993,10 @@ const bootGame = async (
     restoreTime: (state) => Effect.runPromise(time.restore(state.time)),
     restoreWeather: (state) => Effect.runPromise(weather.restore(state.weather)),
     restoreCrops: (state) => Effect.runPromise(crops.restore(state.crops)),
-    restoreVillagerTrades: (state) =>
-      Effect.runPromise(restoreVillagerTrades(gameplayState, state.villagers.trades)),
-    restoreBrewingStand: (state) =>
-      Effect.runPromise(restoreBrewingStand(gameplayState, state.brewing)),
+    // Also sets the frame state's movement and modifier caches, which seeding
+    // the status-effects owner alone would leave at their defaults.
     restoreStatusEffects: (state) =>
-      Effect.runPromise(restoreStatusEffects(gameplayState, state.statusEffects)),
+      Effect.runPromise(restoreStatusEffects(gameplayState, state.statusEffects, gameplayCommit)),
     restoreEnderDragon: (state) =>
       Effect.runPromise(gameplayState.enderDragonEncounter.restore(state.end.dragon)),
   })
@@ -1296,10 +1303,10 @@ const bootGame = async (
       entities: snapshotEntityRosters(),
       villagers: {
         residents: [...villagerResidents.values()],
-        trades: Effect.runSync(snapshotVillagerTrades(gameplayState)),
+        trades: Effect.runSync(snapshotGameplayVillagerTrades),
       },
-      brewing: Effect.runSync(snapshotBrewingStand(gameplayState)),
-      statusEffects: Effect.runSync(snapshotStatusEffects(gameplayState)),
+      brewing: Effect.runSync(snapshotGameplayBrewing),
+      statusEffects: Effect.runSync(snapshotStatusEffects(gameplayState, gameplayCommit)),
       wither: snapshotWitherRuntime(witherRuntimeState),
       fishing: {
         result: fishingResult,
@@ -2393,7 +2400,7 @@ const bootGame = async (
   document.body.setAttribute('data-brewing-open', 'false')
 
   const renderTradeUi = (): void => {
-    const trades = Effect.runSync(snapshotVillagerTrades(gameplayState))
+    const trades = Effect.runSync(snapshotGameplayVillagerTrades)
     const villager = trades.villagers.find((candidate) => candidate.id === activeVillagerId)
     if (!tradeOpen || villager === undefined) {
       tradeParent.replaceChildren()
@@ -2483,18 +2490,15 @@ const bootGame = async (
     return undefined
   }
 
-  const brewingBottleLabel = (bottle: BrewingBottle | undefined): string => {
-    if (bottle === undefined) return 'Empty'
-    if (bottle === 'water_bottle') return 'Water bottle'
-    return bottle.potion === 'speed' ? 'Potion of swiftness' : `${bottle.potion} potion`
-  }
+  const brewingSlotLabel = (slot: BrewingState['fuel']): string =>
+    slot === undefined ? 'Empty' : `${String(slot.count)} ${slot.item}`
 
   const renderBrewingUi = (): void => {
     if (!brewingOpen) {
       brewingParent.replaceChildren()
       return
     }
-    const state = Effect.runSync(snapshotBrewingStand(gameplayState))
+    const state = Effect.runSync(snapshotGameplayBrewing)
     let summary = brewingParent.querySelector<HTMLElement>('[data-testid="brewing-state"]')
     let progress = brewingParent.querySelector<HTMLElement>('[data-testid="brewing-progress"]')
     let status = brewingParent.querySelector<HTMLElement>('.brewing-status')
@@ -2526,10 +2530,10 @@ const bootGame = async (
       status.setAttribute('role', 'status')
       brewingParent.replaceChildren(title, summary, progress, insert, collect, drink, close, status)
     }
-    summary.textContent = `Fuel: ${String(state.fuelUnits)} | Bottle: ${brewingBottleLabel(state.bottle)} | Ingredient: ${state.ingredient ?? 'Empty'}`
-    progress.textContent = state.brewing === undefined
+    summary.textContent = `Fuel: ${brewingSlotLabel(state.fuel)} (${String(state.fuelCharges)} charges) | Bottles: ${state.bottles.map(brewingSlotLabel).join(', ')} | Ingredient: ${brewingSlotLabel(state.ingredient)}`
+    progress.textContent = state.brewProgressSecs === 0
       ? 'Idle'
-      : `Brewing ${state.brewing.output}: ${state.brewing.remainingSecs.toFixed(1)}s`
+      : `Brewing: ${state.brewProgressSecs.toFixed(1)}s / ${BREWING_TIME_SECS.toFixed(1)}s`
     status.textContent = brewingStatus
   }
 
@@ -2816,7 +2820,7 @@ const bootGame = async (
           .map((slot, slotIndex) => slotSnapshotOf(slot, durabilityBySlot.get(slotIndex))),
         selectedHotbarIndex,
       }),
-      getActiveEffects: () => Effect.runSync(snapshotStatusEffects(gameplayState)).effects,
+      getActiveEffects: () => Effect.runSync(snapshotStatusEffects(gameplayState, gameplayCommit)).effects,
       statusEffectsHud,
       documentBody: document.body,
     }),

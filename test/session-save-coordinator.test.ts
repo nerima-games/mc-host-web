@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { ChunkAxis, CHUNK_SIZE_XZ, chunkCoord } from '@nerima-games/mc-kernel'
 import {
   CHUNK_VOLUME,
-  type Chunk,
+  type ChunkWithBlockStates,
   type Dimension,
 } from '@nerima-games/mc-worldgen'
 
@@ -13,7 +13,7 @@ import {
   type SessionSavePublication,
 } from '../apps/web/session-save-coordinator'
 
-const chunk = (cx: number, cz: number, marker: number): Chunk => ({
+const chunk = (cx: number, cz: number, marker: number): ChunkWithBlockStates => ({
   coord: chunkCoord(ChunkAxis(cx), ChunkAxis(cz)),
   blocks: new Uint16Array(CHUNK_VOLUME).fill(marker),
   blockStates: new Uint32Array(CHUNK_VOLUME),
