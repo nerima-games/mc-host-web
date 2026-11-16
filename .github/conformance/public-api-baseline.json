@@ -2067,13 +2067,13 @@
     "count": 1,
     "file": "apps/web/tick/player-movement.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(Ref.set(context.simState.velocity, swimmingTick.state.velocity))"
+    "text": "Effect.runSync(Ref.set(context.simState.velocity, { x: BlocksPerSecond(swimmingTick.state.velocity.x), y: BlocksPerSecond(swimmingTick.state.velocity.y), z: BlocksPerSecond(swimmingTick.state.velocity.z), }))"
   },
   {
     "count": 1,
     "file": "apps/web/tick/player-movement.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(Ref.set(context.simState.velocity, { x: 0, y: 0, z: 0 }))"
+    "text": "Effect.runSync(Ref.set(context.simState.velocity, { x: BlocksPerSecond(0), y: BlocksPerSecond(0), z: BlocksPerSecond(0) }))"
   },
   {
     "count": 1,
@@ -2109,7 +2109,7 @@
     "count": 1,
     "file": "apps/web/tick/player-movement.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(context.playerApi.moveTo({ x: poseBeforeFrame.feetPosition.x + swimmingTick.state.velocity.x * deltaSecs, y: poseBeforeFrame.feetPosition.y + swimmingTick.state.velocity.y * deltaSecs, z: poseBeforeFrame.feetPosition.z + swimmingTick.state.velocity.z * deltaSecs, }))"
+    "text": "Effect.runSync(context.playerApi.moveTo(position( PositionAxis(poseBeforeFrame.feetPosition.x + swimmingTick.state.velocity.x * deltaSecs), PositionAxis(poseBeforeFrame.feetPosition.y + swimmingTick.state.velocity.y * deltaSecs), PositionAxis(poseBeforeFrame.feetPosition.z + swimmingTick.state.velocity.z * deltaSecs), )))"
   },
   {
     "count": 2,
@@ -2403,7 +2403,7 @@
     "count": 1,
     "file": "apps/web/tick/post-frame-gameplay.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(multiplayer.host.enqueueOutbound({ _tag: 'BlockPlace', player: multiplayer.query.player, world: WorldId.make(Effect.runSync(playerApi.dimension)), at: target.value.adjacentPosition, block: heldItem, }))"
+    "text": "Effect.runSync(multiplayer.host.enqueueOutbound({ _tag: 'BlockPlace', player: multiplayer.query.player, world: WorldId.make(Effect.runSync(playerApi.dimension)), at: target.value.adjacentPosition, block: heldItem, state: Result.getOrThrow(encodeBlockState(Option.getOrThrow(blockIdOf(blockOfPlaceableItem(heldItem))), {})), }))"
   },
   {
     "count": 9,
@@ -2457,13 +2457,13 @@
     "count": 1,
     "file": "apps/web/tick/post-frame-gameplay.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(redstoneRuntime.pressButton( currentChunkContext().dimension, target.value.position, ))"
+    "text": "Effect.runSync(redstoneRuntime.pressButton( Schema.decodeUnknownSync(DimensionIdSchema)(currentChunkContext().dimension), blockPosition(target.value.position.x, target.value.position.y, target.value.position.z), ))"
   },
   {
     "count": 1,
     "file": "apps/web/tick/post-frame-gameplay.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(requestBlockPlacementCommand(gameplayState, { requestId: placementRequestId, positionKey: `${target.value.adjacentPosition.x},${target.value.adjacentPosition.y},${target.value.adjacentPosition.z}` as Parameters<typeof requestBlockPlacementCommand>[1]['positionKey'], heldItem, mode: isCreativeMode ? 'creative' : 'survival', }))"
+    "text": "Effect.runSync(requestBlockPlacementCommand(gameplayState, { requestId: placementRequestId, positionKey: Result.getOrThrow(BlockPositionKey(`${target.value.adjacentPosition.x},${target.value.adjacentPosition.y},${target.value.adjacentPosition.z}`)), heldItem, mode: isCreativeMode ? 'creative' : 'survival', }))"
   },
   {
     "count": 1,
@@ -2475,7 +2475,7 @@
     "count": 1,
     "file": "apps/web/tick/post-frame-gameplay.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(spawnDroppedItems(world.entities, [{ item: event.item, count: event.count, at: endDragonPosition(), }]))"
+    "text": "Effect.runSync(spawnDroppedItems(world.entities, [{ item: event.item, count: event.count, at: endDragonWorldPosition(), }]))"
   },
   {
     "count": 1,
@@ -2541,7 +2541,7 @@
     "count": 1,
     "file": "apps/web/tick/post-frame-gameplay.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(vehicleService.spawn( type, Effect.runSync(playerApi.dimension), { x: at.x + 0.5, y: at.y, z: at.z + 0.5 }, poseBeforeFrame.yawRadians, ))"
+    "text": "Effect.runSync(vehicleService.spawn( type, Effect.runSync(playerApi.dimension), position(PositionAxis(at.x + 0.5), PositionAxis(at.y), PositionAxis(at.z + 0.5)), AngleRadians(poseBeforeFrame.yawRadians), ))"
   },
   {
     "count": 1,
@@ -2571,7 +2571,7 @@
     "count": 1,
     "file": "apps/web/tick/post-frame-gameplay.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(world.entities.sweep((entity) => { if (entity.id !== knockback.id || entity.healthPoints <= 0) { return { transition: UNCHANGED, emit: undefined } } applied = true return { transition: changed({ feetPosition: knockback.direction._tag === 'Away' ? { x: entity.feetPosition.x + knockback.direction.x * 0.35, y: entity.feetPosition.y, z: entity.feetPosition.z + knockback.direction.z * 0.35, } : { x: entity.feetPosition.x, y: entity.feetPosition.y + 0.35, z: entity.feetPosition.z, }, healthPoints: entity.healthPoints, behaviour: entity.behaviour, }), emit: undefined, } }))"
+    "text": "Effect.runSync(world.entities.sweep((entity) => { if (entity.id !== knockback.id || entity.healthPoints <= 0) { return { transition: UNCHANGED, emit: undefined } } applied = true return { transition: changed({ feetPosition: knockback.direction._tag === 'Away' ? position( PositionAxis(entity.feetPosition.x + knockback.direction.x * 0.35), entity.feetPosition.y, PositionAxis(entity.feetPosition.z + knockback.direction.z * 0.35), ) : position( entity.feetPosition.x, PositionAxis(entity.feetPosition.y + 0.35), entity.feetPosition.z, ), healthPoints: entity.healthPoints, behaviour: entity.behaviour, }), emit: undefined, } }))"
   },
   {
     "count": 1,
@@ -2643,7 +2643,7 @@
     "count": 2,
     "file": "apps/web/tick/post-frame-gameplay.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(world.vitals.restore(addVitalsExperience(currentVitals, event.amount)))"
+    "text": "Effect.runSync(world.vitals.restore(addVitalsExperience(currentVitals, ExperienceDelta(event.amount))))"
   },
   {
     "count": 3,
@@ -2679,7 +2679,7 @@
     "count": 1,
     "file": "apps/web/tick/post-frame.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync( requestPotatoHarvest(gameplayState, requestId, target.position, ripe, Math.random()), )"
+    "text": "Effect.runSync( requestPotatoHarvest(gameplayState, requestId, target.position, Math.random()), )"
   },
   {
     "count": 1,
@@ -2823,7 +2823,7 @@
     "count": 1,
     "file": "apps/web/tick/post-frame.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(spawnDroppedItems(world.entities, [{ item: 'eye_of_ender', count: 1, at: settlement.position, }]))"
+    "text": "Effect.runSync(spawnDroppedItems(world.entities, [{ item: 'eye_of_ender', count: 1, at: position(PositionAxis(settlement.position.x), PositionAxis(settlement.position.y), PositionAxis(settlement.position.z)), }]))"
   },
   {
     "count": 2,
@@ -2853,13 +2853,13 @@
     "count": 1,
     "file": "apps/web/tick/post-frame.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(world.entities.sweep((candidate) => ({ transition: candidate.id === entity.id && isDroppedItemBehaviour(candidate.behaviour) ? changed({ feetPosition: candidate.feetPosition, healthPoints: candidate.healthPoints, behaviour: { ...candidate.behaviour, count: remaining }, }) : UNCHANGED, emit: undefined, })))"
+    "text": "Effect.runSync(world.entities.sweep((candidate) => ({ transition: candidate.id === entity.id && isDroppedItemBehaviour(candidate.behaviour) ? changed({ feetPosition: candidate.feetPosition, healthPoints: candidate.healthPoints, behaviour: { ...candidate.behaviour, count: StackCount(remaining) }, }) : UNCHANGED, emit: undefined, })))"
   },
   {
     "count": 1,
     "file": "apps/web/tick/post-frame.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(world.entities.sweep((entity) => ({ transition: entity.id === target.id ? changed({ feetPosition: { x: entity.feetPosition.x + impact.velocity.x / horizontalSpeed * impact.knockback, y: entity.feetPosition.y, z: entity.feetPosition.z + impact.velocity.z / horizontalSpeed * impact.knockback, }, healthPoints: entity.healthPoints, behaviour: entity.behaviour, }) : UNCHANGED, emit: undefined, })))"
+    "text": "Effect.runSync(world.entities.sweep((entity) => ({ transition: entity.id === target.id ? changed({ feetPosition: position( PositionAxis(entity.feetPosition.x + impact.velocity.x / horizontalSpeed * impact.knockback), entity.feetPosition.y, PositionAxis(entity.feetPosition.z + impact.velocity.z / horizontalSpeed * impact.knockback), ), healthPoints: entity.healthPoints, behaviour: entity.behaviour, }) : UNCHANGED, emit: undefined, })))"
   },
   {
     "count": 1,

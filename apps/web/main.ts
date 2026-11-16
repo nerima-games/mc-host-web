@@ -118,6 +118,7 @@ import {
 import {
   addExperience as addVitalsExperience,
   containerIdAt,
+  CropSnapshotSchema,
   emptyPlayerStorage,
   itemStack,
   makeBrewingService,
@@ -196,6 +197,7 @@ import {
   EYE_LEVEL_OFFSET,
   fishingPhase,
   GAMEPLAY_BREWING_OWNER_ID,
+  GAMEPLAY_CROPS_OWNER_ID,
   GAMEPLAY_ENTITIES_OWNER_ID,
   GAMEPLAY_PLAYER_OWNER_ID,
   GAMEPLAY_PLAYER_STORAGE_OWNER_ID,
@@ -938,6 +940,7 @@ const bootGame = async (
     ...(loadedSessionState === undefined ? {} : {
       villagerTrades: loadedSessionState.villagers.trades,
       brewing: loadedSessionState.brewing,
+      crops: loadedSessionState.crops,
     }),
   })
   if (Result.isFailure(gameplayOwners)) {
@@ -966,13 +969,15 @@ const bootGame = async (
   const hostWorldWrite = hostWorldWriteExit.value
   const gameplayBrewingService = await Effect.runPromise(makeBrewingService(GAMEPLAY_BREWING_OWNER_ID))
   // The one set of commit services every reader of the gameplay owners shares.
-  // Owners the host still simulates in its own services (crops, entities,
-  // dropped items) stay unset, as before this wiring.
+  // Owners the host still simulates in its own services (entities, dropped
+  // items) stay unset, as before this wiring. Crops live only in their owner:
+  // without `cropOwnerId` the gameplay stages reject planting and harvest.
   const gameplayCommit: GameplayCommitServices = {
     coordinator: hostWorldWrite.coordinator,
     playerOwnerId: GAMEPLAY_PLAYER_OWNER_ID,
     playerStorageOwnerId: GAMEPLAY_PLAYER_STORAGE_OWNER_ID,
     vitalsOwnerId: GAMEPLAY_VITALS_OWNER_ID,
+    cropOwnerId: GAMEPLAY_CROPS_OWNER_ID,
     statusEffectsOwnerId: GAMEPLAY_STATUS_EFFECTS_OWNER_ID,
     villagerTradesOwnerId: GAMEPLAY_VILLAGER_TRADES_OWNER_ID,
     brewingOwnerId: GAMEPLAY_BREWING_OWNER_ID,
@@ -980,6 +985,9 @@ const bootGame = async (
   }
   const snapshotGameplayVillagerTrades = gameplayCommit.coordinator
     .snapshot(GAMEPLAY_VILLAGER_TRADES_OWNER_ID, GameplayVillagerTradeSnapshotSchema)
+    .pipe(Effect.map(({ state }) => state))
+  const snapshotGameplayCrops = gameplayCommit.coordinator
+    .snapshot(GAMEPLAY_CROPS_OWNER_ID, CropSnapshotSchema)
     .pipe(Effect.map(({ state }) => state))
   const snapshotGameplayBrewing = gameplayBrewingService.snapshot
     .pipe(Effect.provideService(WorldCommitCoordinator, gameplayCommit.coordinator))
@@ -994,7 +1002,9 @@ const bootGame = async (
   await restoreLoadedSessionServices(loadedSessionState, {
     restoreTime: (state) => Effect.runPromise(time.restore(state.time)),
     restoreWeather: (state) => Effect.runPromise(weather.restore(state.weather)),
-    restoreCrops: (state) => Effect.runPromise(crops.restore(state.crops)),
+    // The crop owner was seeded from this session state at registration; the
+    // sim stage's own CropService stays empty so no second crop state exists.
+    restoreCrops: () => Promise.resolve(),
     // Also sets the frame state's movement and modifier caches, which seeding
     // the status-effects owner alone would leave at their defaults.
     restoreStatusEffects: (state) =>
@@ -1301,7 +1311,7 @@ const bootGame = async (
       redstone: { levers: [...leverStates.values()] },
       furnaces: [...furnaceStates.values()],
       portals: [...portalStates.values()],
-      crops: Effect.runSync(crops.snapshot),
+      crops: Effect.runSync(snapshotGameplayCrops),
       entities: snapshotEntityRosters(),
       villagers: {
         residents: [...villagerResidents.values()],
@@ -3342,7 +3352,7 @@ const bootGame = async (
       playerApi,
       simState,
       currentChunkStore,
-      blockPosition,
+      blockPosition: (x, y, z) => blockPosition(BlockAxis(x), BlockAxis(y), BlockAxis(z)),
       eyeLevelOffset: EYE_LEVEL_OFFSET,
       blockTypeOfId,
       mountedVehicleId: () => mountedVehicleId,
@@ -3354,6 +3364,11 @@ const bootGame = async (
       getPlayerMovementSpeedMultiplier,
       gameplayState,
       time,
+      targeting: {
+        coordinator: hostWorldWrite.coordinator,
+        playerOwnerId: GAMEPLAY_PLAYER_OWNER_ID,
+        entitiesOwnerId: GAMEPLAY_ENTITIES_OWNER_ID,
+      },
       weather,
       syncPortalCandidateSnapshots,
       setFishingResult,
@@ -3478,7 +3493,6 @@ const bootGame = async (
       requestMeleeAttack,
       requestBlockBreak,
       requestPotatoHarvest,
-      crops,
       pendingItemUses: {
         set: (requestId, pending) => { pendingItemUses.set(requestId, pending) },
       },
@@ -3574,7 +3588,7 @@ const bootGame = async (
         comparatorModes,
         poweredRails,
         redstoneLampTransitionLog,
-        crops,
+        worldWrite: hostWorldWrite.port,
         isGameplayUseItemType,
         isGameplayHoeItem,
         isGameplayIgnitionItem,
@@ -3582,20 +3596,22 @@ const bootGame = async (
       },
     }
 
-    return (): void => {
-    const nowSecs = readNow()
-    const frameInput = Effect.runSync(inputApi.snapshot)
-    try {
-      const frame = runTickFrameInput(h5aTickContext, nowSecs, frameInput)
-      if (frame === undefined) return
-      const movement = runTickPlayerMovement(h5aTickContext, frame)
-      if (movement === undefined) return
-      const postFrame = runTickPostFrame(h5bTickContext, { frame, movement, framesTotal })
-      runTickPostFrameGameplay(h5cTickContext, { frame, movement, postFrame, nowSecs })
-    } finally {
-      Effect.runSync(inputApi.endFrame(frameInput))
-    }
-    }
+    // The browser preview runs this Effect inside the mc-sim GameLoop's frame
+    // handler and awaits it before taking the next frame, so the coordinator
+    // commits of one frame complete before the next frame starts. A typed
+    // failure reaches the preview's frame-failure path, which stops the loop.
+    return Effect.gen(function* () {
+      const nowSecs = readNow()
+      const frameInput = yield* inputApi.snapshot
+      yield* Effect.gen(function* () {
+        const frame = runTickFrameInput(h5aTickContext, nowSecs, frameInput)
+        if (frame === undefined) return
+        const movement = yield* runTickPlayerMovement(h5aTickContext, frame)
+        if (movement === undefined) return
+        const postFrame = yield* runTickPostFrame(h5bTickContext, { frame, movement, framesTotal })
+        yield* runTickPostFrameGameplay(h5cTickContext, { frame, movement, postFrame, nowSecs })
+      }).pipe(Effect.ensuring(inputApi.endFrame(frameInput)))
+    })
   })()
 
   const preview = Effect.runSync(makeBrowserPreview({
@@ -3625,7 +3641,7 @@ const bootGame = async (
         document.body.setAttribute('data-mc-compose-boot', 'stopped')
       })
       return {
-        frame: () => Effect.sync(tick),
+        frame: () => tick,
         stop: Effect.sync(() => {
           requestBackgroundFlush()
           disposeMultiplayer()
