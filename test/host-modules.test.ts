@@ -1,6 +1,5 @@
 import { assert, describe, expect, it } from '@effect/vitest'
 import { Context, Effect, Layer, Option, Ref, Schema } from 'effect'
-import { vi } from 'vitest'
 import {
   BlockAxis,
   blockIdOf,
@@ -48,8 +47,6 @@ import {
   GAMEPLAY_VILLAGER_TRADES_OWNER_ID,
   GAMEPLAY_VITALS_OWNER_ID,
   gameplayOwnerRegistrations,
-  gameplayStages,
-  makeGameplayFrameState,
   makeGameplayFrameStateForOwner,
   makeGeneratedWorld,
   requestStatusEffect,
@@ -75,11 +72,6 @@ import {
 } from '../apps/web/host-modules'
 import { makeOwnerBackedHost } from '../apps/web/owner-backed-services'
 import { makeHostWorldWrite } from '../apps/web/world-write-port'
-
-vi.mock('@nerima-games/mx-gameplay', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@nerima-games/mx-gameplay')>()
-  return { ...actual, gameplayStages: vi.fn(actual.gameplayStages) }
-})
 
 // The browser twin of this list is e2e/smoke.e2e.ts #3b; both must change together.
 const SMOKE_STAGE_ORDER = [
@@ -136,13 +128,26 @@ const makeHost = Effect.gen(function* () {
     inputContext: yield* Layer.build(InputServiceLayer()),
     redstoneContext: yield* Layer.build(RedstoneWorldRuntimeLayer),
   }
-  return { instances, owned, generated, hostWorldWrite, coordinator: hostWorldWrite.coordinator }
+  const gameplayCommit: GameplayCommitServices = {
+    coordinator: hostWorldWrite.coordinator,
+    playerOwnerId: GAMEPLAY_PLAYER_OWNER_ID,
+    playerStorageOwnerId: GAMEPLAY_PLAYER_STORAGE_OWNER_ID,
+    cropOwnerId: GAMEPLAY_CROPS_OWNER_ID,
+    droppedItemsOwnerId: GAMEPLAY_DROPPED_ITEMS_OWNER_ID,
+    entitiesOwnerId: GAMEPLAY_ENTITIES_OWNER_ID,
+    vitalsOwnerId: GAMEPLAY_VITALS_OWNER_ID,
+    statusEffectsOwnerId: GAMEPLAY_STATUS_EFFECTS_OWNER_ID,
+    villagerTradesOwnerId: GAMEPLAY_VILLAGER_TRADES_OWNER_ID,
+    brewingOwnerId: GAMEPLAY_BREWING_OWNER_ID,
+    brewingService: yield* makeBrewingService(GAMEPLAY_BREWING_OWNER_ID),
+  }
+  return { instances, owned, generated, hostWorldWrite, gameplayCommit, coordinator: hostWorldWrite.coordinator }
 })
 
 const makeInstances = Effect.map(makeHost, ({ instances }) => instances)
 
 const makeDeps = (
-  instances: HostServiceInstances,
+  { instances, gameplayCommit }: { readonly instances: HostServiceInstances; readonly gameplayCommit: GameplayCommitServices },
   chunkSync: ChunkSyncPort = NO_CHUNK_SYNC,
   simState?: SimFrameState,
 ) =>
@@ -154,7 +159,11 @@ const makeDeps = (
       chunkSync,
       uiFrameState: yield* makeUiFrameState,
       simState: simState ?? (yield* makeSimFrameState),
-      gameplayState: yield* makeGameplayFrameState,
+      gameplayState: yield* makeGameplayFrameStateForOwner({
+        coordinator: gameplayCommit.coordinator,
+        vitalsOwnerId: GAMEPLAY_VITALS_OWNER_ID,
+      }),
+      gameplayCommit,
       isActiveDimension: () => true,
       poweredRails: new Set<string>(),
       leverKeyOf: (lever) =>
@@ -172,7 +181,8 @@ const makeDeps = (
 // reads, as main.ts wires it, with one jump's exhaustion already submitted.
 const runRegisteredHungerStage = (mode: 'single-player survival' | 'creative' | 'multiplayer') =>
   Effect.gen(function* () {
-    const { instances, coordinator } = yield* makeHost
+    const host = yield* makeHost
+    const { coordinator } = host
     const gameplayState = yield* makeGameplayFrameStateForOwner({
       coordinator,
       vitalsOwnerId: GAMEPLAY_VITALS_OWNER_ID,
@@ -181,7 +191,7 @@ const runRegisteredHungerStage = (mode: 'single-player survival' | 'creative' | 
       ? { host: yield* makeMultiplayerHost.pipe(Effect.provideService(TransportPort, yield* disconnectedTransport)) }
       : undefined
     const modules = yield* registerHostModules({
-      ...(yield* makeDeps(instances)),
+      ...(yield* makeDeps(host)),
       gameplayState,
       multiplayer,
       isCreativeMode: mode === 'creative',
@@ -202,29 +212,13 @@ const runRegisteredHungerStage = (mode: 'single-player survival' | 'creative' | 
   })
 
 describe('host modules', () => {
-  it.effect('passes the shared commit object to gameplayStages and commits through the Context port coordinator', () =>
+  it.effect('commits gameplay stage changes and Context port batches through the same coordinator', () =>
     Effect.gen(function* () {
-      const { instances, hostWorldWrite } = yield* makeHost
+      const host = yield* makeHost
+      const { instances, hostWorldWrite, gameplayCommit } = host
       const coordinator = hostWorldWrite.coordinator
-      const gameplayCommit: GameplayCommitServices = {
-        coordinator,
-        playerOwnerId: GAMEPLAY_PLAYER_OWNER_ID,
-        playerStorageOwnerId: GAMEPLAY_PLAYER_STORAGE_OWNER_ID,
-        cropOwnerId: GAMEPLAY_CROPS_OWNER_ID,
-        droppedItemsOwnerId: GAMEPLAY_DROPPED_ITEMS_OWNER_ID,
-        entitiesOwnerId: GAMEPLAY_ENTITIES_OWNER_ID,
-        vitalsOwnerId: GAMEPLAY_VITALS_OWNER_ID,
-        statusEffectsOwnerId: GAMEPLAY_STATUS_EFFECTS_OWNER_ID,
-        villagerTradesOwnerId: GAMEPLAY_VILLAGER_TRADES_OWNER_ID,
-        brewingOwnerId: GAMEPLAY_BREWING_OWNER_ID,
-        brewingService: yield* makeBrewingService(GAMEPLAY_BREWING_OWNER_ID),
-      }
-      const deps = { ...(yield* makeDeps(instances)), gameplayCommit }
-      vi.mocked(gameplayStages).mockClear()
+      const deps = yield* makeDeps(host)
       const modules = yield* registerHostModules(deps)
-      expect(vi.mocked(gameplayStages).mock.calls).toHaveLength(1)
-      expect(vi.mocked(gameplayStages).mock.calls[0]?.[9]).toBe(gameplayCommit)
-      expect(gameplayCommit.coordinator).toBe(hostWorldWrite.coordinator)
       const port = Context.get(deps.services, WorldWritePort)
       expect(port).toBe(hostWorldWrite.port)
 
@@ -259,7 +253,7 @@ describe('host modules', () => {
 
   it.effect('composes the stage order the browser smoke test asserts', () =>
     Effect.gen(function* () {
-      const deps = yield* makeDeps(yield* makeInstances)
+      const deps = yield* makeDeps(yield* makeHost)
 
       // Compile-time: providing `services` discharges every registration requirement.
       const registered: Effect.Effect<ReadonlyArray<HostGameModule>, never, never> = registerHostModules(deps)
@@ -289,8 +283,9 @@ describe('host modules', () => {
 
   it.effect('the registered sim:physics stage advances the host-owned TimeService', () =>
     Effect.gen(function* () {
-      const instances = yield* makeInstances
-      const modules = yield* registerHostModules(yield* makeDeps(instances))
+      const host = yield* makeHost
+      const { instances } = host
+      const modules = yield* registerHostModules(yield* makeDeps(host))
       const physics = modules
         .find((module) => module.name === '@nerima-games/mc-sim')
         ?.frameStages.find((stage) => stage.id === 'sim:physics')
@@ -316,7 +311,7 @@ describe('host modules', () => {
           return EMPTY_SYNC_REPORT
         }),
       }
-      const modules = yield* registerHostModules(yield* makeDeps(yield* makeInstances, chunkSync))
+      const modules = yield* registerHostModules(yield* makeDeps(yield* makeHost, chunkSync))
       const chunkSyncStages = modules.flatMap((module) =>
         module.frameStages
           .filter((stage) => stage.id.endsWith(':chunk-sync'))
@@ -366,9 +361,10 @@ describe('host modules', () => {
 
   it.effect('the registered sim:physics stage writes the player through the same owner-backed adapter', () =>
     Effect.gen(function* () {
-      const { instances, owned, coordinator } = yield* makeHost
+      const host = yield* makeHost
+      const { owned, coordinator } = host
       const simState = yield* makeSimFrameState
-      const modules = yield* registerHostModules(yield* makeDeps(instances, NO_CHUNK_SYNC, simState))
+      const modules = yield* registerHostModules(yield* makeDeps(host, NO_CHUNK_SYNC, simState))
       const physics = modules
         .find((module) => module.name === '@nerima-games/mc-sim')
         ?.frameStages.find((stage) => stage.id === 'sim:physics')

@@ -970,6 +970,7 @@ const bootGame = async (
   const loadedSessionState = Option.isSome(loadedSession) ? loadedSession.value.state : undefined
   const time = await Effect.runPromise(makeTimeService())
   const weather = await Effect.runPromise(makeWeatherService())
+  const crops = await Effect.runPromise(makeCropService())
   // The owners are the only store of the player, its storage, vitals,
   // entities, villager trades and the brewing stand, so the loaded session (or
   // the generated world) seeds them here and nothing restores them later.
@@ -1012,7 +1013,6 @@ const bootGame = async (
     return
   }
   const hostWorldWrite = hostWorldWriteExit.value
-  const crops = await Effect.runPromise(makeCropService())
   const ownerIds: OwnerBackedOwnerIds = {
     player: GAMEPLAY_PLAYER_OWNER_ID,
     playerStorage: GAMEPLAY_PLAYER_STORAGE_OWNER_ID,
