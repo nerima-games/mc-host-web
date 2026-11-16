@@ -1,8 +1,7 @@
 import { expect, test, type Page } from '@playwright/test'
 
+import { callQa } from './helpers/qa'
 import { waitForSimulationProgress } from './helpers/simulation-wait'
-
-const QA_GLOBAL_KEY = '__NERIMA_GAMES_QA__'
 
 type GameplaySnapshot = {
   readonly mode: 'survival' | 'creative'
@@ -13,16 +12,6 @@ type GameplaySnapshot = {
   readonly target: { readonly block: number | null }
   readonly ignitionTarget: { readonly block: number | null }
 }
-
-const callQa = <A>(page: Page, command: string): Promise<A> =>
-  page.evaluate(async ({ key, commandName }) => {
-    const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-      | Record<string, () => unknown>
-      | undefined
-    const operation = surface?.[commandName]
-    if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
-    return await operation()
-  }, { key: QA_GLOBAL_KEY, commandName: command }) as Promise<A>
 
 const snapshot = (page: Page): Promise<GameplaySnapshot> =>
   callQa(page, 'gameplay.snapshot')
@@ -39,31 +28,37 @@ type PlacementProgress = { readonly requests: number; readonly placed: boolean; 
 const readBreakProgress = (
   page: Page,
 ): Promise<{ frames: number; value: BreakProgress }> =>
-  page.evaluate((key) => {
-    const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-      | Record<string, () => unknown>
-      | undefined
-    const snap = surface?.['gameplay.snapshot']?.() as GameplaySnapshot | undefined
+  page.evaluate(async () => {
+    const transport = window.__NERIMA_GAMES_QA__
+    if (transport === undefined) throw new Error('missing QA transport')
+    const result = await transport.dispatch('gameplay', 'snapshot', null)
+    if (result._tag === 'Failure') {
+      throw new Error(`QA command failed: gameplay.snapshot: ${JSON.stringify(result.error)}`)
+    }
+    const snap = result.value as GameplaySnapshot
     const canvas = document.querySelector<HTMLCanvasElement>('#game-canvas')
     return {
       frames: Number(document.body.getAttribute('data-frames')),
       value: {
         requests: Number(canvas?.getAttribute('data-breaks-requested')),
-        block: snap?.target.block ?? null,
+        block: snap.target.block,
       },
     }
-  }, QA_GLOBAL_KEY)
+  })
 
 const readPlacementProgress = (
   page: Page,
 ): Promise<{ frames: number; value: PlacementProgress }> =>
-  page.evaluate((key) => {
-    const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-      | Record<string, () => unknown>
-      | undefined
-    const snap = surface?.['gameplay.snapshot']?.() as GameplaySnapshot | undefined
+  page.evaluate(async () => {
+    const transport = window.__NERIMA_GAMES_QA__
+    if (transport === undefined) throw new Error('missing QA transport')
+    const result = await transport.dispatch('gameplay', 'snapshot', null)
+    if (result._tag === 'Failure') {
+      throw new Error(`QA command failed: gameplay.snapshot: ${JSON.stringify(result.error)}`)
+    }
+    const snap = result.value as GameplaySnapshot
     const canvas = document.querySelector<HTMLCanvasElement>('#game-canvas')
-    const stone = (snap?.inventory.slots ?? []).reduce(
+    const stone = snap.inventory.slots.reduce(
       (total, slot) => total + (slot?.item === 'stone' ? slot.count : 0),
       0,
     )
@@ -71,13 +66,12 @@ const readPlacementProgress = (
       frames: Number(document.body.getAttribute('data-frames')),
       value: {
         requests: Number(canvas?.getAttribute('data-placements-requested')),
-        placed: snap !== undefined
-          && snap.ignitionTarget.block !== null
+        placed: snap.ignitionTarget.block !== null
           && snap.ignitionTarget.block !== 0,
         stone,
       },
     }
-  }, QA_GLOBAL_KEY)
+  })
 
 const grantPointerLock = async (page: Page): Promise<void> => {
   await page.evaluate(() => {

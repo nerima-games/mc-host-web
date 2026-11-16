@@ -1,9 +1,8 @@
 import { expect, test, type Page } from '@playwright/test'
 
+import { callQa, callQaWithFrames } from './helpers/qa'
 import { startGameSession } from './helpers/session'
 import { waitForSimulationProgress } from './helpers/simulation-wait'
-
-const QA_GLOBAL_KEY = '__NERIMA_GAMES_QA__'
 
 type GameplaySnapshot = {
   readonly vitals: {
@@ -25,22 +24,6 @@ type GameplaySnapshot = {
   }
 }
 
-const callQa = <A>(page: Page, command: string, ...arguments_: ReadonlyArray<unknown>): Promise<A> =>
-  page.evaluate(
-    async ({ key, commandName, commandArguments }) => {
-      const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-        | { dispatch: (namespace: string, operation: string, input: unknown) => Promise<{ _tag: 'Success'; value: unknown } | { _tag: 'Failure'; error: unknown }> }
-        | undefined
-      if (surface === undefined) throw new Error('missing QA transport')
-      const [namespace, operation] = commandName.split('.')
-      if (namespace === undefined || operation === undefined) throw new Error(`invalid QA command: ${commandName}`)
-      const result = await surface.dispatch(namespace, operation, commandArguments.length === 0 ? null : commandArguments[0])
-      if (result._tag === 'Failure') throw new Error(`QA command failed: ${commandName}: ${JSON.stringify(result.error)}`)
-      return result.value
-    },
-    { key: QA_GLOBAL_KEY, commandName: command, commandArguments: arguments_ },
-  ) as Promise<A>
-
 const snapshot = (page: Page): Promise<GameplaySnapshot> =>
   callQa(page, 'gameplay.snapshot')
 
@@ -48,21 +31,7 @@ const snapshot = (page: Page): Promise<GameplaySnapshot> =>
 // they can describe different frames, and a wait comparing them would then be
 // reasoning about a state that never existed.
 const readWithFrames = (page: Page): Promise<{ frames: number; value: GameplaySnapshot }> =>
-  page.evaluate(
-    async ({ key, commandName }) => {
-      const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-        | { dispatch: (namespace: string, operation: string, input: unknown) => Promise<{ _tag: 'Success'; value: unknown } | { _tag: 'Failure'; error: unknown }> }
-        | undefined
-      if (surface === undefined) throw new Error('missing QA transport')
-      const result = await surface.dispatch('gameplay', commandName, null)
-      if (result._tag === 'Failure') throw new Error(`QA snapshot failed: ${JSON.stringify(result.error)}`)
-      return {
-        frames: Number(document.body.getAttribute('data-frames')),
-        value: result.value,
-      }
-    },
-    { key: QA_GLOBAL_KEY, commandName: 'snapshot' },
-  ) as Promise<{ frames: number; value: GameplaySnapshot }>
+  callQaWithFrames(page, 'gameplay.snapshot')
 
 const grantPointerLock = (page: Page): Promise<void> => page.evaluate(() => {
   const canvas = document.querySelector<HTMLCanvasElement>('#game-canvas')

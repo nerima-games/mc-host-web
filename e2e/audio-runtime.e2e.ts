@@ -1,8 +1,7 @@
 import { expect, test, type ConsoleMessage, type Page } from '@playwright/test'
 
+import { callQa } from './helpers/qa'
 import { startGameSession } from './helpers/session'
-
-const QA_GLOBAL_KEY = '__NERIMA_GAMES_QA__'
 
 type AudioReport = {
   readonly availability: string
@@ -34,19 +33,6 @@ const watchForFaults = (page: Page): PageFaults => {
   return { consoleErrors, pageErrors }
 }
 
-const callQa = <A>(page: Page, command: string): Promise<A> =>
-  page.evaluate(
-    async ({ key, commandName }) => {
-      const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-        | Record<string, () => unknown>
-        | undefined
-      const operation = surface?.[commandName]
-      if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
-      return await operation()
-    },
-    { key: QA_GLOBAL_KEY, commandName: command },
-  ) as Promise<A>
-
 test('unlocks Web Audio and schedules a player-hurt node from a game event', async ({ page }) => {
   const faults = watchForFaults(page)
   await startGameSession(page)
@@ -58,17 +44,22 @@ test('unlocks Web Audio and schedules a player-hurt node from a game event', asy
     unlockAttempts: 1,
   })
 
-  const result = await page.evaluate(({ key }) => {
-    const surface = (globalThis as unknown as Record<string, unknown>)[key] as Record<
-      string,
-      () => unknown
-    >
-    surface['gameplay.damage']?.()
-    return {
-      report: surface['audio.report']?.(),
-      snapshot: surface['audio.snapshot']?.(),
+  const result = await page.evaluate(async () => {
+    const transport = window.__NERIMA_GAMES_QA__
+    if (transport === undefined) throw new Error('missing QA transport')
+    const run = async (namespace: string, operation: string): Promise<unknown> => {
+      const result = await transport.dispatch(namespace, operation, null)
+      if (result._tag === 'Failure') {
+        throw new Error(`QA command failed: ${namespace}.${operation}: ${JSON.stringify(result.error)}`)
+      }
+      return result.value
     }
-  }, { key: QA_GLOBAL_KEY }) as { readonly report: AudioReport; readonly snapshot: AudioSnapshot }
+    await run('gameplay', 'damage')
+    return {
+      report: await run('audio', 'report'),
+      snapshot: await run('audio', 'snapshot'),
+    }
+  }) as { readonly report: AudioReport; readonly snapshot: AudioSnapshot }
 
   expect(result.report.activeTones).toBeGreaterThan(0)
   expect(result.snapshot.cueIds).toContain('playerHurt')

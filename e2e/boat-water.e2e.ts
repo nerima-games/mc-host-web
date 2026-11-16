@@ -1,5 +1,6 @@
 import { expect, test, type Page } from '@playwright/test'
 
+import { callQa, callQaWithFrames } from './helpers/qa'
 import { startGameSession } from './helpers/session'
 import { waitForSimulationProgress } from './helpers/simulation-wait'
 
@@ -22,30 +23,10 @@ type BoatSnapshot = {
   } | null
 }
 
-const callQa = async <Result>(page: Page, command: string): Promise<Result> =>
-  page.evaluate((commandName) => {
-    const qa = (globalThis as unknown as Record<string, unknown>)['__NERIMA_GAMES_QA__'] as
-      | Record<string, () => unknown>
-      | undefined
-    const operation = qa?.[commandName]
-    if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
-    return operation() as Result
-  }, command)
-
 const boatSnapshotWithFrames = (
   page: Page,
 ): Promise<{ frames: number; value: BoatSnapshot }> =>
-  page.evaluate(() => {
-    const qa = (globalThis as unknown as Record<string, unknown>)['__NERIMA_GAMES_QA__'] as
-      | Record<string, () => unknown>
-      | undefined
-    const operation = qa?.['gameplay.boatWaterSnapshot']
-    if (operation === undefined) throw new Error('missing QA command: gameplay.boatWaterSnapshot')
-    return {
-      frames: Number(document.body.getAttribute('data-frames')),
-      value: operation() as BoatSnapshot,
-    }
-  })
+  callQaWithFrames(page, 'gameplay.boatWaterSnapshot')
 
 const clearDatabase = async (page: Page): Promise<void> => {
   await page.goto('/@vite/client')

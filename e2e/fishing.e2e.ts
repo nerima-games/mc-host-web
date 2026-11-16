@@ -1,9 +1,8 @@
 import { expect, test, type ConsoleMessage, type Page } from '@playwright/test'
 
+import { callQa } from './helpers/qa'
 import { startGameSession } from './helpers/session'
 import { waitForSimulationProgress } from './helpers/simulation-wait'
-
-const QA_GLOBAL_KEY = '__NERIMA_GAMES_QA__'
 
 type InventorySlot = { readonly item: string; readonly count: number } | null
 type Durability = { readonly current: number; readonly maximum: number } | null
@@ -13,19 +12,6 @@ type GameplaySnapshot = {
     readonly durability: ReadonlyArray<Durability>
   }
 }
-
-const callQa = <A>(page: Page, command: string): Promise<A> =>
-  page.evaluate(
-    async ({ key, commandName }) => {
-      const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-        | Record<string, () => unknown>
-        | undefined
-      const operation = surface?.[commandName]
-      if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
-      return await operation()
-    },
-    { key: QA_GLOBAL_KEY, commandName: command },
-  ) as Promise<A>
 
 const grantPointerLock = async (page: Page): Promise<void> => {
   await page.evaluate(() => {

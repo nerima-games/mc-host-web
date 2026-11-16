@@ -9,10 +9,9 @@ import { velocityVectorResult, type AABB, type VelocityVector } from '@nerima-ga
 import { ARROW_PROFILE, stepProjectile, type Projectile, type ProjectileWorld } from '@nerima-games/mc-sim'
 import { Result } from 'effect'
 
+import { callQa, callQaWithFrames } from './helpers/qa'
 import { startGameSession } from './helpers/session'
 import { waitForSimulationProgress } from './helpers/simulation-wait'
-
-const QA_GLOBAL_KEY = '__NERIMA_GAMES_QA__'
 
 type Position = Readonly<{ x: number; y: number; z: number }>
 type InventorySlot = Readonly<{ item: string; count: number }> | null
@@ -36,18 +35,6 @@ type GameplaySnapshot = Readonly<{
   projectiles: ReadonlyArray<ProjectileSnapshot>
 }>
 
-const callQa = <A>(page: Page, command: string): Promise<A> => page.evaluate(
-  async ({ key, commandName }) => {
-    const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-      | Record<string, () => unknown>
-      | undefined
-    const operation = surface?.[commandName]
-    if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
-    return await operation()
-  },
-  { key: QA_GLOBAL_KEY, commandName: command },
-) as Promise<A>
-
 const snapshot = (page: Page): Promise<GameplaySnapshot> =>
   callQa(page, 'gameplay.snapshot')
 
@@ -56,20 +43,8 @@ const snapshot = (page: Page): Promise<GameplaySnapshot> =>
 // then reasoning about a state that never existed.
 const readGameplayWithFrames = (
   page: Page,
-): Promise<{ frames: number; value: GameplaySnapshot }> => page.evaluate(
-  async ({ key, commandName }) => {
-    const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-      | Record<string, () => unknown>
-      | undefined
-    const operation = surface?.[commandName]
-    if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
-    return {
-      frames: Number(document.body.getAttribute('data-frames')),
-      value: await operation(),
-    }
-  },
-  { key: QA_GLOBAL_KEY, commandName: 'gameplay.snapshot' },
-) as Promise<{ frames: number; value: GameplaySnapshot }>
+): Promise<{ frames: number; value: GameplaySnapshot }> =>
+  callQaWithFrames(page, 'gameplay.snapshot')
 
 const itemCount = (current: GameplaySnapshot, item: string): number =>
   current.inventory.slots.reduce(
