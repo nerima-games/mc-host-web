@@ -26,6 +26,7 @@ import {
   makeTimeService,
   makeVehicleService,
   makeWeatherService,
+  OccupantId,
   TotalExperience,
   validateContainerStorageSnapshot,
   validatePlayerStorageSnapshot,
@@ -326,7 +327,7 @@ export type MultiplayerClientContext = {
     readonly leverKeyOf: (lever: Pick<PersistedLeverState, 'dimension' | 'position'>) => string
     readonly vehicleById: (id: string) => Vehicle | undefined
     readonly vehicleService: VehicleService
-    readonly applyAuthoritativeVehicle: (entity: Extract<AuthoritativeEntityState, { readonly _tag: 'vehicle' }>) => void
+    readonly applyAuthoritativeVehicle: (vehicle: DecodedVehicle) => void
     readonly alignActiveDimension: (dimension: Dimension) => void
     readonly resetSimState: (reset: boolean) => void
     readonly presentWeather: (state: WeatherState) => void
@@ -605,6 +606,25 @@ const furnaceLocationFromId = (furnaceId: string): Result.Result<FurnaceLocation
   ) return invalid
   return Result.succeed({ dimension, position: { x, y, z } })
 }
+
+type NetworkVehicleState = Extract<AuthoritativeEntityState, { readonly _tag: 'vehicle' }>
+
+/** A server vehicle whose occupant is a valid local occupant id. */
+export type DecodedVehicle = {
+  readonly entity: NetworkVehicleState
+  readonly occupant: OccupantId | undefined
+}
+
+// The wire PlayerId accepts a blank string, which OccupantId refuses.
+const decodeNetworkVehicle = (entity: NetworkVehicleState): Result.Result<DecodedVehicle, InvalidServerState> =>
+  Result.mapError(Result.gen(function* () {
+    return { entity, occupant: entity.occupant === null ? undefined : yield* OccupantId.result(entity.occupant) }
+  }), invalidServerState('vehicle occupant'))
+
+const decodeNetworkVehicles = (
+  entities: ReadonlyArray<AuthoritativeEntityState>,
+): Result.Result<ReadonlyArray<DecodedVehicle>, InvalidServerState> =>
+  Result.all(entities.flatMap((entity) => entity._tag === 'vehicle' ? [decodeNetworkVehicle(entity)] : []))
 
 const decodeNetworkFurnace = (state: NetworkFurnaceState, known: FurnaceLocation | undefined) => {
   const networkStack = (stack: NetworkFurnaceState['input']): Result.Result<ItemStack | undefined, ItemStackFailure> =>
@@ -1511,6 +1531,7 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
         )),
         // A snapshot replaces every furnace, so each location comes from its id.
         furnaces: yield* Effect.fromResult(Result.all(message.furnaces.map((furnace) => decodeNetworkFurnace(furnace, undefined)))),
+        vehicles: yield* Effect.fromResult(decodeNetworkVehicles(message.entities ?? [])),
       }
     })
 
@@ -1643,10 +1664,8 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
         clientContext.callbacks.setInventoryOpen(false)
       }
       clientContext.state.multiplayerEntities.clear()
-      for (const entity of message.entities ?? []) {
-        clientContext.state.multiplayerEntities.set(entity.entityId, entity)
-        if (entity._tag === 'vehicle') clientContext.services.applyAuthoritativeVehicle(entity)
-      }
+      for (const entity of message.entities ?? []) clientContext.state.multiplayerEntities.set(entity.entityId, entity)
+      for (const vehicle of decoded.vehicles) clientContext.services.applyAuthoritativeVehicle(vehicle)
       if (playerDamageResyncPending) {
         playerDamageResyncPending = false
         pendingPlayerDamage = null
@@ -1727,12 +1746,14 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
           return
         }
         case 'EntitySpawnDelta':
-        case 'EntityUpdateDelta':
+        case 'EntityUpdateDelta': {
           if (message.revision < multiplayerRevision) return
+          const vehicles = yield* Effect.fromResult(decodeNetworkVehicles([message.entity]))
           multiplayerRevision = message.revision
           clientContext.state.multiplayerEntities.set(message.entity.entityId, message.entity)
-          if (message.entity._tag === 'vehicle') clientContext.services.applyAuthoritativeVehicle(message.entity)
+          for (const vehicle of vehicles) clientContext.services.applyAuthoritativeVehicle(vehicle)
           return
+        }
         case 'EntityDespawnDelta': {
           if (message.revision < multiplayerRevision) return
           multiplayerRevision = message.revision

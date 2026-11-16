@@ -40,6 +40,7 @@ import { initialEyeOfEnderRuntimeState } from '../../apps/web/eye-of-ender-runti
 import {
   createMultiplayerClient,
   makeMultiplayerCommandIds,
+  type DecodedVehicle,
   type MultiplayerClientApi,
   type MultiplayerCommandIds,
   type MultiplayerClientContext,
@@ -96,6 +97,7 @@ export type MultiplayerClientHarnessCalls = {
   readonly resetSimState: Array<boolean>
   readonly alignActiveDimension: Array<Dimension>
   readonly presentWeather: Array<WeatherState>
+  readonly applyAuthoritativeVehicle: Array<DecodedVehicle>
 }
 
 export type MultiplayerClientHarness = Readonly<{
@@ -164,6 +166,7 @@ export const makeMultiplayerClientHarness = async (): Promise<MultiplayerClientH
     resetSimState: [],
     alignActiveDimension: [],
     presentWeather: [],
+    applyAuthoritativeVehicle: [],
   }
   const chunkContext: ReturnType<MultiplayerClientContext['services']['currentChunkContext']> = {
     dimension: 'overworld',
@@ -253,7 +256,7 @@ export const makeMultiplayerClientHarness = async (): Promise<MultiplayerClientH
       leverKeyOf: (lever) => JSON.stringify([lever.dimension, lever.position.x, lever.position.y, lever.position.z]),
       vehicleById: () => undefined,
       vehicleService,
-      applyAuthoritativeVehicle: () => undefined,
+      applyAuthoritativeVehicle: (vehicle) => { calls.applyAuthoritativeVehicle.push(vehicle) },
       alignActiveDimension: (dimension) => { calls.alignActiveDimension.push(dimension) },
       resetSimState: (reset) => { calls.resetSimState.push(reset) },
       presentWeather: (state) => { calls.presentWeather.push(state) },

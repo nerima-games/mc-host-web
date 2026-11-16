@@ -1,6 +1,6 @@
 import { Effect, Result } from 'effect'
 import { CHEST_CONTAINER_CAPACITY, furnaceState, INVENTORY_SLOT_COUNT } from '@nerima-games/mc-sim'
-import { CommandId, PlayerId, WorldId, type NetworkMessage } from '@nerima-games/mx-multiplayer'
+import { CommandId, EntityId, PlayerId, WorldId, type NetworkMessage } from '@nerima-games/mx-multiplayer'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
@@ -80,6 +80,7 @@ describe('multiplayer client', () => {
 
 type InventoryState = Extract<NetworkMessage, { readonly _tag: 'PlayerInventoryDelta' }>['state']
 type AuthoritativeSnapshotMessage = Extract<NetworkMessage, { readonly _tag: 'AuthoritativeSnapshot' }>
+type VehicleEntityState = Extract<Extract<NetworkMessage, { readonly _tag: 'EntityUpdateDelta' }>['entity'], { readonly _tag: 'vehicle' }>
 
 const OVERWORLD = WorldId.make('overworld')
 const NETHER = WorldId.make('nether')
@@ -276,6 +277,58 @@ describe('multiplayer client server-state rejection', () => {
     expect(harness.canvasAttributes.get('data-multiplayer-revision')).toBe('0')
     expect(harness.context.state.multiplayerRejection).toBe('invalid furnace')
     expect(harness.multiplayerStatus.textContent).toBe('Invalid furnace from the multiplayer server was not applied.')
+  })
+
+  const vehicle = (occupant: PlayerId | null): VehicleEntityState => ({
+    _tag: 'vehicle',
+    entityId: EntityId.make('v:0'),
+    at: { x: 4, y: 64, z: 4 },
+    occupant,
+    vehicleType: 'boat',
+  })
+
+  it.each<'EntitySpawnDelta' | 'EntityUpdateDelta'>(['EntitySpawnDelta', 'EntityUpdateDelta'])(
+    'keeps the revision, the entities and the vehicles when a %s carries a blank vehicle occupant',
+    async (tag) => {
+      const harness = await makeMultiplayerClientHarness()
+      const existing = vehicle(harness.localPlayer)
+      harness.context.state.multiplayerEntities.set(existing.entityId, existing)
+
+      harness.deliver({ _tag: tag, revision: 3, world: OVERWORLD, entity: vehicle(PlayerId.make(' ')) })
+
+      expect(harness.canvasAttributes.get('data-multiplayer-revision')).toBe('0')
+      expect(harness.context.state.multiplayerRejection).toBe('invalid vehicle occupant')
+      expect([...harness.context.state.multiplayerEntities]).toEqual([[existing.entityId, existing]])
+      expect(harness.calls.applyAuthoritativeVehicle).toEqual([])
+    },
+  )
+
+  it('keeps the revision, the owners, the entities and the vehicles when a snapshot carries a blank vehicle occupant', async () => {
+    const harness = await makeMultiplayerClientHarness()
+    const existing = vehicle(harness.localPlayer)
+    harness.context.state.multiplayerEntities.set(existing.entityId, existing)
+    const vitalsBefore = Effect.runSync(harness.world.vitals.snapshot)
+    const weatherBefore = Effect.runSync(harness.weather.snapshot)
+
+    harness.deliver({ ...authoritativeSnapshot(harness.localPlayer, []), entities: [vehicle(PlayerId.make(' '))] })
+
+    expect(harness.canvasAttributes.get('data-multiplayer-revision')).toBe('0')
+    expect(harness.context.state.multiplayerRejection).toBe('invalid vehicle occupant')
+    expect([...harness.context.state.multiplayerEntities]).toEqual([[existing.entityId, existing]])
+    expect(harness.calls.applyAuthoritativeVehicle).toEqual([])
+    expect(Effect.runSync(harness.world.vitals.snapshot)).toEqual(vitalsBefore)
+    expect(Effect.runSync(harness.weather.snapshot)).toEqual(weatherBefore)
+  })
+
+  it('hands a vehicle delta to the vehicle owner with its decoded occupant', async () => {
+    const harness = await makeMultiplayerClientHarness()
+    const entity = vehicle(harness.localPlayer)
+
+    harness.deliver({ _tag: 'EntityUpdateDelta', revision: 3, world: OVERWORLD, entity })
+
+    expect(harness.canvasAttributes.get('data-multiplayer-revision')).toBe('3')
+    expect(harness.context.state.multiplayerRejection).toBe('')
+    expect(harness.calls.applyAuthoritativeVehicle).toEqual([{ entity, occupant: 'local-player' }])
   })
 
   it('applies a valid authoritative snapshot and a container delta over it', async () => {

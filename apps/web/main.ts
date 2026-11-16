@@ -309,6 +309,7 @@ import {
   connectMultiplayer,
   createMultiplayerClient,
   multiplayerRegistrationTokenKey,
+  type DecodedVehicle,
   type MultiplayerClientContext,
 } from './multiplayer-client'
 import {
@@ -1300,14 +1301,9 @@ const bootGame = async (
       yawRadians: vehicle.yawRadians,
     }))
 }
-  const applyAuthoritativeVehicle = (
-    entity: Extract<AuthoritativeEntityState, { readonly _tag: 'vehicle' }>,
-  ): void => {
+  const applyAuthoritativeVehicle = ({ entity, occupant }: DecodedVehicle): void => {
     const current = vehicleById(String(entity.entityId))
     if (current === undefined) return
-    const occupant = entity.occupant === null
-      ? undefined
-      : OccupantId(String(entity.occupant))
     Effect.runSync(vehicleService.updateState(current.id, {
       dimension: current.dimension,
       // mx-multiplayer's Vec3 wire schema rejects non-finite axes at decodeFrame.
