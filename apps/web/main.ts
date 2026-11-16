@@ -94,6 +94,7 @@ import {
   blockTypeOfId,
   DeltaTimeSecs,
   DimensionIdSchema,
+  blockPositionOfPosition,
   chunkCoordOfBlock,
   isEmpty,
   PositionAxis,
@@ -3203,10 +3204,10 @@ const bootGame = async (
     getWitherEntities: () => witherRenderDescriptors(witherRuntimeState, currentChunkContext.dimension),
     getRemotePlayers: () => [...(multiplayer?.players.entries() ?? [])],
     getVillagerResidents: () => [...villagerResidents.values()],
-    isCurrentChunkLoaded: (position) => currentChunkContext.streamLoaded.has(chunkKeyOf({
-      cx: Math.floor(position.x / 16),
-      cz: Math.floor(position.z / 16),
-    })),
+    isCurrentChunkLoaded: (position) => Result.map(
+      blockPositionOfPosition(position),
+      (cell) => currentChunkContext.streamLoaded.has(chunkKeyOf(chunkCoordOfBlock(cell))),
+    ),
     getEndDragonPhase: () => endDragonSnapshot().phase,
     getEndDragonPosition: endDragonPosition,
     getVehicles: vehicleList,
@@ -3769,7 +3770,10 @@ const bootGame = async (
         drainAnvilInbound()
         drainEnchantingInbound()
         drainPlayerDamageInbound()
-        syncRenderedEntities()
+        // The hidden-tab pump runs outside the frame runner, so a failed entity
+        // sync is reported here like a failed screenshot capture.
+        const synced = Effect.runSync(Effect.result(syncRenderedEntities()))
+        if (Result.isFailure(synced)) console.error('[mc-compose] hidden-tab entity sync failed', synced.failure)
         enqueueMultiplayerPlayerMove(performance.now() / 1_000)
         Effect.runSync(multiplayerOutboundStage.run(DeltaTimeSecs(0)).pipe(Effect.provide(BrowserClockLayer)))
       }, 100)

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { Effect, Schema } from 'effect'
+import { Effect, Result, Schema } from 'effect'
 import { PositionAxis, position } from '@nerima-games/mc-kernel'
 import { VehicleSchema } from '@nerima-games/mc-sim'
 import { LivingEntityState, PlayerName, WorldId } from '@nerima-games/mx-multiplayer'
@@ -23,7 +23,7 @@ const sessionContext = (overrides: Partial<PlayerSessionRuntimeContext> = {}): P
   getWitherEntities: () => [],
   getRemotePlayers: () => [],
   getVillagerResidents: () => [],
-  isCurrentChunkLoaded: () => true,
+  isCurrentChunkLoaded: () => Result.succeed(true),
   getEndDragonPhase: () => 'dead',
   getEndDragonPosition: () => point(0, 64, 0),
   getVehicles: () => [],
@@ -103,7 +103,7 @@ describe('player session runtime', () => {
         { id: 'villager:unloaded', profession: 'farmer', dimension: 'overworld', feetPosition: { x: 70, y: 65, z: 8 } },
         { id: 'villager:nether', profession: 'farmer', dimension: 'nether', feetPosition: { x: 7, y: 65, z: 8 } },
       ],
-      isCurrentChunkLoaded: (value) => { loadedPositions.push(value); return value.x < 10 },
+      isCurrentChunkLoaded: (value) => { loadedPositions.push(value); return Result.succeed(value.x < 10) },
       getVehicles: () => ['overworld', 'nether'].map((dimension) => Schema.decodeUnknownSync(VehicleSchema)({
         id: `boat:${dimension}`, type: 'boat', dimension,
         position: { x: 9, y: 65, z: 10 }, velocity: { x: 0, y: 0, z: 0 }, yawRadians: 0.5,
@@ -111,7 +111,9 @@ describe('player session runtime', () => {
       syncEntities: (entities) => Effect.sync(() => { synced.push(entities) }),
     })
     const runtime = createPlayerSessionRuntime(context)
-    const projected = runtime.entityRenderProjection()
+    const projection = runtime.entityRenderProjection()
+    if (Result.isFailure(projection)) throw new Error('entity projection failed')
+    const projected = projection.success
     expect(projected).toEqual([
       { id: 'item:1', kind: 'dropped_item', feetPosition: localPosition, category: 'item' },
       { id: 'authoritative:mob:1', kind: 'zombie', feetPosition: { x: 3, y: 65, z: 4 }, category: 'hostile' },
@@ -120,8 +122,39 @@ describe('player session runtime', () => {
       { id: 'boat:overworld', kind: 'boat', feetPosition: { x: 9, y: 65, z: 10 }, facingRadians: 0.5 },
     ])
     expect(loadedPositions).toEqual([{ x: 7, y: 65, z: 8 }, { x: 70, y: 65, z: 8 }])
-    runtime.syncRenderedEntities()
+    Effect.runSync(runtime.syncRenderedEntities())
     expect(synced).toEqual([projected])
+  })
+
+  it('decodes runtime projectile descriptor ids into render identifiers', () => {
+    const runtime = createPlayerSessionRuntime(sessionContext({
+      getProjectileEntities: () => [{
+        id: 'projectile:arrow-1', kind: 'arrow', category: 'item', feetPosition: { x: 1, y: 65, z: 2 }, facingRadians: 0.25,
+      }],
+      getEyeOfEnderEntities: () => [{
+        id: 'projectile:eye-1', kind: 'eye_of_ender', category: 'item', feetPosition: { x: 3, y: 66, z: 4 }, facingRadians: 0.5,
+      }],
+    }))
+
+    expect(runtime.entityRenderProjection()).toEqual(Result.succeed([
+      { id: 'projectile:arrow-1', kind: 'arrow', category: 'item', feetPosition: { x: 1, y: 65, z: 2 }, facingRadians: 0.25 },
+      { id: 'projectile:eye-1', kind: 'eye_of_ender', category: 'item', feetPosition: { x: 3, y: 66, z: 4 }, facingRadians: 0.5 },
+    ]))
+  })
+
+  it('returns a chunk lookup failure from the entity sync without syncing', () => {
+    const failure = { _tag: 'CoordinateConversionFailure', reason: 'block-axis-out-of-range', axis: 'x', kind: 'RangeError' } as const
+    const synced: Array<unknown> = []
+    const runtime = createPlayerSessionRuntime(sessionContext({
+      getVillagerResidents: () => [
+        { id: 'villager:far', profession: 'farmer', dimension: 'overworld', feetPosition: { x: 7, y: 65, z: 8 } },
+      ],
+      isCurrentChunkLoaded: () => Result.fail(failure),
+      syncEntities: (entities) => Effect.sync(() => { synced.push(entities) }),
+    }))
+
+    expect(Effect.runSync(Effect.result(runtime.syncRenderedEntities()))).toEqual(Result.fail(failure))
+    expect(synced).toEqual([])
   })
 
   it('retains the live end dragon projection and nearest-villager tie breaking', () => {
@@ -135,7 +168,9 @@ describe('player session runtime', () => {
       getEndDragonPosition: () => point(10, 70, 10),
       getVillagerResidents: () => villagers,
     }))
-    expect(runtime.entityRenderProjection().at(-1)).toEqual({
+    const projection = runtime.entityRenderProjection()
+    if (Result.isFailure(projection)) throw new Error('entity projection failed')
+    expect(projection.success.at(-1)).toEqual({
       id: 'ender-dragon', kind: 'ender_dragon', category: 'hostile', feetPosition: { x: 10, y: 70, z: 10 },
     })
     expect(runtime.nearestVillagerForTrade({ x: 0, y: 64, z: 0 }, 'end')).toBe(villagers[1])

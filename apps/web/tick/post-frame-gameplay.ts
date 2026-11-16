@@ -74,6 +74,7 @@ type TickGameplayFailure = Effect.Error<
   | ReturnType<H5cTickContext['services']['targetedBlock']>
   | ReturnType<H5cTickContext['services']['fishingEnvironmentAt']>
   | ReturnType<H5cTickContext['services']['presentWeatherRuntime']>
+  | ReturnType<H5cTickContext['services']['syncRenderedEntities']>
 > | Result.Result.Failure<ReturnType<H5cTickContext['h5b']['applyWorldExplosion']>>
 
 export const runTickPostFrameGameplay = (
@@ -1181,7 +1182,7 @@ export const runTickPostFrameGameplay = (
     events: adapters.drainEndAudioEvents(),
   })
 
-  syncRenderedEntities()
+  yield* syncRenderedEntities()
   if (h5aState.brewingOpen.get()) renderBrewingUi()
   renderPlayerUi()
   renderCrosshair(nowSecs)

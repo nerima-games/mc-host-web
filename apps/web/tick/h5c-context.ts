@@ -122,7 +122,10 @@ export type H5cTickContext = {
       pose: Readonly<{ readonly feetPosition: Position }>,
       nowSecs: MonotonicTimeSecs,
     ) => Effect.Effect<void, Brand.BrandError | Schema.SchemaError>
-    readonly syncRenderedEntities: () => void
+    readonly syncRenderedEntities: () => Effect.Effect<
+      void,
+      import('@nerima-games/mc-kernel').CoordinateConversionFailure | Schema.SchemaError
+    >
     readonly registerPortal: (portal: PersistedPortalState) => boolean
     readonly requiredSleepRatio: number
     readonly sleepHud: Pick<HTMLOutputElement, 'textContent' | 'hidden'>

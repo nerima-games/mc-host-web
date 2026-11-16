@@ -1,5 +1,11 @@
-import { Effect, Schema } from 'effect'
-import { PositionAxis, position as worldPosition, type Position, type MonotonicTimeSecs } from '@nerima-games/mc-kernel'
+import { Effect, Result, Schema } from 'effect'
+import {
+  PositionAxis,
+  position as worldPosition,
+  type CoordinateConversionFailure,
+  type Position,
+  type MonotonicTimeSecs,
+} from '@nerima-games/mc-kernel'
 import type { Vehicle } from '@nerima-games/mc-sim'
 import type { Dimension } from '@nerima-games/mc-worldgen'
 import { EntityRenderIdentifierSchema, type RenderEntity } from '@nerima-games/mc-render'
@@ -18,20 +24,24 @@ type LocalEntityProjection = Readonly<{
   feetPosition: Position
 }>
 
+// Runtime projectile descriptors carry plain string ids; the projection
+// decodes each one into the renderer's identifier like every other entity.
+type RenderEntityDescriptor = Omit<RenderEntity, 'id'> & Readonly<{ id: string }>
+
 export type PlayerSessionRuntimeContext = {
   readonly getCurrentDimension: () => Dimension
   readonly getLocalEntities: () => ReadonlyArray<LocalEntityProjection>
   readonly getAuthoritativeEntities: () => ReadonlyArray<readonly [string, AuthoritativeEntityState]>
-  readonly getProjectileEntities: () => ReadonlyArray<RenderEntity>
-  readonly getEyeOfEnderEntities: () => ReadonlyArray<RenderEntity>
+  readonly getProjectileEntities: () => ReadonlyArray<RenderEntityDescriptor>
+  readonly getEyeOfEnderEntities: () => ReadonlyArray<RenderEntityDescriptor>
   readonly getWitherEntities: () => ReadonlyArray<RenderEntity>
   readonly getRemotePlayers: () => ReadonlyArray<readonly [string, RemotePlayer]>
   readonly getVillagerResidents: () => ReadonlyArray<PersistedVillager>
-  readonly isCurrentChunkLoaded: (position: Position) => boolean
+  readonly isCurrentChunkLoaded: (position: Position) => Result.Result<boolean, CoordinateConversionFailure>
   readonly getEndDragonPhase: () => string
-  readonly getEndDragonPosition: () => Position
+  readonly getEndDragonPosition: () => RenderEntity['feetPosition']
   readonly getVehicles: () => ReadonlyArray<Vehicle>
-  readonly syncEntities: (entities: ReadonlyArray<RenderEntity>) => Effect.Effect<void>
+  readonly syncEntities: (entities: ReadonlyArray<RenderEntity>) => Effect.Effect<void, Schema.SchemaError>
 }
 
 export type PlayerLifecycleContext = {
@@ -56,8 +66,8 @@ export type PlayerLifecycleContext = {
 }
 
 export type PlayerSessionRuntime = {
-  readonly entityRenderProjection: () => ReadonlyArray<RenderEntity>
-  readonly syncRenderedEntities: () => void
+  readonly entityRenderProjection: () => Result.Result<ReadonlyArray<RenderEntity>, CoordinateConversionFailure>
+  readonly syncRenderedEntities: () => Effect.Effect<void, CoordinateConversionFailure | Schema.SchemaError>
   readonly nearestVillagerForTrade: (
     position: SessionPosition,
     dimension: Dimension,
@@ -72,69 +82,74 @@ export type PlayerLifecycleRuntime = {
 export const createPlayerSessionRuntime = (
   context: PlayerSessionRuntimeContext,
 ): PlayerSessionRuntime => {
-  const entityRenderProjection = (): ReadonlyArray<RenderEntity> => [
-    ...context.getLocalEntities().map((entity) => ({
-      id: renderEntityId(entity.id),
-      kind: entity.kind,
-      feetPosition: entity.feetPosition,
-      category: entity.kind === 'dropped_item' ? 'item' : 'hostile',
-    } satisfies RenderEntity)),
-    ...context.getAuthoritativeEntities().map(([, entity]) => ({
-      id: renderEntityId(`authoritative:${String(entity.entityId)}`),
-      kind: entity._tag === 'living'
-        ? entity.entityType
-        : entity._tag === 'vehicle'
-          ? entity.vehicleType
-          : entity._tag === 'arrow'
-            ? 'arrow'
-            : entity._tag === 'primed-tnt'
-              ? 'primed_tnt'
-              : 'dropped_item',
-      feetPosition: entity.at,
-      category: entity._tag === 'item-drop' || entity._tag === 'arrow' ? 'item' as const : 'hostile' as const,
-    } satisfies RenderEntity)),
-    ...context.getProjectileEntities(),
-    ...context.getEyeOfEnderEntities(),
-    ...context.getWitherEntities(),
-    ...context.getRemotePlayers()
-      .filter(([, player]) => player.world === context.getCurrentDimension())
-      .map(([playerId, player]) => ({
-        id: renderEntityId(`multiplayer:${String(playerId)}`),
-        kind: 'remote_player',
-        feetPosition: player.at,
-      } satisfies RenderEntity)),
-    ...context.getVillagerResidents()
-      .filter((villager) => villager.dimension === context.getCurrentDimension())
-      .filter((villager) => context.isCurrentChunkLoaded(worldPosition(
-        PositionAxis(villager.feetPosition.x),
-        PositionAxis(villager.feetPosition.y),
-        PositionAxis(villager.feetPosition.z),
-      )))
-      .map((villager) => ({
-        id: renderEntityId(villager.id),
-        kind: 'villager',
-        feetPosition: villager.feetPosition,
-      } satisfies RenderEntity)),
-    ...(context.getCurrentDimension() === 'end' && context.getEndDragonPhase() !== 'dead'
-      ? [{
-          id: renderEntityId('ender-dragon'),
-          kind: 'ender_dragon',
-          category: 'hostile' as const,
-          feetPosition: context.getEndDragonPosition(),
-        } satisfies RenderEntity]
-      : []),
-    ...context.getVehicles()
-      .filter((vehicle) => vehicle.dimension === context.getCurrentDimension())
-      .map((vehicle) => ({
-        id: renderEntityId(String(vehicle.id)),
-        kind: vehicle.type,
-        feetPosition: vehicle.position,
-        facingRadians: vehicle.yawRadians,
-      } satisfies RenderEntity)),
-  ]
-  const syncRenderedEntities = (): void => {
-    Effect.runSync(context.syncEntities(entityRenderProjection()))
-  }
+  const entityRenderProjection = (): Result.Result<ReadonlyArray<RenderEntity>, CoordinateConversionFailure> =>
+    Result.gen(function* () {
+      const loadedVillagers: Array<PersistedVillager> = []
+      for (const villager of context.getVillagerResidents()) {
+        if (villager.dimension !== context.getCurrentDimension()) continue
+        const loaded = yield* context.isCurrentChunkLoaded(worldPosition(
+          PositionAxis(villager.feetPosition.x),
+          PositionAxis(villager.feetPosition.y),
+          PositionAxis(villager.feetPosition.z),
+        ))
+        if (loaded) loadedVillagers.push(villager)
+      }
+      return [
+        ...context.getLocalEntities().map((entity) => ({
+          id: renderEntityId(entity.id),
+          kind: entity.kind,
+          feetPosition: entity.feetPosition,
+          category: entity.kind === 'dropped_item' ? 'item' : 'hostile',
+        } satisfies RenderEntity)),
+        ...context.getAuthoritativeEntities().map(([, entity]) => ({
+          id: renderEntityId(`authoritative:${String(entity.entityId)}`),
+          kind: entity._tag === 'living'
+            ? entity.entityType
+            : entity._tag === 'vehicle'
+              ? entity.vehicleType
+              : entity._tag === 'arrow'
+                ? 'arrow'
+                : entity._tag === 'primed-tnt'
+                  ? 'primed_tnt'
+                  : 'dropped_item',
+          feetPosition: entity.at,
+          category: entity._tag === 'item-drop' || entity._tag === 'arrow' ? 'item' as const : 'hostile' as const,
+        } satisfies RenderEntity)),
+        ...context.getProjectileEntities().map((entity) => ({ ...entity, id: renderEntityId(entity.id) } satisfies RenderEntity)),
+        ...context.getEyeOfEnderEntities().map((entity) => ({ ...entity, id: renderEntityId(entity.id) } satisfies RenderEntity)),
+        ...context.getWitherEntities(),
+        ...context.getRemotePlayers()
+          .filter(([, player]) => player.world === context.getCurrentDimension())
+          .map(([playerId, player]) => ({
+            id: renderEntityId(`multiplayer:${String(playerId)}`),
+            kind: 'remote_player',
+            feetPosition: player.at,
+          } satisfies RenderEntity)),
+        ...loadedVillagers.map((villager) => ({
+          id: renderEntityId(villager.id),
+          kind: 'villager',
+          feetPosition: villager.feetPosition,
+        } satisfies RenderEntity)),
+        ...(context.getCurrentDimension() === 'end' && context.getEndDragonPhase() !== 'dead'
+          ? [{
+              id: renderEntityId('ender-dragon'),
+              kind: 'ender_dragon',
+              category: 'hostile' as const,
+              feetPosition: context.getEndDragonPosition(),
+            } satisfies RenderEntity]
+          : []),
+        ...context.getVehicles()
+          .filter((vehicle) => vehicle.dimension === context.getCurrentDimension())
+          .map((vehicle) => ({
+            id: renderEntityId(String(vehicle.id)),
+            kind: vehicle.type,
+            feetPosition: vehicle.position,
+            facingRadians: vehicle.yawRadians,
+          } satisfies RenderEntity)),
+      ]
+    })
+  const syncRenderedEntities = (): Effect.Effect<void, CoordinateConversionFailure | Schema.SchemaError> =>
+    Effect.flatMap(Effect.fromResult(entityRenderProjection()), context.syncEntities)
   const nearestVillagerForTrade = (
     position: SessionPosition,
     dimension: Dimension,

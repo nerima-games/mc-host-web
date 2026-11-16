@@ -565,12 +565,6 @@
   },
   {
     "count": 1,
-    "file": "apps/web/player-session-runtime.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(context.syncEntities(entityRenderProjection()))"
-  },
-  {
-    "count": 1,
     "file": "apps/web/player-ui-runtime.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync( context.worldInventory.damageAt({ _tag: 'Equipment', slot }, appliedWear), )"

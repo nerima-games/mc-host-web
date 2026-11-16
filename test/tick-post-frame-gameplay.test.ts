@@ -337,7 +337,7 @@ const makeHarness = async (options: HarnessOptions = {}) => {
     },
     presentWeather: () => undefined,
     presentWeatherRuntime: () => Effect.void,
-    syncRenderedEntities: () => undefined,
+    syncRenderedEntities: () => Effect.void,
     registerPortal: () => false,
     requiredSleepRatio: 1,
     sleepHud: { textContent: '', hidden: true },
