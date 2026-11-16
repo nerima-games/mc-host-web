@@ -1,10 +1,10 @@
 import { expect, test, type ConsoleMessage, type Page } from '@playwright/test'
 
 import { callQa, callQaWithFrames } from './helpers/qa'
+import { clearDatabase } from './helpers/database'
 import { startGameSession } from './helpers/session'
 import { waitForSimulationProgress } from './helpers/simulation-wait'
 
-const DATABASE_NAME = 'nerima-games-minecraft'
 const AIR_BLOCK_ID = 0
 const FARMLAND_BLOCK_ID = 49
 const POTATO_CROP_BLOCK_ID = 72
@@ -75,23 +75,9 @@ const grantPointerLock = async (page: Page): Promise<void> => {
   })
 }
 
-const deleteSessionDatabase = async (page: Page): Promise<void> => {
-  await page.goto('/@vite/client')
-  await page.evaluate(async (databaseName) => {
-    await new Promise<void>((resolve, reject) => {
-      const request = indexedDB.deleteDatabase(databaseName)
-      request.addEventListener('success', () => resolve(), { once: true })
-      request.addEventListener('error', () => reject(request.error), { once: true })
-      request.addEventListener('blocked', () => reject(new Error('database deletion blocked')), {
-        once: true,
-      })
-    })
-  }, DATABASE_NAME)
-}
-
 test('matures, persists, harvests, eats, and replants potatoes', async ({ page }) => {
   const faults = watchForFaults(page)
-  await deleteSessionDatabase(page)
+  await clearDatabase(page)
   await startGameSession(page)
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
 

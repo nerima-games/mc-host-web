@@ -1,4 +1,6 @@
+import { itemComponents, type ItemComponents } from '@nerima-games/mc-kernel'
 import { expect, test, type ConsoleMessage, type Locator, type Page } from '@playwright/test'
+import { Result } from 'effect'
 
 import { callQa, callQaWithFrames } from './helpers/qa'
 import { startGameSession } from './helpers/session'
@@ -43,7 +45,11 @@ type GameplaySnapshot = {
   }
   readonly dead: boolean
   readonly inventory: {
-    readonly slots: ReadonlyArray<{ readonly item: string; readonly count: number } | null>
+    readonly slots: ReadonlyArray<{
+      readonly item: string
+      readonly count: number
+      readonly components: ItemComponents
+    } | null>
     readonly durability: ReadonlyArray<{
       readonly current: number
       readonly max: number
@@ -786,6 +792,7 @@ test('kills a hostile with a left click and collects its dropped item', async ({
   expect(seededSnapshot.inventory.slots[0]).toEqual({
     item: 'wooden_sword',
     count: 1,
+    components: Result.getOrThrow(itemComponents('wooden_sword')),
   })
   expect(seededSnapshot.inventory.durability[0]).toEqual({
     current: 59,

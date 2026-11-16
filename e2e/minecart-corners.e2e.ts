@@ -1,10 +1,9 @@
 import { expect, test, type Page } from '@playwright/test'
 
 import { callQa, callQaWithFrames } from './helpers/qa'
+import { clearDatabase } from './helpers/database'
 import { startGameSession } from './helpers/session'
 import { waitForSimulationProgress } from './helpers/simulation-wait'
-
-const DATABASE_NAME = 'nerima-games-minecraft'
 
 // Mirrors qa-fixtures.ts's QA_RAIL_TRACK_ORIGIN / _WIDTH / _HEIGHT — the loop
 // gameplay.seedRailTrackEncounter (apps/web/main.ts) actually builds. Kept as
@@ -49,19 +48,6 @@ const railSnapshotWithFrames = (
   page: Page,
 ): Promise<{ frames: number; value: RailTrackSnapshot }> =>
   callQaWithFrames(page, 'gameplay.railTrackSnapshot')
-
-const clearDatabase = async (page: Page): Promise<void> => {
-  await page.goto('/@vite/client')
-  await page.evaluate(
-    (databaseName) => new Promise<void>((resolve, reject) => {
-      const request = indexedDB.deleteDatabase(databaseName)
-      request.onsuccess = () => resolve()
-      request.onerror = () => reject(request.error)
-      request.onblocked = () => reject(new Error(`Database ${databaseName} deletion was blocked`))
-    }),
-    DATABASE_NAME,
-  )
-}
 
 // FIXED (browser-level testability gap): the minecart-corners fix shipped
 // with package-level proof only — mx-gameplay's own closed-rectangle

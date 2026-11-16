@@ -1,4 +1,6 @@
+import { itemComponents, type ItemComponents } from '@nerima-games/mc-kernel'
 import { expect, test, type Locator, type Page } from '@playwright/test'
+import { Result } from 'effect'
 
 import { callQa } from './helpers/qa'
 import { startGameSession } from './helpers/session'
@@ -6,7 +8,11 @@ import { waitForSimulationProgress } from './helpers/simulation-wait'
 
 type GameplaySnapshot = {
   readonly inventory: {
-    readonly slots: ReadonlyArray<{ readonly item: string; readonly count: number } | null>
+    readonly slots: ReadonlyArray<{
+      readonly item: string
+      readonly count: number
+      readonly components: ItemComponents
+    } | null>
     readonly durability: ReadonlyArray<{ readonly current: number; readonly max: number } | null>
   }
   readonly ignitionTarget: {
@@ -144,7 +150,11 @@ test.describe('player inventory experience', () => {
     await expect(destination).toHaveAttribute('aria-label', /stone, 2/)
     const snapshot = await callQa<GameplaySnapshot>(page, 'gameplay.snapshot')
     expect(snapshot.inventory.slots[0]).toBeNull()
-      expect(snapshot.inventory.slots[9]).toEqual({ item: 'stone', count: 2 })
+      expect(snapshot.inventory.slots[9]).toEqual({
+        item: 'stone',
+        count: 2,
+        components: Result.getOrThrow(itemComponents('stone')),
+      })
     })
 
     test('places an inventory stack into the crafting grid by dragging', async ({ page }) => {

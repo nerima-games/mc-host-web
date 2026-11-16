@@ -1,21 +1,23 @@
+import { itemComponents, type ItemComponents } from '@nerima-games/mc-kernel'
 import { expect, test, type Page } from '@playwright/test'
+import { Result } from 'effect'
 
 import { callQa, callQaWithFrames } from './helpers/qa'
+import { clearDatabase } from './helpers/database'
 import { startGameSession } from './helpers/session'
 import { waitForSimulationProgress } from './helpers/simulation-wait'
-
-const DATABASE_NAME = 'nerima-games-minecraft'
 
 type StoredStack = {
   item: string
   count: number
+  components: ItemComponents
   durability: { current: number; max: number } | null
 }
 
 type GameplaySnapshot = {
   target: { block: number }
   inventory: {
-    slots: Array<{ item: string; count: number } | null>
+    slots: Array<{ item: string; count: number; components: ItemComponents } | null>
     durability: Array<{ current: number; max: number } | null>
   }
   containerStorage: {
@@ -44,20 +46,6 @@ type GameplaySnapshot = {
 
 const snapshotWithFrames = (page: Page): Promise<{ frames: number; value: GameplaySnapshot }> =>
   callQaWithFrames(page, 'gameplay.snapshot')
-
-const clearDatabase = async (page: Page): Promise<void> => {
-  await page.goto('/@vite/client')
-  await page.evaluate(
-    (databaseName) =>
-      new Promise<void>((resolve, reject) => {
-        const request = indexedDB.deleteDatabase(databaseName)
-        request.onsuccess = () => resolve()
-        request.onerror = () => reject(request.error)
-        request.onblocked = () => reject(new Error(`Database ${databaseName} deletion was blocked`))
-      }),
-    DATABASE_NAME,
-  )
-}
 
 const grantPointerLock = async (page: Page): Promise<void> => {
   await page.evaluate(() => {
@@ -140,6 +128,7 @@ test('moves, persists, and spills chest contents', async ({ page }) => {
   expect(snapshot.containerStorage.containers[0]?.slots[0]).toEqual({
     item: 'oak_log',
     count: 1,
+    components: Result.getOrThrow(itemComponents('oak_log')),
     durability: null,
   })
 
@@ -158,6 +147,7 @@ test('moves, persists, and spills chest contents', async ({ page }) => {
   expect(snapshot.containerStorage.containers[0]?.slots[0]).toEqual({
     item: 'oak_log',
     count: 1,
+    components: Result.getOrThrow(itemComponents('oak_log')),
     durability: null,
   })
 
@@ -182,7 +172,11 @@ test('moves, persists, and spills chest contents', async ({ page }) => {
   snapshot = await callQa<GameplaySnapshot>(page, 'gameplay.snapshot')
   expect(snapshot.containerStorage.containers).toEqual([])
   const pickedUpSlot = snapshot.inventory.slots.findIndex((slot) => slot?.item === 'oak_log')
-  expect(snapshot.inventory.slots[pickedUpSlot]).toEqual({ item: 'oak_log', count: 1 })
+  expect(snapshot.inventory.slots[pickedUpSlot]).toEqual({
+    item: 'oak_log',
+    count: 1,
+    components: Result.getOrThrow(itemComponents('oak_log')),
+  })
   expect(snapshot.inventory.durability[pickedUpSlot]).toBeNull()
 })
 

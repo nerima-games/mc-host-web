@@ -1,11 +1,11 @@
 import { expect, test, type ConsoleMessage, type Page } from '@playwright/test'
 
 import { callQa, callQaWithFrames } from './helpers/qa'
+import { clearDatabase } from './helpers/database'
 import { startGameSession } from './helpers/session'
 import { waitForSimulationProgress } from './helpers/simulation-wait'
 
 const SAVED_MARKER_KEY = '__mcComposeSawSavedPersistence'
-const DATABASE_NAME = 'nerima-games-minecraft'
 const AIR_BLOCK_ID = 0
 const STONE_BLOCK_ID = 2
 const OBSIDIAN_BLOCK_ID = 40
@@ -156,25 +156,9 @@ const seedGroundedMiningEncounter = async (page: Page): Promise<void> => {
   await expect(page.locator('#game-canvas')).toHaveAttribute('data-player-grounded', 'true')
 }
 
-const deleteSessionDatabase = async (page: Page): Promise<void> => {
-  // Use a same-origin document that does not start the game, so no open session
-  // connection can block deletion before this test's first boot.
-  await page.goto('/@vite/client')
-  await page.evaluate(async (databaseName) => {
-    await new Promise<void>((resolve, reject) => {
-      const request = indexedDB.deleteDatabase(databaseName)
-      request.addEventListener('success', () => resolve(), { once: true })
-      request.addEventListener('error', () => reject(request.error), { once: true })
-      request.addEventListener('blocked', () => reject(new Error('database deletion blocked')), {
-        once: true,
-      })
-    })
-  }, DATABASE_NAME)
-}
-
 test('restores a dynamic entity with stable identity and state', async ({ page }) => {
   const faults = watchForFaults(page)
-  await deleteSessionDatabase(page)
+  await clearDatabase(page)
 
   await startGameSession(page)
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
@@ -200,7 +184,7 @@ test('restores a dynamic entity with stable identity and state', async ({ page }
 
 test('retains death-drop custom name and enchantments through reload and pickup', async ({ page }) => {
   const faults = watchForFaults(page)
-  await deleteSessionDatabase(page)
+  await clearDatabase(page)
 
   await startGameSession(page)
   const body = page.locator('body')
@@ -290,7 +274,7 @@ const seededEntities = (
 
 test('isolates and restores entity rosters across dimensions and reload', async ({ page }) => {
   const faults = watchForFaults(page)
-  await deleteSessionDatabase(page)
+  await clearDatabase(page)
 
   await startGameSession(page)
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
@@ -441,7 +425,7 @@ test('isolates and restores entity rosters across dimensions and reload', async 
 
 test('publishes a mined world, inventory, and exact pose across reload', async ({ page }) => {
   const faults = watchForFaults(page)
-  await deleteSessionDatabase(page)
+  await clearDatabase(page)
 
   await startGameSession(page)
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
@@ -497,7 +481,7 @@ test('publishes a mined world, inventory, and exact pose across reload', async (
 
 test('debounces dirty gameplay into a durable save without an explicit flush', async ({ page }) => {
   const faults = watchForFaults(page)
-  await deleteSessionDatabase(page)
+  await clearDatabase(page)
 
   await startGameSession(page)
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
@@ -559,7 +543,7 @@ test('debounces dirty gameplay into a durable save without an explicit flush', a
 
 test('isolates and restores edits while travelling overworld to nether and back', async ({ page }) => {
   const faults = watchForFaults(page)
-  await deleteSessionDatabase(page)
+  await clearDatabase(page)
 
   await startGameSession(page)
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
@@ -586,7 +570,7 @@ test('isolates and restores edits while travelling overworld to nether and back'
 
 test('materializes, persists, and reuses a portal round trip without duplicates', async ({ page }) => {
   const faults = watchForFaults(page)
-  await deleteSessionDatabase(page)
+  await clearDatabase(page)
 
   await startGameSession(page)
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
@@ -650,7 +634,7 @@ test('materializes, persists, and reuses a portal round trip without duplicates'
 
 test('reaches saved after an autosave, even while the player keeps drifting', async ({ page }) => {
   const faults = watchForFaults(page)
-  await deleteSessionDatabase(page)
+  await clearDatabase(page)
 
   await startGameSession(page)
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
