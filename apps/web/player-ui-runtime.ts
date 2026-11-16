@@ -614,7 +614,7 @@ export const createPlayerUiRuntime = (
             index !== selectedHotbarIndex && candidate?.item === 'iron_ingot' && candidate.count > 0,
           )
         : undefined
-      const anvilPlan = selectedStack == null
+      const planned = selectedStack == null
         ? undefined
         : planAnvilOperation({
             item: selectedStack.item,
@@ -624,25 +624,30 @@ export const createPlayerUiRuntime = (
             ...(enchantedItem === undefined ? {} : { enchantedItem }),
             ...(iron === undefined ? {} : { material: { item: iron.item, count: iron.count } }),
           })
+      const anvilPlan = planned === undefined || Result.isFailure(planned) ? undefined : planned.success
       const levelCost = anvilPlan?.ok === true ? anvilPlan.levelCost : 0
       const materialCost = anvilPlan?.ok === true ? anvilPlan.materialCost : 0
-      const hasEnoughExperience = anvilPlan?.ok === true
-        && spendExperienceLevels(context.getTotalExperience(), anvilPlan.levelCost) !== undefined
-      const rejectionReason = selectedStack == null
+      const spent = anvilPlan?.ok === true
+        ? spendExperienceLevels(context.getTotalExperience(), anvilPlan.levelCost)
+        : undefined
+      const hasEnoughExperience = spent !== undefined && Result.isSuccess(spent) && spent.success !== undefined
+      const rejectionReason = planned === undefined
         ? 'Select an item in the hotbar'
-        : anvilPlan === undefined
-          ? 'Anvil operation is invalid'
-          : !anvilPlan.ok
-            ? anvilPlan.reason === 'incompatible-input' && needsRepair && iron === undefined
+        : Result.isFailure(planned)
+          ? planned.failure.message
+          : !planned.success.ok
+            ? planned.success.reason === 'incompatible-input' && needsRepair && iron === undefined
               ? 'Requires one iron ingot'
-              : anvilPlan.reason === 'nothing-to-do'
+              : planned.success.reason === 'nothing-to-do'
                 ? 'Change the name or repair a damaged item'
-                : anvilPlan.reason === 'too-expensive'
+                : planned.success.reason === 'too-expensive'
                   ? 'Anvil operation is too expensive'
                   : 'Anvil operation is invalid'
-            : !hasEnoughExperience
-              ? `Requires level ${levelCost}`
-              : undefined
+            : spent !== undefined && Result.isFailure(spent)
+              ? spent.failure.message
+              : !hasEnoughExperience
+                ? `Requires level ${levelCost}`
+                : undefined
       context.anvilView.render(anvilViewModel({
         primaryInput: selectedSlot,
         secondaryInput: anvilPlan?.ok === true && materialCost > 0 && iron !== undefined
@@ -1795,17 +1800,29 @@ export const createPlayerUiRuntime = (
     const itemKey = String(selectedHotbarIndex)
     const currentName = context.customNames.get(itemKey) ?? null
     const existingEnchantment = context.enchantedItems.get(itemKey)
-    const anvilResult = selected == null
+    const anvilOutcome = selected == null
       ? undefined
       : applyAnvilOperation(storage, selectedHotbarIndex, {
           name: normalizedName,
           currentName,
           ...(existingEnchantment === undefined ? {} : { enchantedItem: existingEnchantment }),
         })
-    const remainingExperience = anvilResult === undefined
+    if (anvilOutcome !== undefined && Result.isFailure(anvilOutcome)) {
+      context.setAnvilStatus(anvilOutcome.failure._tag)
+      renderPlayerUi()
+      return
+    }
+    const anvilResult = anvilOutcome?.success
+    const spent = anvilResult === undefined
       ? undefined
       : spendExperienceLevels(vitals.totalExperience, anvilResult.levelCost)
-    if (selected == null || anvilResult === undefined || remainingExperience === undefined) {
+    if (spent !== undefined && Result.isFailure(spent)) {
+      context.setAnvilStatus(spent.failure._tag)
+      renderPlayerUi()
+      return
+    }
+    const remainingExperience = spent?.success
+    if (anvilResult === undefined || remainingExperience === undefined) {
       context.setAnvilStatus('Repair or rename requirements are not met')
       renderPlayerUi()
       return
