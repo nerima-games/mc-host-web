@@ -53,6 +53,7 @@ export type PlayerLifecycleContext = {
   readonly getStopBrowserPreview: () => (() => Promise<void>) | undefined
   readonly hasMultiplayer: () => boolean
   readonly leaveMultiplayer: () => void
+  readonly pauseMenu: { readonly destroy: () => void }
   readonly settingsView: { readonly dispose: () => void }
   readonly endAudio: { readonly dispose: () => void }
   readonly weatherAudio: { readonly dispose: () => void }
@@ -201,6 +202,7 @@ export const installPlayerLifecycle = (context: PlayerLifecycleContext): PlayerL
     if (runtimeDisposed) return
     runtimeDisposed = true
     context.disposeQaSurface()
+    context.pauseMenu.destroy()
     context.settingsView.dispose()
     context.endAudio.dispose()
     context.weatherAudio.dispose()

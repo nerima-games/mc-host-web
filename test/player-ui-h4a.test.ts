@@ -191,6 +191,7 @@ const makePauseMenu = (locked = true) => {
       return event
     },
     errorText: () => parent.children[0]?.children.at(-1)?.textContent,
+    errorRole: () => parent.children[0]?.children.at(-1)?.getAttribute('role'),
   }
 }
 
@@ -410,6 +411,7 @@ describe('pointer lock pause menu', () => {
     state.click('save-and-quit')
     await vi.waitFor(() => expect(state.onFailure).toHaveBeenCalledExactlyOnceWith({ _tag: 'PauseSaveQuitFailure', cause }))
     expect(state.errorText()).toBe('Save failed. Your world is still open; please try again.')
+    expect(state.errorRole()).toBe('alert')
     expect(state.getPaused()).toBe(true)
     expect(state.assign).not.toHaveBeenCalled()
     expect(state.parent.findAction('save-and-quit').hasAttribute('disabled')).toBe(false)

@@ -35,7 +35,7 @@ describe('H4b main.ts wiring', () => {
     const runtimeCreation = positionOf(mainSource, 'const inventoryRuntime = createPlayerUiRuntime({')
     const runtimeDestructure = positionOf(mainSource, '} = inventoryRuntime')
     const listenerInstallation = positionOf(mainSource, 'installInventoryListeners()')
-    const pauseInstallation = positionOf(mainSource, 'const handlePauseRequest = installPauseControls({')
+    const pauseInstallation = positionOf(mainSource, 'const pauseMenu = installPlayerPauseMenu({')
     const tickStart = positionOf(mainSource, 'const tick = (() => {')
 
     expect(clientCreation).toBeLessThan(runtimeCreation)
@@ -79,6 +79,16 @@ describe('H4b main.ts wiring', () => {
     expect(runtimeSetup).toContain('sendInventoryCommand,')
     expect(runtimeSetup).toContain('requestCrafting,')
     expect(runtimeSetup).toContain('sendFacilityCommand,')
+  })
+
+  it('routes the frame Escape and session disposal through the pause menu adapter', () => {
+    const pauseInstallation = positionOf(mainSource, 'const pauseMenu = installPlayerPauseMenu({')
+    const lifecycle = positionOf(mainSource, '= installPlayerLifecycle({')
+    const tickStart = positionOf(mainSource, 'const tick = (() => {')
+    expect(pauseInstallation).toBeLessThan(lifecycle)
+    expect(positionOf(mainSource, 'pauseMenu,', lifecycle)).toBeLessThan(tickStart)
+    expect(positionOf(mainSource, 'handlePauseRequest: pauseMenu.handleEscape,', tickStart)).toBeGreaterThan(tickStart)
+    expect(frameInputSource).toContain('context.handlePauseRequest()')
   })
 
   it('keeps inventory input gated before calling the extracted runtime', () => {

@@ -55,6 +55,11 @@ export type OnboardingPersistenceFailure = {
   readonly cause: unknown
 }
 
+export const onboardingFailureMessage = (failure: OnboardingPersistenceFailure): string =>
+  failure.operation === 'read'
+    ? 'Controls preferences could not be loaded.'
+    : 'Controls could not be saved. Please try again.'
+
 export const installPlayerOnboarding = (context: {
   readonly document: DomElementFactory
   readonly parent: DomElement
@@ -226,9 +231,7 @@ export const bootTitleMenu = async (context: TitleMenuContext): Promise<void> =>
   const onboardingParent = document.createElement('div')
   titleScreen.appendChild(onboardingParent)
   const reportOnboardingFailure = (failure: OnboardingPersistenceFailure): void => {
-    titleStatus.textContent = failure.operation === 'read'
-      ? 'Controls preferences could not be loaded.'
-      : 'Controls could not be saved. Please try again.'
+    titleStatus.textContent = onboardingFailureMessage(failure)
     console.error('[mc-compose] controls persistence failed', failure)
   }
   const onboarding = installPlayerOnboarding({

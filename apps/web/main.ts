@@ -391,10 +391,16 @@ import {
   type GameplayCommitServices,
 } from './host-modules'
 import { makeHostWorldWrite } from './world-write-port'
-import { bootTitleMenu } from './title-menu'
+import {
+  bootTitleMenu,
+  installPlayerOnboarding,
+  onboardingFailureMessage,
+  playerControlHints,
+  type OnboardingPersistenceFailure,
+} from './title-menu'
 import {
   handleLocalPlayerDeath as handleLocalPlayerDeathUi,
-  installPauseControls,
+  installPlayerPauseMenu,
   renderCrosshair as renderCrosshairUi,
   renderPlayerHud,
   respawnPlayer as respawnPlayerUi,
@@ -668,11 +674,8 @@ const bootGame = async (
 ): Promise<void> => {
   const { sessionId } = route
   const gameShell = requireElement('game-shell')
-  const pauseOverlay = requireElement('pause-overlay')
-  const resumeButton = requireElement('resume-button')
-  const settingsButton = requireElement('settings-button')
-  const saveQuitButton = requireElement('save-quit-button')
-  const pauseError = requireElement('pause-error')
+  const pauseRoot = requireElement('pause-root')
+  const sessionOnboarding = requireElement('session-onboarding')
   const settingsRoot = requireElement('settings-root')
   gameShell.hidden = false
   document.body.setAttribute('data-mc-compose-route', 'session')
@@ -838,6 +841,32 @@ const bootGame = async (
     worldRenderer,
   } = adapters
   let playerSettings = adapters.playerSettings
+  const onboardingParent = document.createElement('div')
+  const onboardingStatus = document.createElement('p')
+  onboardingStatus.setAttribute('role', 'status')
+  sessionOnboarding.append(onboardingParent, onboardingStatus)
+  const reportOnboardingFailure = (failure: OnboardingPersistenceFailure): void => {
+    onboardingStatus.textContent = onboardingFailureMessage(failure)
+    console.error('[mc-compose] controls persistence failed', failure)
+  }
+  const onboarding = installPlayerOnboarding({
+    document,
+    parent: onboardingParent,
+    getStorage: () => window.localStorage,
+    getQuickControls: () => playerControlHints(playerSettings.bindings).quickControls,
+    getAllControls: () => playerControlHints(playerSettings.bindings).allControls,
+    onFailure: reportOnboardingFailure,
+  })
+  if (Result.isFailure(onboarding)) {
+    reportOnboardingFailure(onboarding.failure)
+  } else {
+    const controlsButton = document.createElement('button')
+    controlsButton.setAttribute('type', 'button')
+    controlsButton.setAttribute('data-session-action', 'show-controls')
+    controlsButton.textContent = 'Controls'
+    controlsButton.addEventListener('click', () => onboarding.success.showControls())
+    sessionOnboarding.appendChild(controlsButton)
+  }
   // mc-audio ships no production music playlist or ambient sound definition.
   // Until the host has those assets, the empty manifest and registry keep
   // music and ambient silent: mc-audio plays nothing for a scene without a
@@ -3143,9 +3172,10 @@ const bootGame = async (
     onChange: (next) => {
       playerSettings = next
       applyBindings(next.bindings)
+      if (Result.isSuccess(onboarding)) onboarding.success.render()
       audio.configure(next)
       document.body.setAttribute('data-player-settings-persistence', 'dirty')
-      pauseError.textContent = ''
+      pauseMenu.clearError()
       settingsView.clearPersistenceError()
       enqueueSettingsWrite(
         settingsWrites,
@@ -3158,28 +3188,24 @@ const bootGame = async (
         (error) => {
           document.body.setAttribute('data-player-settings-persistence', 'error')
           const message = 'Settings could not be saved.'
-          pauseError.textContent = message
+          pauseMenu.reportError(message)
           settingsView.reportPersistenceError(message)
           console.error('[mc-compose] player settings persistence failed', error)
         },
       )
     },
     onClose: () => {
-      pauseOverlay.inert = false
+      pauseMenu.closeSettings()
     },
   })
 
-  const handlePauseRequest = installPauseControls({
+  const pauseMenu = installPlayerPauseMenu({
     deferToFrameBoundary,
     document,
     window,
+    parent: pauseRoot,
     canvas,
     gameShell,
-    pauseOverlay,
-    resumeButton,
-    settingsButton,
-    saveQuitButton,
-    pauseError,
     settingsView,
     getPlayerSettings: () => playerSettings,
     getPaused: () => paused,
@@ -3202,6 +3228,13 @@ const bootGame = async (
     syncTouchControls,
     requestFlush,
     drainSettingsWrites: () => drainSettingsWrites(settingsWrites),
+    canPause: () => !playerIsDead(),
+    clearGameplayInput: () => {
+      Effect.runSync(inputApi.clearHeld)
+      nativeInputQueue = EMPTY_NATIVE_INPUT_QUEUE
+      touchLookState = TOUCH_LOOK_CONTROLLER_IDLE
+    },
+    onFailure: (failure) => console.error('[mc-compose] pause menu failed', failure),
   })
 
   // -------------------------------------------------------------------------
@@ -3396,6 +3429,7 @@ const bootGame = async (
         : multiplayer.transport.close
       void Effect.runPromise(close)
     },
+    pauseMenu,
     settingsView,
     endAudio,
     weatherAudio,
@@ -3457,7 +3491,7 @@ const bootGame = async (
         nextItemUseRequestId: mutableState(() => nextItemUseRequestId, (value) => { nextItemUseRequestId = value }),
       },
       touchLook: { consume: consumeTouchLook },
-      handlePauseRequest,
+      handlePauseRequest: pauseMenu.handleEscape,
       renderCrosshair,
       pointerLock: {
         isLockedToCanvas: () => document.pointerLockElement === canvas,

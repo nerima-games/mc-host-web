@@ -194,24 +194,21 @@ export const respawnPlayer = (context: H4aRespawnContext): Result.Result<void, B
   return Result.void
 }
 
-type PauseSettingsView = {
-  readonly isOpen: () => boolean
-  readonly open: (settings: PlayerSettingsV1, returnFocusTo: HTMLElement) => void
+export type PointerLockPauseFailure = {
+  readonly _tag: 'PointerLockPauseFailure'
+  readonly cause: unknown
 }
 
-export type H4aPauseContext = {
+export type PauseSaveQuitFailure = {
+  readonly _tag: 'PauseSaveQuitFailure'
+  readonly cause: unknown
+}
+
+type PauseButton = DomInteractiveElement & Pick<HTMLElement, 'getAttribute' | 'hasAttribute'>
+
+export type PlayerPauseContext<Button extends PauseButton> = {
   /** Runs `work` at the next frame boundary; the pause and close paths read and write the world. */
   readonly deferToFrameBoundary: (work: () => void) => void
-  readonly document: Document
-  readonly window: Pick<Window, 'location'>
-  readonly canvas: HTMLCanvasElement
-  readonly gameShell: HTMLElement
-  readonly pauseOverlay: HTMLElement
-  readonly resumeButton: HTMLElement
-  readonly settingsButton: HTMLElement
-  readonly saveQuitButton: HTMLElement
-  readonly pauseError: HTMLElement
-  readonly settingsView: PauseSettingsView
   readonly getPlayerSettings: () => PlayerSettingsV1
   readonly getPaused: () => boolean
   readonly setPaused: (paused: boolean) => void
@@ -227,113 +224,6 @@ export type H4aPauseContext = {
   readonly syncTouchControls: () => void
   readonly requestFlush: () => Promise<void>
   readonly drainSettingsWrites: () => Promise<void>
-}
-
-export const installPauseControls = (context: H4aPauseContext): (() => void) => {
-  const setPaused = (next: boolean): void => {
-    context.resetPrimaryAttackGesture()
-    if (next) context.resetBowUse()
-    context.setPaused(next)
-    context.gameShell.inert = next
-    context.pauseOverlay.hidden = !next
-    context.document.body.setAttribute('data-session-paused', String(next))
-    context.renderCrosshair()
-    context.syncTouchControls()
-    if (next) {
-      if (context.document.pointerLockElement === context.canvas) context.document.exitPointerLock()
-      context.resumeButton.focus()
-      return
-    }
-    context.pauseError.textContent = ''
-    context.canvas.focus()
-  }
-
-  const handlePauseRequest = (): void => {
-    if (context.isBrewingOpen()) {
-      context.closeBrewing()
-      return
-    }
-    if (context.isTradeOpen()) {
-      context.closeTrade()
-      return
-    }
-    if (context.isInventoryOpen()) {
-      context.closeInventory()
-      return
-    }
-    setPaused(!context.getPaused())
-  }
-
-  context.document.addEventListener('keydown', (event) => {
-    if (context.settingsView.isOpen()) return
-    if (event.code === 'Escape' && !event.repeat) {
-      event.preventDefault()
-      event.stopPropagation()
-      context.deferToFrameBoundary(handlePauseRequest)
-      return
-    }
-
-    if (!context.getPaused() || event.code !== 'Tab') return
-    const pauseActions = [context.resumeButton, context.settingsButton, context.saveQuitButton].filter(
-      (button) => !button.hasAttribute('disabled'),
-    )
-    const firstAction = pauseActions[0]
-    const lastAction = pauseActions.at(-1)
-    if (firstAction === undefined || lastAction === undefined) return
-
-    const activeElement = context.document.activeElement
-    const activeIsPauseAction = pauseActions.some((button) => button === activeElement)
-    const allowsNativeFocusMove = event.shiftKey
-      ? activeElement !== firstAction && activeIsPauseAction
-      : activeElement !== lastAction && activeIsPauseAction
-    if (allowsNativeFocusMove) {
-      return
-    }
-
-    event.preventDefault()
-    event.stopPropagation()
-    ;(event.shiftKey ? lastAction : firstAction).focus()
-  })
-  context.resumeButton.addEventListener('click', () => context.deferToFrameBoundary(() => setPaused(false)))
-  context.settingsButton.addEventListener('click', () => {
-    context.pauseOverlay.inert = true
-    context.settingsView.open(context.getPlayerSettings(), context.settingsButton)
-  })
-  context.saveQuitButton.addEventListener('click', () => {
-    if (context.saveQuitButton.getAttribute('aria-busy') === 'true') return
-    context.saveQuitButton.setAttribute('aria-busy', 'true')
-    context.saveQuitButton.setAttribute('disabled', '')
-    context.pauseError.textContent = ''
-    void Promise.all([context.requestFlush(), context.drainSettingsWrites()])
-      .then(() => context.window.location.assign('/'))
-      .catch((error: unknown) => {
-        context.pauseError.textContent = 'Save failed. Your world is still open; please try again.'
-        console.error('[mc-compose] Save & Quit failed', error)
-      })
-      .finally(() => {
-        context.saveQuitButton.removeAttribute('aria-busy')
-        context.saveQuitButton.removeAttribute('disabled')
-      })
-  })
-
-  return handlePauseRequest
-}
-
-export type PointerLockPauseFailure = {
-  readonly _tag: 'PointerLockPauseFailure'
-  readonly cause: unknown
-}
-
-export type PauseSaveQuitFailure = {
-  readonly _tag: 'PauseSaveQuitFailure'
-  readonly cause: unknown
-}
-
-type PauseButton = DomInteractiveElement & Pick<HTMLElement, 'getAttribute' | 'hasAttribute'>
-
-export type PlayerPauseContext<Button extends PauseButton> = Omit<H4aPauseContext,
-  'document' | 'window' | 'canvas' | 'gameShell' | 'pauseOverlay' | 'resumeButton' | 'settingsButton'
-  | 'saveQuitButton' | 'pauseError' | 'settingsView'> & {
   readonly document: {
     createElement(tag: 'button'): Button
     createElement(tag: 'input'): DomInputElement
@@ -501,7 +391,7 @@ export const installPlayerPauseMenu = <Button extends PauseButton>(context: Play
   const settingsButton = actionButton('settings')
   const saveQuitButton = actionButton('save-and-quit')
   const pauseError = context.document.createElement('p')
-  pauseError.setAttribute('role', 'status')
+  pauseError.setAttribute('role', 'alert')
   pauseError.setAttribute('data-pause-error', '')
   view.root.appendChild(pauseError)
   const reportError = (message: string): void => { pauseError.textContent = message }

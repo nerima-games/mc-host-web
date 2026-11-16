@@ -60,6 +60,7 @@ const lifecycleContext = () => {
     getStopBrowserPreview: () => undefined,
     hasMultiplayer: () => true,
     leaveMultiplayer: vi.fn(),
+    pauseMenu: { destroy: vi.fn(() => disposalOrder.push('pause')) },
     settingsView: { dispose: vi.fn(() => disposalOrder.push('settings')) },
     endAudio: { dispose: vi.fn() },
     weatherAudio: { dispose: vi.fn() },
@@ -185,7 +186,7 @@ describe('player session runtime', () => {
     for (const callback of harness.hotDisposeCallbacks) callback()
     expect(harness.context.disposeQaSurface).toHaveBeenCalledTimes(1)
     expect(harness.context.disposeWorldRenderer).toHaveBeenCalledTimes(1)
-    expect(harness.disposalOrder).toEqual(['qa', 'settings', 'renderer'])
+    expect(harness.disposalOrder).toEqual(['qa', 'pause', 'settings', 'renderer'])
     expect(harness.context.leaveMultiplayer).toHaveBeenCalledTimes(1)
   })
 
