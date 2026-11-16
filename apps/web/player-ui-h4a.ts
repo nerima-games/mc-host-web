@@ -1,4 +1,6 @@
-import { addExperience as addVitalsExperience, EQUIPMENT_SLOTS } from '@nerima-games/mc-sim'
+import { Result } from 'effect'
+import { type MonotonicTimeSecs } from '@nerima-games/mc-kernel'
+import { addExperience as addVitalsExperience, EQUIPMENT_SLOTS, ExperienceDelta } from '@nerima-games/mc-sim'
 import {
   crosshairViewModel,
   hudViewModel,
@@ -16,7 +18,7 @@ import { type SessionState } from './session-persistence'
 import { type SleepLocation } from './sleep-runtime'
 
 type CrosshairView = {
-  readonly render: (viewModel: ReturnType<typeof crosshairViewModel>) => void
+  readonly render: (viewModel: Result.Result.Success<ReturnType<typeof crosshairViewModel>>) => void
 }
 
 export type H4aCrosshairContext = {
@@ -30,16 +32,20 @@ export type H4aCrosshairContext = {
 
 export const renderCrosshair = (
   context: H4aCrosshairContext,
-  nowSecs: number,
+  nowSecs: MonotonicTimeSecs,
 ): void => {
   const modals: Parameters<typeof crosshairViewModel>[0]['modals'] =
     context.getPaused() ? ['pause'] : context.isInventoryOpen() || context.isTradeOpen() || context.isBrewingOpen() ? ['inventory'] : []
   const miningProgress = context.getMiningProgress()
-  context.crosshair.render(crosshairViewModel({
+  // Every input crosshairViewModel can reject is constant or already validated: modals
+  // are ScreenId literals, lastHitAtSecs is undefined, pulseSecs is the library default,
+  // breakProgress is a MiningProgressFraction decoded as finite in [0, 1], and nowSecs is a
+  // MonotonicTimeSecs (finite, non-negative).
+  context.crosshair.render(Result.getOrThrow(crosshairViewModel({
     modals,
     lastHitAtSecs: undefined,
     breakProgress: miningProgress === null ? undefined : miningProgressFraction(miningProgress),
-  }, nowSecs))
+  }, nowSecs)))
 }
 
 type StatusEffectView = {
@@ -49,14 +55,14 @@ type StatusEffectView = {
 
 export type H4aHudContext = {
   readonly render: (viewModel: ReturnType<typeof hudViewModel>) => void
-  readonly getHudInput: () => Parameters<typeof hudViewModel>[0]
+  readonly getHudInput: () => Parameters<typeof hudViewModel>
   readonly getActiveEffects: () => ReadonlyArray<StatusEffectView>
   readonly statusEffectsHud: Pick<HTMLElement, 'hidden' | 'textContent'>
   readonly documentBody: Pick<HTMLElement, 'setAttribute'>
 }
 
 export const renderPlayerHud = (context: H4aHudContext): void => {
-  context.render(hudViewModel(context.getHudInput()))
+  context.render(hudViewModel(...context.getHudInput()))
   const activeEffects = context.getActiveEffects()
   context.statusEffectsHud.hidden = activeEffects.length === 0
   context.statusEffectsHud.textContent = activeEffects
@@ -130,7 +136,8 @@ export const handleLocalPlayerDeath = (context: H4aDeathContext): void => {
   }
   context.restoreEmptyStorage()
   const vitals = context.getVitalsSnapshot()
-  context.restoreVitals(addVitalsExperience(vitals, -vitals.totalExperience))
+  // TotalExperience is branded finite, so its negation always satisfies ExperienceDelta.
+  context.restoreVitals(addVitalsExperience(vitals, ExperienceDelta(-vitals.totalExperience)))
   context.setDeathDropDimension(context.getPlayerDimension())
   context.markSessionDirty()
 }

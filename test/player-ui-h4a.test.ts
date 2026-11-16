@@ -1,6 +1,20 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { hudViewModel } from '@nerima-games/mx-ui'
-import { emptyPlayerStorage, itemStack, type PlayerStorage } from '@nerima-games/mc-sim'
+import { Result } from 'effect'
+import { MonotonicTimeSecs, position, PositionAxis } from '@nerima-games/mc-kernel'
+import {
+  DamageCause,
+  emptyPlayerStorage,
+  EntityHealthPoints,
+  ExhaustionAmount,
+  FoodSaturation,
+  FoodTimerSecs,
+  HungerPoints,
+  itemStack,
+  TotalExperience,
+  type PlayerStorage,
+  type Vitals,
+} from '@nerima-games/mc-sim'
 import type { EnchantedItem } from '@nerima-games/mx-gameplay'
 import type { DroppedItemMetadata } from '../apps/web/dropped-item-metadata'
 
@@ -77,7 +91,7 @@ describe('H4a player UI', () => {
       isTradeOpen: () => { getterOrder.push('trade'); return false },
       isBrewingOpen: () => { getterOrder.push('brewing'); return false },
       getMiningProgress: () => { getterOrder.push('mining'); return null },
-    }, 0)
+    }, MonotonicTimeSecs(0))
 
     expect(getterOrder).toEqual(['paused', 'inventory', 'trade', 'brewing', 'mining'])
     expect(rendered).toEqual([{ breakProgress: undefined, hit: false }])
@@ -90,16 +104,22 @@ describe('H4a player UI', () => {
       setAttribute: (name: string, value: string) => attributes.set(name, value),
     }
     const rendered: Array<unknown> = []
-    const hudInput: Parameters<typeof hudViewModel>[0] = {
-      healthPoints: 17,
-      maxHealthPoints: 20,
-      hungerPoints: 13,
-      maxHungerPoints: 20,
-      experienceLevel: 2,
-      experienceProgress: 0.375,
-      hotbar: [{ itemId: 'stone', count: 4, durability: undefined }],
-      selectedHotbarIndex: 1,
-    }
+    const hudInput: Parameters<typeof hudViewModel> = [
+      {
+        healthPoints: EntityHealthPoints(17),
+        maxHealthPoints: EntityHealthPoints(20),
+        hungerPoints: HungerPoints(13),
+        maxHungerPoints: HungerPoints(20),
+        saturation: FoodSaturation(5),
+        exhaustion: ExhaustionAmount(0),
+        foodTimerSecs: FoodTimerSecs(0),
+        // Level 2 at 0.375 progress: 16 total for level 2 plus 0.375 of its 11-point cost.
+        totalExperience: TotalExperience(20.125),
+        lastDamageCause: undefined,
+      },
+      [Result.getOrThrow(itemStack('stone', 4))],
+      1,
+    ]
     const hudModel: ReturnType<typeof hudViewModel> = {
       dead: false,
       experienceLevelLabel: '2',
@@ -121,7 +141,7 @@ describe('H4a player UI', () => {
       documentBody,
     })
 
-    expect(mocks.hudViewModel).toHaveBeenCalledExactlyOnceWith(hudInput)
+    expect(mocks.hudViewModel).toHaveBeenCalledExactlyOnceWith(...hudInput)
     expect(rendered).toEqual([hudModel])
     expect(statusEffectsHud.hidden).toBe(false)
     expect(statusEffectsHud.textContent).toBe('speed: 4s | regeneration: 1s')
@@ -131,8 +151,8 @@ describe('H4a player UI', () => {
   it('spawns fixed death drops, transfers metadata, clears storage metadata, restores vitals, and dirties the session', () => {
     const empty = emptyPlayerStorage()
     const inventorySlots = [...empty.inventory.slots]
-    inventorySlots[0] = itemStack('diamond_pickaxe', 1)
-    inventorySlots[5] = itemStack('stone', 4)
+    inventorySlots[0] = Result.getOrThrow(itemStack('diamond_pickaxe', 1))
+    inventorySlots[5] = Result.getOrThrow(itemStack('stone', 4))
     const storage: PlayerStorage = {
       ...empty,
       inventory: { slots: inventorySlots },
@@ -140,17 +160,17 @@ describe('H4a player UI', () => {
         index === 0 ? { current: 1500, max: 1561 } : durability,
       ),
     }
-    const deathPosition = { x: 4.5, y: 65, z: -2.25 }
-    const vitals = {
-      healthPoints: 6,
-      maxHealthPoints: 20,
-      hungerPoints: 13,
-      maxHungerPoints: 20,
-      saturation: 2,
-      exhaustion: 1,
-      foodTimerSecs: 3,
-      totalExperience: 27,
-      lastDamageCause: 'fall',
+    const deathPosition = position(PositionAxis(4.5), PositionAxis(65), PositionAxis(-2.25))
+    const vitals: Vitals = {
+      healthPoints: EntityHealthPoints(6),
+      maxHealthPoints: EntityHealthPoints(20),
+      hungerPoints: HungerPoints(13),
+      maxHungerPoints: HungerPoints(20),
+      saturation: FoodSaturation(2),
+      exhaustion: ExhaustionAmount(1),
+      foodTimerSecs: FoodTimerSecs(3),
+      totalExperience: TotalExperience(27),
+      lastDamageCause: DamageCause('fall'),
     }
     const customNames = new Map<string, string>([
       ['0', 'Fortune Miner'],

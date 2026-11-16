@@ -1,7 +1,9 @@
-import { Effect, Layer, Scope } from 'effect'
-import { indexedDbStorageLayer } from '@nerima-games/mc-save'
+import { Array as Arr, Effect, Layer, Result, Scope } from 'effect'
+import { WorldId } from '@nerima-games/mc-kernel'
+import { IndexedDbDatabaseName, indexedDbStorageLayer } from '@nerima-games/mc-save'
 import {
   createMainMenuView,
+  decodeWorldNameText,
   initialMainMenuState,
   mainMenuViewModel,
   type CreateWorldRequest,
@@ -85,10 +87,12 @@ export const bootTitleMenu = async (context: TitleMenuContext): Promise<void> =>
     titleStatus.textContent = MISSING_SESSION_ERROR
   }
 
+  // DATABASE_NAME is a non-empty literal, the only IndexedDbDatabaseName requirement.
+  const databaseName = IndexedDbDatabaseName(DATABASE_NAME)
   const scope = Effect.runSync(Scope.make())
   const storageContext = await Effect.runPromise(
     Effect.provideService(
-      Layer.build(indexedDbStorageLayer({ factory: indexedDB, databaseName: DATABASE_NAME })),
+      Layer.build(indexedDbStorageLayer({ factory: indexedDB, databaseName })),
       Scope.Scope,
       scope,
     ),
@@ -119,10 +123,18 @@ export const bootTitleMenu = async (context: TitleMenuContext): Promise<void> =>
       },
     )
   }
-  const savedWorlds: ReadonlyArray<SavedWorld> = sessions.map(({ sessionId, metadata }) => ({
-    sessionId,
-    name: metadata.name,
-  }))
+  // Stored heads only guarantee a non-empty session id, while WorldId also rejects
+  // blank ids. Such a session cannot be opened through sessionHref either, so it is
+  // left out of the list and reported rather than shown under a substituted id.
+  const [savedWorlds, invalidSessionIds] = Arr.partition(sessions, ({ sessionId, metadata }) =>
+    Result.map(WorldId.result(sessionId), (worldId): SavedWorld => ({
+      sessionId: worldId,
+      // WorldNameTextSchema is an unchecked string brand, so decoding a string cannot fail.
+      name: Result.getOrThrow(decodeWorldNameText(metadata.name)),
+    })))
+  for (const failure of invalidSessionIds) {
+    console.error('[mc-compose] saved session has an invalid world id', failure)
+  }
   multiplayerWorld.replaceChildren(...savedWorlds.map(({ sessionId, name }) => {
     const option = document.createElement('option')
     option.value = sessionId
