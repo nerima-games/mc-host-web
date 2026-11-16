@@ -146,10 +146,12 @@ import {
   RENDER_STAGE_IDS,
   syncWorld,
   wrapHotbarSelection,
+  type DrawPort,
 } from '@nerima-games/mc-render'
 import { BLOCK } from '@nerima-games/mc-worldgen'
 import { makeBudgetedDirtySource } from './chunk-sync-budget'
 import { makeRedstoneContainerRuntime } from './redstone-container-runtime'
+import { makeScreenshotRuntime } from './screenshot'
 import {
   clearRenderedChunks,
   makeChunkStreaming,
@@ -668,6 +670,34 @@ const bootGame = async (
   document.body.setAttribute('data-mc-compose-route', 'session')
   document.body.setAttribute('data-session-id', sessionId)
   const canvas = requireCanvas('game-canvas')
+  // Starting the download is all the browser lets the page observe; it cannot
+  // confirm the file reached the disk. A throw here becomes the capture's
+  // ScreenshotSaveFailure.
+  const screenshots = makeScreenshotRuntime({
+    canvas,
+    save: (blob, filename) => {
+      const objectUrl = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = objectUrl
+      link.download = filename
+      link.hidden = true
+      document.body.append(link)
+      try {
+        link.click()
+      } finally {
+        link.remove()
+        // Revoking in the click's own task can cancel the download it started.
+        window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0)
+      }
+    },
+  })
+  const handleScreenshotKey = (event: KeyboardEvent): void => {
+    if (event.code !== 'F2' || event.repeat || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return
+    event.preventDefault()
+    const requested = screenshots.request(new Date())
+    if (Result.isFailure(requested)) console.error('Screenshot request rejected', requested.failure)
+  }
+  canvas.addEventListener('keydown', handleScreenshotKey)
   const hudParent = requireElement('hud-root')
   const captionsParent = requireElement('sound-captions')
   const inventoryParent = requireElement('inventory-root')
@@ -2334,12 +2364,27 @@ const bootGame = async (
   // 3. Composition
   // -------------------------------------------------------------------------
 
+  // toBlob must start in the draw's own continuation, before the browser may
+  // discard the WebGL drawing buffer. The save promise settles outside the
+  // frame, so the draw never waits for it.
+  const screenshotDrawPort: DrawPort = {
+    draw: (camera) => adapters.worldRenderer.draw(camera).pipe(
+      Effect.andThen(Effect.sync(() => {
+        void screenshots.captureAfterRender().then((captured) => {
+          if (Result.isFailure(captured)) console.error('Screenshot capture failed', captured.failure)
+        })
+      })),
+    ),
+    resize: (width, height) => adapters.worldRenderer.resize(width, height),
+    setPostProcessingChain: (chain) => adapters.worldRenderer.setPostProcessingChain(chain),
+  }
+
   const composedExit = await Effect.runPromiseExit(
     Effect.flatMap(
       registerHostModules({
         services,
         renderQuality: adapters.renderQuality,
-        draw: adapters.worldRenderer,
+        draw: screenshotDrawPort,
         chunkSyncStage,
         uiFrameState,
         simState,
@@ -3658,6 +3703,7 @@ const bootGame = async (
       }, 100)
       surface.onCleanup(() => {
         window.clearInterval(hiddenNetworkPump)
+        canvas.removeEventListener('keydown', handleScreenshotKey)
         disposeQaSurface()
         document.body.setAttribute('data-mc-compose-boot', 'stopped')
       })
