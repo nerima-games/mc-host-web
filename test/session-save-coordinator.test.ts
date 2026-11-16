@@ -509,7 +509,7 @@ describe('owner-backed save state', () => {
     }
     const encoded = await Effect.runPromise(Schema.encodeEffect(SESSION_FORMAT.schema)(head))
     const decoded = await Effect.runPromise(Schema.decodeUnknownEffect(SESSION_FORMAT.schema)(encoded))
-    expect(SESSION_FORMAT_VERSION).toBe(18)
+    expect(SESSION_FORMAT_VERSION).toBe(19)
     expect(decoded.state.crops).toEqual(loaded.crops)
     const restored = await Effect.runPromise(makeRestoredCoordinator(decoded.state))
     expect((await Effect.runPromise(restored.snapshot(GAMEPLAY_CROPS_OWNER_ID, CropSnapshotSchema))).state)
@@ -682,7 +682,7 @@ describe('session save failure messages', () => {
     const state = await generatedSessionState()
     const futureHead = Result.getOrThrow(sealSaveEnvelope({
       format: SaveFormatName(SESSION_FORMAT_NAME),
-      version: SaveFormatVersion(19),
+      version: SaveFormatVersion(20),
       payload: {
         sessionId: 'host-world',
         revision: 'r1',
@@ -696,7 +696,7 @@ describe('session save failure messages', () => {
     const rejection = await rejectionOfHostSave(Layer.succeed(StoragePort, storage))
 
     expect(rejection).toBeInstanceOf(SessionIncompatibleError)
-    expect(rejection).toMatchObject({ reason: 'future-version', storedVersion: 19, currentVersion: 18 })
+    expect(rejection).toMatchObject({ reason: 'future-version', storedVersion: 20, currentVersion: 19 })
     expect(sessionSaveFailureMessage(rejection)).toBe(
       'This world was saved by a newer version. Saving is blocked so it is not overwritten.',
     )

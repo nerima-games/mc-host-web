@@ -1,7 +1,21 @@
-import { assert, describe, expect, it } from '@effect/vitest'
-import { Effect, Option, Result, Schema } from 'effect'
-import { SaveDecodeError, SaveKey, StorageError } from '@nerima-games/mc-save'
-
+import {
+  assert,
+  describe,
+  expect,
+  it,
+  beforeAll,
+} from '@effect/vitest'
+import {
+  Effect,
+  Option,
+  Result,
+  Schema,
+} from 'effect'
+import {
+  SaveDecodeError,
+  SaveKey,
+  StorageError,
+} from '@nerima-games/mc-save'
 import {
   ChunkAxis,
   chunkCoord,
@@ -11,6 +25,8 @@ import {
   position,
   PositionAxis,
   WorldIdSchema,
+  blockIdOf,
+  encodeBlockState,
 } from '@nerima-games/mc-kernel'
 import {
   BrewingStateSchema,
@@ -31,6 +47,10 @@ import {
   NoiseSeed,
   type ChunkSource,
   type ChunkWithBlockStates,
+  generatedDimensionChunkSource,
+  chunkSnapshotOf,
+  type Chunk,
+  type Dimension,
 } from '@nerima-games/mc-worldgen'
 import {
   ExperienceOrbVitalsOwnerSnapshotSchema,
@@ -57,7 +77,6 @@ import {
   type MobEntity,
   type MobRoster,
 } from '@nerima-games/mx-gameplay'
-
 import {
   gameplayOwnerInitialState,
   makeSessionChunkSourceFor,
@@ -67,9 +86,15 @@ import {
   sessionLoadErrorOf,
   sessionOpenFailureMessage,
   type GeneratedOwnerState,
+  makeSessionTerrainSources,
+  restoreDimensionTerrain,
 } from '../apps/web/session-restoration'
-import { createDroppedItemLifetimeTracker } from '../apps/web/dropped-item-lifetime'
-import { initializeSessionWorld } from '../apps/web/session-world'
+import {
+  createDroppedItemLifetimeTracker,
+} from '../apps/web/dropped-item-lifetime'
+import {
+  initializeSessionWorld,
+} from '../apps/web/session-world'
 import {
   SessionCorruptError,
   SessionIncompatibleError,
@@ -77,8 +102,11 @@ import {
   type PersistedEntityRosters,
   type SessionOpenError,
   type SessionState,
+  type DimensionChunk,
 } from '../apps/web/session-persistence'
-import { makeHostWorldWrite } from '../apps/web/world-write-port'
+import {
+  makeHostWorldWrite,
+} from '../apps/web/world-write-port'
 
 const chunk = (cx: number, cz: number, marker: number): ChunkWithBlockStates => ({
   coord: chunkCoord(ChunkAxis(cx), ChunkAxis(cz)),
@@ -121,7 +149,7 @@ describe('session open failure messages', () => {
     [
       new StorageError({ operation: 'get', key: 'mc-compose/session/w/head' }),
       'session-storage-failure',
-      'Saved worlds could not be read from browser storage.',
+      'Saved worlds could not be read from or updated in browser storage.',
     ],
   ]
 
@@ -138,6 +166,119 @@ describe('session open failure messages', () => {
     expect(sessionLoadErrorMessage('missing-session')).toEqual(Option.none())
     expect(sessionLoadErrorMessage('toString')).toEqual(Option.none())
   })
+})
+
+const seed = NoiseSeed(81)
+const coord = chunkCoord(ChunkAxis(0), ChunkAxis(0))
+const materialize = async (chunk: Chunk): Promise<ChunkWithBlockStates> => {
+  const store = await Effect.runPromise(makeChunkStore(() => Effect.succeed(chunk), ChunkCapacity(1)))
+  await Effect.runPromise(store.load(chunk.coord))
+  return Option.getOrThrow(Option.fromUndefinedOr(await Effect.runPromise(store.snapshot(chunk.coord))))
+}
+const terrainFixtures = new Map<Dimension, { generated: Chunk; snapshot: ChunkWithBlockStates }>()
+beforeAll(async () => {
+  for (const dimension of ['overworld', 'nether', 'end'] satisfies ReadonlyArray<Dimension>) {
+    const generated = await Effect.runPromise(generatedDimensionChunkSource(seed, dimension)(coord))
+    terrainFixtures.set(dimension, { generated, snapshot: await materialize(generated) })
+  }
+})
+const terrainFixture = (dimension: Dimension): { generated: Chunk; snapshot: ChunkWithBlockStates } =>
+  Option.getOrThrow(Option.fromUndefinedOr(terrainFixtures.get(dimension)))
+const legacyChunk = async (): Promise<ChunkWithBlockStates> =>
+  chunkSnapshotOf(terrainFixture('overworld').snapshot)
+
+describe('dimension terrain restoration', () => {
+  for (const dimension of ['nether', 'end'] satisfies ReadonlyArray<Dimension>) {
+    it(`rebuilds an unedited saved ${dimension} chunk from that dimension`, async () => {
+      const saved = await legacyChunk()
+      const result = await Effect.runPromise(restoreDimensionTerrain(makeSessionTerrainSources(seed), [{ dimension, chunk: saved }]))
+      const fixture = terrainFixture(dimension)
+      const expected = {
+        ...fixture.generated,
+        ...chunkSnapshotOf(fixture.snapshot),
+      }
+
+      expect(result.chunks).toEqual([{ dimension, chunk: expected }])
+      expect(result.rebuiltChunks).toEqual(result.chunks)
+      expect(result.chunks[0]?.chunk.blocks).not.toEqual(saved.blocks)
+      expect(saved).toEqual(await legacyChunk())
+    })
+  }
+
+  it('preserves an edited block instead of regenerating it', async () => {
+    const saved = await legacyChunk()
+    // Generated air at the world ceiling becomes stone with its default state.
+    saved.blocks[saved.blocks.length - 1] = 1
+    saved.blockStates[saved.blockStates.length - 1] = 0
+    const result = await Effect.runPromise(restoreDimensionTerrain(makeSessionTerrainSources(seed), [{ dimension: 'nether', chunk: saved }]))
+
+    expect(result.chunks).toEqual([{ dimension: 'nether', chunk: saved }])
+    expect(result.rebuiltChunks).toEqual([])
+  })
+
+  it('preserves a biome edit even when every block matches', async () => {
+    const legacy = await legacyChunk()
+    const saved: ChunkWithBlockStates = { ...legacy, biomes: legacy.biomes.map(() => 'DESERT') }
+    const result = await Effect.runPromise(restoreDimensionTerrain(makeSessionTerrainSources(seed), [{ dimension: 'end', chunk: saved }]))
+
+    expect(result.chunks[0]?.chunk).toEqual(saved)
+    expect(result.rebuiltChunks).toEqual([])
+  })
+
+  it('preserves a block-state edit when block ids are unchanged', async () => {
+    const saved = await legacyChunk()
+    const water = Option.getOrThrow(blockIdOf('water'))
+    const index = saved.blocks.findIndex((id) => id === water)
+    expect(index).toBeGreaterThanOrEqual(0)
+    saved.blockStates[index] = Result.getOrThrow(encodeBlockState(water, { level: 1 }))
+    const result = await Effect.runPromise(restoreDimensionTerrain(makeSessionTerrainSources(seed), [{ dimension: 'nether', chunk: saved }]))
+
+    expect(result.chunks[0]?.chunk).toEqual(saved)
+    expect(result.rebuiltChunks).toEqual([])
+  })
+
+  it('never rebuilds a saved overworld chunk', async () => {
+    const saved = await legacyChunk()
+    const result = await Effect.runPromise(restoreDimensionTerrain(makeSessionTerrainSources(seed), [{ dimension: 'overworld', chunk: saved }]))
+
+    expect(result.chunks).toEqual([{ dimension: 'overworld', chunk: saved }])
+    expect(result.rebuiltChunks).toEqual([])
+  })
+
+  it('keys rebuilt chunks by dimension at the same coordinates', async () => {
+    const saved = await legacyChunk()
+    const records: Array<DimensionChunk> = [
+      { dimension: 'overworld', chunk: saved },
+      { dimension: 'nether', chunk: chunkSnapshotOf(saved) },
+      { dimension: 'end', chunk: chunkSnapshotOf(saved) },
+    ]
+    const result = await Effect.runPromise(restoreDimensionTerrain(makeSessionTerrainSources(seed), records))
+
+    expect(result.rebuiltChunks.map(({ dimension, chunk }) => ({ dimension, coord: chunk.coord }))).toEqual([
+      { dimension: 'nether', coord },
+      { dimension: 'end', coord },
+    ])
+    expect(result.chunks[0]).toEqual(records[0])
+    expect(result.chunks[1]?.chunk.blocks).not.toEqual(result.chunks[2]?.chunk.blocks)
+  })
+
+  it('propagates schema failure from an injected invalid chunk buffer', async () => {
+    const legacy = await legacyChunk()
+    const corrupt = { ...legacy, blockStates: new Uint32Array(1) }
+    const result = await Effect.runPromise(Effect.result(restoreDimensionTerrain(makeSessionTerrainSources(seed), [{ dimension: 'nether', chunk: corrupt }])))
+
+    if (!Result.isFailure(result)) assert.fail('corrupt saved chunk must fail')
+    expect(result.failure._tag).toBe('SchemaError')
+  })
+
+  it('preserves already dimension-generated terrain on subsequent restores', async () => {
+    const saved = chunkSnapshotOf(terrainFixture('end').snapshot)
+    const result = await Effect.runPromise(restoreDimensionTerrain(makeSessionTerrainSources(seed), [{ dimension: 'end', chunk: saved }]))
+
+    expect(result.chunks).toEqual([{ dimension: 'end', chunk: saved }])
+    expect(result.rebuiltChunks).toEqual([])
+  })
+
 })
 
 describe('session restoration', () => {

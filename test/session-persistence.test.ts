@@ -1,8 +1,23 @@
-import { readFileSync } from 'node:fs'
-
-import { assert, describe, expect, it } from '@effect/vitest'
-import { Effect, Layer, Option, Result, Schema } from 'effect'
-
+import * as restoration from '../apps/web/session-restoration'
+import {
+  readFileSync,
+} from 'node:fs'
+import {
+  assert,
+  describe,
+  expect,
+  it,
+  afterEach,
+  beforeAll,
+} from '@effect/vitest'
+import {
+  Effect,
+  Layer,
+  Option,
+  Result,
+  Schema,
+  Exit,
+} from 'effect'
 import {
   encodeSave,
   SaveFormatName,
@@ -14,6 +29,7 @@ import {
   StoragePort,
   type SaveEnvelope,
   type StorageService,
+  saveBatchEntry,
 } from '@nerima-games/mc-save'
 import {
   FLINT_AND_STEEL_MAX_DURABILITY,
@@ -36,6 +52,8 @@ import {
   WitherHealthPoints,
   type CropSnapshot,
   type Vehicle,
+  WitherProjectileSpeed,
+  WitherExplosionPower,
 } from '@nerima-games/mc-sim'
 import {
   CHUNK_SIZE_XZ,
@@ -47,6 +65,7 @@ import {
   position,
   itemStackEqualsIgnoringCount,
   type ChunkCoord,
+  blockIdOf,
 } from '@nerima-games/mc-kernel'
 import {
   CHUNK_FORMAT,
@@ -54,13 +73,19 @@ import {
   type ChunkSource,
   type ChunkWithBlockStates,
   type Dimension,
+  chunkSnapshotOf,
+  generatedDimensionChunkSource,
+  makeChunkStore,
+  ChunkCapacity,
+  NoiseSeed,
+  blockIndex,
 } from '@nerima-games/mc-worldgen'
 import {
   SPAWN_PLAYER_VITALS,
   emptyStatusEffectState,
   isDroppedItemBehaviour,
+  makeVillager,
 } from '@nerima-games/mx-gameplay'
-
 import {
   EMPTY_END_STATE,
   EMPTY_ENTITY_ROSTER,
@@ -92,7 +117,11 @@ import {
   sessionLoadErrorOf,
   sessionOpenFailureMessage,
   sessionOpenNotice,
+  reconcileTerrainMigrationState,
 } from '../apps/web/session-restoration'
+import {
+  vi,
+} from 'vitest'
 
 const fixtureEnvelopeText = (name: string): string =>
   readFileSync(new URL(`./fixtures/${name}`, import.meta.url), 'utf8')
@@ -214,6 +243,21 @@ const dimensionChunk = (
   cz: number,
   marker: number,
 ): DimensionChunk => ({ dimension, chunk: chunk(cx, cz, marker) })
+
+let legacyTerrain: ChunkWithBlockStates
+let legacyTerrainEnvelope: SaveEnvelope
+const generatedTerrainFixtures = new Map<Dimension, ChunkWithBlockStates>()
+beforeAll(async () => {
+  for (const dimension of ['overworld', 'nether', 'end'] satisfies ReadonlyArray<Dimension>) {
+    const source = generatedDimensionChunkSource(NoiseSeed(81), dimension)
+    const store = await Effect.runPromise(makeChunkStore(source, ChunkCapacity(1)))
+    await Effect.runPromise(store.load(coordOf(0, 0)))
+    generatedTerrainFixtures.set(dimension, Option.getOrThrow(Option.fromUndefinedOr(await Effect.runPromise(store.snapshot(coordOf(0, 0))))))
+  }
+  legacyTerrain = Option.getOrThrow(Option.fromUndefinedOr(generatedTerrainFixtures.get('overworld')))
+  legacyTerrainEnvelope = await Effect.runPromise(saveBatchEntry(CHUNK_FORMAT, SaveKey('terrain-fixture'), legacyTerrain).prepare)
+})
+afterEach(() => { vi.restoreAllMocks() })
 
 describe('dynamic entity persistence', () => {
   it('reads item-drop elapsed time and defaults legacy saves to zero', () => {
@@ -454,6 +498,9 @@ const controlledStorage = (): ControlledStorage => {
         const next = new Map(entries)
         for (const mutation of mutations) {
           const key = mutation.key
+          if (mutation.expected !== undefined && JSON.stringify(Option.getOrUndefined(mutation.expected)) !== JSON.stringify(entries.get(key))) {
+            return Effect.fail(new StorageError({ operation: 'commitBatch', key }))
+          }
           if (mutation._tag === 'Put') {
             if (String(key).includes('/chunk/')) state.chunkWriteCount += 1
             if (state.failChunkKey === String(key)) {
@@ -533,6 +580,309 @@ const controlledStorage = (): ControlledStorage => {
 }
 
 describe('session persistence', () => {
+  const safeChunk = (cx = 0): ChunkWithBlockStates => {
+    const terrain = chunk(cx, 0, Option.getOrThrow(blockIdOf('air')))
+    terrain.blocks[blockIndex(1, 63, 1)] = Option.getOrThrow(blockIdOf('stone'))
+    return terrain
+  }
+
+  it.effect('moves an affected player onto actual terrain and resets only affected non-player state', () => Effect.gen(function* () {
+    const state = sessionState(81)
+    const affectedPosition = { x: 1.5, y: 80, z: 1.5 }
+    const editedPosition = { x: 17.5, y: 64, z: 1.5 }
+    const roster = normalizePersistedEntityRoster({ nextSerial: 9, entities: [
+      ...['zombie', 'dropped_item', 'experience_orb'].map((kind, index) => ({
+        id: `affected-${index}`, kind, feetPosition: affectedPosition, healthPoints: 1,
+        behaviour: kind === 'dropped_item' ? { item: 'stone', count: 1 } : {},
+      })),
+      { id: 'edited-zombie', kind: 'zombie', feetPosition: editedPosition, healthPoints: 20, behaviour: {} },
+    ] })
+    expect(roster.entities).toHaveLength(4)
+    const vehicles = validVehicles([affectedPosition, editedPosition].map((at, index) => ({
+      id: `v:${index}`, type: 'boat', dimension: 'nether', position: at,
+      velocity: { x: 0.25, y: 0, z: -0.5 }, yawRadians: 1,
+      ...(index === 0 ? { occupant: 'local-player' } : {}),
+    })), 2)
+    const wither = state.wither!.withers[0]!
+    const skull = (id: string, at: typeof affectedPosition): NonNullable<SessionState['wither']>['skulls'][number] => ({
+      id, ownerId: wither.id, dimension: 'nether', position: position(PositionAxis(at.x), PositionAxis(at.y), PositionAxis(at.z)), ageSecs: 1,
+      descriptor: { kind: 'wither_skull', variant: 'normal', origin: wither.snapshot.state.feetPosition,
+        direction: position(PositionAxis(1), PositionAxis(0), PositionAxis(0)),
+        speed: WitherProjectileSpeed(1), explosivePower: WitherExplosionPower(1), destroysResistantBlocks: false },
+    })
+    const input: SessionState = {
+      ...state, dimension: 'nether', player: { ...state.player, feetPosition: affectedPosition },
+      end: { ...state.end, dragon: { phase: 'dead', phaseTimerSecs: 7, health: 0, rewardEmitted: true },
+        exitPortalMaterialized: true, dragonEggRewarded: true },
+      entities: { ...state.entities, nether: roster }, vehicles, mountedVehicleId: 'v:0',
+      villagers: { residents: [
+        { id: 'affected-villager', profession: 'farmer', dimension: 'nether', feetPosition: affectedPosition },
+        { id: 'edited-villager', profession: 'toolsmith', dimension: 'nether', feetPosition: editedPosition },
+      ], trades: { villagers: [makeVillager('affected-villager', 'farmer'), makeVillager('edited-villager', 'toolsmith')], restockElapsedSecs: 71 } },
+      wither: { ...state.wither!, withers: [{ ...wither, dimension: 'nether', snapshot: { ...wither.snapshot, state: { ...wither.snapshot.state,
+        feetPosition: position(PositionAxis(1.5), PositionAxis(64), PositionAxis(1.5)) } } }],
+        skulls: [skull('affected-skull', affectedPosition), skull('edited-skull', editedPosition)] },
+    }
+    const replacement: DimensionChunk = { dimension: 'nether', chunk: safeChunk() }
+    const sources = { overworld: () => Effect.succeed(safeChunk()), nether: () => Effect.succeed(safeChunk()), end: () => Effect.succeed(safeChunk()) }
+    const result = yield* reconcileTerrainMigrationState(input, { chunks: [replacement], rebuiltChunks: [replacement] }, sources)
+    expect(result.state.player).toEqual({ ...input.player, feetPosition: { x: 1.5, y: 64, z: 1.5 } })
+    expect(result.state.entities.nether.entities).toEqual(roster.entities.filter(({ id }) => id === 'edited-zombie'))
+    expect(result.state.entities.nether.nextSerial).toBe(9)
+    expect(result.state.vehicles).toEqual([vehicles[1]])
+    expect(result.state.mountedVehicleId).toBeNull()
+    expect(result.state.wither?.withers).toEqual([])
+    expect(result.state.wither?.skulls).toEqual([input.wither!.skulls[1]])
+    expect(result.state.villagers).toEqual({ residents: [input.villagers.residents[1]],
+      trades: { ...input.villagers.trades, villagers: [input.villagers.trades.villagers[1]] } })
+    expect(result.state.end).toEqual(input.end)
+    expect(result.state.storage).toEqual(input.storage)
+  }))
+
+  it.effect('preserves an unaffected player and uses a saved center before generating a fallback', () => Effect.gen(function* () {
+    const state = sessionState(81)
+    const replacement: DimensionChunk = { dimension: 'end', chunk: chunk(2, 0, 0) }
+    let generated = 0
+    const source: ChunkSource = () => Effect.sync(() => { generated += 1; return safeChunk() })
+    const sources = { overworld: source, nether: source, end: source }
+    const unaffected = yield* reconcileTerrainMigrationState(state, { chunks: [replacement], rebuiltChunks: [replacement] }, sources)
+    expect(unaffected.state.player).toEqual(state.player)
+    const affected: SessionState = { ...state, dimension: 'end', player: { ...state.player, feetPosition: { x: 33, y: 70, z: 1 } } }
+    const savedCenter: DimensionChunk = { dimension: 'end', chunk: safeChunk() }
+    const saved = yield* reconcileTerrainMigrationState(affected, { chunks: [replacement, savedCenter], rebuiltChunks: [replacement] }, sources)
+    expect(saved.state.player.feetPosition).toEqual({ x: 1.5, y: 64, z: 1.5 })
+    expect(generated).toBe(0)
+    const fresh = yield* reconcileTerrainMigrationState(affected, { chunks: [replacement], rebuiltChunks: [replacement] }, sources)
+    expect(generated).toBe(1)
+    expect(fresh.chunks).toHaveLength(2)
+    expect(fresh.chunks[1]?.chunk.coord).toEqual(coordOf(0, 0))
+    const blocked = yield* Effect.result(reconcileTerrainMigrationState(affected, {
+      chunks: [replacement, { dimension: 'end', chunk: chunk(0, 0, 0) }], rebuiltChunks: [replacement],
+    }, sources))
+    expect(Result.isFailure(blocked)).toBe(true)
+    if (Result.isFailure(blocked)) expect(blocked.failure._tag).toBe('SessionTerrainMigrationUnsafePosition')
+    expect(generated).toBe(1)
+  }))
+
+  const seedV18 = (storage: ControlledStorage, chunks: ReadonlyArray<DimensionChunk>, state = sessionState(81)) => Effect.gen(function* () {
+    const source = (dimension: Dimension): ChunkSource => () => Effect.sync(() =>
+      chunkSnapshotOf(Option.getOrThrow(Option.fromUndefinedOr(generatedTerrainFixtures.get(dimension)))))
+    vi.spyOn(crypto, 'randomUUID').mockReturnValue('00000000-0000-4000-8000-000000000001')
+    vi.spyOn(restoration, 'makeSessionTerrainSources').mockReturnValue({
+      overworld: source('overworld'), nether: source('nether'), end: source('end'),
+    })
+    const manifest = chunks.map(({ dimension, chunk }) => {
+      const key = sessionChunkKey('terrain-v18', 'original', dimension, chunk.coord)
+      // Reuse the prepared CHUNK_FORMAT payload in each independent storage map.
+      storage.setEnvelope(key, legacyTerrainEnvelope)
+      return { dimension, coord: chunk.coord, key }
+    })
+    storage.setEnvelope(sessionHeadKey('terrain-v18'), {
+      format: SESSION_FORMAT_NAME, version: 18, payload: {
+        sessionId: 'terrain-v18', revision: 'original', metadata: defaultMetadata,
+        state: storedRecord(state), chunks: manifest,
+      },
+    })
+    yield* Effect.void
+  })
+
+  it.effect('leaves the old head valid when an affected player has no safe terrain', () => {
+    const storage = controlledStorage()
+    return Effect.gen(function* () {
+      const state: SessionState = { ...sessionState(81), dimension: 'nether',
+        player: { ...sessionState(81).player, feetPosition: { x: 1, y: 64, z: 1 } } }
+      yield* seedV18(storage, [{ dimension: 'nether', chunk: legacyTerrain }], state)
+      const head = storage.envelope(sessionHeadKey('terrain-v18'))
+      const keys = [...storage.keys]
+      const sourceFactory = vi.spyOn(restoration, 'makeSessionTerrainSources').mockReturnValue({
+        overworld: () => Effect.succeed(legacyTerrain),
+        nether: () => Effect.succeed(chunk(0, 0, 0)),
+        end: () => Effect.succeed(chunk(0, 0, 0)),
+      })
+      const failed = yield* Effect.result(loadSession('terrain-v18'))
+      sourceFactory.mockRestore()
+      expect(Result.isFailure(failed)).toBe(true)
+      if (Result.isFailure(failed)) expect(failed.failure._tag).toBe('SessionTerrainMigrationUnsafePosition')
+      expect(storage.envelope(sessionHeadKey('terrain-v18'))).toEqual(head)
+      expect(storage.keys).toEqual(keys)
+    }).pipe(Effect.provide(storage.layer))
+  })
+
+  it.effect('publishes terrain migration once with all dimensions in a new revision', () => {
+    const storage = controlledStorage()
+    return Effect.gen(function* () {
+      yield* seedV18(storage, [
+        { dimension: 'overworld', chunk: legacyTerrain },
+        { dimension: 'nether', chunk: legacyTerrain },
+        { dimension: 'end', chunk: legacyTerrain },
+      ])
+      const oldHead = storage.envelope(sessionHeadKey('terrain-v18'))
+      const listed = yield* listSessions()
+      expect(listed).toHaveLength(1)
+      expect(storage.envelope(sessionHeadKey('terrain-v18'))).toEqual(oldHead)
+      const migrated = Option.getOrThrow(yield* loadSession('terrain-v18'))
+      expect(migrated.revision).toBe('original-terrain-v19-00000000-0000-4000-8000-000000000001')
+      expect(migrated.chunks).toHaveLength(3)
+      expect(storage.keys.filter((key) => key.includes('/chunk/'))).toHaveLength(6)
+      expect(storage.keys.some((key) => key.includes('/revision/original/') && !key.includes('/checkpoint/'))).toBe(false)
+      expect(storage.envelope(sessionHeadKey('terrain-v18'))?.version).toBe(19)
+      const loaded = yield* makeSessionChunkSource(migrated, 'overworld', () => Effect.succeed(legacyTerrain))
+      expect(loaded.chunks[0]?.chunk.blocks).toEqual(legacyTerrain.blocks)
+      expect(loaded.chunks[1]?.chunk.blocks).not.toEqual(legacyTerrain.blocks)
+      expect(loaded.chunks[2]?.chunk.blocks).not.toEqual(legacyTerrain.blocks)
+      storage.chunkWriteCount = 0
+      expect(Option.getOrThrow(yield* loadSession('terrain-v18'))).toEqual(migrated)
+      expect(storage.chunkWriteCount).toBe(0)
+    }).pipe(Effect.provide(storage.layer))
+  })
+
+  for (const failure of ['chunk', 'head'] satisfies ReadonlyArray<'chunk' | 'head'>) {
+    it.effect(`retains the old complete revision when migration ${failure} publication fails and retries`, () => {
+      const storage = controlledStorage()
+      return Effect.gen(function* () {
+        yield* seedV18(storage, [{ dimension: 'nether', chunk: legacyTerrain }])
+        const oldHead = storage.envelope(sessionHeadKey('terrain-v18'))
+        const oldKeys = [...storage.keys]
+        if (failure === 'chunk') storage.failChunkKey = sessionChunkKey('terrain-v18', 'original-terrain-v19-00000000-0000-4000-8000-000000000001', 'nether', coordOf(0, 0))
+        else storage.failNextHeadWrite = true
+        const failed = yield* Effect.result(loadSession('terrain-v18'))
+        expect(Result.isFailure(failed)).toBe(true)
+        if (Result.isFailure(failed)) expect(failed.failure._tag).toBe('StorageError')
+        expect(storage.envelope(sessionHeadKey('terrain-v18'))).toEqual(oldHead)
+        expect(storage.keys).toEqual(oldKeys)
+        storage.failChunkKey = undefined
+        const retried = Option.getOrThrow(yield* loadSession('terrain-v18'))
+        expect(retried.revision).toBe('original-terrain-v19-00000000-0000-4000-8000-000000000001')
+        expect(storage.envelope(sessionHeadKey('terrain-v18'))?.version).toBe(19)
+      }).pipe(Effect.provide(storage.layer))
+    })
+  }
+
+  it.effect('does not compare or regenerate terrain on an ordinary v19 boot', () => {
+    const storage = controlledStorage()
+    return Effect.gen(function* () {
+      yield* saveSession({ sessionId: 'current', revision: 'current', state: sessionState(81), chunks: [{ dimension: 'nether', chunk: legacyTerrain }] })
+      const before = storage.chunkWriteCount
+      const sourceFactory = vi.spyOn(restoration, 'makeSessionTerrainSources')
+      const loaded = Option.getOrThrow(yield* loadSession('current'))
+      expect(sourceFactory).not.toHaveBeenCalled()
+      sourceFactory.mockRestore()
+      expect(loaded.revision).toBe('current')
+      expect(storage.chunkWriteCount).toBe(before)
+      expect(storage.envelope(loaded.chunks[0]!.key)?.payload).toBeDefined()
+    }).pipe(Effect.provide(storage.layer))
+  })
+
+  it('keeps the old revision usable when interrupted before atomic publication', async () => {
+    const storage = controlledStorage()
+    await Effect.runPromise(seedV18(storage, [{ dimension: 'nether', chunk: legacyTerrain }]).pipe(Effect.provide(storage.layer)))
+    const previous = storage.envelope(sessionHeadKey('terrain-v18'))
+    const keys = [...storage.keys]
+    const exited = await Effect.runPromiseExit(Effect.gen(function* () {
+      const service = yield* StoragePort
+      return yield* loadSession('terrain-v18').pipe(Effect.provideService(StoragePort, {
+        ...service, commitBatch: () => Effect.interrupt,
+      }))
+    }).pipe(Effect.provide(storage.layer)))
+    expect(Exit.isFailure(exited)).toBe(true)
+    expect(storage.envelope(sessionHeadKey('terrain-v18'))).toEqual(previous)
+    expect(storage.keys).toEqual(keys)
+    const retried = await Effect.runPromise(loadSession('terrain-v18').pipe(Effect.provide(storage.layer)))
+    expect(Option.getOrThrow(retried).revision).toBe('original-terrain-v19-00000000-0000-4000-8000-000000000001')
+  })
+
+  for (const conflict of ['head', 'chunk'] satisfies ReadonlyArray<'head' | 'chunk'>) {
+    it.effect(`does not overwrite a concurrently changed migration ${conflict}`, () => {
+      const storage = controlledStorage()
+      return Effect.gen(function* () {
+        yield* seedV18(storage, [{ dimension: 'nether', chunk: legacyTerrain }])
+        const service = yield* StoragePort
+        const conflictKey = conflict === 'head' ? sessionHeadKey('terrain-v18') : sessionChunkKey('terrain-v18', 'original', 'nether', coordOf(0, 0))
+        const previous = storage.envelope(conflictKey)!
+        const concurrent = Result.getOrThrow(sealSaveEnvelope({ format: previous.format, version: SaveFormatVersion(999), payload: previous.payload }))
+        const failed = yield* Effect.result(loadSession('terrain-v18').pipe(Effect.provideService(StoragePort, {
+          ...service, commitBatch: (mutations) => Effect.suspend(() => {
+            storage.setEnvelope(conflictKey, concurrent)
+            return service.commitBatch(mutations)
+          }),
+        })))
+        expect(Result.isFailure(failed)).toBe(true)
+        expect(storage.envelope(conflictKey)).toEqual(concurrent)
+        expect(storage.keys.some((key) => key.includes('/original-terrain-v19/'))).toBe(false)
+      }).pipe(Effect.provide(storage.layer))
+    })
+  }
+
+
+  const seedCheckpointMigration = (storage: ControlledStorage) => Effect.gen(function* () {
+    yield* seedV18(storage, [{ dimension: 'nether', chunk: legacyTerrain }])
+    const head = storage.envelope(sessionHeadKey('terrain-v18'))!
+    storage.setEnvelope('mc-compose/session/terrain-v18/checkpoint/head', head)
+    storage.setEnvelope('mc-compose/session/terrain-v18/checkpoint/revision/original/dimension/nether/chunk/0/0', legacyTerrainEnvelope)
+    storage.setEnvelope(sessionHeadKey('terrain-v18'), { format: SESSION_FORMAT_NAME, version: 19, payload: { damaged: true } })
+    const service = yield* StoragePort
+    yield* service.remove(sessionChunkKey('terrain-v18', 'original', 'nether', coordOf(0, 0)))
+  })
+
+  it.effect('recovers the same v18 checkpoint again after a migrated live revision is damaged', () => {
+    const storage = controlledStorage()
+    return Effect.gen(function* () {
+      yield* seedCheckpointMigration(storage)
+      const checkpoint = storage.envelope('mc-compose/session/terrain-v18/checkpoint/head')
+      const first = Option.getOrThrow(yield* openSession('terrain-v18'))
+      expect(first._tag).toBe('Checkpoint')
+      expect(first.head.chunks[0]?.key).toBe(sessionChunkKey('terrain-v18', first.head.revision, 'nether', coordOf(0, 0)))
+      expect(storage.envelope('mc-compose/session/terrain-v18/checkpoint/head')).toEqual(checkpoint)
+      storage.setEnvelope(sessionHeadKey('terrain-v18'), { format: SESSION_FORMAT_NAME, version: 19, payload: { damaged: true } })
+      vi.mocked(crypto.randomUUID).mockReturnValue('00000000-0000-4000-8000-000000000002')
+      const second = Option.getOrThrow(yield* openSession('terrain-v18'))
+      expect(second._tag).toBe('Checkpoint')
+      expect(second.head.revision).not.toBe(first.head.revision)
+      expect(storage.envelope('mc-compose/session/terrain-v18/checkpoint/head')).toEqual(checkpoint)
+      expect(storage.envelope(second.head.chunks[0]!.key)).toBeDefined()
+      expect(Option.getOrThrow(yield* openSession('terrain-v18'))._tag).toBe('Live')
+    }).pipe(Effect.provide(storage.layer))
+  })
+
+  it.effect('does not migrate a selected v19 checkpoint after an unreadable v18 live revision', () => {
+    const storage = controlledStorage()
+    return Effect.gen(function* () {
+      yield* seedV18(storage, [{ dimension: 'nether', chunk: legacyTerrain }])
+      storage.setEnvelope('mc-compose/session/terrain-v18/checkpoint/head', {
+        format: SESSION_FORMAT_NAME, version: 19, payload: { sessionId: 'terrain-v18', revision: 'checkpoint-v19',
+          metadata: defaultMetadata, state: storedRecord(sessionState(81)), chunks: [] },
+      })
+      const service = yield* StoragePort
+      yield* service.remove(sessionChunkKey('terrain-v18', 'original', 'nether', coordOf(0, 0)))
+      vi.mocked(restoration.makeSessionTerrainSources).mockClear()
+      const opened = Option.getOrThrow(yield* openSession('terrain-v18'))
+      expect(opened._tag).toBe('Checkpoint')
+      expect(opened.head.revision).toBe('checkpoint-v19')
+      expect(restoration.makeSessionTerrainSources).not.toHaveBeenCalled()
+      expect(storage.envelope(sessionHeadKey('terrain-v18'))?.version).toBe(18)
+    }).pipe(Effect.provide(storage.layer))
+  })
+
+  it.effect('guards the original damaged live head when publishing a migrated checkpoint', () => {
+    const storage = controlledStorage()
+    return Effect.gen(function* () {
+      yield* seedCheckpointMigration(storage)
+      const service = yield* StoragePort
+      const concurrent = Result.getOrThrow(sealSaveEnvelope({ format: SaveFormatName(SESSION_FORMAT_NAME),
+        version: SaveFormatVersion(19), payload: { concurrent: true } }))
+      const failed = yield* Effect.result(openSession('terrain-v18').pipe(Effect.provideService(StoragePort, {
+        ...service, commitBatch: (mutations) => Effect.suspend(() => {
+          storage.setEnvelope(sessionHeadKey('terrain-v18'), concurrent)
+          return service.commitBatch(mutations)
+        }),
+      })))
+      expect(Result.isFailure(failed)).toBe(true)
+      expect(storage.envelope(sessionHeadKey('terrain-v18'))).toEqual(concurrent)
+      expect(storage.keys.some((key) => key.includes('original-terrain-v19-'))).toBe(false)
+      expect(storage.envelope('mc-compose/session/terrain-v18/checkpoint/head')?.version).toBe(18)
+    }).pipe(Effect.provide(storage.layer))
+  })
+
   it.effect('round-trips session state and its revision manifest', () => {
     const storage = controlledStorage()
     return Effect.gen(function* () {
@@ -721,7 +1071,7 @@ describe('session persistence', () => {
           _tag: 'SessionIncompatibleError',
           reason: 'unsupported-version',
           storedVersion: version,
-          currentVersion: 18,
+          currentVersion: 19,
         })
       }
     }).pipe(Effect.provide(storage.layer))
@@ -972,8 +1322,8 @@ describe('session persistence', () => {
         _tag: 'SessionIncompatibleError',
         reason: 'future-version',
         key: 'mc-compose/session/future-version/head',
-        storedVersion: 19,
-        currentVersion: 18,
+        storedVersion: 20,
+        currentVersion: 19,
       })
     }).pipe(Effect.provide(storage.layer))
   })
@@ -2247,13 +2597,13 @@ describe('session checkpoint and compatibility', () => {
       _tag: 'SessionIncompatibleError',
       reason: 'future-version',
       key: 'mc-compose/session/future/head',
-      storedVersion: 19,
-      currentVersion: 18,
+      storedVersion: 20,
+      currentVersion: 19,
     }
     return Effect.gen(function* () {
       yield* saveRevision('future', 'r1', 1, [3])
       yield* saveRevision('future', 'r2', 2, [5])
-      storage.setEnvelope('mc-compose/session/future/head', sealedHeadDraft('future', 19))
+      storage.setEnvelope('mc-compose/session/future/head', sealedHeadDraft('future', 20))
 
       // The checkpoint is readable, but an older copy must not hide the newer save.
       const openError = yield* Effect.flip(openSession('future'))
@@ -2279,7 +2629,7 @@ describe('session checkpoint and compatibility', () => {
       reason: 'unsupported-version',
       key: 'mc-compose/session/legacy/head',
       storedVersion: 16,
-      currentVersion: 18,
+      currentVersion: 19,
     }
     storage.setEnvelope('mc-compose/session/legacy/head', sealedHeadDraft('legacy', 16))
     return Effect.gen(function* () {
@@ -2547,14 +2897,14 @@ describe('session checkpoint and compatibility', () => {
 
       const opened = Option.getOrThrow(yield* openSession('v17-fixture'))
       assert(opened._tag === 'Live')
-      expect(opened.head.revision).toBe('r1')
-      expect(opened.head.chunks).toEqual([{ dimension: 'overworld', coord: coordOf(0, 0), key: liveChunkKey }])
+      expect(opened.head.revision).toMatch(/^r1-terrain-v19-/u)
+      expect(opened.head.chunks).toEqual([{ dimension: 'overworld', coord: coordOf(0, 0), key: sessionChunkKey('v17-fixture', opened.head.revision, 'overworld', coordOf(0, 0)) }])
       expect(yield* savedMarkers(opened.head)).toEqual([3])
       expect(yield* listSessionEntries()).toEqual({ sessions: [opened.head], unavailable: [] })
 
       yield* saveRevision('v17-fixture', 'r2', 2, [5])
 
-      expect(storage.envelope('mc-compose/session/v17-fixture/checkpoint/head')).toMatchObject({ version: 17 })
+      expect(storage.envelope('mc-compose/session/v17-fixture/checkpoint/head')).toMatchObject({ version: 19 })
       tamper(storage, 'mc-compose/session/v17-fixture/head')
       const fromCheckpoint = Option.getOrThrow(yield* openSession('v17-fixture'))
       assert(fromCheckpoint._tag === 'Checkpoint')
@@ -2562,7 +2912,7 @@ describe('session checkpoint and compatibility', () => {
       expect(fromCheckpoint.head.chunks).toEqual([{
         dimension: 'overworld',
         coord: coordOf(0, 0),
-        key: 'mc-compose/session/v17-fixture/checkpoint/revision/r1/dimension/overworld/chunk/0/0',
+        key: `mc-compose/session/v17-fixture/checkpoint/revision/${opened.head.revision}/dimension/overworld/chunk/0/0`,
       }])
       expect(yield* savedMarkers(fromCheckpoint.head)).toEqual([3])
     }).pipe(Effect.provide(storage.layer))
