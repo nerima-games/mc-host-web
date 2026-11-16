@@ -1,14 +1,17 @@
 import { describe, expect, it } from '@effect/vitest'
 import { Effect, Result } from 'effect'
 
-import { DeltaTimeSecs, MonotonicTimeSecs, position, PositionAxis } from '@nerima-games/mc-kernel'
+import { DeltaTimeSecs, MonotonicTimeSecs, position, PositionAxis, WorldId } from '@nerima-games/mc-kernel'
 import { ESCAPE_KEY_CODE, wrapHotbarSelection, type InputAction, type InputSnapshot } from '@nerima-games/mc-render'
+import { makeWorldCommitCoordinator, PlayerServiceSnapshotSchema } from '@nerima-games/mc-sim'
+import { GAMEPLAY_ENTITIES_OWNER_ID, GAMEPLAY_PLAYER_OWNER_ID, GAMEPLAY_PLAYER_STORAGE_OWNER_ID, GAMEPLAY_VITALS_OWNER_ID, gameplayOwnerRegistrations, makeInMemoryWorld, type MobBehaviour } from '@nerima-games/mx-gameplay'
 
-import { runTickFrameInput, readFrameTiming } from '../apps/web/tick/frame-input'
+import { applyFrameLook, runTickFrameInput, readFrameTiming } from '../apps/web/tick/frame-input'
 import { mutableState, type H5aFrameInputContext } from '../apps/web/tick/h5a-context'
 import { consumeNativeInput, EMPTY_NATIVE_INPUT_QUEUE, type NativeInputQueueState } from '../apps/web/native-input-queue'
 import { selectedHotbarAfterInput } from '../apps/web/player-experience'
-import { TOUCH_LOOK_CONTROLLER_IDLE } from '../apps/web/touch-input'
+import { advanceTouchLook, consumeTouchLook, TOUCH_LOOK_CONTROLLER_IDLE } from '../apps/web/touch-input'
+import { makeOwnerBackedWorld } from '../apps/web/owner-backed-services'
 
 type FrameInputFixtureOptions = {
   readonly paused?: boolean
@@ -145,6 +148,196 @@ const makeFrameInputFixture = (options: FrameInputFixtureOptions = {}) => {
   }
 }
 
+const makeOwnedLookFixture = (options: FrameInputFixtureOptions = {}) => Effect.gen(function* () {
+  const fixture = makeFrameInputFixture(options)
+  const coordinator = yield* makeWorldCommitCoordinator({
+    world: WorldId('frame-look-test'),
+    owners: gameplayOwnerRegistrations(),
+  })
+  const view = yield* makeOwnerBackedWorld({
+    coordinator,
+    world: yield* makeInMemoryWorld<MobBehaviour>(),
+    ownerIds: {
+      player: GAMEPLAY_PLAYER_OWNER_ID,
+      playerStorage: GAMEPLAY_PLAYER_STORAGE_OWNER_ID,
+      vitals: GAMEPLAY_VITALS_OWNER_ID,
+      entities: GAMEPLAY_ENTITIES_OWNER_ID,
+    },
+  })
+  yield* view.player.look(0.25, -0.1)
+  let touchState = TOUCH_LOOK_CONTROLLER_IDLE
+  let lookCalls = 0
+  let touchConsumes = 0
+  const context: H5aFrameInputContext = {
+    ...fixture.context,
+    state: {
+      ...fixture.context.state,
+      touchLookState: mutableState(() => touchState, (next) => { touchState = next }),
+    },
+    touchLook: {
+      consume: (state) => {
+        touchConsumes += 1
+        return consumeTouchLook(state)
+      },
+    },
+    playerSettings: () => ({ sensitivity: 1.5 }),
+    lookSensitivity: 0.002,
+    playerApi: {
+      look: (yaw, pitch) => {
+        lookCalls += 1
+        return view.player.look(yaw, pitch)
+      },
+    },
+  }
+  return {
+    ...fixture,
+    context,
+    coordinator,
+    view,
+    lookCalls: () => lookCalls,
+    touchConsumes: () => touchConsumes,
+    touchState: () => touchState,
+    startTouch: () => {
+      touchState = advanceTouchLook(touchState, 'start', { identifier: 1, clientX: 0, clientY: 0 })
+    },
+    moveTouch: (clientX: number, clientY: number) => {
+      touchState = advanceTouchLook(touchState, 'move', { identifier: 1, clientX, clientY })
+    },
+  }
+})
+
+describe('frame look ownership', () => {
+  it.effect('rotates the player view and owner once for one pointer reading', () => Effect.gen(function* () {
+    const fixture = yield* makeOwnedLookFixture()
+    const before = yield* fixture.coordinator.revision
+    const looked = applyFrameLook(fixture.context, {
+      ...fixture.frameInput,
+      pointerDelta: { x: 12, y: -8 },
+    }, DeltaTimeSecs(1 / 60))
+    const pose = yield* fixture.view.player.pose
+    const owner = yield* fixture.coordinator.snapshot(GAMEPLAY_PLAYER_OWNER_ID, PlayerServiceSnapshotSchema)
+    expect(looked).toBe(true)
+    expect(pose.yawRadians).toBeCloseTo(0.214, 12)
+    expect(pose.pitchRadians).toBeCloseTo(-0.076, 12)
+    expect(owner.state.pose.yawRadians).toBeCloseTo(0.214, 12)
+    expect(owner.state.pose.pitchRadians).toBeCloseTo(-0.076, 12)
+    expect(yield* fixture.coordinator.revision).toBe(before + 1)
+    expect(fixture.lookCalls()).toBe(1)
+    expect(fixture.touchConsumes()).toBe(1)
+    expect(fixture.context.state.previousSecs.get()).toBe(MonotonicTimeSecs(9.875))
+    expect(fixture.calls).toEqual([])
+  }))
+
+  it.effect('does not rotate or consume touch input while processing a tick', () => Effect.gen(function* () {
+    const fixture = yield* makeOwnedLookFixture({ gamepadAxes: { leftX: 0, leftY: 0, rightX: 0.5, rightY: -0.25 } })
+    fixture.startTouch()
+    fixture.moveTouch(6, -4)
+    const before = yield* fixture.coordinator.revision
+    const frame = runTickFrameInput(fixture.context, MonotonicTimeSecs(10), {
+      ...fixture.frameInput,
+      pointerDelta: { x: 12, y: -8 },
+    })
+    const pose = yield* fixture.view.player.pose
+    const owner = yield* fixture.coordinator.snapshot(GAMEPLAY_PLAYER_OWNER_ID, PlayerServiceSnapshotSchema)
+    expect({
+      yaw: pose.yawRadians,
+      pitch: pose.pitchRadians,
+      ownerYaw: owner.state.pose.yawRadians,
+      ownerPitch: owner.state.pose.pitchRadians,
+      revisionChange: (yield* fixture.coordinator.revision) - before,
+      lookCalls: fixture.lookCalls(),
+      touchConsumes: fixture.touchConsumes(),
+      looked: frame?.looked,
+    }).toEqual({ yaw: 0.25, pitch: -0.1, ownerYaw: 0.25, ownerPitch: -0.1, revisionChange: 0, lookCalls: 0, touchConsumes: 0, looked: false })
+    expect(fixture.touchState().pending).toEqual({ positionX: 6, positionY: -4 })
+  }))
+
+  it.effect('integrates the same gamepad turn at 60 and 20 frames per second', () => Effect.gen(function* () {
+    const sixty = yield* makeOwnedLookFixture({ gamepadAxes: { leftX: 0, leftY: 0, rightX: 0.25, rightY: -0.125 } })
+    const twenty = yield* makeOwnedLookFixture({ gamepadAxes: { leftX: 0, leftY: 0, rightX: 0.25, rightY: -0.125 } })
+    expect(sixty.coordinator).not.toBe(twenty.coordinator)
+    for (let frame = 0; frame < 60; frame += 1) applyFrameLook(sixty.context, sixty.frameInput, DeltaTimeSecs(1 / 60))
+    for (let frame = 0; frame < 20; frame += 1) applyFrameLook(twenty.context, twenty.frameInput, DeltaTimeSecs(1 / 20))
+    const sixtyPose = yield* sixty.view.player.pose
+    const twentyPose = yield* twenty.view.player.pose
+    expect(sixtyPose.yawRadians).toBeCloseTo(-0.8, 12)
+    expect(twentyPose.yawRadians).toBeCloseTo(-0.8, 12)
+    expect(sixtyPose.pitchRadians).toBeCloseTo(0.425, 12)
+    expect(twentyPose.pitchRadians).toBeCloseTo(0.425, 12)
+    expect(sixty.lookCalls()).toBe(60)
+    expect(twenty.lookCalls()).toBe(20)
+  }))
+
+  it.effect('uses touch pixel distance once at both 60 and 20 frame partitions', () => Effect.gen(function* () {
+    const sixty = yield* makeOwnedLookFixture()
+    const twenty = yield* makeOwnedLookFixture()
+    expect(sixty.coordinator).not.toBe(twenty.coordinator)
+    for (const { fixture, frames } of [{ fixture: sixty, frames: 60 }, { fixture: twenty, frames: 20 }]) {
+      fixture.startTouch()
+      for (let frame = 1; frame <= frames; frame += 1) {
+        fixture.moveTouch(120 * frame / frames, -80 * frame / frames)
+        applyFrameLook(fixture.context, fixture.frameInput, DeltaTimeSecs(1 / frames))
+        expect(fixture.touchState().pending).toEqual({ positionX: 0, positionY: 0 })
+      }
+    }
+    const sixtyPose = yield* sixty.view.player.pose
+    const twentyPose = yield* twenty.view.player.pose
+    expect(sixtyPose.yawRadians).toBeCloseTo(-0.11, 12)
+    expect(twentyPose.yawRadians).toBeCloseTo(-0.11, 12)
+    expect(sixtyPose.pitchRadians).toBeCloseTo(0.14, 12)
+    expect(twentyPose.pitchRadians).toBeCloseTo(0.14, 12)
+    expect(sixty.touchConsumes()).toBe(60)
+    expect(twenty.touchConsumes()).toBe(20)
+  }))
+
+  it.effect('returns false for zero rotation while preserving the existing active look call', () => Effect.gen(function* () {
+    const fixture = yield* makeOwnedLookFixture()
+    const before = yield* fixture.coordinator.revision
+    expect(applyFrameLook(fixture.context, fixture.frameInput, DeltaTimeSecs(1 / 60))).toBe(false)
+    expect(fixture.lookCalls()).toBe(1)
+    expect(yield* fixture.coordinator.revision).toBe(before + 1)
+    const pose = yield* fixture.view.player.pose
+    expect(pose.yawRadians).toBe(0.25)
+    expect(pose.pitchRadians).toBe(-0.1)
+  }))
+
+  it('reports a vertical-only rotation for the save notification', () => {
+    const fixture = makeFrameInputFixture()
+    expect(applyFrameLook(fixture.context, {
+      ...fixture.frameInput,
+      pointerDelta: { x: 0, y: 3 },
+    }, DeltaTimeSecs(1 / 60))).toBe(true)
+    expect(fixture.looks).toEqual([[-0, -3]])
+  })
+
+  const blockedCases: ReadonlyArray<{ readonly name: string; readonly options: FrameInputFixtureOptions }> = [
+    { name: 'Escape', options: { escapePressed: true } },
+    { name: 'pause', options: { paused: true } },
+    { name: 'death', options: { playerDead: true } },
+    { name: 'inventory', options: { inventoryOpen: true } },
+    { name: 'trade', options: { tradeOpen: true } },
+    { name: 'brewing', options: { brewingOpen: true } },
+  ]
+  for (const entry of blockedCases) {
+    it.effect(`consumes and discards touch look without rotating during ${entry.name}`, () => Effect.gen(function* () {
+      const fixture = yield* makeOwnedLookFixture(entry.options)
+      fixture.startTouch()
+      fixture.moveTouch(6, -4)
+      const before = yield* fixture.coordinator.revision
+      expect(applyFrameLook(fixture.context, {
+        ...fixture.frameInput,
+        pointerDelta: { x: 12, y: -8 },
+        gamepadAxes: { leftX: 0, leftY: 0, rightX: 0.5, rightY: -0.25 },
+      }, DeltaTimeSecs(1 / 60))).toBe(false)
+      expect(fixture.touchState().pending).toEqual({ positionX: 0, positionY: 0 })
+      expect(fixture.touchConsumes()).toBe(1)
+      expect(fixture.lookCalls()).toBe(0)
+      expect(yield* fixture.coordinator.revision).toBe(before)
+      expect(fixture.calls).toEqual([])
+    }))
+  }
+})
+
 describe('tick frame timing', () => {
   it('stores the current time and clamps a long frame to the physics limit', () => {
     const order: Array<string> = []
@@ -175,7 +368,7 @@ describe('tick frame timing', () => {
     expect(timing).toEqual({ raw: 0.016, deltaSecs: 0.016 })
   })
 
-  it('consumes touch look before handling Escape and records the current time', () => {
+  it('handles Escape and records the current time without consuming frame look', () => {
     const calls: Array<string> = []
     let previousSecs: ReturnType<typeof MonotonicTimeSecs> | undefined = MonotonicTimeSecs(1)
     const playerPose = {
@@ -254,19 +447,19 @@ describe('tick frame timing', () => {
     expect(runTickFrameInput(context, MonotonicTimeSecs(2), frameInput)).toBeUndefined()
 
     expect(previousSecs).toBe(MonotonicTimeSecs(2))
-    expect(calls).toEqual(['consume-touch', 'pause', 'crosshair:2'])
+    expect(calls).toEqual(['pause', 'crosshair:2'])
   })
 })
 
 describe('tick frame input branches', () => {
-  it('adds the right stick to the look delta and reads the current sensitivity', () => {
+  it('adds the right stick to frame look and reads the current sensitivity', () => {
     const fixture = makeFrameInputFixture({ gamepadAxes: { leftX: 0, leftY: 0, rightX: 0.5, rightY: -0.25 } })
     fixture.setSensitivity(2)
 
-    const frame = runTickFrameInput(fixture.context, MonotonicTimeSecs(10), fixture.frameInput)
+    const looked = applyFrameLook(fixture.context, fixture.frameInput, DeltaTimeSecs(0.05))
 
-    // deltaSecs is clamped to 0.05: 0.5 * 1400 * 0.05 = 35 and -0.25 * 1400 * 0.05 = -17.5.
-    expect(frame?.looked).toBe(true)
+    // At a 0.05 s frame: 0.5 * 1400 * 0.05 = 35 and -0.25 * 1400 * 0.05 = -17.5.
+    expect(looked).toBe(true)
     expect(fixture.looks).toEqual([[-70, 35]])
   })
 
@@ -277,7 +470,7 @@ describe('tick frame input branches', () => {
 
     expect(frame).toBeUndefined()
     expect(fixture.context.state.previousSecs.get()).toBe(MonotonicTimeSecs(10))
-    expect(fixture.calls).toEqual(['consume-touch', 'crosshair:10', 'store:10'])
+    expect(fixture.calls).toEqual(['crosshair:10', 'store:10'])
   })
 
   // Hunger and its starvation death moved into the frame (the survival-hunger
@@ -302,7 +495,6 @@ describe('tick frame input branches', () => {
     expect(fixture.context.state.inventoryOpen.get()).toBe(false)
     expect(fixture.context.state.brewingOpen.get()).toBe(false)
     expect(fixture.calls).toEqual([
-      'consume-touch',
       'store:10',
       'clamp:0.125',
       'touch-sync',
@@ -326,7 +518,6 @@ describe('tick frame input branches', () => {
     expect(fixture.context.state.redstoneDirty.get()).toBe(true)
     expect(fixture.context.state.simulationElapsedSecs.get()).toBe(5.05)
     expect(fixture.calls).toEqual([
-      'consume-touch',
       'store:10',
       'clamp:0.125',
       'redstone-sync',
@@ -343,7 +534,6 @@ describe('tick frame input branches', () => {
     expect(frame?.canUse).toBe(false)
     expect(fixture.context.state.inventoryOpen.get()).toBe(true)
     expect(fixture.calls).toEqual([
-      'consume-touch',
       'store:10',
       'clamp:0.125',
       'touch-sync',
@@ -364,7 +554,6 @@ describe('tick frame input branches', () => {
     expect(frame?.dead).toBe(false)
     expect(fixture.context.state.selectedHotbarIndex.get()).toBe(3)
     expect(fixture.calls).toEqual([
-      'consume-touch',
       'store:10',
       'clamp:0.125',
       'touch-sync',
@@ -387,7 +576,6 @@ describe('tick frame input branches', () => {
     expect(frame?.dead).toBe(false)
     expect(context.state.selectedHotbarIndex.get()).toBe(6)
     expect(fixture.calls).toEqual([
-      'consume-touch',
       'store:10',
       'clamp:0.125',
       'touch-sync',
@@ -408,7 +596,6 @@ describe('tick frame input branches', () => {
     expect(frame?.useHeld).toBe(false)
     expect(fixture.context.state.nativeInputQueue.get()).toEqual({ attack: 0, use: 0 })
     expect(fixture.calls).toEqual([
-      'consume-touch',
       'store:10',
       'clamp:0.125',
       'touch-sync',
