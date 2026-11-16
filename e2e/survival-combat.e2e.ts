@@ -806,7 +806,15 @@ test('mines only after continuous hold and exposes progress at the crosshair', a
 
   await page.mouse.down({ button: 'left' })
   await expect(progress).toBeVisible()
-  const firstProgress = Number(await progress.getAttribute('aria-valuenow'))
+  const firstProgress = await waitForSimulationProgress(
+    page,
+    () => progress.evaluate((element) => ({
+      frames: Number(document.body.getAttribute('data-frames')),
+      value: Number(element.getAttribute('aria-valuenow')),
+    })),
+    (value) => value > 0 && value < 100,
+    { description: 'mining progress starts' },
+  )
   expect(firstProgress).toBeGreaterThan(0)
   expect(firstProgress).toBeLessThan(100)
   // Mining progress accumulates over simulated frames — see
