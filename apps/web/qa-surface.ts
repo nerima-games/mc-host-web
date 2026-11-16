@@ -14,11 +14,25 @@
  * `bootGame`-local — the constructed services, the local helper closures, and
  * the live-state accessors — crosses the dep boundary.
  */
-import { Effect, Option, Ref } from 'effect'
+import { Effect, Option, Ref, Result, Schema } from 'effect'
 import {
   BlockId,
-  blockIdOf,
-  blockPosition,
+  blockIdOf as lookupBlockId,
+  blockPosition as kernelBlockPosition,
+  BlockAxis,
+  PositionAxis,
+  position,
+  AngleRadians,
+  EntityHealthPoints,
+  DimensionIdSchema,
+  encodeBlockState,
+  ChunkAxis,
+  type QaOperation,
+  type QaNamespaceName,
+  type QaOperationName,
+  QaNamespaceNameSchema,
+  QaOperationNameSchema,
+  type QaNamespace as ModuleQaNamespace,
   type BlockPosition,
   type ClockService,
   type Position as Vec3,
@@ -33,6 +47,7 @@ import {
   overworldToNether,
   surfaceHeightAt,
   villageVillagerSpawnsForChunk,
+  NoiseSeed,
   type ChunkStoreApi,
   type Dimension,
 } from '@nerima-games/mc-worldgen'
@@ -54,6 +69,12 @@ import {
   type VehicleServiceApi,
   type WeatherServiceApi,
   type WeatherState,
+  ExperienceDelta,
+  ExperienceLevel,
+  VehicleVelocitySchema,
+  WorldCommitCoordinator,
+  type BrewingServiceApi,
+  type WorldCommitCoordinatorApi,
 } from '@nerima-games/mc-sim'
 import {
   BLAZE_KIND,
@@ -62,7 +83,6 @@ import {
   EYE_LEVEL_OFFSET,
   PLAYER_HALF_WIDTH,
   ZOMBIE_KIND,
-  emptyBrewingStandState,
   emptyStatusEffectState,
   enchantmentOffers,
   initialBehaviourOfKind,
@@ -73,12 +93,13 @@ import {
   requestPotatoHarvest,
   requestTargetedBlockBreak,
   requestTargetedBlockUse,
-  restoreBrewingStand,
   restoreStatusEffects,
-  snapshotBrewingStand,
   snapshotStatusEffects,
-  snapshotVillagerTrades,
   weatherLightScale,
+  SkyLightLevel,
+  gameplayStages,
+  GAMEPLAY_VILLAGER_TRADES_OWNER_ID,
+  GameplayVillagerTradeSnapshotSchema,
   type Damage,
   type EnchantedItem,
   type EnvironmentalContact,
@@ -104,7 +125,7 @@ import {
   type ChestStorageSlotTarget,
   type InventoryInteractionTarget,
 } from '@nerima-games/mx-ui'
-import { buildQaRegistry, installQaApi, type QaApiError } from '@nerima-games/mc-compose'
+import { QaBridge, type QaBridgeApi, type DuplicateModuleContract, QaOperationNotFound, QA_GLOBAL_KEY } from '@nerima-games/mc-compose'
 import {
   FARMLAND_BLOCK_ID,
   KNOWN_TARGET_BLOCK,
@@ -258,7 +279,11 @@ type QaSurfaceDeps = {
     readonly weather: WeatherServiceApi
     readonly getLightingSnapshot: () => RenderLightingSnapshot
   }
+  readonly makeQaBridge: (namespaces: ReadonlyArray<ModuleQaNamespace>) => Result.Result<QaBridgeApi<unknown>, DuplicateModuleContract>
   readonly gameplay: {
+    readonly commit: NonNullable<Parameters<typeof gameplayStages>[9]>
+    readonly targetingEntitiesOwnerId: NonNullable<Parameters<typeof requestTargetedBlockBreak>[2]['entitiesOwnerId']>
+    readonly brewingService: BrewingServiceApi
     readonly world: GeneratedWorld<MobBehaviour>
     readonly worldRenderer: WorldRenderer
     readonly gameplayState: GameplayFrameState
@@ -370,19 +395,609 @@ type QaSurfaceDeps = {
     readonly browserClock: ClockService
   }
   readonly lifecycle: {
+    readonly registerQaTeardown: (dispose: () => void) => void
     readonly getStopBrowserPreview: () => (() => Promise<void>) | undefined
   }
 }
 
+// QA fixtures name blocks from the shipped registry; absence is an internal invariant violation.
+const blockIdOf = (name: Parameters<typeof lookupBlockId>[0]): BlockId => Option.getOrThrow(lookupBlockId(name))
+const blockPosition = (x: number, y: number, z: number): BlockPosition =>
+  kernelBlockPosition(BlockAxis(x), BlockAxis(y), BlockAxis(z))
+const qaPosition = (value: { readonly x: number; readonly y: number; readonly z: number }): Vec3 =>
+  position(PositionAxis(value.x), PositionAxis(value.y), PositionAxis(value.z))
+
+// Match the JSON transport's representation of void and omitted object fields.
+const jsonValue = (value: unknown): unknown => {
+  if (value === undefined) return null
+  if (Array.isArray(value)) return value.map(jsonValue)
+  if (typeof value !== 'object' || value === null) return value
+  if ('toJSON' in value && typeof value.toJSON === 'function') return jsonValue(value.toJSON())
+  if (value instanceof Error) return jsonValue({
+    ...value,
+    _tag: '_tag' in value ? value._tag : value.name,
+    message: value.message,
+  })
+  return Object.fromEntries(Object.entries(value)
+    .filter(([, entry]) => entry !== undefined)
+    .map(([key, entry]) => [key, jsonValue(entry)]))
+}
+
+export type QaDispatchTransport = {
+  readonly dispatch: (namespace: QaNamespaceName, operation: QaOperationName, inputJson: unknown) => Promise<
+    | { readonly _tag: 'Success'; readonly value: unknown }
+    | { readonly _tag: 'Failure'; readonly error: unknown }
+  >
+}
+
+export const installQaDispatch = (target: object, bridge: QaBridgeApi<unknown>): (() => void) => {
+  let active = true
+  const dispatch = (namespace: QaNamespaceName, operation: QaOperationName, inputJson: unknown) => {
+    const effect = Effect.gen(function* () {
+      if (!active) return yield* Effect.fail(new QaOperationNotFound({ namespace, operation }))
+      const service = yield* QaBridge
+      return yield* service.run(namespace, operation, inputJson)
+    }).pipe(
+      Effect.provideService(QaBridge, bridge),
+      Effect.match({
+        onFailure: (error) => ({ _tag: 'Failure' as const, error: jsonValue(error) }),
+        onSuccess: (value) => ({ _tag: 'Success' as const, value }),
+      }),
+    )
+    return Effect.runPromise(effect)
+  }
+  const transport = { dispatch }
+  Object.defineProperty(target, QA_GLOBAL_KEY, { configurable: true, value: transport })
+  return () => {
+    active = false
+    if (Reflect.get(target, QA_GLOBAL_KEY) === transport) Reflect.deleteProperty(target, QA_GLOBAL_KEY)
+  }
+}
+
+export const makeQaOperation = <Input extends Schema.Codec<unknown>>(
+  name: string,
+  input: Input,
+  run: (input: Input['Type']) => unknown,
+): QaOperation<Input, typeof Schema.Unknown, unknown> => ({
+  name: Schema.decodeUnknownSync(QaOperationNameSchema)(name),
+  input,
+  output: Schema.Unknown,
+  run: (value) => Effect.tryPromise({
+    try: async () => jsonValue(await run(value)),
+    catch: (error) => error,
+  }),
+})
+
+export const makeQaNamespaces = (namespaces: ReadonlyArray<
+  Omit<ModuleQaNamespace, 'name'> & { readonly namespace: string }
+>): ReadonlyArray<ModuleQaNamespace> => namespaces.map(({ namespace, observe, command }) => ({
+  name: Schema.decodeUnknownSync(QaNamespaceNameSchema)(namespace),
+  observe,
+  command,
+}))
+
+export const makeQaRenderCommands = (render: QaSurfaceDeps['render']): {
+  readonly snapshotLighting: () => RenderLightingSnapshot & { readonly weatherBrightness: number }
+} => ({
+  snapshotLighting: () => ({
+    ...render.getLightingSnapshot(),
+    weatherBrightness: weatherLightScale(Effect.runSync(render.weather.snapshot).weather),
+  }),
+})
+
+export const makeQaWeatherCommand = <Snapshot>(context: {
+  readonly weather: WeatherServiceApi
+  readonly presentWeather: (state: WeatherState) => void
+  readonly markSessionDirty: () => void
+  readonly snapshot: () => Snapshot
+}): (() => Snapshot) => () => {
+  const qaWeather: WeatherState = { weather: 'thunder', remainingSecs: 300 }
+  Effect.runSync(context.weather.applyTransition(qaWeather))
+  context.presentWeather(qaWeather)
+  context.markSessionDirty()
+  return context.snapshot()
+}
+
+export const observeQaBrewing = (
+  service: BrewingServiceApi,
+  coordinator: WorldCommitCoordinatorApi,
+): Effect.Effect<Effect.Success<BrewingServiceApi['snapshot']>, Effect.Error<BrewingServiceApi['snapshot']>> =>
+  service.snapshot.pipe(Effect.provideService(WorldCommitCoordinator, coordinator))
+
 export const makeQaSurface = (
   deps: QaSurfaceDeps,
 ):
-  | { readonly _id: 'Either'; readonly _tag: 'Left'; readonly left: QaApiError }
-  | { readonly _id: 'Either'; readonly _tag: 'Right'; readonly right: QaSurfaceApi } => {
+  Result.Result<QaSurfaceApi, DuplicateModuleContract> => {
+  // Composition validates registrations without invoking handlers; acquire session state only on success.
+  const moduleNamespaces = makeQaNamespaces([
+    {
+      namespace: 'render',
+      observe: { snapshotLighting: makeQaOperation('snapshotLighting', Schema.Null, () => renderCommands.snapshotLighting()) },
+      command: {},
+    },
+    {
+      namespace: 'gameplay',
+      observe: {
+        snapshot: makeQaOperation('snapshot', Schema.Null, () => gameplaySnapshot()),
+        stickyPistonSnapshot: makeQaOperation('stickyPistonSnapshot', Schema.Null, () => stickyPistonSnapshot()),
+        redstoneFixturesSnapshot: makeQaOperation('redstoneFixturesSnapshot', Schema.Null, () => redstoneFixturesSnapshot()),
+        railTrackSnapshot: makeQaOperation('railTrackSnapshot', Schema.Null, () => railTrackSnapshot()),
+        boatWaterSnapshot: makeQaOperation('boatWaterSnapshot', Schema.Null, () => boatWaterSnapshot()),
+      },
+      command: {
+        seedChestTransferMetadata: makeQaOperation('seedChestTransferMetadata', Schema.Null, () => {
+          Effect.runSync(world.inventory.reset)
+          for (const key of [...customNames.keys(), ...enchantedItems.keys()]) {
+            if (/^\d+$/.test(key)) deleteItemMetadata(key)
+          }
+          Effect.runSync(world.inventory.add('diamond_pickaxe', 1))
+          const durability = Effect.runSync(world.inventory.storageSnapshot).inventoryDurability[0]
+          if (durability === null || durability === undefined) {
+            throw new Error('seeded diamond pickaxe has no durability')
+          }
+          customNames.set('0', 'Silk Runner')
+          enchantedItems.set('0', {
+            item: 'diamond_pickaxe',
+            durability,
+            enchantments: [{ id: 'efficiency', level: 5 }],
+          })
+          markSessionDirty()
+          renderPlayerUi()
+          return gameplaySnapshot()
+        }),
+        seedChestTransferMetadataConflict: makeQaOperation('seedChestTransferMetadataConflict', Schema.Null, () => {
+          Effect.runSync(world.inventory.add('diamond_pickaxe', 1))
+          const durability = Effect.runSync(world.inventory.storageSnapshot).inventoryDurability[0]
+          if (durability === null || durability === undefined) {
+            throw new Error('seeded diamond pickaxe has no durability')
+          }
+          customNames.set('0', 'Fortune Runner')
+          enchantedItems.set('0', {
+            item: 'diamond_pickaxe',
+            durability,
+            enchantments: [{ id: 'fortune', level: 3 }],
+          })
+          markSessionDirty()
+          renderPlayerUi()
+          return gameplaySnapshot()
+        }),
+        seedStaleCustomNames: makeQaOperation('seedStaleCustomNames', Schema.Null, () => {
+          customNames.set('35', 'Stale inventory name')
+          customNames.set('equipment:head', 'Stale equipment name')
+          customNames.set('unknown:slot', 'Stale unknown name')
+          markSessionDirty()
+          return gameplaySnapshot()
+        }),
+        setWeather: makeQaOperation('setWeather', Schema.Null, () => qaWeatherCommand()),
+        setPose: makeQaOperation('setPose', Schema.NullOr(Schema.Number), (targetBlock: number | null) => {
+          Effect.runSync(restorePlayer(QA_POSE, Effect.runSync(playerApi.dimension)))
+          if (targetBlock !== null) {
+            Effect.runSync(currentChunkStore.setBlock(KNOWN_TARGET_BLOCK, BlockId(targetBlock)))
+          }
+          resetSimState(true)
+          markSessionDirty()
+          return gameplaySnapshot()
+        }),
+        seedSmokeGroundingEncounter: makeQaOperation('seedSmokeGroundingEncounter', Schema.Null, () => {
+          const dimension = Effect.runSync(playerApi.dimension)
+          Effect.runSync(streamAround(getCurrentChunkContext(), QA_POSE.feetPosition.x, QA_POSE.feetPosition.z))
+          for (let x = -16; x <= 32; x += 1) {
+            for (let z = -16; z <= 32; z += 1) {
+              Effect.runSync(currentChunkStore.setBlock(blockPosition(x, 62, z), blockIdOf('stone')))
+              Effect.runSync(currentChunkStore.setBlock(blockPosition(x, 63, z), blockIdOf('stone')))
+              for (let y = 64; y <= 68; y += 1) {
+                Effect.runSync(currentChunkStore.setBlock(blockPosition(x, y, z), blockIdOf('air')))
+              }
+            }
+          }
+          Effect.runSync(restorePlayer({
+            ...QA_POSE,
+            feetPosition: { ...QA_POSE.feetPosition, y: 66 },
+          }, dimension))
+          resetSimState(true)
+          markSessionDirty()
+          return gameplaySnapshot()
+        }),
+        setMultiplayerInvalidPose: makeQaOperation('setMultiplayerInvalidPose', Schema.Null, () => {
+          const pose = Effect.runSync(playerApi.pose)
+          Effect.runSync(restorePlayer({
+            ...pose,
+            feetPosition: { ...pose.feetPosition, x: pose.feetPosition.x + 100 },
+          }, Effect.runSync(playerApi.dimension)))
+          resetSimState(true)
+          return gameplaySnapshot()
+        }),
+        seedCreativeBreakEncounter: makeQaOperation('seedCreativeBreakEncounter', Schema.Null, () => {
+          Effect.runSync(restorePlayer(QA_POSE, Effect.runSync(playerApi.dimension)))
+          resetSimState(true)
+          Effect.runSync(world.inventory.reset)
+          Effect.runSync(world.inventory.add('stone', 2))
+          Effect.runSync(currentChunkStore.setBlock(KNOWN_TARGET_BLOCK, blockIdOf('stone')))
+          setSelectedHotbarIndex(0)
+          setInventoryFocus({ kind: 'slot', region: 'hotbar', index: getSelectedHotbarIndex() })
+          inventoryInteraction.reset()
+          markSessionDirty()
+          renderPlayerUi()
+          return gameplaySnapshot()
+        }),
+        seedCreativePlacementEncounter: makeQaOperation('seedCreativePlacementEncounter', Schema.Null, () => {
+          Effect.runSync(restorePlayer(QA_IGNITION_POSE, Effect.runSync(playerApi.dimension)))
+          resetSimState(true)
+          Effect.runSync(world.inventory.reset)
+          Effect.runSync(world.inventory.add('stone', 2))
+          Effect.runSync(currentChunkStore.setBlock(QA_IGNITION_HIT_BLOCK, blockIdOf('stone')))
+          Effect.runSync(currentChunkStore.setBlock(QA_IGNITION_CELL, blockIdOf('air')))
+          Effect.runSync(currentChunkStore.setBlock(QA_IGNITION_SUPPORT_BLOCK, blockIdOf('stone')))
+          // See QA_IGNITION_FLOOR_BLOCK's other call sites in this file:
+          // fixtures that restore the player to QA_IGNITION_POSE without it
+          // leave the player free-falling for the whole encounter.
+          Effect.runSync(currentChunkStore.setBlock(QA_IGNITION_FLOOR_BLOCK, blockIdOf('stone')))
+          setSelectedHotbarIndex(0)
+          setInventoryFocus({ kind: 'slot', region: 'hotbar', index: getSelectedHotbarIndex() })
+          inventoryInteraction.reset()
+          markSessionDirty()
+          renderPlayerUi()
+          return gameplaySnapshot()
+        }),
+        requestMultiplayerBlockPlacement: makeQaOperation('requestMultiplayerBlockPlacement', Schema.Null, () => {
+          if (multiplayer === undefined || !getMultiplayerHandshakeComplete()) return gameplaySnapshot()
+          Effect.runSync(multiplayer.host.enqueueOutbound({
+            _tag: 'BlockPlace',
+            player: multiplayer.query.player,
+            world: WorldId.make(Effect.runSync(playerApi.dimension)),
+            at: QA_IGNITION_CELL,
+            block: 'stone',
+            state: Result.getOrThrow(encodeBlockState(blockIdOf('stone'), {})),
+          }))
+          return gameplaySnapshot()
+        }),
+        requestMultiplayerBlockBreak: makeQaOperation('requestMultiplayerBlockBreak', Schema.Null, () => {
+          if (multiplayer === undefined || !getMultiplayerHandshakeComplete()) return gameplaySnapshot()
+          Effect.runSync(multiplayer.host.enqueueOutbound({
+            _tag: 'BlockBreak',
+            player: multiplayer.query.player,
+            world: WorldId.make(Effect.runSync(playerApi.dimension)),
+            at: QA_IGNITION_CELL,
+          }))
+          return gameplaySnapshot()
+        }),
+        returnToCraftingTable: makeQaOperation('returnToCraftingTable', Schema.Null, () => {
+          Effect.runSync(restorePlayer(QA_IGNITION_POSE, Effect.runSync(playerApi.dimension)))
+          resetSimState(true)
+          // See QA_IGNITION_FLOOR_BLOCK's other call sites in this file:
+          // fixtures that restore the player to QA_IGNITION_POSE without it
+          // leave the player free-falling for the whole encounter.
+          Effect.runSync(currentChunkStore.setBlock(QA_IGNITION_FLOOR_BLOCK, blockIdOf('stone')))
+          markSessionDirty()
+          return gameplaySnapshot()
+        }),
+        enterNether: makeQaOperation('enterNether', Schema.Null, () => enterQaDimension('nether')),
+        enterOverworld: makeQaOperation('enterOverworld', Schema.Null, () => enterQaDimension('overworld')),
+        enterEnd: makeQaOperation('enterEnd', Schema.Null, () => enterQaDimension('end')),
+        seedBedExplosionEncounter: makeQaOperation('seedBedExplosionEncounter', Schema.Null, () => seedBedExplosionEncounter()),
+        seedBowProjectileEncounter: makeQaOperation('seedBowProjectileEncounter', Schema.Null, () => seedBowProjectileEncounter()),
+        breakTarget: makeQaOperation('breakTarget', Schema.Null, () => {
+          if (playerIsDead()) return null
+          const target = Effect.runSync(
+            requestTargetedBlockBreak(gameplayState, currentChunkStore, targetingContext),
+          )
+          if (Option.isSome(target)) markSessionDirty()
+          return Option.isSome(target) ? target.value : null
+        }),
+        seedCraftingLog: makeQaOperation('seedCraftingLog', Schema.Null, () => {
+          if (playerIsDead()) return gameplaySnapshot()
+          Effect.runSync(world.inventory.reset)
+          Effect.runSync(world.inventory.add('oak_log', 1))
+          inventoryInteraction.reset()
+          markSessionDirty()
+          renderPlayerUi()
+          return gameplaySnapshot()
+        }),
+        seedCraftingTableEncounter: makeQaOperation('seedCraftingTableEncounter', Schema.Null, () => seedCraftingTableEncounter()),
+        seedStickyPistonEncounter: makeQaOperation('seedStickyPistonEncounter', Schema.Null, () => seedStickyPistonEncounter()),
+        seedRedstoneFixtures: makeQaOperation('seedRedstoneFixtures', Schema.Null, () => seedRedstoneFixtures()),
+        pressRedstoneBranchButton: makeQaOperation('pressRedstoneBranchButton', Schema.Null, () => pressRedstoneBranchButton()),
+        mutateObserverInput: makeQaOperation('mutateObserverInput', Schema.Null, () => mutateObserverInput()),
+        seedRailTrackEncounter: makeQaOperation('seedRailTrackEncounter', Schema.Null, () => seedRailTrackEncounter()),
+        seedBoatWaterEncounter: makeQaOperation('seedBoatWaterEncounter', Schema.Null, () => seedBoatWaterEncounter()),
+        seedFarmingEncounter: makeQaOperation('seedFarmingEncounter', Schema.Null, () => seedFarmingEncounter()),
+        seedFishingEncounter: makeQaOperation('seedFishingEncounter', Schema.Null, () => seedFishingEncounter()),
+        seedSubmergedSwimmingEncounter: makeQaOperation('seedSubmergedSwimmingEncounter', Schema.Null, () => seedSubmergedSwimmingEncounter()),
+        leaveSubmergedSwimmingEncounter: makeQaOperation('leaveSubmergedSwimmingEncounter', Schema.Null, () => leaveSubmergedSwimmingEncounter()),
+        seedVillageTradingEncounter: makeQaOperation('seedVillageTradingEncounter', Schema.Null, () => seedVillageTradingEncounter()),
+        grantNearestVillagerTradeInput: makeQaOperation('grantNearestVillagerTradeInput', Schema.Null, () => grantNearestVillagerTradeInput()),
+        harvestFarmingCrop: makeQaOperation('harvestFarmingCrop', Schema.Null, () => harvestFarmingCrop()),
+        seedCactusApproach: makeQaOperation('seedCactusApproach', Schema.Null, () => seedEnvironmentalContactEncounter('cactus')),
+        seedDuplicateLavaContact: makeQaOperation('seedDuplicateLavaContact', Schema.Null, () => seedEnvironmentalContactEncounter('duplicateLava')),
+        seedLethalMixedContact: makeQaOperation('seedLethalMixedContact', Schema.Null, () => seedEnvironmentalContactEncounter('lethalMixed')),
+        seedSafeFall: makeQaOperation('seedSafeFall', Schema.Null, () => seedFallEncounter('safe')),
+        seedDamagingFall: makeQaOperation('seedDamagingFall', Schema.Null, () => seedFallEncounter('damaging')),
+        seedLethalFall: makeQaOperation('seedLethalFall', Schema.Null, () => seedFallEncounter('lethal')),
+        preparePotatoEating: makeQaOperation('preparePotatoEating', Schema.Null, () => {
+          Effect.runSync(restorePlayer(QA_IGNITION_POSE, Effect.runSync(playerApi.dimension)))
+          resetSimState(true)
+          // See QA_IGNITION_FLOOR_BLOCK's other call sites in this file:
+          // fixtures that restore the player to QA_IGNITION_POSE without it
+          // leave the player free-falling for the whole encounter.
+          Effect.runSync(currentChunkStore.setBlock(QA_IGNITION_FLOOR_BLOCK, blockIdOf('stone')))
+          Effect.runSync(world.vitals.addExhaustion(36))
+          markSessionDirty()
+          return gameplaySnapshot()
+        }),
+        returnToFarmingPlot: makeQaOperation('returnToFarmingPlot', Schema.Null, () => {
+          Effect.runSync(restorePlayer(QA_FARM_POSE, Effect.runSync(playerApi.dimension)))
+          resetSimState(true)
+          markSessionDirty()
+          return gameplaySnapshot()
+        }),
+        seedPortalEncounter: makeQaOperation('seedPortalEncounter', Schema.Null, () => seedPortalEncounter()),
+        seedPortalArrivalIntoSolidGround: makeQaOperation('seedPortalArrivalIntoSolidGround', Schema.Null, () => seedPortalArrivalIntoSolidGround()),
+        seedPortalIgnitionEncounter: makeQaOperation('seedPortalIgnitionEncounter', Schema.Null, () => seedPortalIgnitionEncounter()),
+        seedWoodenPickaxeProgression: makeQaOperation('seedWoodenPickaxeProgression', Schema.Null, () => seedWoodenPickaxeProgression()),
+        seedIronArmor: makeQaOperation('seedIronArmor', Schema.Null, () => {
+          Effect.runSync(world.inventory.reset)
+          const equipment = [
+            ['iron_helmet', 'head'],
+            ['iron_chestplate', 'chest'],
+            ['iron_leggings', 'legs'],
+            ['iron_boots', 'feet'],
+          ] as const
+          equipment.forEach(([item]) => Effect.runSync(world.inventory.add(item, 1)))
+          equipment.forEach(([, slot], inventorySlot) => {
+            const result = Effect.runSync(world.inventory.equipFromInventory(inventorySlot, slot))
+            if (result._tag !== 'Equipped') {
+              throw new Error(`failed to equip ${slot}: ${result._tag}`)
+            }
+          })
+          Effect.runSync(world.inventory.add('iron_sword', 1))
+          inventoryInteraction.reset()
+          markSessionDirty()
+          renderPlayerUi()
+          return gameplaySnapshot()
+        }),
+        damage: makeQaOperation('damage', Schema.Null, () => {
+          applyPlayerDamage({ amount: 4, cause: 'generic' })
+          markSessionDirty()
+          renderPlayerUi()
+          return gameplaySnapshot()
+        }),
+        heal: makeQaOperation('heal', Schema.Null, () => {
+          Effect.runSync(world.vitals.heal(4))
+          markSessionDirty()
+          renderPlayerUi()
+          return gameplaySnapshot()
+        }),
+        eat: makeQaOperation('eat', Schema.Null, () => {
+          survivalHunger.eat(4, 0.3)
+          markSessionDirty()
+          renderPlayerUi()
+          return gameplaySnapshot()
+        }),
+        respawn: makeQaOperation('respawn', Schema.Null, () => {
+          respawnPlayer()
+          return gameplaySnapshot()
+        }),
+        shoot: makeQaOperation('shoot', Schema.Null, () => {
+          if (playerIsDead()) return gameplaySnapshot()
+          const currentPose = Effect.runSync(playerApi.pose)
+          const horizontal = Math.cos(currentPose.pitchRadians)
+          Effect.runSync(requestBowShot(gameplayState, {
+            origin: {
+              x: currentPose.feetPosition.x,
+              y: PositionAxis(currentPose.feetPosition.y + EYE_LEVEL_OFFSET),
+              z: currentPose.feetPosition.z,
+            },
+            dirX: -Math.sin(currentPose.yawRadians) * horizontal,
+            dirY: Math.sin(currentPose.pitchRadians),
+            dirZ: -Math.cos(currentPose.yawRadians) * horizontal,
+            chargeSecs: 1,
+            inventory: { mode: isCreativeMode ? 'creative' : 'survival', slotIndex: getSelectedHotbarIndex() },
+          }))
+          return gameplaySnapshot()
+        }),
+        seedZombiePursuitEncounter: makeQaOperation('seedZombiePursuitEncounter', Schema.Null, () => {
+          respawnPlayer()
+          Effect.runSync(currentChunkStore.setBlock(QA_IGNITION_FLOOR_BLOCK, blockIdOf('stone')))
+          Effect.runSync(currentChunkStore.setBlock(blockPosition(8, 65, 10), blockIdOf('air')))
+          Effect.runSync(currentChunkStore.setBlock(blockPosition(8, 66, 10), blockIdOf('air')))
+          Effect.runSync(restorePlayer(QA_IGNITION_POSE, Effect.runSync(playerApi.dimension)))
+          resetSimState(true)
+          const currentPose = Effect.runSync(playerApi.pose)
+          Effect.runSync(requestMobSpawn(gameplayState, {
+            kind: ZOMBIE_KIND,
+            feetPosition: {
+              x: PositionAxis(currentPose.feetPosition.x + 4),
+              y: PositionAxis(currentPose.feetPosition.y),
+              z: currentPose.feetPosition.z,
+            },
+            candidate: {
+              groundBlock: blockIdOf('stone'),
+              footBlock: blockIdOf('air'),
+              headBlock: blockIdOf('air'),
+              blockLight: 0,
+              skyLight: SkyLightLevel(0),
+              biome: 'plains',
+              timeOfDay: 0,
+              distanceToPlayerBlocksXZ: 16,
+            },
+          }))
+          markSessionDirty()
+          return gameplaySnapshot()
+        }),
+        seedLethalZombieEncounter: makeQaOperation('seedLethalZombieEncounter', Schema.Null, () => {
+          respawnPlayer()
+          Effect.runSync(world.inventory.reset)
+          Effect.runSync(world.inventory.add('stone_pickaxe', 1))
+          Effect.runSync(world.inventory.add('potato', 2))
+          Effect.runSync(world.inventory.add('torch', 8))
+          Effect.runSync(world.inventory.add('oak_planks', 4))
+          Effect.runSync(currentChunkStore.setBlock(QA_IGNITION_FLOOR_BLOCK, blockIdOf('stone')))
+          Effect.runSync(currentChunkStore.setBlock(blockPosition(8, 65, 10), blockIdOf('air')))
+          Effect.runSync(currentChunkStore.setBlock(blockPosition(8, 66, 10), blockIdOf('air')))
+          Effect.runSync(restorePlayer(QA_IGNITION_POSE, Effect.runSync(playerApi.dimension)))
+          resetSimState(true)
+          const currentPose = Effect.runSync(playerApi.pose)
+          Effect.runSync(requestMobSpawn(gameplayState, {
+            kind: ZOMBIE_KIND,
+            feetPosition: {
+              x: PositionAxis(currentPose.feetPosition.x + 0.5),
+              y: PositionAxis(currentPose.feetPosition.y),
+              z: currentPose.feetPosition.z,
+            },
+            candidate: {
+              groundBlock: blockIdOf('stone'),
+              footBlock: blockIdOf('air'),
+              headBlock: blockIdOf('air'),
+              blockLight: 0,
+              skyLight: SkyLightLevel(0),
+              biome: 'plains',
+              timeOfDay: 0,
+              distanceToPlayerBlocksXZ: 16,
+            },
+          }))
+          applyPlayerDamage({ amount: 20, cause: 'mob' })
+          markSessionDirty()
+          renderPlayerUi()
+          return gameplaySnapshot()
+        }),
+        seedFoodUseEncounter: makeQaOperation('seedFoodUseEncounter', Schema.Null, () => {
+          respawnPlayer()
+          Effect.runSync(restorePlayer(QA_IGNITION_POSE, Effect.runSync(playerApi.dimension)))
+          resetSimState(true)
+          // See QA_IGNITION_FLOOR_BLOCK's other call sites in this file:
+          // fixtures that restore the player to QA_IGNITION_POSE without it
+          // leave the player free-falling for the whole encounter.
+          Effect.runSync(currentChunkStore.setBlock(QA_IGNITION_FLOOR_BLOCK, blockIdOf('stone')))
+          Effect.runSync(world.inventory.reset)
+          Effect.runSync(world.inventory.add('potato', 2))
+          applyPlayerDamage({ amount: 4, cause: 'generic' })
+          Effect.runSync(world.vitals.addExhaustion(36))
+          setSelectedHotbarIndex(0)
+          setInventoryFocus({ kind: 'slot', region: 'hotbar', index: getSelectedHotbarIndex() })
+          inventoryInteraction.reset()
+          markSessionDirty()
+          renderPlayerUi()
+          return gameplaySnapshot()
+        }),
+        seedFireChargeIgnition: makeQaOperation('seedFireChargeIgnition', Schema.Null, () => seedIgnitionEncounter('fire_charge')),
+        seedFlintAndSteelIgnition: makeQaOperation('seedFlintAndSteelIgnition', Schema.Null, () => seedIgnitionEncounter('flint_and_steel')),
+        seedRefusedFireChargeIgnition: makeQaOperation('seedRefusedFireChargeIgnition', Schema.Null, () => {
+          seedIgnitionEncounter('fire_charge')
+          Effect.runSync(currentChunkStore.setBlock(QA_IGNITION_CELL, blockIdOf('stone')))
+          setNextItemUseRequestId(getNextItemUseRequestId() + 1)
+          const requestId = `item-use-${String(getNextItemUseRequestId())}`
+          Effect.runSync(
+            requestItemUse(gameplayState, requestId, QA_IGNITION_CELL, 'fire_charge'),
+          )
+          pendingItemUses.set(requestId, {
+            kind: 'ignition',
+            slotIndex: getSelectedHotbarIndex(),
+            heldItem: 'fire_charge',
+            dimension: Effect.runSync(playerApi.dimension),
+          })
+          markSessionDirty()
+          return gameplaySnapshot()
+        }),
+        seedMeleeDropEncounter: makeQaOperation('seedMeleeDropEncounter', Schema.Null, () => {
+          respawnPlayer()
+          Effect.runSync(world.inventory.reset)
+          Effect.runSync(world.inventory.add('wooden_sword', 1))
+          inventoryInteraction.reset()
+          setSelectedHotbarIndex(0)
+          setInventoryFocus({
+            kind: 'slot',
+            region: 'hotbar',
+            index: getSelectedHotbarIndex(),
+          })
+          const spawnPose = Effect.runSync(playerApi.pose)
+          Effect.runSync(playerApi.look(-spawnPose.yawRadians, -spawnPose.pitchRadians))
+          const currentPose = Effect.runSync(playerApi.pose)
+          const distance = 2
+          const horizontal = Math.cos(currentPose.pitchRadians)
+          const direction = {
+            x: -Math.sin(currentPose.yawRadians) * horizontal,
+            y: Math.sin(currentPose.pitchRadians),
+            z: -Math.cos(currentPose.yawRadians) * horizontal,
+          }
+          const eyeY = Math.floor(currentPose.feetPosition.y + EYE_LEVEL_OFFSET)
+          for (let zOffset = 0; zOffset >= -3; zOffset -= 1) {
+            Effect.runSync(currentChunkStore.setBlock(blockPosition(
+              Math.floor(currentPose.feetPosition.x),
+              eyeY,
+              Math.floor(currentPose.feetPosition.z) + zOffset,
+            ), blockIdOf('air')))
+          }
+          Effect.runSync(
+            world.entities.spawn({
+              kind: CREEPER_KIND,
+              feetPosition: {
+                x: PositionAxis(currentPose.feetPosition.x + direction.x * distance),
+                y: PositionAxis(currentPose.feetPosition.y
+                  + EYE_LEVEL_OFFSET
+                  + direction.y * distance
+                  - 0.9),
+                z: PositionAxis(currentPose.feetPosition.z + direction.z * distance),
+              },
+              healthPoints: EntityHealthPoints(1),
+              behaviour: undefined,
+            }),
+          )
+          markSessionDirty()
+          renderPlayerUi()
+          return gameplaySnapshot()
+        }),
+        seedBrewingEncounter: makeQaOperation('seedBrewingEncounter', Schema.Null, () => seedBrewingEncounter()),
+        seedItemUpgradeEncounter: makeQaOperation('seedItemUpgradeEncounter', Schema.Null, () => seedItemUpgradeEncounter()),
+        switchItemUpgradeStationToAnvil: makeQaOperation('switchItemUpgradeStationToAnvil', Schema.Null, () => switchItemUpgradeStationToAnvil()),
+        seedEndEyeCrafting: makeQaOperation('seedEndEyeCrafting', Schema.Null, () => seedEndEyeCrafting()),
+        forceNextEyeOfEnderDrop: makeQaOperation('forceNextEyeOfEnderDrop', Schema.Null, () => {
+          setNextEyeOfEnderBreaks(false)
+          return gameplaySnapshot()
+        }),
+        forceNextEyeOfEnderBreak: makeQaOperation('forceNextEyeOfEnderBreak', Schema.Null, () => {
+          setNextEyeOfEnderBreaks(true)
+          return gameplaySnapshot()
+        }),
+        spawnFullHealthEnderman: makeQaOperation('spawnFullHealthEnderman', Schema.Null, () => spawnFullHealthHostile(ENDERMAN_KIND, 40)),
+        spawnFullHealthBlaze: makeQaOperation('spawnFullHealthBlaze', Schema.Null, () => spawnFullHealthHostile(BLAZE_KIND, 20)),
+        targetNearestHostile: makeQaOperation('targetNearestHostile', Schema.Null, () => targetNearestHostile()),
+        targetNearestDroppedItem: makeQaOperation('targetNearestDroppedItem', Schema.Null, () => targetNearestDroppedItem()),
+        targetNearestStrongholdFrame: makeQaOperation('targetNearestStrongholdFrame', Schema.Null, () => targetNearestStrongholdFrame()),
+        seedEndPortalFinalFrame: makeQaOperation('seedEndPortalFinalFrame', Schema.Null, () => seedEndPortalFinalFrame()),
+        targetCompletedEndPortal: makeQaOperation('targetCompletedEndPortal', Schema.Null, () => targetCompletedEndPortal()),
+        seedEndDragonFinalHit: makeQaOperation('seedEndDragonFinalHit', Schema.Null, () => seedEndDragonFinalHit()),
+        targetEndDragon: makeQaOperation('targetEndDragon', Schema.Null, () => targetEndDragon()),
+        targetEndExitPortal: makeQaOperation('targetEndExitPortal', Schema.Null, () => targetEndExitPortal()),
+      },
+    },
+    {
+      namespace: 'persistence',
+      observe: {},
+      command: { flush: makeQaOperation('flush', Schema.Null, () => requestFlush()) },
+    },
+    {
+      namespace: 'audio',
+      observe: {
+        report: makeQaOperation('report', Schema.Null, () => Effect.runSync(audioBackend.report)),
+        snapshot: makeQaOperation('snapshot', Schema.Null, () => audioRuntime.snapshot(Effect.runSync(browserClock.monotonicSecs))),
+      },
+      command: {},
+    },
+    {
+      namespace: 'lifecycle',
+      observe: {},
+      command: { stop: makeQaOperation('stop', Schema.Null, () => getStopBrowserPreview()?.()) },
+    },
+  ])
+  const bridge = deps.makeQaBridge(moduleNamespaces)
+  if (Result.isFailure(bridge)) return Result.fail(bridge.failure)
+
   const { render, gameplay, persistence, audio, lifecycle } = deps
-  const { weather: renderWeather, getLightingSnapshot } = render
+  const renderCommands = makeQaRenderCommands(render)
   const {
     world,
+    commit,
+    brewingService,
     worldRenderer,
     gameplayState,
     simState,
@@ -482,6 +1097,18 @@ export const makeQaSurface = (
   const { audio: audioRuntime, audioBackend, browserClock } = audio
   const { getStopBrowserPreview } = lifecycle
 
+  const restorePlayer = (pose: QaPose, dimension: Dimension) => playerApi.restore({
+    feetPosition: qaPosition(pose.feetPosition),
+    yawRadians: AngleRadians(pose.yawRadians),
+    pitchRadians: AngleRadians(pose.pitchRadians),
+  }, dimension)
+
+  const targetingContext = {
+    coordinator: commit.coordinator,
+    playerOwnerId: commit.playerOwnerId,
+    entitiesOwnerId: deps.gameplay.targetingEntitiesOwnerId,
+  }
+
   const gameplaySnapshot = () => {
     const pose = Effect.runSync(playerApi.pose)
     const dimension = Effect.runSync(playerApi.dimension)
@@ -498,6 +1125,10 @@ export const makeQaSurface = (
     const inventory = storage.inventory
     const vitals = Effect.runSync(world.vitals.snapshot)
     const entities = Effect.runSync(world.entities.snapshot).entities
+    const { brewing, statusEffects } = Effect.runSync(Effect.all({
+      brewing: observeQaBrewing(brewingService, commit.coordinator),
+      statusEffects: snapshotStatusEffects(gameplayState, commit),
+    }))
     const activePortal = [...portalStates.values()].find(
       (portal) => portal.dimension === dimension,
     )
@@ -558,9 +1189,9 @@ export const makeQaSurface = (
         status: getTradeStatus(),
       },
       villagers: [...villagerResidents.values()],
-      villagerTrades: Effect.runSync(snapshotVillagerTrades(gameplayState)),
-      brewing: Effect.runSync(snapshotBrewingStand(gameplayState)),
-      statusEffects: Effect.runSync(snapshotStatusEffects(gameplayState)),
+      villagerTrades: Effect.runSync(commit.coordinator.snapshot(GAMEPLAY_VILLAGER_TRADES_OWNER_ID, GameplayVillagerTradeSnapshotSchema).pipe(Effect.map((snapshot) => snapshot.state))),
+      brewing,
+      statusEffects,
       end: {
         frames: [...endPortalFrames.values()],
         portalComplete: getEndPortalComplete(),
@@ -639,7 +1270,7 @@ export const makeQaSurface = (
 
   const seedIgnitionEncounter = (heldItem: IgnitionItemType) => {
     respawnPlayer()
-    Effect.runSync(playerApi.restore(QA_IGNITION_POSE, Effect.runSync(playerApi.dimension)))
+    Effect.runSync(restorePlayer(QA_IGNITION_POSE, Effect.runSync(playerApi.dimension)))
     resetSimState(true)
     Effect.runSync(world.inventory.reset)
     Effect.runSync(world.inventory.add(heldItem, 2))
@@ -675,7 +1306,7 @@ export const makeQaSurface = (
   const seedStickyPistonEncounter = () => {
     respawnPlayer()
     const dimension = Effect.runSync(playerApi.dimension)
-    Effect.runSync(playerApi.restore(QA_IGNITION_POSE, dimension))
+    Effect.runSync(restorePlayer(QA_IGNITION_POSE, dimension))
     resetSimState(true)
     Effect.runSync(world.inventory.reset)
     Effect.runSync(world.inventory.add('stone', 1))
@@ -736,7 +1367,7 @@ export const makeQaSurface = (
   const seedRedstoneFixtures = () => {
     respawnPlayer()
     const dimension = Effect.runSync(playerApi.dimension)
-    Effect.runSync(playerApi.restore(QA_IGNITION_POSE, dimension))
+    Effect.runSync(restorePlayer(QA_IGNITION_POSE, dimension))
     resetSimState(true)
     // Every sibling seed*Encounter fixture (seedBoatWaterEncounter,
     // seedPortalEncounter, seedRailTrackEncounter, ...) streams its own
@@ -796,7 +1427,7 @@ export const makeQaSurface = (
 
   const pressRedstoneBranchButton = () => {
     Effect.runSync(redstoneRuntime.pressButton(
-      Effect.runSync(playerApi.dimension),
+      Schema.decodeUnknownSync(DimensionIdSchema)(Effect.runSync(playerApi.dimension)),
       QA_REDSTONE_BRANCH_BUTTON,
     ))
     return redstoneFixturesSnapshot()
@@ -837,7 +1468,7 @@ export const makeQaSurface = (
       }
     }
     Effect.runSync(streamAround(getCurrentChunkContext(), QA_RAIL_POSE.feetPosition.x, QA_RAIL_POSE.feetPosition.z))
-    Effect.runSync(playerApi.restore(QA_RAIL_POSE, dimension))
+    Effect.runSync(restorePlayer(QA_RAIL_POSE, dimension))
     resetSimState(true)
     // Flatten the loop's bounding box into a predictable floor one block
     // below track level and open air at track level and above — the same
@@ -871,17 +1502,17 @@ export const makeQaSurface = (
     const spawned = Effect.runSync(vehicleService.spawn(
       'minecart',
       dimension,
-      {
+      qaPosition({
         x: QA_RAIL_TRACK_ORIGIN.x + 1.5,
         y: QA_RAIL_TRACK_ORIGIN.y,
         z: QA_RAIL_TRACK_ORIGIN.z + 0.5,
-      },
-      0,
+      }),
+      AngleRadians(0),
     ))
     // A small nudge along the first leg's own direction, exactly as the real
     // placement path at this file's VehicleCommand handling gives a freshly
     // placed minecart a starting push — the powered loop takes it from there.
-    replaceVehicle({ ...spawned, velocity: { x: 1, y: 0, z: 0 } })
+    replaceVehicle({ ...spawned, velocity: Schema.decodeUnknownSync(VehicleVelocitySchema)({ x: 1, y: 0, z: 0 }) })
     markSessionDirty()
     renderPlayerUi()
     // This loop is deliberately not wired into the interactive redstone
@@ -958,7 +1589,7 @@ export const makeQaSurface = (
     for (const cell of QA_WATER_CELLS) {
       Effect.runSync(currentChunkStore.setBlock(cell, blockIdOf('water')))
     }
-    Effect.runSync(playerApi.restore(QA_WATER_PLACEMENT_POSE, 'overworld'))
+    Effect.runSync(restorePlayer(QA_WATER_PLACEMENT_POSE, 'overworld'))
     alignActiveDimension('overworld')
     resetSimState(true)
     Effect.runSync(world.inventory.reset)
@@ -973,7 +1604,7 @@ export const makeQaSurface = (
 
   const seedWoodenPickaxeProgression = () => {
     respawnPlayer()
-    Effect.runSync(playerApi.restore(QA_IGNITION_POSE, Effect.runSync(playerApi.dimension)))
+    Effect.runSync(restorePlayer(QA_IGNITION_POSE, Effect.runSync(playerApi.dimension)))
     resetSimState(true)
     Effect.runSync(world.inventory.reset)
     Effect.runSync(world.inventory.add('oak_log', 3))
@@ -993,7 +1624,7 @@ export const makeQaSurface = (
 
   const seedCraftingTableEncounter = () => {
     respawnPlayer()
-    Effect.runSync(playerApi.restore(QA_IGNITION_POSE, Effect.runSync(playerApi.dimension)))
+    Effect.runSync(restorePlayer(QA_IGNITION_POSE, Effect.runSync(playerApi.dimension)))
     resetSimState(true)
     Effect.runSync(world.inventory.reset)
     Effect.runSync(world.inventory.add('crafting_table', 1))
@@ -1009,7 +1640,7 @@ export const makeQaSurface = (
       requestTargetedBlockUse(
         gameplayState,
         currentChunkStore,
-        playerApi,
+        targetingContext,
         `block-use-${String(getNextBlockUseRequestId())}`,
         'crafting_table',
       ),
@@ -1022,7 +1653,7 @@ export const makeQaSurface = (
   const seedFarmingEncounter = () => {
     respawnPlayer()
     const dimension = Effect.runSync(playerApi.dimension)
-    Effect.runSync(playerApi.restore(QA_FARM_POSE, dimension))
+    Effect.runSync(restorePlayer(QA_FARM_POSE, dimension))
     resetSimState(true)
     Effect.runSync(world.inventory.reset)
     Effect.runSync(world.inventory.add('potato', 1))
@@ -1056,7 +1687,7 @@ export const makeQaSurface = (
     setNextItemUseRequestId(getNextItemUseRequestId() + 1)
     const requestId = `item-use-${String(getNextItemUseRequestId())}`
     Effect.runSync(
-      requestPotatoHarvest(gameplayState, requestId, QA_FARM_CROP_BLOCK, true, Math.random()),
+      requestPotatoHarvest(gameplayState, requestId, QA_FARM_CROP_BLOCK, Math.random()),
     )
     pendingItemUses.set(requestId, {
       kind: 'harvest',
@@ -1074,7 +1705,7 @@ export const makeQaSurface = (
     const dimension = Effect.runSync(playerApi.dimension)
     const encounterPose =
       kind === 'cactus' ? QA_CACTUS_APPROACH_POSE : QA_ENVIRONMENT_OVERLAP_POSE
-    Effect.runSync(playerApi.restore(encounterPose, dimension))
+    Effect.runSync(restorePlayer(encounterPose, dimension))
     Effect.runSync(
       streamAround(
         getCurrentChunkContext(),
@@ -1134,7 +1765,7 @@ export const makeQaSurface = (
         }
       }
     }
-    Effect.runSync(playerApi.restore({
+    Effect.runSync(restorePlayer({
       feetPosition: {
         x: QA_FALL_CENTER.x + 0.5,
         y: QA_FALL_START_Y[kind],
@@ -1150,7 +1781,7 @@ export const makeQaSurface = (
 
   const seedPortalEncounter = () => {
     respawnPlayer()
-    Effect.runSync(playerApi.restore(QA_PORTAL_POSE, 'overworld'))
+    Effect.runSync(restorePlayer(QA_PORTAL_POSE, 'overworld'))
     alignActiveDimension('overworld')
     resetSimState(true)
     Effect.runSync(materializePortal('overworld', QA_PORTAL_LAYOUT))
@@ -1206,7 +1837,7 @@ export const makeQaSurface = (
   // separately) does not push a body out of on its own.
   const seedPortalArrivalIntoSolidGround = () => {
     respawnPlayer()
-    Effect.runSync(playerApi.restore(QA_PORTAL_POSE, 'overworld'))
+    Effect.runSync(restorePlayer(QA_PORTAL_POSE, 'overworld'))
     alignActiveDimension('overworld')
     resetSimState(true)
     Effect.runSync(materializePortal('overworld', QA_PORTAL_LAYOUT))
@@ -1239,7 +1870,7 @@ export const makeQaSurface = (
 
   const seedPortalIgnitionEncounter = () => {
     respawnPlayer()
-    Effect.runSync(playerApi.restore(QA_IGNITION_POSE, 'overworld'))
+    Effect.runSync(restorePlayer(QA_IGNITION_POSE, 'overworld'))
     alignActiveDimension('overworld')
     resetSimState(true)
     // See QA_IGNITION_FLOOR_BLOCK's other call sites in this file: fixtures
@@ -1272,7 +1903,7 @@ export const makeQaSurface = (
 
   const enterQaDimension = (dimension: Dimension) => {
     const pose = Effect.runSync(playerApi.pose)
-    Effect.runSync(playerApi.restore(pose, dimension))
+    Effect.runSync(restorePlayer(pose, dimension))
     alignActiveDimension(dimension)
     resetSimState(true)
     Effect.runSync(
@@ -1284,7 +1915,7 @@ export const makeQaSurface = (
 
   const seedBedExplosionEncounter = () => {
     respawnPlayer()
-    Effect.runSync(playerApi.restore(QA_IGNITION_POSE, 'nether'))
+    Effect.runSync(restorePlayer(QA_IGNITION_POSE, 'nether'))
     alignActiveDimension('nether')
     resetSimState(true)
     Effect.runSync(
@@ -1319,7 +1950,7 @@ export const makeQaSurface = (
 
   const seedBowProjectileEncounter = () => {
     respawnPlayer()
-    Effect.runSync(playerApi.restore(QA_IGNITION_POSE, 'overworld'))
+    Effect.runSync(restorePlayer(QA_IGNITION_POSE, 'overworld'))
     alignActiveDimension('overworld')
     resetSimState(true)
     Effect.runSync(
@@ -1361,19 +1992,20 @@ export const makeQaSurface = (
     for (let radius = 0; radius <= 256 && villager === undefined; radius += 1) {
       for (let cx = -radius; cx <= radius && villager === undefined; cx += 1) {
         for (const cz of new Set([-radius, radius])) {
-          const spawn = villageVillagerSpawnsForChunk(
-            getActiveSeed(),
-            cx,
-            cz,
+          // Loop coordinates are integer chunks and the active session seed is validated at startup.
+          const spawn = Result.getOrThrow(villageVillagerSpawnsForChunk(
+            NoiseSeed(getActiveSeed()),
+            ChunkAxis(cx),
+            ChunkAxis(cz),
             (x, z) => {
-              const surfaceY = surfaceHeightAt(getActiveSeed(), x, z)
+              const surfaceY = surfaceHeightAt(NoiseSeed(getActiveSeed()), x, z)
               return {
-                biome: biomeFor(getActiveSeed(), x, z, surfaceY, DEFAULT_TERRAIN_LEVELS),
+                biome: biomeFor(NoiseSeed(getActiveSeed()), x, z, surfaceY, DEFAULT_TERRAIN_LEVELS),
                 surfaceY,
-                seaLevel: DEFAULT_TERRAIN_LEVELS.seaLevel,
+                seaLevel: BlockAxis(DEFAULT_TERRAIN_LEVELS.seaLevel),
               }
             },
-          )[0]
+          ))[0]
           if (spawn !== undefined) {
             Effect.runSync(streamAround(getCurrentChunkContext(), spawn.x, spawn.z))
             villager = villagerResidents.get(spawn.id)
@@ -1383,19 +2015,19 @@ export const makeQaSurface = (
       }
       for (let cz = -radius + 1; cz < radius && villager === undefined; cz += 1) {
         for (const cx of new Set([-radius, radius])) {
-          const spawn = villageVillagerSpawnsForChunk(
-            getActiveSeed(),
-            cx,
-            cz,
+          const spawn = Result.getOrThrow(villageVillagerSpawnsForChunk(
+            NoiseSeed(getActiveSeed()),
+            ChunkAxis(cx),
+            ChunkAxis(cz),
             (x, z) => {
-              const surfaceY = surfaceHeightAt(getActiveSeed(), x, z)
+              const surfaceY = surfaceHeightAt(NoiseSeed(getActiveSeed()), x, z)
               return {
-                biome: biomeFor(getActiveSeed(), x, z, surfaceY, DEFAULT_TERRAIN_LEVELS),
+                biome: biomeFor(NoiseSeed(getActiveSeed()), x, z, surfaceY, DEFAULT_TERRAIN_LEVELS),
                 surfaceY,
-                seaLevel: DEFAULT_TERRAIN_LEVELS.seaLevel,
+                seaLevel: BlockAxis(DEFAULT_TERRAIN_LEVELS.seaLevel),
               }
             },
-          )[0]
+          ))[0]
           if (spawn !== undefined) {
             Effect.runSync(streamAround(getCurrentChunkContext(), spawn.x, spawn.z))
             villager = villagerResidents.get(spawn.id)
@@ -1405,7 +2037,7 @@ export const makeQaSurface = (
       }
     }
     if (villager === undefined) throw new Error('no village villager found near the QA origin')
-    Effect.runSync(playerApi.restore({
+    Effect.runSync(restorePlayer({
       feetPosition: {
         x: villager.feetPosition.x + 1.5,
         y: villager.feetPosition.y,
@@ -1425,7 +2057,7 @@ export const makeQaSurface = (
 
   const seedBrewingEncounter = () => {
     respawnPlayer()
-    Effect.runSync(playerApi.restore(QA_IGNITION_POSE, 'overworld'))
+    Effect.runSync(restorePlayer(QA_IGNITION_POSE, 'overworld'))
     alignActiveDimension('overworld')
     resetSimState(true)
     Effect.runSync(
@@ -1453,8 +2085,8 @@ export const makeQaSurface = (
     setSelectedHotbarIndex(0)
     setInventoryFocus({ kind: 'slot', region: 'hotbar', index: getSelectedHotbarIndex() })
     inventoryInteraction.reset()
-    Effect.runSync(restoreBrewingStand(gameplayState, emptyBrewingStandState()))
-    Effect.runSync(restoreStatusEffects(gameplayState, emptyStatusEffectState()))
+    Effect.runSync(brewingService.reset.pipe(Effect.provideService(WorldCommitCoordinator, commit.coordinator)))
+    Effect.runSync(restoreStatusEffects(gameplayState, emptyStatusEffectState(), commit))
     setBrewingOpen(false)
     markSessionDirty()
     renderPlayerUi()
@@ -1463,7 +2095,7 @@ export const makeQaSurface = (
 
   const seedItemUpgradeEncounter = () => {
     respawnPlayer()
-    Effect.runSync(playerApi.restore(QA_IGNITION_POSE, 'overworld'))
+    Effect.runSync(restorePlayer(QA_IGNITION_POSE, 'overworld'))
     alignActiveDimension('overworld')
     resetSimState(true)
     Effect.runSync(
@@ -1499,7 +2131,8 @@ export const makeQaSurface = (
       if (/^\d+$/.test(key)) deleteItemMetadata(key)
     }
     for (let candidate = 0; candidate < 10_000; candidate += 1) {
-      const id = enchantmentOffers(candidate, 15)[0].enchantment.id
+      // Both the bounded seed candidate and the fixed bookshelf count satisfy the offer contract.
+      const id = Result.getOrThrow(enchantmentOffers(candidate, 15))[0].enchantment.id
       if (id === 'efficiency' || id === 'unbreaking' || id === 'fortune') {
         setEnchantmentSeed(candidate)
         break
@@ -1508,7 +2141,7 @@ export const makeQaSurface = (
     const vitals = Effect.runSync(world.vitals.snapshot)
     Effect.runSync(world.vitals.restore(addVitalsExperience(
       vitals,
-      totalExperienceAtLevel(30) - vitals.totalExperience,
+      ExperienceDelta(totalExperienceAtLevel(ExperienceLevel(30)) - vitals.totalExperience),
     )))
     setSelectedHotbarIndex(0)
     setInventoryFocus({ kind: 'slot', region: 'hotbar', index: getSelectedHotbarIndex() })
@@ -1520,7 +2153,7 @@ export const makeQaSurface = (
   }
 
   const switchItemUpgradeStationToAnvil = () => {
-    Effect.runSync(playerApi.restore(QA_IGNITION_POSE, 'overworld'))
+    Effect.runSync(restorePlayer(QA_IGNITION_POSE, 'overworld'))
     alignActiveDimension('overworld')
     resetSimState(true)
     Effect.runSync(
@@ -1557,7 +2190,7 @@ export const makeQaSurface = (
   // already terraformed (fishing water, an end portal frame), but not for a
   // live entity's feetPosition. spawnFullHealthHostile and
   // targetNearestHostile both reposition the player next to a mob, so both
-  // go through here instead of calling playerApi.restore(poseLookingAt(...))
+  // go through here instead of calling restorePlayer(poseLookingAt(...))
   // directly, and both get the same floor.
   //
   // Two things measured live rule out "just place a block under the
@@ -1646,7 +2279,7 @@ export const makeQaSurface = (
         Effect.runSync(currentChunkStore.setBlock(blockPosition(x, floorY + 2, z), blockIdOf('air')))
       }
     }
-    Effect.runSync(playerApi.restore(pose, dimension))
+    Effect.runSync(restorePlayer(pose, dimension))
   }
 
   const seedFishingEncounter = () => {
@@ -1659,7 +2292,7 @@ export const makeQaSurface = (
         Effect.runSync(currentChunkStore.setBlock(blockPosition(x, water.y + 1, z), blockIdOf('air')))
       }
     }
-    Effect.runSync(playerApi.restore(poseLookingAt(water, 3), 'overworld'))
+    Effect.runSync(restorePlayer(poseLookingAt(water, 3), 'overworld'))
     alignActiveDimension('overworld')
     resetSimState(true)
     Effect.runSync(world.inventory.reset)
@@ -1698,7 +2331,7 @@ export const makeQaSurface = (
         y === pool.y - 1 ? 'stone' : 'air',
       )))
     }
-    Effect.runSync(playerApi.restore({
+    Effect.runSync(restorePlayer({
       feetPosition: { x: pool.x + 0.5, y: pool.y + 0.05, z: pool.z + 0.5 },
       yawRadians: 0,
       pitchRadians: 0,
@@ -1717,7 +2350,7 @@ export const makeQaSurface = (
 
   const leaveSubmergedSwimmingEncounter = () => {
     const pool = QA_IGNITION_HIT_BLOCK
-    Effect.runSync(playerApi.restore({
+    Effect.runSync(restorePlayer({
       feetPosition: { x: pool.x + 3.5, y: pool.y + 0.05, z: pool.z + 0.5 },
       yawRadians: 0,
       pitchRadians: 0,
@@ -1742,7 +2375,7 @@ export const makeQaSurface = (
   const seedEndPortalFinalFrame = () => {
     respawnPlayer()
     const currentPose = Effect.runSync(playerApi.pose)
-    const site = nearestStrongholdSite(getActiveSeed(), currentPose.feetPosition.x, currentPose.feetPosition.z)
+    const site = nearestStrongholdSite(NoiseSeed(getActiveSeed()), BlockAxis(Math.floor(currentPose.feetPosition.x)), BlockAxis(Math.floor(currentPose.feetPosition.z)))
     if (Option.isNone(site)) throw new Error('no stronghold found near the QA player')
     const center = endPortalCenterForStronghold(site.value)
     const finalOffset = END_PORTAL_FRAME_OFFSETS[0]
@@ -1770,7 +2403,7 @@ export const makeQaSurface = (
       y: center.y,
       z: center.z + finalOffset.dz,
     }
-    Effect.runSync(playerApi.restore(poseLookingAt(finalPosition, 3), 'overworld'))
+    Effect.runSync(restorePlayer(poseLookingAt(finalPosition, 3), 'overworld'))
     alignActiveDimension('overworld')
     resetSimState(true)
     Effect.runSync(world.inventory.reset)
@@ -1787,10 +2420,10 @@ export const makeQaSurface = (
     const firstFrame = endPortalFrames.values().next()
     const frame: PersistedEndPortalFrameState | undefined = firstFrame.done ? undefined : firstFrame.value
     if (frame === undefined || !getEndPortalComplete()) throw new Error('End portal is not complete')
-    const site = nearestStrongholdSite(getActiveSeed(), frame.position.x, frame.position.z)
+    const site = nearestStrongholdSite(NoiseSeed(getActiveSeed()), BlockAxis(frame.position.x), BlockAxis(frame.position.z))
     if (Option.isNone(site)) throw new Error('no stronghold found for the completed portal')
     const center = endPortalCenterForStronghold(site.value)
-    Effect.runSync(playerApi.restore({
+    Effect.runSync(restorePlayer({
       feetPosition: {
         x: center.x + 0.5,
         y: center.y + 3 - EYE_LEVEL_OFFSET,
@@ -1824,8 +2457,8 @@ export const makeQaSurface = (
     }
     Effect.runSync(world.entities.spawn({
       kind,
-      feetPosition: target,
-      healthPoints,
+      feetPosition: qaPosition(target),
+      healthPoints: EntityHealthPoints(healthPoints),
       behaviour: initialBehaviourOfKind(kind),
     }))
     restoreLookingAt(target, 2, Effect.runSync(playerApi.dimension))
@@ -1872,7 +2505,7 @@ export const makeQaSurface = (
 
   const targetNearestStrongholdFrame = async () => {
     const pose = Effect.runSync(playerApi.pose)
-    const site = nearestStrongholdSite(getActiveSeed(), pose.feetPosition.x, pose.feetPosition.z)
+    const site = nearestStrongholdSite(NoiseSeed(getActiveSeed()), BlockAxis(Math.floor(pose.feetPosition.x)), BlockAxis(Math.floor(pose.feetPosition.z)))
     if (Option.isNone(site)) throw new Error('no stronghold found near the QA player')
     const center = endPortalCenterForStronghold(site.value)
     alignActiveDimension('overworld')
@@ -1884,7 +2517,7 @@ export const makeQaSurface = (
     })
     if (targetOffset === undefined) throw new Error('no empty stronghold frame found')
     const target = { x: center.x + targetOffset.dx, y: center.y, z: center.z + targetOffset.dz }
-    Effect.runSync(playerApi.restore({
+    Effect.runSync(restorePlayer({
       feetPosition: { x: target.x + 0.5, y: target.y + 2, z: target.z + 0.5 },
       yawRadians: 0,
       pitchRadians: -Math.PI / 2 + 0.01,
@@ -1899,7 +2532,7 @@ export const makeQaSurface = (
     const dz = target.z + 0.5 - normalizedPose.feetPosition.z
     const horizontalDistance = Math.hypot(dx, dz)
     resetSimState(false)
-    Effect.runSync(playerApi.restore({
+    Effect.runSync(restorePlayer({
       ...normalizedPose,
       yawRadians: Math.atan2(-dx, -dz),
       pitchRadians: Math.atan2(dy, horizontalDistance),
@@ -1915,7 +2548,7 @@ export const makeQaSurface = (
   }
 
   const targetEndDragon = () => {
-    Effect.runSync(playerApi.restore(poseLookingAt(endDragonPosition(), 5), 'end'))
+    Effect.runSync(restorePlayer(poseLookingAt(endDragonPosition(), 5), 'end'))
     alignActiveDimension('end')
     resetSimState(true)
     return gameplaySnapshot()
@@ -1929,7 +2562,7 @@ export const makeQaSurface = (
       rewardEmitted: false,
     }))
     const dragon = endDragonPosition()
-    Effect.runSync(playerApi.restore(poseLookingAt(dragon, 5), 'end'))
+    Effect.runSync(restorePlayer(poseLookingAt(dragon, 5), 'end'))
     alignActiveDimension('end')
     resetSimState(true)
     markSessionDirty()
@@ -1938,7 +2571,7 @@ export const makeQaSurface = (
 
   const targetEndExitPortal = () => {
     if (!getExitPortalMaterialized()) throw new Error('End exit portal is not materialized')
-    Effect.runSync(playerApi.restore(poseLookingAt({ x: 0, y: 64, z: 0 }, 3), 'end'))
+    Effect.runSync(restorePlayer(poseLookingAt({ x: 0, y: 64, z: 0 }, 3), 'end'))
     resetSimState(true)
     markSessionDirty()
     return gameplaySnapshot()
@@ -1947,7 +2580,7 @@ export const makeQaSurface = (
   const grantNearestVillagerTradeInput = () => {
     const pose = Effect.runSync(playerApi.pose)
     const villager = nearestVillagerForTrade(pose.feetPosition, 'overworld')
-    const trade = Effect.runSync(snapshotVillagerTrades(gameplayState)).villagers
+    const trade = Effect.runSync(commit.coordinator.snapshot(GAMEPLAY_VILLAGER_TRADES_OWNER_ID, GameplayVillagerTradeSnapshotSchema).pipe(Effect.map((snapshot) => snapshot.state))).villagers
       .find((candidate) => candidate.id === villager?.id)
     const offer = trade?.offers[0]
     if (offer === undefined) throw new Error('no nearby villager trade offer')
@@ -1957,496 +2590,11 @@ export const makeQaSurface = (
     return gameplaySnapshot()
   }
 
-  const registry = buildQaRegistry([
-    {
-      namespace: 'render',
-      commands: {
-        snapshotLighting: () => ({
-          ...getLightingSnapshot(),
-          weatherBrightness: weatherLightScale(Effect.runSync(renderWeather.snapshot).weather),
-        }),
-      },
+  const qaWeatherCommand = makeQaWeatherCommand({ weather, presentWeather, markSessionDirty, snapshot: gameplaySnapshot })
+  return Result.succeed({
+    install: () => {
+      const dispose = installQaDispatch(globalThis, bridge.success)
+      lifecycle.registerQaTeardown(dispose)
     },
-    {
-      namespace: 'gameplay',
-      commands: {
-        snapshot: gameplaySnapshot,
-        seedChestTransferMetadata: () => {
-          Effect.runSync(world.inventory.reset)
-          for (const key of [...customNames.keys(), ...enchantedItems.keys()]) {
-            if (/^\d+$/.test(key)) deleteItemMetadata(key)
-          }
-          Effect.runSync(world.inventory.add('diamond_pickaxe', 1))
-          const durability = Effect.runSync(world.inventory.storageSnapshot).inventoryDurability[0]
-          if (durability === null || durability === undefined) {
-            throw new Error('seeded diamond pickaxe has no durability')
-          }
-          customNames.set('0', 'Silk Runner')
-          enchantedItems.set('0', {
-            item: 'diamond_pickaxe',
-            durability,
-            enchantments: [{ id: 'efficiency', level: 5 }],
-          })
-          markSessionDirty()
-          renderPlayerUi()
-          return gameplaySnapshot()
-        },
-        seedChestTransferMetadataConflict: () => {
-          Effect.runSync(world.inventory.add('diamond_pickaxe', 1))
-          const durability = Effect.runSync(world.inventory.storageSnapshot).inventoryDurability[0]
-          if (durability === null || durability === undefined) {
-            throw new Error('seeded diamond pickaxe has no durability')
-          }
-          customNames.set('0', 'Fortune Runner')
-          enchantedItems.set('0', {
-            item: 'diamond_pickaxe',
-            durability,
-            enchantments: [{ id: 'fortune', level: 3 }],
-          })
-          markSessionDirty()
-          renderPlayerUi()
-          return gameplaySnapshot()
-        },
-        seedStaleCustomNames: () => {
-          customNames.set('35', 'Stale inventory name')
-          customNames.set('equipment:head', 'Stale equipment name')
-          customNames.set('unknown:slot', 'Stale unknown name')
-          markSessionDirty()
-          return gameplaySnapshot()
-        },
-        setWeather: () => {
-          const qaWeather: WeatherState = { weather: 'thunder', remainingSecs: 300 }
-          Effect.runSync(weather.applyTransition(qaWeather))
-          presentWeather(qaWeather)
-          markSessionDirty()
-          return gameplaySnapshot()
-        },
-        setPose: (targetBlock?: number) => {
-          Effect.runSync(playerApi.restore(QA_POSE, Effect.runSync(playerApi.dimension)))
-          if (targetBlock !== undefined) {
-            Effect.runSync(currentChunkStore.setBlock(KNOWN_TARGET_BLOCK, BlockId(targetBlock)))
-          }
-          resetSimState(true)
-          markSessionDirty()
-          return gameplaySnapshot()
-        },
-        seedSmokeGroundingEncounter: () => {
-          const dimension = Effect.runSync(playerApi.dimension)
-          Effect.runSync(streamAround(getCurrentChunkContext(), QA_POSE.feetPosition.x, QA_POSE.feetPosition.z))
-          for (let x = -16; x <= 32; x += 1) {
-            for (let z = -16; z <= 32; z += 1) {
-              Effect.runSync(currentChunkStore.setBlock(blockPosition(x, 62, z), blockIdOf('stone')))
-              Effect.runSync(currentChunkStore.setBlock(blockPosition(x, 63, z), blockIdOf('stone')))
-              for (let y = 64; y <= 68; y += 1) {
-                Effect.runSync(currentChunkStore.setBlock(blockPosition(x, y, z), blockIdOf('air')))
-              }
-            }
-          }
-          Effect.runSync(playerApi.restore({
-            ...QA_POSE,
-            feetPosition: { ...QA_POSE.feetPosition, y: 66 },
-          }, dimension))
-          resetSimState(true)
-          markSessionDirty()
-          return gameplaySnapshot()
-        },
-        setMultiplayerInvalidPose: () => {
-          const pose = Effect.runSync(playerApi.pose)
-          Effect.runSync(playerApi.restore({
-            ...pose,
-            feetPosition: { ...pose.feetPosition, x: pose.feetPosition.x + 100 },
-          }, Effect.runSync(playerApi.dimension)))
-          resetSimState(true)
-          return gameplaySnapshot()
-        },
-        seedCreativeBreakEncounter: () => {
-          Effect.runSync(playerApi.restore(QA_POSE, Effect.runSync(playerApi.dimension)))
-          resetSimState(true)
-          Effect.runSync(world.inventory.reset)
-          Effect.runSync(world.inventory.add('stone', 2))
-          Effect.runSync(currentChunkStore.setBlock(KNOWN_TARGET_BLOCK, blockIdOf('stone')))
-          setSelectedHotbarIndex(0)
-          setInventoryFocus({ kind: 'slot', region: 'hotbar', index: getSelectedHotbarIndex() })
-          inventoryInteraction.reset()
-          markSessionDirty()
-          renderPlayerUi()
-          return gameplaySnapshot()
-        },
-        seedCreativePlacementEncounter: () => {
-          Effect.runSync(playerApi.restore(QA_IGNITION_POSE, Effect.runSync(playerApi.dimension)))
-          resetSimState(true)
-          Effect.runSync(world.inventory.reset)
-          Effect.runSync(world.inventory.add('stone', 2))
-          Effect.runSync(currentChunkStore.setBlock(QA_IGNITION_HIT_BLOCK, blockIdOf('stone')))
-          Effect.runSync(currentChunkStore.setBlock(QA_IGNITION_CELL, blockIdOf('air')))
-          Effect.runSync(currentChunkStore.setBlock(QA_IGNITION_SUPPORT_BLOCK, blockIdOf('stone')))
-          // See QA_IGNITION_FLOOR_BLOCK's other call sites in this file:
-          // fixtures that restore the player to QA_IGNITION_POSE without it
-          // leave the player free-falling for the whole encounter.
-          Effect.runSync(currentChunkStore.setBlock(QA_IGNITION_FLOOR_BLOCK, blockIdOf('stone')))
-          setSelectedHotbarIndex(0)
-          setInventoryFocus({ kind: 'slot', region: 'hotbar', index: getSelectedHotbarIndex() })
-          inventoryInteraction.reset()
-          markSessionDirty()
-          renderPlayerUi()
-          return gameplaySnapshot()
-        },
-        requestMultiplayerBlockPlacement: () => {
-          if (multiplayer === undefined || !getMultiplayerHandshakeComplete()) return gameplaySnapshot()
-          Effect.runSync(multiplayer.host.enqueueOutbound({
-            _tag: 'BlockPlace',
-            player: multiplayer.query.player,
-            world: WorldId.make(Effect.runSync(playerApi.dimension)),
-            at: QA_IGNITION_CELL,
-            block: 'stone',
-          }))
-          return gameplaySnapshot()
-        },
-        requestMultiplayerBlockBreak: () => {
-          if (multiplayer === undefined || !getMultiplayerHandshakeComplete()) return gameplaySnapshot()
-          Effect.runSync(multiplayer.host.enqueueOutbound({
-            _tag: 'BlockBreak',
-            player: multiplayer.query.player,
-            world: WorldId.make(Effect.runSync(playerApi.dimension)),
-            at: QA_IGNITION_CELL,
-          }))
-          return gameplaySnapshot()
-        },
-        returnToCraftingTable: () => {
-          Effect.runSync(playerApi.restore(QA_IGNITION_POSE, Effect.runSync(playerApi.dimension)))
-          resetSimState(true)
-          // See QA_IGNITION_FLOOR_BLOCK's other call sites in this file:
-          // fixtures that restore the player to QA_IGNITION_POSE without it
-          // leave the player free-falling for the whole encounter.
-          Effect.runSync(currentChunkStore.setBlock(QA_IGNITION_FLOOR_BLOCK, blockIdOf('stone')))
-          markSessionDirty()
-          return gameplaySnapshot()
-        },
-        enterNether: () => enterQaDimension('nether'),
-        enterOverworld: () => enterQaDimension('overworld'),
-        enterEnd: () => enterQaDimension('end'),
-        seedBedExplosionEncounter,
-        seedBowProjectileEncounter,
-        breakTarget: () => {
-          if (playerIsDead()) return null
-          const target = Effect.runSync(
-            requestTargetedBlockBreak(gameplayState, currentChunkStore, playerApi),
-          )
-          if (Option.isSome(target)) markSessionDirty()
-          return Option.isSome(target) ? target.value : null
-        },
-        seedCraftingLog: () => {
-          if (playerIsDead()) return gameplaySnapshot()
-          Effect.runSync(world.inventory.reset)
-          Effect.runSync(world.inventory.add('oak_log', 1))
-          inventoryInteraction.reset()
-          markSessionDirty()
-          renderPlayerUi()
-          return gameplaySnapshot()
-        },
-        seedCraftingTableEncounter,
-        seedStickyPistonEncounter,
-        stickyPistonSnapshot,
-        seedRedstoneFixtures,
-        redstoneFixturesSnapshot,
-        pressRedstoneBranchButton,
-        mutateObserverInput,
-        seedRailTrackEncounter,
-        railTrackSnapshot,
-        seedBoatWaterEncounter,
-        boatWaterSnapshot,
-        seedFarmingEncounter,
-        seedFishingEncounter,
-        seedSubmergedSwimmingEncounter,
-        leaveSubmergedSwimmingEncounter,
-        seedVillageTradingEncounter,
-        grantNearestVillagerTradeInput,
-        harvestFarmingCrop,
-        seedCactusApproach: () => seedEnvironmentalContactEncounter('cactus'),
-        seedDuplicateLavaContact: () => seedEnvironmentalContactEncounter('duplicateLava'),
-        seedLethalMixedContact: () => seedEnvironmentalContactEncounter('lethalMixed'),
-        seedSafeFall: () => seedFallEncounter('safe'),
-        seedDamagingFall: () => seedFallEncounter('damaging'),
-        seedLethalFall: () => seedFallEncounter('lethal'),
-        preparePotatoEating: () => {
-          Effect.runSync(playerApi.restore(QA_IGNITION_POSE, Effect.runSync(playerApi.dimension)))
-          resetSimState(true)
-          // See QA_IGNITION_FLOOR_BLOCK's other call sites in this file:
-          // fixtures that restore the player to QA_IGNITION_POSE without it
-          // leave the player free-falling for the whole encounter.
-          Effect.runSync(currentChunkStore.setBlock(QA_IGNITION_FLOOR_BLOCK, blockIdOf('stone')))
-          Effect.runSync(world.vitals.addExhaustion(36))
-          markSessionDirty()
-          return gameplaySnapshot()
-        },
-        returnToFarmingPlot: () => {
-          Effect.runSync(playerApi.restore(QA_FARM_POSE, Effect.runSync(playerApi.dimension)))
-          resetSimState(true)
-          markSessionDirty()
-          return gameplaySnapshot()
-        },
-        seedPortalEncounter,
-        seedPortalArrivalIntoSolidGround,
-        seedPortalIgnitionEncounter,
-        seedWoodenPickaxeProgression,
-        seedIronArmor: () => {
-          Effect.runSync(world.inventory.reset)
-          const equipment = [
-            ['iron_helmet', 'head'],
-            ['iron_chestplate', 'chest'],
-            ['iron_leggings', 'legs'],
-            ['iron_boots', 'feet'],
-          ] as const
-          equipment.forEach(([item]) => Effect.runSync(world.inventory.add(item, 1)))
-          equipment.forEach(([, slot], inventorySlot) => {
-            const result = Effect.runSync(world.inventory.equipFromInventory(inventorySlot, slot))
-            if (result._tag !== 'Equipped') {
-              throw new Error(`failed to equip ${slot}: ${result._tag}`)
-            }
-          })
-          Effect.runSync(world.inventory.add('iron_sword', 1))
-          inventoryInteraction.reset()
-          markSessionDirty()
-          renderPlayerUi()
-          return gameplaySnapshot()
-        },
-        damage: () => {
-          applyPlayerDamage({ amount: 4, cause: 'generic' })
-          markSessionDirty()
-          renderPlayerUi()
-          return gameplaySnapshot()
-        },
-        heal: () => {
-          Effect.runSync(world.vitals.heal(4))
-          markSessionDirty()
-          renderPlayerUi()
-          return gameplaySnapshot()
-        },
-        eat: () => {
-          survivalHunger.eat(4, 0.3)
-          markSessionDirty()
-          renderPlayerUi()
-          return gameplaySnapshot()
-        },
-        respawn: () => {
-          respawnPlayer()
-          return gameplaySnapshot()
-        },
-        shoot: () => {
-          if (playerIsDead()) return gameplaySnapshot()
-          const currentPose = Effect.runSync(playerApi.pose)
-          const horizontal = Math.cos(currentPose.pitchRadians)
-          Effect.runSync(requestBowShot(gameplayState, {
-            origin: {
-              x: currentPose.feetPosition.x,
-              y: currentPose.feetPosition.y + EYE_LEVEL_OFFSET,
-              z: currentPose.feetPosition.z,
-            },
-            dirX: -Math.sin(currentPose.yawRadians) * horizontal,
-            dirY: Math.sin(currentPose.pitchRadians),
-            dirZ: -Math.cos(currentPose.yawRadians) * horizontal,
-            chargeSecs: 1,
-            inventory: { mode: isCreativeMode ? 'creative' : 'survival', slotIndex: getSelectedHotbarIndex() },
-          }))
-          return gameplaySnapshot()
-        },
-        seedZombiePursuitEncounter: () => {
-          respawnPlayer()
-          Effect.runSync(currentChunkStore.setBlock(QA_IGNITION_FLOOR_BLOCK, blockIdOf('stone')))
-          Effect.runSync(currentChunkStore.setBlock(blockPosition(8, 65, 10), blockIdOf('air')))
-          Effect.runSync(currentChunkStore.setBlock(blockPosition(8, 66, 10), blockIdOf('air')))
-          Effect.runSync(playerApi.restore(QA_IGNITION_POSE, Effect.runSync(playerApi.dimension)))
-          resetSimState(true)
-          const currentPose = Effect.runSync(playerApi.pose)
-          Effect.runSync(requestMobSpawn(gameplayState, {
-            kind: ZOMBIE_KIND,
-            feetPosition: {
-              x: currentPose.feetPosition.x + 4,
-              y: currentPose.feetPosition.y,
-              z: currentPose.feetPosition.z,
-            },
-            candidate: {
-              groundBlock: blockIdOf('stone'),
-              footBlock: blockIdOf('air'),
-              headBlock: blockIdOf('air'),
-              blockLight: 0,
-              timeOfDay: 0,
-              distanceToPlayerBlocksXZ: 16,
-            },
-          }))
-          markSessionDirty()
-          return gameplaySnapshot()
-        },
-        seedLethalZombieEncounter: () => {
-          respawnPlayer()
-          Effect.runSync(world.inventory.reset)
-          Effect.runSync(world.inventory.add('stone_pickaxe', 1))
-          Effect.runSync(world.inventory.add('potato', 2))
-          Effect.runSync(world.inventory.add('torch', 8))
-          Effect.runSync(world.inventory.add('oak_planks', 4))
-          Effect.runSync(currentChunkStore.setBlock(QA_IGNITION_FLOOR_BLOCK, blockIdOf('stone')))
-          Effect.runSync(currentChunkStore.setBlock(blockPosition(8, 65, 10), blockIdOf('air')))
-          Effect.runSync(currentChunkStore.setBlock(blockPosition(8, 66, 10), blockIdOf('air')))
-          Effect.runSync(playerApi.restore(QA_IGNITION_POSE, Effect.runSync(playerApi.dimension)))
-          resetSimState(true)
-          const currentPose = Effect.runSync(playerApi.pose)
-          Effect.runSync(requestMobSpawn(gameplayState, {
-            kind: ZOMBIE_KIND,
-            feetPosition: {
-              x: currentPose.feetPosition.x + 0.5,
-              y: currentPose.feetPosition.y,
-              z: currentPose.feetPosition.z,
-            },
-            candidate: {
-              groundBlock: blockIdOf('stone'),
-              footBlock: blockIdOf('air'),
-              headBlock: blockIdOf('air'),
-              blockLight: 0,
-              timeOfDay: 0,
-              distanceToPlayerBlocksXZ: 16,
-            },
-          }))
-          applyPlayerDamage({ amount: 20, cause: 'mob' })
-          markSessionDirty()
-          renderPlayerUi()
-          return gameplaySnapshot()
-        },
-        seedFoodUseEncounter: () => {
-          respawnPlayer()
-          Effect.runSync(playerApi.restore(QA_IGNITION_POSE, Effect.runSync(playerApi.dimension)))
-          resetSimState(true)
-          // See QA_IGNITION_FLOOR_BLOCK's other call sites in this file:
-          // fixtures that restore the player to QA_IGNITION_POSE without it
-          // leave the player free-falling for the whole encounter.
-          Effect.runSync(currentChunkStore.setBlock(QA_IGNITION_FLOOR_BLOCK, blockIdOf('stone')))
-          Effect.runSync(world.inventory.reset)
-          Effect.runSync(world.inventory.add('potato', 2))
-          applyPlayerDamage({ amount: 4, cause: 'generic' })
-          Effect.runSync(world.vitals.addExhaustion(36))
-          setSelectedHotbarIndex(0)
-          setInventoryFocus({ kind: 'slot', region: 'hotbar', index: getSelectedHotbarIndex() })
-          inventoryInteraction.reset()
-          markSessionDirty()
-          renderPlayerUi()
-          return gameplaySnapshot()
-        },
-        seedFireChargeIgnition: () => seedIgnitionEncounter('fire_charge'),
-        seedFlintAndSteelIgnition: () => seedIgnitionEncounter('flint_and_steel'),
-        seedRefusedFireChargeIgnition: () => {
-          seedIgnitionEncounter('fire_charge')
-          Effect.runSync(currentChunkStore.setBlock(QA_IGNITION_CELL, blockIdOf('stone')))
-          setNextItemUseRequestId(getNextItemUseRequestId() + 1)
-          const requestId = `item-use-${String(getNextItemUseRequestId())}`
-          Effect.runSync(
-            requestItemUse(gameplayState, requestId, QA_IGNITION_CELL, 'fire_charge'),
-          )
-          pendingItemUses.set(requestId, {
-            kind: 'ignition',
-            slotIndex: getSelectedHotbarIndex(),
-            heldItem: 'fire_charge',
-            dimension: Effect.runSync(playerApi.dimension),
-          })
-          markSessionDirty()
-          return gameplaySnapshot()
-        },
-        seedMeleeDropEncounter: () => {
-          respawnPlayer()
-          Effect.runSync(world.inventory.reset)
-          Effect.runSync(world.inventory.add('wooden_sword', 1))
-          inventoryInteraction.reset()
-          setSelectedHotbarIndex(0)
-          setInventoryFocus({
-            kind: 'slot',
-            region: 'hotbar',
-            index: getSelectedHotbarIndex(),
-          })
-          const spawnPose = Effect.runSync(playerApi.pose)
-          Effect.runSync(playerApi.look(-spawnPose.yawRadians, -spawnPose.pitchRadians))
-          const currentPose = Effect.runSync(playerApi.pose)
-          const distance = 2
-          const horizontal = Math.cos(currentPose.pitchRadians)
-          const direction = {
-            x: -Math.sin(currentPose.yawRadians) * horizontal,
-            y: Math.sin(currentPose.pitchRadians),
-            z: -Math.cos(currentPose.yawRadians) * horizontal,
-          }
-          const eyeY = Math.floor(currentPose.feetPosition.y + EYE_LEVEL_OFFSET)
-          for (let zOffset = 0; zOffset >= -3; zOffset -= 1) {
-            Effect.runSync(currentChunkStore.setBlock(blockPosition(
-              Math.floor(currentPose.feetPosition.x),
-              eyeY,
-              Math.floor(currentPose.feetPosition.z) + zOffset,
-            ), blockIdOf('air')))
-          }
-          Effect.runSync(
-            world.entities.spawn({
-              kind: CREEPER_KIND,
-              feetPosition: {
-                x: currentPose.feetPosition.x + direction.x * distance,
-                y: currentPose.feetPosition.y
-                  + EYE_LEVEL_OFFSET
-                  + direction.y * distance
-                  - 0.9,
-                z: currentPose.feetPosition.z + direction.z * distance,
-              },
-              healthPoints: 1,
-              behaviour: undefined,
-            }),
-          )
-          markSessionDirty()
-          renderPlayerUi()
-          return gameplaySnapshot()
-        },
-        seedBrewingEncounter,
-        seedItemUpgradeEncounter,
-        switchItemUpgradeStationToAnvil,
-        seedEndEyeCrafting,
-        forceNextEyeOfEnderDrop: () => {
-          setNextEyeOfEnderBreaks(false)
-          return gameplaySnapshot()
-        },
-        forceNextEyeOfEnderBreak: () => {
-          setNextEyeOfEnderBreaks(true)
-          return gameplaySnapshot()
-        },
-        spawnFullHealthEnderman: () => spawnFullHealthHostile(ENDERMAN_KIND, 40),
-        spawnFullHealthBlaze: () => spawnFullHealthHostile(BLAZE_KIND, 20),
-        targetNearestHostile,
-        targetNearestDroppedItem,
-        targetNearestStrongholdFrame,
-        seedEndPortalFinalFrame,
-        targetCompletedEndPortal,
-        seedEndDragonFinalHit,
-        targetEndDragon,
-        targetEndExitPortal,
-      },
-    },
-    {
-      namespace: 'persistence',
-      commands: { flush: requestFlush },
-    },
-    {
-      namespace: 'audio',
-      commands: {
-        report: () => Effect.runSync(audioBackend.report),
-        snapshot: () => audioRuntime.snapshot(Effect.runSync(browserClock.monotonicSecs)),
-      },
-    },
-    {
-      namespace: 'lifecycle',
-      commands: {
-        stop: () => getStopBrowserPreview()?.(),
-      },
-    },
-  ])
-  if (registry._tag === 'Left') {
-    return { _id: 'Either', _tag: 'Left', left: registry.left }
-  }
-  return {
-    _id: 'Either',
-    _tag: 'Right',
-    right: {
-      install: () => installQaApi(globalThis as unknown as Record<string, unknown>, registry.right),
-    },
-  }
+  })
 }
