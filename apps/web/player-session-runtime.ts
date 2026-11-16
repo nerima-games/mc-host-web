@@ -7,7 +7,6 @@ import type { AuthoritativeEntityState } from '@nerima-games/mx-multiplayer'
 import type { RemotePlayer } from './multiplayer-client'
 import type { PersistedVillager, SessionPosition } from './session-persistence'
 import { makeQaSurface } from './qa-surface'
-import { describeQaApiError } from '@nerima-games/mc-compose'
 import type { TouchLookResetReason } from './touch-input'
 
 // Projected entities originate from the session's registered entities and require stable, non-empty IDs.
@@ -167,9 +166,7 @@ export const installPlayerQaSurface = (
 ): boolean => {
   const result = makeQaSurface(context)
   if (result._tag === 'Failure') {
-    failBoot('QA registry rejected', result.failure._tag === 'DuplicateModuleContract'
-      ? JSON.stringify(result.failure)
-      : describeQaApiError(result.failure))
+    failBoot('QA composition rejected', JSON.stringify(result.failure))
     return false
   }
   result.success.install()
