@@ -5,6 +5,7 @@ import {
   makeRecordingBackend,
   SoundCueId,
   type AudioBackend,
+  type AudioEvent,
   type WebAudioBackend,
 } from '@nerima-games/mc-audio'
 import {
@@ -18,7 +19,7 @@ import {
   type Position,
 } from '@nerima-games/mc-kernel'
 import { describe, expect, it } from 'vitest'
-import { Effect, type Layer } from 'effect'
+import { Effect, type Layer, Result } from 'effect'
 
 import {
   announceConfirmedPlacements,
@@ -27,6 +28,7 @@ import {
   horizontalListenerForward,
   makeAudioRuntime,
   makePlacementAudioLatch,
+  playAudioEvent,
   pruneExpiredCaptionEvents,
 } from '../apps/web/audio-runtime'
 
@@ -280,5 +282,139 @@ describe('web audio runtime', () => {
     const atFour = pruneExpiredCaptionEvents(captions, MonotonicTimeSecs(4))
     expect(atFour.map((caption) => caption.text)).toEqual(['Current', 'Future'])
     expect(pruneExpiredCaptionEvents(atFour, MonotonicTimeSecs(8)).map((caption) => caption.text)).toEqual(['Future'])
+  })
+})
+
+const freshRuntime = async (atSecs: number, wrap?: (backend: AudioBackend) => AudioBackend) => {
+  const recording = await Effect.runPromise(makeRecordingBackend('ready'))
+  const runtime = await Effect.runPromise(
+    makeAudioRuntime({
+      backend: makeBackend(wrap === undefined ? recording.backend : wrap(recording.backend), { unlocks: 0, closes: 0 }),
+      clockLayer: fixedClockLayer(atSecs),
+      listener: () => ORIGIN,
+    }),
+  )
+  return { recording, runtime }
+}
+
+type EventCase = {
+  readonly id: string
+  readonly event: AudioEvent
+  readonly cueId: string
+  readonly caption: string
+}
+
+// Expected cue ids and caption strings come from mc-audio's cue-definitions
+// (dist/data/cue-definitions.js) and audio-event-map.js, not from the code under test.
+const EVENT_CASES: ReadonlyArray<EventCase> = [
+  { id: 'mining-stone', event: { kind: 'mining', blockType: 'stone' }, cueId: 'blockBreak', caption: 'Block breaks' },
+  { id: 'place-oak-planks', event: { kind: 'place', blockType: 'oak_planks' }, cueId: 'blockPlace', caption: 'Block placed' },
+  { id: 'pickup', event: { kind: 'pickup' }, cueId: 'itemPickup', caption: 'Item picked up' },
+  { id: 'attack', event: { kind: 'attack' }, cueId: 'entityHit', caption: 'Attack lands' },
+  { id: 'hurt-player', event: { kind: 'hurt', target: 'player' }, cueId: 'playerHurt', caption: 'You were hurt' },
+  { id: 'hurt-mob', event: { kind: 'hurt', target: 'mob' }, cueId: 'mobHurt', caption: 'Mob hurts' },
+  { id: 'mob-death', event: { kind: 'mobDeath' }, cueId: 'mobDeath', caption: 'Mob dies' },
+  { id: 'ambient-rain', event: { kind: 'ambient', layer: 'rain' }, cueId: 'rainAmbient', caption: 'Rain falls' },
+  { id: 'ambient-thunder', event: { kind: 'ambient', layer: 'thunder' }, cueId: 'thunderClap', caption: 'Thunder rumbles' },
+]
+
+describe('playAudioEvent through a real audio runtime', () => {
+  for (const eventCase of EVENT_CASES) {
+    it(`${eventCase.id}: plays ${eventCase.cueId} with caption "${eventCase.caption}"`, async () => {
+      const { recording, runtime } = await freshRuntime(3)
+
+      const mapping = playAudioEvent(runtime, eventCase.event)
+
+      expect(Result.isSuccess(mapping) && mapping.success.cueId).toBe(eventCase.cueId)
+      const snapshot = runtime.snapshot(MonotonicTimeSecs(3))
+      expect(snapshot.cueIds).toEqual([eventCase.cueId])
+      expect(snapshot.captions.map((caption) => caption.text)).toEqual([eventCase.caption])
+      expect(await Effect.runPromise(recording.played)).toHaveLength(1)
+    })
+  }
+
+  it('forwards play options so a positioned event pans in world space', async () => {
+    const { recording, runtime } = await freshRuntime(0)
+
+    playAudioEvent(runtime, { kind: 'place', blockType: 'stone' }, { position: at(12, 0, 0) })
+
+    expect((await Effect.runPromise(recording.played))[0]?.pan).toBeCloseTo(1)
+  })
+
+  it('returns the typed failure and plays nothing for an unknown block type', async () => {
+    const { recording, runtime } = await freshRuntime(0)
+
+    const mapping = playAudioEvent(runtime, { kind: 'mining', blockType: 'not_a_block' })
+
+    expect(Result.isFailure(mapping) && mapping.failure).toEqual({
+      _tag: 'AudioEventMapFailure',
+      kind: 'mining',
+      blockType: 'not_a_block',
+      reason: 'unknown-block-type',
+    })
+    const snapshot = runtime.snapshot(MonotonicTimeSecs(0))
+    expect(snapshot.cueIds).toEqual([])
+    expect(snapshot.captions).toEqual([])
+    expect(await Effect.runPromise(recording.played)).toEqual([])
+  })
+
+  it('returns an invalid-type failure and plays nothing for a non-string block type', async () => {
+    const { recording, runtime } = await freshRuntime(0)
+
+    const mapping = playAudioEvent(runtime, { kind: 'place', blockType: 42 })
+
+    expect(Result.isFailure(mapping) && mapping.failure).toEqual({
+      _tag: 'AudioEventMapFailure',
+      kind: 'place',
+      blockType: null,
+      reason: 'invalid-type',
+    })
+    const snapshot = runtime.snapshot(MonotonicTimeSecs(0))
+    expect(snapshot.cueIds).toEqual([])
+    expect(snapshot.captions).toEqual([])
+    expect(await Effect.runPromise(recording.played)).toEqual([])
+  })
+
+  it('does not let a failed event suppress a later valid one', async () => {
+    const { runtime } = await freshRuntime(0)
+
+    playAudioEvent(runtime, { kind: 'mining', blockType: 'not_a_block' })
+    playAudioEvent(runtime, { kind: 'mining', blockType: 'dirt' })
+
+    expect(runtime.snapshot(MonotonicTimeSecs(0)).cueIds).toEqual(['blockBreak'])
+  })
+
+  it('produces the same cue and caption sequence in two fresh runtimes', async () => {
+    const events: ReadonlyArray<AudioEvent> = EVENT_CASES.map((eventCase) => eventCase.event)
+    const run = async () => {
+      const { recording, runtime } = await freshRuntime(5)
+      for (const event of events) playAudioEvent(runtime, event)
+      const snapshot = runtime.snapshot(MonotonicTimeSecs(5))
+      return {
+        cueIds: snapshot.cueIds,
+        captions: snapshot.captions.map((caption) => caption.text),
+        gains: (await Effect.runPromise(recording.played)).map((request) => request.gain),
+      }
+    }
+
+    const first = await run()
+    const second = await run()
+
+    expect(first.cueIds).toEqual(EVENT_CASES.map((eventCase) => eventCase.cueId))
+    expect(second).toEqual(first)
+  })
+
+  it('keeps the cue and caption when backend playback defects', async () => {
+    const { runtime } = await freshRuntime(4, (backend) => ({
+      ...backend,
+      playTone: () => Effect.die(new Error('backend defect')),
+    }))
+
+    const mapping = playAudioEvent(runtime, { kind: 'hurt', target: 'player' })
+
+    expect(Result.isSuccess(mapping) && mapping.success.cueId).toBe('playerHurt')
+    const snapshot = runtime.snapshot(MonotonicTimeSecs(4))
+    expect(snapshot.cueIds).toEqual(['playerHurt'])
+    expect(snapshot.captions.map((caption) => caption.text)).toEqual(['You were hurt'])
   })
 })
