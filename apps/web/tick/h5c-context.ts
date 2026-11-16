@@ -114,7 +114,7 @@ export type H5cTickContext = {
     readonly worldWrite: import('@nerima-games/mc-kernel').WorldWritePort['Service']
     readonly streamAround: (
       ...args: Parameters<ReturnType<typeof import('../chunk-streaming').makeChunkStreaming>['streamAround']>
-    ) => Effect.Effect<void, import('@nerima-games/mc-sim').WorldCommitCoordinatorError | import('@nerima-games/mc-worldgen').InvalidNaturalStructureCoordinate>
+    ) => Effect.Effect<void, import('../chunk-streaming').ChunkStreamingFailure>
     readonly presentWeather: (state: import('@nerima-games/mc-sim').WeatherState) => void
     readonly presentWeatherRuntime: (
       state: import('@nerima-games/mc-sim').WeatherState,

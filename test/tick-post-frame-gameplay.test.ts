@@ -18,7 +18,7 @@ import { mutableState, type H5aFrameInputResult, type H5aMovementResult, type H5
 import type { H5bPostFrameResult } from '../apps/web/tick/h5b-context'
 import type { H5cTickContext } from '../apps/web/tick/h5c-context'
 import { runTickPostFrameGameplay as runTickPostFrameGameplayEffect } from '../apps/web/tick/post-frame-gameplay'
-import { type DimensionChunkContext } from '../apps/web/chunk-streaming'
+import { type ChunkStreamingFailure, type DimensionChunkContext } from '../apps/web/chunk-streaming'
 
 const blockPosition = (x: number, y: number, z: number) => kernelBlockPosition(BlockAxis(x), BlockAxis(y), BlockAxis(z))
 const chunkCoord = (cx: number, cz: number) => kernelChunkCoord(ChunkAxis(cx), ChunkAxis(cz))
@@ -916,9 +916,11 @@ describe('tick post-frame gameplay processing', () => {
     })
   })
 
-  it('propagates streaming owner failures before presenting the frame', async () => {
+  it.each([
+    { kind: 'owner', failure: { _tag: 'WorldCommitCoordinatorInvalidOptions', value: 'stream failure' } },
+    { kind: 'chunk store', failure: { _tag: 'DirtyChunkEvictionError', coord: chunkCoord(0, 0) } },
+  ] satisfies ReadonlyArray<{ kind: string; failure: ChunkStreamingFailure }>)('propagates streaming $kind failures before presenting the frame', async ({ failure }) => {
     await withHarness({}, (harness) => {
-      const failure = { _tag: 'WorldCommitCoordinatorInvalidOptions', value: 'stream failure' } as const
       const context: H5cTickContext = {
         ...harness.context,
         services: { ...harness.context.services, streamAround: () => Effect.fail(failure) },
@@ -930,7 +932,7 @@ describe('tick post-frame gameplay processing', () => {
         nowSecs: MonotonicTimeSecs(2),
       })))
 
-      expect(result).toMatchObject({ _tag: 'Failure', failure })
+      expect(result).toEqual(Result.fail(failure))
       expect(harness.canvasAttributes.has('data-player-feet')).toBe(false)
     })
   })
