@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { Effect, Option, Result, Schema } from 'effect'
 import {
   ChunkAxis,
@@ -96,7 +96,7 @@ describe('session save coordinator', () => {
       initialKnownChunks: [dimensionChunk('overworld', 0, 0, 1)],
       snapshotResidents: async () => [],
       currentGeneration: () => 4,
-      snapshotState: () => 1,
+      snapshotState: async () => 1,
       publish: (publication) => {
         publications.push(publication)
         if (publications.length === 1) {
@@ -143,7 +143,7 @@ describe('session save coordinator', () => {
       initialKnownChunks: [],
       snapshotResidents: async () => [],
       currentGeneration: () => 0,
-      snapshotState: () => publications.length,
+      snapshotState: async () => publications.length,
       publish: (publication) => {
         publications.push(publication)
         return saves[publications.length - 1]!.promise
@@ -159,8 +159,10 @@ describe('session save coordinator', () => {
     await first
 
     expect(firstSettled).toBe(true)
+    // The state snapshot is asynchronous, so the next batch publishes a few
+    // promise turns after the first settles.
+    await vi.waitFor(() => { expect(publications).toHaveLength(2) })
     expect(secondSettled).toBe(false)
-    expect(publications).toHaveLength(2)
 
     saves[1]!.resolve()
     await second
@@ -174,7 +176,7 @@ describe('session save coordinator', () => {
       initialKnownChunks: [dimensionChunk('overworld', 0, 0, 1)],
       snapshotResidents: async () => [],
       currentGeneration: () => 0,
-      snapshotState: () => 1,
+      snapshotState: async () => 1,
       publish: async (publication) => {
         publications.push(publication)
         if (shouldFail) throw new Error('storage unavailable')
@@ -200,7 +202,7 @@ describe('session save coordinator', () => {
       initialKnownChunks: [],
       snapshotResidents: async () => [],
       currentGeneration: () => 0,
-      snapshotState: () => 1,
+      snapshotState: async () => 1,
       publish: (publication) => {
         publications.push(publication)
         return publications.length === 1 ? firstSave.promise : Promise.resolve()
@@ -208,7 +210,7 @@ describe('session save coordinator', () => {
     })
     coordinator.retainChunk(dimensionChunk('overworld', 7, 2, 3))
     const first = coordinator.requestSave()
-    await Promise.resolve()
+    await vi.waitFor(() => { expect(publications).toHaveLength(1) })
     coordinator.retainChunk(dimensionChunk('overworld', 7, 2, 9))
     firstSave.resolve()
     await first
@@ -234,7 +236,7 @@ describe('session save coordinator', () => {
           : Promise.resolve([dimensionChunk('overworld', 0, 0, residentMarker)])
       },
       currentGeneration: () => state,
-      snapshotState: () => state,
+      snapshotState: async () => state,
       publish: async (publication) => { publications.push(publication) },
     })
 
@@ -267,7 +269,7 @@ describe('session save coordinator', () => {
         return snapshotCount === 1 ? firstResidents.promise : Promise.resolve([])
       },
       currentGeneration: () => generation,
-      snapshotState: () => state,
+      snapshotState: async () => state,
       publish: async (publication) => { publications.push(publication) },
       onPublished: (publishedGeneration) => { publishedGenerations.push(publishedGeneration) },
     })
@@ -297,7 +299,7 @@ describe('session save coordinator', () => {
         return []
       },
       currentGeneration: () => generation,
-      snapshotState: () => generation,
+      snapshotState: async () => generation,
       publish: async (publication) => { publications.push(publication) },
     })
 
@@ -321,7 +323,7 @@ describe('session save coordinator', () => {
       initialKnownChunks: [],
       snapshotResidents: async () => [],
       currentGeneration: () => 4,
-      snapshotState: () => ++stateSnapshotCount,
+      snapshotState: async () => ++stateSnapshotCount,
       publish: async (publication) => { publications.push(publication) },
     })
 
@@ -337,7 +339,7 @@ describe('session save coordinator', () => {
       initialKnownChunks: [],
       snapshotResidents: async () => [],
       currentGeneration: () => 0,
-      snapshotState: () => 1,
+      snapshotState: async () => 1,
       publish: async (publication) => { publications.push(publication) },
     })
     coordinator.retainChunk(dimensionChunk('overworld', 120, -80, 6))
@@ -356,7 +358,7 @@ describe('session save coordinator', () => {
         dimensionChunk('overworld', 2, 2, 7),
       ],
       currentGeneration: () => 0,
-      snapshotState: () => 1,
+      snapshotState: async () => 1,
       publish: async (saved) => { publication = saved },
     })
     coordinator.retainChunk(dimensionChunk('overworld', 1, 1, 4))
@@ -373,7 +375,7 @@ describe('session save coordinator', () => {
       initialKnownChunks: [dimensionChunk('overworld', 3, -4, 2)],
       snapshotResidents: async () => [dimensionChunk('nether', 3, -4, 8)],
       currentGeneration: () => 0,
-      snapshotState: () => 1,
+      snapshotState: async () => 1,
       publish: async (saved) => { publication = saved },
     })
 
@@ -445,7 +447,7 @@ describe('owner-backed save state', () => {
       initialKnownChunks: [],
       snapshotResidents: async () => [],
       currentGeneration: () => 0,
-      snapshotState: () => Effect.runSync(
+      snapshotState: () => Effect.runPromise(
         snapshotOwnedSessionState(coordinator, ownerIds, sessionWorld.snapshotEntityRosters),
       ),
       publish: async (publication) => { published.push(publication) },

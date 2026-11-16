@@ -285,6 +285,8 @@ export type MultiplayerClientContext = {
     } | undefined
   }
   readonly services: {
+    /** Runs `work` at the next frame boundary, for DOM events that read the world. */
+    readonly deferToFrameBoundary: (work: () => void) => void
     readonly world: Pick<OwnerBackedWorld, 'inventory' | 'vitals'>
     readonly gameplayState: GameplayFrameState
     readonly playerApi: OwnerBackedWorld['player']
@@ -1158,14 +1160,17 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
     const detail = (event as CustomEvent<{ readonly entityId: string; readonly action: 'attack' | 'pickup' | 'mount' | 'dismount' | 'move'; readonly direction?: 'forward' | 'backward' }>).detail
     if (detail === undefined) return
     const entityId = EntityId.make(detail.entityId)
-    if (detail.action === 'attack') sendEntityCommand({ _tag: 'EntityAttackCommand', entityId })
-    else if (detail.action === 'pickup') sendEntityCommand({ _tag: 'EntityPickupCommand', entityId })
-    else if (detail.action !== 'move') sendEntityCommand({
-      _tag: 'VehicleCommand',
-      entityId,
-      action: detail.action,
+    // A command names the player's dimension, which is read from the world.
+    clientContext.services.deferToFrameBoundary(() => {
+      if (detail.action === 'attack') sendEntityCommand({ _tag: 'EntityAttackCommand', entityId })
+      else if (detail.action === 'pickup') sendEntityCommand({ _tag: 'EntityPickupCommand', entityId })
+      else if (detail.action !== 'move') sendEntityCommand({
+        _tag: 'VehicleCommand',
+        entityId,
+        action: detail.action,
+      })
+      else if (detail.direction !== undefined) sendEntityCommand({ _tag: 'VehicleCommand', entityId, action: { _tag: 'move', direction: detail.direction } })
     })
-    else if (detail.direction !== undefined) sendEntityCommand({ _tag: 'VehicleCommand', entityId, action: { _tag: 'move', direction: detail.direction } })
   })
 
   const applyNetworkVitals = (state: { readonly health: number; readonly hunger: number; readonly experience: number }): void => {

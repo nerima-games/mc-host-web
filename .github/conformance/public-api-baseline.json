@@ -717,7 +717,7 @@
     "count": 1,
     "file": "apps/web/qa-surface.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runPromise(targetedBlock())"
+    "text": "Effect.runSync(targetedBlock())"
   },
   {
     "count": 1,

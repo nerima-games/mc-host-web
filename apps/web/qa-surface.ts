@@ -423,6 +423,8 @@ type QaSurfaceDeps = {
   readonly lifecycle: {
     readonly registerQaTeardown: (dispose: () => void) => void
     readonly getStopBrowserPreview: () => (() => Promise<void>) | undefined
+    /** Runs `run` at the next frame boundary and settles with its result or what it threw. */
+    readonly atFrameBoundary: <A>(run: () => A) => Promise<A>
   }
 }
 
@@ -534,24 +536,33 @@ export const makeQaSurface = (
   deps: QaSurfaceDeps,
 ):
   Result.Result<QaSurfaceApi, QaBridgeCompositionFailure> => {
+  // An operation reads or writes the world, so it runs at the frame boundary and never
+  // inside a frame that has yielded. `flush` and `stop` run directly: a save takes its
+  // snapshot under the frame lock itself, and `stop` interrupts the loop, so it must not
+  // run inside a frame.
+  const frameOperation = <Input extends Schema.Codec<unknown>>(
+    name: string,
+    input: Input,
+    run: (input: Input['Type']) => unknown,
+  ): QaOperation<Input, typeof Schema.Unknown, unknown> => makeQaOperation(name, input, (value) => lifecycle.atFrameBoundary(() => run(value)))
   // Composition validates registrations without invoking handlers; acquire session state only on success.
   const moduleNamespaces = makeQaNamespaces([
     {
       namespace: 'render',
-      observe: { snapshotLighting: makeQaOperation('snapshotLighting', Schema.Null, () => renderCommands.snapshotLighting()) },
+      observe: { snapshotLighting: frameOperation('snapshotLighting', Schema.Null, () => renderCommands.snapshotLighting()) },
       command: {},
     },
     {
       namespace: 'gameplay',
       observe: {
-        snapshot: makeQaOperation('snapshot', Schema.Null, () => gameplaySnapshot()),
-        stickyPistonSnapshot: makeQaOperation('stickyPistonSnapshot', Schema.Null, () => stickyPistonSnapshot()),
-        redstoneFixturesSnapshot: makeQaOperation('redstoneFixturesSnapshot', Schema.Null, () => redstoneFixturesSnapshot()),
-        railTrackSnapshot: makeQaOperation('railTrackSnapshot', Schema.Null, () => railTrackSnapshot()),
-        boatWaterSnapshot: makeQaOperation('boatWaterSnapshot', Schema.Null, () => boatWaterSnapshot()),
+        snapshot: frameOperation('snapshot', Schema.Null, () => gameplaySnapshot()),
+        stickyPistonSnapshot: frameOperation('stickyPistonSnapshot', Schema.Null, () => stickyPistonSnapshot()),
+        redstoneFixturesSnapshot: frameOperation('redstoneFixturesSnapshot', Schema.Null, () => redstoneFixturesSnapshot()),
+        railTrackSnapshot: frameOperation('railTrackSnapshot', Schema.Null, () => railTrackSnapshot()),
+        boatWaterSnapshot: frameOperation('boatWaterSnapshot', Schema.Null, () => boatWaterSnapshot()),
       },
       command: {
-        seedChestTransferMetadata: makeQaOperation('seedChestTransferMetadata', Schema.Null, () => {
+        seedChestTransferMetadata: frameOperation('seedChestTransferMetadata', Schema.Null, () => {
           Effect.runSync(world.inventory.reset)
           for (const key of [...customNames.keys(), ...enchantedItems.keys()]) {
             if (/^\d+$/.test(key)) deleteItemMetadata(key)
@@ -571,7 +582,7 @@ export const makeQaSurface = (
           renderPlayerUi()
           return gameplaySnapshot()
         }),
-        seedChestTransferMetadataConflict: makeQaOperation('seedChestTransferMetadataConflict', Schema.Null, () => {
+        seedChestTransferMetadataConflict: frameOperation('seedChestTransferMetadataConflict', Schema.Null, () => {
           Effect.runSync(world.inventory.add('diamond_pickaxe', 1))
           const durability = Effect.runSync(world.inventory.storageSnapshot).inventoryDurability[0]
           if (durability === null || durability === undefined) {
@@ -587,15 +598,15 @@ export const makeQaSurface = (
           renderPlayerUi()
           return gameplaySnapshot()
         }),
-        seedStaleCustomNames: makeQaOperation('seedStaleCustomNames', Schema.Null, () => {
+        seedStaleCustomNames: frameOperation('seedStaleCustomNames', Schema.Null, () => {
           customNames.set('35', 'Stale inventory name')
           customNames.set('equipment:head', 'Stale equipment name')
           customNames.set('unknown:slot', 'Stale unknown name')
           markSessionDirty()
           return gameplaySnapshot()
         }),
-        setWeather: makeQaOperation('setWeather', Schema.Null, () => qaWeatherCommand()),
-        setPose: makeQaOperation('setPose', Schema.NullOr(Schema.Number), (targetBlock: number | null) => {
+        setWeather: frameOperation('setWeather', Schema.Null, () => qaWeatherCommand()),
+        setPose: frameOperation('setPose', Schema.NullOr(Schema.Number), (targetBlock: number | null) => {
           Effect.runSync(restorePlayer(QA_POSE, Effect.runSync(playerApi.dimension)))
           if (targetBlock !== null) {
             Effect.runSync(currentChunkStore.setBlock(KNOWN_TARGET_BLOCK, BlockId(targetBlock)))
@@ -604,7 +615,7 @@ export const makeQaSurface = (
           markSessionDirty()
           return gameplaySnapshot()
         }),
-        seedSmokeGroundingEncounter: makeQaOperation('seedSmokeGroundingEncounter', Schema.Null, () => {
+        seedSmokeGroundingEncounter: frameOperation('seedSmokeGroundingEncounter', Schema.Null, () => {
           const dimension = Effect.runSync(playerApi.dimension)
           Effect.runSync(streamAround(getCurrentChunkContext(), QA_POSE.feetPosition.x, QA_POSE.feetPosition.z))
           for (let x = -16; x <= 32; x += 1) {
@@ -624,7 +635,7 @@ export const makeQaSurface = (
           markSessionDirty()
           return gameplaySnapshot()
         }),
-        setMultiplayerInvalidPose: makeQaOperation('setMultiplayerInvalidPose', Schema.Null, () => {
+        setMultiplayerInvalidPose: frameOperation('setMultiplayerInvalidPose', Schema.Null, () => {
           const pose = Effect.runSync(playerApi.pose)
           Effect.runSync(restorePlayer({
             ...pose,
@@ -633,7 +644,7 @@ export const makeQaSurface = (
           resetSimState(true)
           return gameplaySnapshot()
         }),
-        seedCreativeBreakEncounter: makeQaOperation('seedCreativeBreakEncounter', Schema.Null, () => {
+        seedCreativeBreakEncounter: frameOperation('seedCreativeBreakEncounter', Schema.Null, () => {
           Effect.runSync(restorePlayer(QA_POSE, Effect.runSync(playerApi.dimension)))
           resetSimState(true)
           Effect.runSync(world.inventory.reset)
@@ -646,7 +657,7 @@ export const makeQaSurface = (
           renderPlayerUi()
           return gameplaySnapshot()
         }),
-        seedCreativePlacementEncounter: makeQaOperation('seedCreativePlacementEncounter', Schema.Null, () => {
+        seedCreativePlacementEncounter: frameOperation('seedCreativePlacementEncounter', Schema.Null, () => {
           Effect.runSync(restorePlayer(QA_IGNITION_POSE, Effect.runSync(playerApi.dimension)))
           resetSimState(true)
           Effect.runSync(world.inventory.reset)
@@ -665,7 +676,7 @@ export const makeQaSurface = (
           renderPlayerUi()
           return gameplaySnapshot()
         }),
-        requestMultiplayerBlockPlacement: makeQaOperation('requestMultiplayerBlockPlacement', Schema.Null, () => {
+        requestMultiplayerBlockPlacement: frameOperation('requestMultiplayerBlockPlacement', Schema.Null, () => {
           if (multiplayer === undefined || !getMultiplayerHandshakeComplete()) return gameplaySnapshot()
           Effect.runSync(multiplayer.host.enqueueOutbound({
             _tag: 'BlockPlace',
@@ -677,7 +688,7 @@ export const makeQaSurface = (
           }))
           return gameplaySnapshot()
         }),
-        requestMultiplayerBlockBreak: makeQaOperation('requestMultiplayerBlockBreak', Schema.Null, () => {
+        requestMultiplayerBlockBreak: frameOperation('requestMultiplayerBlockBreak', Schema.Null, () => {
           if (multiplayer === undefined || !getMultiplayerHandshakeComplete()) return gameplaySnapshot()
           Effect.runSync(multiplayer.host.enqueueOutbound({
             _tag: 'BlockBreak',
@@ -687,7 +698,7 @@ export const makeQaSurface = (
           }))
           return gameplaySnapshot()
         }),
-        returnToCraftingTable: makeQaOperation('returnToCraftingTable', Schema.Null, () => {
+        returnToCraftingTable: frameOperation('returnToCraftingTable', Schema.Null, () => {
           Effect.runSync(restorePlayer(QA_IGNITION_POSE, Effect.runSync(playerApi.dimension)))
           resetSimState(true)
           // See QA_IGNITION_FLOOR_BLOCK's other call sites in this file:
@@ -697,12 +708,12 @@ export const makeQaSurface = (
           markSessionDirty()
           return gameplaySnapshot()
         }),
-        enterNether: makeQaOperation('enterNether', Schema.Null, () => enterQaDimension('nether')),
-        enterOverworld: makeQaOperation('enterOverworld', Schema.Null, () => enterQaDimension('overworld')),
-        enterEnd: makeQaOperation('enterEnd', Schema.Null, () => enterQaDimension('end')),
-        seedBedExplosionEncounter: makeQaOperation('seedBedExplosionEncounter', Schema.Null, () => seedBedExplosionEncounter()),
-        seedBowProjectileEncounter: makeQaOperation('seedBowProjectileEncounter', Schema.Null, () => seedBowProjectileEncounter()),
-        breakTarget: makeQaOperation('breakTarget', Schema.Null, () => {
+        enterNether: frameOperation('enterNether', Schema.Null, () => enterQaDimension('nether')),
+        enterOverworld: frameOperation('enterOverworld', Schema.Null, () => enterQaDimension('overworld')),
+        enterEnd: frameOperation('enterEnd', Schema.Null, () => enterQaDimension('end')),
+        seedBedExplosionEncounter: frameOperation('seedBedExplosionEncounter', Schema.Null, () => seedBedExplosionEncounter()),
+        seedBowProjectileEncounter: frameOperation('seedBowProjectileEncounter', Schema.Null, () => seedBowProjectileEncounter()),
+        breakTarget: frameOperation('breakTarget', Schema.Null, () => {
           if (playerIsDead()) return null
           const target = Effect.runSync(
             requestTargetedBlockBreak(gameplayState, currentChunkStore, targetingContext),
@@ -710,7 +721,7 @@ export const makeQaSurface = (
           if (Option.isSome(target)) markSessionDirty()
           return Option.isSome(target) ? target.value : null
         }),
-        seedCraftingLog: makeQaOperation('seedCraftingLog', Schema.Null, () => {
+        seedCraftingLog: frameOperation('seedCraftingLog', Schema.Null, () => {
           if (playerIsDead()) return gameplaySnapshot()
           Effect.runSync(world.inventory.reset)
           Effect.runSync(world.inventory.add('oak_log', 1))
@@ -719,27 +730,27 @@ export const makeQaSurface = (
           renderPlayerUi()
           return gameplaySnapshot()
         }),
-        seedCraftingTableEncounter: makeQaOperation('seedCraftingTableEncounter', Schema.Null, () => seedCraftingTableEncounter()),
-        seedStickyPistonEncounter: makeQaOperation('seedStickyPistonEncounter', Schema.Null, () => seedStickyPistonEncounter()),
-        seedRedstoneFixtures: makeQaOperation('seedRedstoneFixtures', Schema.Null, () => seedRedstoneFixtures()),
-        pressRedstoneBranchButton: makeQaOperation('pressRedstoneBranchButton', Schema.Null, () => pressRedstoneBranchButton()),
-        mutateObserverInput: makeQaOperation('mutateObserverInput', Schema.Null, () => mutateObserverInput()),
-        seedRailTrackEncounter: makeQaOperation('seedRailTrackEncounter', Schema.Null, () => seedRailTrackEncounter()),
-        seedBoatWaterEncounter: makeQaOperation('seedBoatWaterEncounter', Schema.Null, () => seedBoatWaterEncounter()),
-        seedFarmingEncounter: makeQaOperation('seedFarmingEncounter', Schema.Null, () => seedFarmingEncounter()),
-        seedFishingEncounter: makeQaOperation('seedFishingEncounter', Schema.Null, () => seedFishingEncounter()),
-        seedSubmergedSwimmingEncounter: makeQaOperation('seedSubmergedSwimmingEncounter', Schema.Null, () => seedSubmergedSwimmingEncounter()),
-        leaveSubmergedSwimmingEncounter: makeQaOperation('leaveSubmergedSwimmingEncounter', Schema.Null, () => leaveSubmergedSwimmingEncounter()),
-        seedVillageTradingEncounter: makeQaOperation('seedVillageTradingEncounter', Schema.Null, () => seedVillageTradingEncounter()),
-        grantNearestVillagerTradeInput: makeQaOperation('grantNearestVillagerTradeInput', Schema.Null, () => grantNearestVillagerTradeInput()),
-        harvestFarmingCrop: makeQaOperation('harvestFarmingCrop', Schema.Null, () => harvestFarmingCrop()),
-        seedCactusApproach: makeQaOperation('seedCactusApproach', Schema.Null, () => seedEnvironmentalContactEncounter('cactus')),
-        seedDuplicateLavaContact: makeQaOperation('seedDuplicateLavaContact', Schema.Null, () => seedEnvironmentalContactEncounter('duplicateLava')),
-        seedLethalMixedContact: makeQaOperation('seedLethalMixedContact', Schema.Null, () => seedEnvironmentalContactEncounter('lethalMixed')),
-        seedSafeFall: makeQaOperation('seedSafeFall', Schema.Null, () => seedFallEncounter('safe')),
-        seedDamagingFall: makeQaOperation('seedDamagingFall', Schema.Null, () => seedFallEncounter('damaging')),
-        seedLethalFall: makeQaOperation('seedLethalFall', Schema.Null, () => seedFallEncounter('lethal')),
-        preparePotatoEating: makeQaOperation('preparePotatoEating', Schema.Null, () => {
+        seedCraftingTableEncounter: frameOperation('seedCraftingTableEncounter', Schema.Null, () => seedCraftingTableEncounter()),
+        seedStickyPistonEncounter: frameOperation('seedStickyPistonEncounter', Schema.Null, () => seedStickyPistonEncounter()),
+        seedRedstoneFixtures: frameOperation('seedRedstoneFixtures', Schema.Null, () => seedRedstoneFixtures()),
+        pressRedstoneBranchButton: frameOperation('pressRedstoneBranchButton', Schema.Null, () => pressRedstoneBranchButton()),
+        mutateObserverInput: frameOperation('mutateObserverInput', Schema.Null, () => mutateObserverInput()),
+        seedRailTrackEncounter: frameOperation('seedRailTrackEncounter', Schema.Null, () => seedRailTrackEncounter()),
+        seedBoatWaterEncounter: frameOperation('seedBoatWaterEncounter', Schema.Null, () => seedBoatWaterEncounter()),
+        seedFarmingEncounter: frameOperation('seedFarmingEncounter', Schema.Null, () => seedFarmingEncounter()),
+        seedFishingEncounter: frameOperation('seedFishingEncounter', Schema.Null, () => seedFishingEncounter()),
+        seedSubmergedSwimmingEncounter: frameOperation('seedSubmergedSwimmingEncounter', Schema.Null, () => seedSubmergedSwimmingEncounter()),
+        leaveSubmergedSwimmingEncounter: frameOperation('leaveSubmergedSwimmingEncounter', Schema.Null, () => leaveSubmergedSwimmingEncounter()),
+        seedVillageTradingEncounter: frameOperation('seedVillageTradingEncounter', Schema.Null, () => seedVillageTradingEncounter()),
+        grantNearestVillagerTradeInput: frameOperation('grantNearestVillagerTradeInput', Schema.Null, () => grantNearestVillagerTradeInput()),
+        harvestFarmingCrop: frameOperation('harvestFarmingCrop', Schema.Null, () => harvestFarmingCrop()),
+        seedCactusApproach: frameOperation('seedCactusApproach', Schema.Null, () => seedEnvironmentalContactEncounter('cactus')),
+        seedDuplicateLavaContact: frameOperation('seedDuplicateLavaContact', Schema.Null, () => seedEnvironmentalContactEncounter('duplicateLava')),
+        seedLethalMixedContact: frameOperation('seedLethalMixedContact', Schema.Null, () => seedEnvironmentalContactEncounter('lethalMixed')),
+        seedSafeFall: frameOperation('seedSafeFall', Schema.Null, () => seedFallEncounter('safe')),
+        seedDamagingFall: frameOperation('seedDamagingFall', Schema.Null, () => seedFallEncounter('damaging')),
+        seedLethalFall: frameOperation('seedLethalFall', Schema.Null, () => seedFallEncounter('lethal')),
+        preparePotatoEating: frameOperation('preparePotatoEating', Schema.Null, () => {
           Effect.runSync(restorePlayer(QA_IGNITION_POSE, Effect.runSync(playerApi.dimension)))
           resetSimState(true)
           // See QA_IGNITION_FLOOR_BLOCK's other call sites in this file:
@@ -750,17 +761,17 @@ export const makeQaSurface = (
           markSessionDirty()
           return gameplaySnapshot()
         }),
-        returnToFarmingPlot: makeQaOperation('returnToFarmingPlot', Schema.Null, () => {
+        returnToFarmingPlot: frameOperation('returnToFarmingPlot', Schema.Null, () => {
           Effect.runSync(restorePlayer(QA_FARM_POSE, Effect.runSync(playerApi.dimension)))
           resetSimState(true)
           markSessionDirty()
           return gameplaySnapshot()
         }),
-        seedPortalEncounter: makeQaOperation('seedPortalEncounter', Schema.Null, () => seedPortalEncounter()),
-        seedPortalArrivalIntoSolidGround: makeQaOperation('seedPortalArrivalIntoSolidGround', Schema.Null, () => seedPortalArrivalIntoSolidGround()),
-        seedPortalIgnitionEncounter: makeQaOperation('seedPortalIgnitionEncounter', Schema.Null, () => seedPortalIgnitionEncounter()),
-        seedWoodenPickaxeProgression: makeQaOperation('seedWoodenPickaxeProgression', Schema.Null, () => seedWoodenPickaxeProgression()),
-        seedIronArmor: makeQaOperation('seedIronArmor', Schema.Null, () => {
+        seedPortalEncounter: frameOperation('seedPortalEncounter', Schema.Null, () => seedPortalEncounter()),
+        seedPortalArrivalIntoSolidGround: frameOperation('seedPortalArrivalIntoSolidGround', Schema.Null, () => seedPortalArrivalIntoSolidGround()),
+        seedPortalIgnitionEncounter: frameOperation('seedPortalIgnitionEncounter', Schema.Null, () => seedPortalIgnitionEncounter()),
+        seedWoodenPickaxeProgression: frameOperation('seedWoodenPickaxeProgression', Schema.Null, () => seedWoodenPickaxeProgression()),
+        seedIronArmor: frameOperation('seedIronArmor', Schema.Null, () => {
           Effect.runSync(world.inventory.reset)
           const equipment = [
             ['iron_helmet', 'head'],
@@ -781,29 +792,29 @@ export const makeQaSurface = (
           renderPlayerUi()
           return gameplaySnapshot()
         }),
-        damage: makeQaOperation('damage', Schema.Null, () => {
+        damage: frameOperation('damage', Schema.Null, () => {
           applyPlayerDamage({ amount: 4, cause: 'generic' })
           markSessionDirty()
           renderPlayerUi()
           return gameplaySnapshot()
         }),
-        heal: makeQaOperation('heal', Schema.Null, () => {
+        heal: frameOperation('heal', Schema.Null, () => {
           Effect.runSync(world.vitals.heal(4))
           markSessionDirty()
           renderPlayerUi()
           return gameplaySnapshot()
         }),
-        eat: makeQaOperation('eat', Schema.Null, () => {
+        eat: frameOperation('eat', Schema.Null, () => {
           Effect.runSync(survivalHunger.eat(4, 0.3))
           markSessionDirty()
           renderPlayerUi()
           return gameplaySnapshot()
         }),
-        respawn: makeQaOperation('respawn', Schema.Null, () => {
+        respawn: frameOperation('respawn', Schema.Null, () => {
           respawnPlayer()
           return gameplaySnapshot()
         }),
-        shoot: makeQaOperation('shoot', Schema.Null, () => {
+        shoot: frameOperation('shoot', Schema.Null, () => {
           if (playerIsDead()) return gameplaySnapshot()
           const currentPose = Effect.runSync(playerApi.pose)
           const horizontal = Math.cos(currentPose.pitchRadians)
@@ -821,7 +832,7 @@ export const makeQaSurface = (
           }))
           return gameplaySnapshot()
         }),
-        seedZombiePursuitEncounter: makeQaOperation('seedZombiePursuitEncounter', Schema.Null, () => {
+        seedZombiePursuitEncounter: frameOperation('seedZombiePursuitEncounter', Schema.Null, () => {
           respawnPlayer()
           Effect.runSync(currentChunkStore.setBlock(QA_IGNITION_FLOOR_BLOCK, blockIdOf('stone')))
           Effect.runSync(currentChunkStore.setBlock(blockPosition(8, 65, 10), blockIdOf('air')))
@@ -850,7 +861,7 @@ export const makeQaSurface = (
           markSessionDirty()
           return gameplaySnapshot()
         }),
-        seedLethalZombieEncounter: makeQaOperation('seedLethalZombieEncounter', Schema.Null, () => {
+        seedLethalZombieEncounter: frameOperation('seedLethalZombieEncounter', Schema.Null, () => {
           respawnPlayer()
           Effect.runSync(world.inventory.reset)
           Effect.runSync(world.inventory.add('stone_pickaxe', 1))
@@ -886,7 +897,7 @@ export const makeQaSurface = (
           renderPlayerUi()
           return gameplaySnapshot()
         }),
-        seedFoodUseEncounter: makeQaOperation('seedFoodUseEncounter', Schema.Null, () => {
+        seedFoodUseEncounter: frameOperation('seedFoodUseEncounter', Schema.Null, () => {
           respawnPlayer()
           Effect.runSync(restorePlayer(QA_IGNITION_POSE, Effect.runSync(playerApi.dimension)))
           resetSimState(true)
@@ -905,9 +916,9 @@ export const makeQaSurface = (
           renderPlayerUi()
           return gameplaySnapshot()
         }),
-        seedFireChargeIgnition: makeQaOperation('seedFireChargeIgnition', Schema.Null, () => seedIgnitionEncounter('fire_charge')),
-        seedFlintAndSteelIgnition: makeQaOperation('seedFlintAndSteelIgnition', Schema.Null, () => seedIgnitionEncounter('flint_and_steel')),
-        seedRefusedFireChargeIgnition: makeQaOperation('seedRefusedFireChargeIgnition', Schema.Null, () => {
+        seedFireChargeIgnition: frameOperation('seedFireChargeIgnition', Schema.Null, () => seedIgnitionEncounter('fire_charge')),
+        seedFlintAndSteelIgnition: frameOperation('seedFlintAndSteelIgnition', Schema.Null, () => seedIgnitionEncounter('flint_and_steel')),
+        seedRefusedFireChargeIgnition: frameOperation('seedRefusedFireChargeIgnition', Schema.Null, () => {
           seedIgnitionEncounter('fire_charge')
           Effect.runSync(currentChunkStore.setBlock(QA_IGNITION_CELL, blockIdOf('stone')))
           setNextItemUseRequestId(getNextItemUseRequestId() + 1)
@@ -924,7 +935,7 @@ export const makeQaSurface = (
           markSessionDirty()
           return gameplaySnapshot()
         }),
-        seedMeleeDropEncounter: makeQaOperation('seedMeleeDropEncounter', Schema.Null, () => {
+        seedMeleeDropEncounter: frameOperation('seedMeleeDropEncounter', Schema.Null, () => {
           respawnPlayer()
           Effect.runSync(world.inventory.reset)
           Effect.runSync(world.inventory.add('wooden_sword', 1))
@@ -972,28 +983,28 @@ export const makeQaSurface = (
           renderPlayerUi()
           return gameplaySnapshot()
         }),
-        seedBrewingEncounter: makeQaOperation('seedBrewingEncounter', Schema.Null, () => seedBrewingEncounter()),
-        seedItemUpgradeEncounter: makeQaOperation('seedItemUpgradeEncounter', Schema.Null, () => seedItemUpgradeEncounter()),
-        switchItemUpgradeStationToAnvil: makeQaOperation('switchItemUpgradeStationToAnvil', Schema.Null, () => switchItemUpgradeStationToAnvil()),
-        seedEndEyeCrafting: makeQaOperation('seedEndEyeCrafting', Schema.Null, () => seedEndEyeCrafting()),
-        forceNextEyeOfEnderDrop: makeQaOperation('forceNextEyeOfEnderDrop', Schema.Null, () => {
+        seedBrewingEncounter: frameOperation('seedBrewingEncounter', Schema.Null, () => seedBrewingEncounter()),
+        seedItemUpgradeEncounter: frameOperation('seedItemUpgradeEncounter', Schema.Null, () => seedItemUpgradeEncounter()),
+        switchItemUpgradeStationToAnvil: frameOperation('switchItemUpgradeStationToAnvil', Schema.Null, () => switchItemUpgradeStationToAnvil()),
+        seedEndEyeCrafting: frameOperation('seedEndEyeCrafting', Schema.Null, () => seedEndEyeCrafting()),
+        forceNextEyeOfEnderDrop: frameOperation('forceNextEyeOfEnderDrop', Schema.Null, () => {
           setNextEyeOfEnderBreaks(false)
           return gameplaySnapshot()
         }),
-        forceNextEyeOfEnderBreak: makeQaOperation('forceNextEyeOfEnderBreak', Schema.Null, () => {
+        forceNextEyeOfEnderBreak: frameOperation('forceNextEyeOfEnderBreak', Schema.Null, () => {
           setNextEyeOfEnderBreaks(true)
           return gameplaySnapshot()
         }),
-        spawnFullHealthEnderman: makeQaOperation('spawnFullHealthEnderman', Schema.Null, () => spawnFullHealthHostile(ENDERMAN_KIND, 40)),
-        spawnFullHealthBlaze: makeQaOperation('spawnFullHealthBlaze', Schema.Null, () => spawnFullHealthHostile(BLAZE_KIND, 20)),
-        targetNearestHostile: makeQaOperation('targetNearestHostile', Schema.Null, () => targetNearestHostile()),
-        targetNearestDroppedItem: makeQaOperation('targetNearestDroppedItem', Schema.Null, () => targetNearestDroppedItem()),
+        spawnFullHealthEnderman: frameOperation('spawnFullHealthEnderman', Schema.Null, () => spawnFullHealthHostile(ENDERMAN_KIND, 40)),
+        spawnFullHealthBlaze: frameOperation('spawnFullHealthBlaze', Schema.Null, () => spawnFullHealthHostile(BLAZE_KIND, 20)),
+        targetNearestHostile: frameOperation('targetNearestHostile', Schema.Null, () => targetNearestHostile()),
+        targetNearestDroppedItem: frameOperation('targetNearestDroppedItem', Schema.Null, () => targetNearestDroppedItem()),
         targetNearestStrongholdFrame: makeQaOperation('targetNearestStrongholdFrame', Schema.Null, () => targetNearestStrongholdFrame()),
-        seedEndPortalFinalFrame: makeQaOperation('seedEndPortalFinalFrame', Schema.Null, () => seedEndPortalFinalFrame()),
-        targetCompletedEndPortal: makeQaOperation('targetCompletedEndPortal', Schema.Null, () => targetCompletedEndPortal()),
-        seedEndDragonFinalHit: makeQaOperation('seedEndDragonFinalHit', Schema.Null, () => seedEndDragonFinalHit()),
-        targetEndDragon: makeQaOperation('targetEndDragon', Schema.Null, () => targetEndDragon()),
-        targetEndExitPortal: makeQaOperation('targetEndExitPortal', Schema.Null, () => targetEndExitPortal()),
+        seedEndPortalFinalFrame: frameOperation('seedEndPortalFinalFrame', Schema.Null, () => seedEndPortalFinalFrame()),
+        targetCompletedEndPortal: frameOperation('targetCompletedEndPortal', Schema.Null, () => targetCompletedEndPortal()),
+        seedEndDragonFinalHit: frameOperation('seedEndDragonFinalHit', Schema.Null, () => seedEndDragonFinalHit()),
+        targetEndDragon: frameOperation('targetEndDragon', Schema.Null, () => targetEndDragon()),
+        targetEndExitPortal: frameOperation('targetEndExitPortal', Schema.Null, () => targetEndExitPortal()),
       },
     },
     {
@@ -1004,8 +1015,8 @@ export const makeQaSurface = (
     {
       namespace: 'audio',
       observe: {
-        report: makeQaOperation('report', Schema.Null, () => Effect.runSync(audioBackend.report)),
-        snapshot: makeQaOperation('snapshot', Schema.Null, () => audioRuntime.snapshot(Effect.runSync(browserClock.monotonicSecs))),
+        report: frameOperation('report', Schema.Null, () => Effect.runSync(audioBackend.report)),
+        snapshot: frameOperation('snapshot', Schema.Null, () => audioRuntime.snapshot(Effect.runSync(browserClock.monotonicSecs))),
       },
       command: {},
     },
@@ -2529,48 +2540,55 @@ export const makeQaSurface = (
     return gameplaySnapshot()
   }
 
+  // The two phases run at separate frame boundaries so the frames between them
+  // settle the restored pose before it is aimed.
   const targetNearestStrongholdFrame = async () => {
-    const pose = Effect.runSync(playerApi.pose)
-    const site = nearestStrongholdSite(NoiseSeed(getActiveSeed()), BlockAxis(Math.floor(pose.feetPosition.x)), BlockAxis(Math.floor(pose.feetPosition.z)))
-    if (Option.isNone(site)) throw new Error('no stronghold found near the QA player')
-    const center = endPortalCenterForStronghold(site.value)
-    alignActiveDimension('overworld')
-    Effect.runSync(streamAround(getCurrentChunkContext(), center.x, center.z))
-    const targetOffset = END_PORTAL_FRAME_OFFSETS.find((offset) => {
-      const position = blockPosition(center.x + offset.dx, center.y, center.z + offset.dz)
-      const reading = Effect.runSync(currentChunkStore.getBlock(position))
-      return reading._tag === 'Block' && reading.block === END_PORTAL_BLOCK.FRAME_EMPTY
+    const target = await lifecycle.atFrameBoundary(() => {
+      const pose = Effect.runSync(playerApi.pose)
+      const site = nearestStrongholdSite(NoiseSeed(getActiveSeed()), BlockAxis(Math.floor(pose.feetPosition.x)), BlockAxis(Math.floor(pose.feetPosition.z)))
+      if (Option.isNone(site)) throw new Error('no stronghold found near the QA player')
+      const center = endPortalCenterForStronghold(site.value)
+      alignActiveDimension('overworld')
+      Effect.runSync(streamAround(getCurrentChunkContext(), center.x, center.z))
+      const targetOffset = END_PORTAL_FRAME_OFFSETS.find((offset) => {
+        const position = blockPosition(center.x + offset.dx, center.y, center.z + offset.dz)
+        const reading = Effect.runSync(currentChunkStore.getBlock(position))
+        return reading._tag === 'Block' && reading.block === END_PORTAL_BLOCK.FRAME_EMPTY
+      })
+      if (targetOffset === undefined) throw new Error('no empty stronghold frame found')
+      const target = { x: center.x + targetOffset.dx, y: center.y, z: center.z + targetOffset.dz }
+      Effect.runSync(restorePlayer({
+        feetPosition: { x: target.x + 0.5, y: target.y + 2, z: target.z + 0.5 },
+        yawRadians: 0,
+        pitchRadians: -Math.PI / 2 + 0.01,
+      }, 'overworld'))
+      resetSimState(true)
+      return target
     })
-    if (targetOffset === undefined) throw new Error('no empty stronghold frame found')
-    const target = { x: center.x + targetOffset.dx, y: center.y, z: center.z + targetOffset.dz }
-    Effect.runSync(restorePlayer({
-      feetPosition: { x: target.x + 0.5, y: target.y + 2, z: target.z + 0.5 },
-      yawRadians: 0,
-      pitchRadians: -Math.PI / 2 + 0.01,
-    }, 'overworld'))
-    resetSimState(true)
     await new Promise<void>((resolve) => {
       requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
     })
-    const normalizedPose = Effect.runSync(playerApi.pose)
-    const dx = target.x + 0.5 - normalizedPose.feetPosition.x
-    const dy = target.y + 0.5 - (normalizedPose.feetPosition.y + EYE_LEVEL_OFFSET)
-    const dz = target.z + 0.5 - normalizedPose.feetPosition.z
-    const horizontalDistance = Math.hypot(dx, dz)
-    resetSimState(false)
-    Effect.runSync(restorePlayer({
-      ...normalizedPose,
-      yawRadians: Math.atan2(-dx, -dz),
-      pitchRadians: Math.atan2(dy, horizontalDistance),
-    }, 'overworld'))
-    const aimedTarget = await Effect.runPromise(targetedBlock())
-    if (aimedTarget?.block !== END_PORTAL_BLOCK.FRAME_EMPTY
-      || aimedTarget.position.x !== target.x
-      || aimedTarget.position.y !== target.y
-      || aimedTarget.position.z !== target.z) {
-      throw new Error(`failed to target empty stronghold frame: ${JSON.stringify(aimedTarget)}`)
-    }
-    return gameplaySnapshot()
+    return lifecycle.atFrameBoundary(() => {
+      const normalizedPose = Effect.runSync(playerApi.pose)
+      const dx = target.x + 0.5 - normalizedPose.feetPosition.x
+      const dy = target.y + 0.5 - (normalizedPose.feetPosition.y + EYE_LEVEL_OFFSET)
+      const dz = target.z + 0.5 - normalizedPose.feetPosition.z
+      const horizontalDistance = Math.hypot(dx, dz)
+      resetSimState(false)
+      Effect.runSync(restorePlayer({
+        ...normalizedPose,
+        yawRadians: Math.atan2(-dx, -dz),
+        pitchRadians: Math.atan2(dy, horizontalDistance),
+      }, 'overworld'))
+      const aimedTarget = Effect.runSync(targetedBlock())
+      if (aimedTarget?.block !== END_PORTAL_BLOCK.FRAME_EMPTY
+        || aimedTarget.position.x !== target.x
+        || aimedTarget.position.y !== target.y
+        || aimedTarget.position.z !== target.z) {
+        throw new Error(`failed to target empty stronghold frame: ${JSON.stringify(aimedTarget)}`)
+      }
+      return gameplaySnapshot()
+    })
   }
 
   const targetEndDragon = () => {

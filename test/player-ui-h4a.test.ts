@@ -310,8 +310,13 @@ describe('H4a player UI', () => {
     const settingsView = { isOpen: () => false, open: vi.fn() }
     const renderCrosshair = vi.fn(() => order.push('crosshair'))
     const syncTouchControls = vi.fn(() => order.push('touch'))
+    const deferred: Array<() => void> = []
+    const frameBoundary = (): void => {
+      for (const work of deferred.splice(0)) work()
+    }
 
     installPauseControls({
+      deferToFrameBoundary: (work) => { deferred.push(work) },
       document: document as unknown as Document,
       window: { location: { assign: vi.fn() } } as unknown as Pick<Window, 'location'>,
       canvas: canvas as unknown as HTMLCanvasElement,
@@ -351,15 +356,22 @@ describe('H4a player UI', () => {
     }
 
     sendEscape()
+    // Closing a screen touches the world, so it waits for the frame boundary.
+    expect(order).toEqual([])
+    frameBoundary()
     expect(order).toEqual(['close:brewing'])
     sendEscape()
+    frameBoundary()
     expect(order).toEqual(['close:brewing', 'close:trade'])
     sendEscape()
+    frameBoundary()
     expect(order).toEqual(['close:brewing', 'close:trade', 'close:inventory'])
 
     pointerLockElement = canvas as unknown as HTMLElement
     document.pointerLockElement = pointerLockElement
     sendEscape()
+    expect(paused).toBe(false)
+    frameBoundary()
 
     expect(paused).toBe(true)
     expect(gameShell.inert).toBe(true)
@@ -376,6 +388,8 @@ describe('H4a player UI', () => {
     ])
 
     emit(resumeButton, 'click', new Event('click'))
+    expect(paused).toBe(true)
+    frameBoundary()
     expect(paused).toBe(false)
     expect(pauseOverlay.hidden).toBe(true)
     expect(body.attributes.get('data-session-paused')).toBe('false')

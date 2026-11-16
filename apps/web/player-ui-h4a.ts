@@ -195,6 +195,8 @@ type PauseSettingsView = {
 }
 
 export type H4aPauseContext = {
+  /** Runs `work` at the next frame boundary; the pause and close paths read and write the world. */
+  readonly deferToFrameBoundary: (work: () => void) => void
   readonly document: Document
   readonly window: Pick<Window, 'location'>
   readonly canvas: HTMLCanvasElement
@@ -262,7 +264,7 @@ export const installPauseControls = (context: H4aPauseContext): (() => void) => 
     if (event.code === 'Escape' && !event.repeat) {
       event.preventDefault()
       event.stopPropagation()
-      handlePauseRequest()
+      context.deferToFrameBoundary(handlePauseRequest)
       return
     }
 
@@ -287,7 +289,7 @@ export const installPauseControls = (context: H4aPauseContext): (() => void) => 
     event.stopPropagation()
     ;(event.shiftKey ? lastAction : firstAction).focus()
   })
-  context.resumeButton.addEventListener('click', () => setPaused(false))
+  context.resumeButton.addEventListener('click', () => context.deferToFrameBoundary(() => setPaused(false)))
   context.settingsButton.addEventListener('click', () => {
     context.pauseOverlay.inert = true
     context.settingsView.open(context.getPlayerSettings(), context.settingsButton)

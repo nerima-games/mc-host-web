@@ -227,6 +227,12 @@ type InventoryRemoveFailure = Effect.Error<ReturnType<OwnerBackedInventory['remo
 type InventoryAddFailure = Effect.Error<ReturnType<OwnerBackedInventory['add']>>
 
 export type PlayerUiRuntimeContext = {
+  /**
+   * Runs `work` at the next frame boundary. The DOM listeners installed here
+   * read and write the world, so they hand everything after the event's own
+   * synchronous needs (`preventDefault`, drag data) to it.
+   */
+  readonly deferToFrameBoundary: (work: () => void) => void
   readonly document: Document
   readonly window: Pick<Window, 'requestAnimationFrame'>
   readonly canvas: HTMLCanvasElement
@@ -1904,69 +1910,89 @@ export const createPlayerUiRuntime = (
     context.markSessionDirty()
     renderPlayerUi()
   }
+  // Each listener resolves its DOM target and calls the event's synchronous
+  // methods at once, then defers the rest. The frame can close or switch the
+  // screen before the deferred work runs; work for a screen that is no longer
+  // shown is dropped.
+  const deferForScreen = (mode: InventoryMode, work: () => void): void => {
+    context.deferToFrameBoundary(() => {
+      if (!context.getInventoryOpen() || context.getInventoryMode() !== mode) return
+      work()
+    })
+  }
+  const deferUnlessDead = (mode: InventoryMode, work: () => void): void => {
+    deferForScreen(mode, () => {
+      if (!playerIsDead()) work()
+    })
+  }
   const installInventoryListeners = (): void => {
     context.inventoryParent.addEventListener('input', (event) => {
       if (context.getInventoryMode() !== 'anvil' || !(event.target instanceof HTMLInputElement)) return
       if (event.target.matches('[data-operation-target="name"]')) {
-        context.setAnvilName(event.target.value.slice(0, 50))
-        renderPlayerUi()
+        const name = event.target.value.slice(0, 50)
+        deferForScreen('anvil', () => {
+          context.setAnvilName(name)
+          renderPlayerUi()
+        })
       }
     })
     context.inventoryParent.addEventListener('click', (event) => {
-      if (playerIsDead()) return
-      if (context.getInventoryMode() === 'anvil') {
+      const mode = context.getInventoryMode()
+      if (mode === 'anvil') {
         const target = event.target instanceof Element
           ? event.target.closest('[data-operation-target]')?.getAttribute('data-operation-target')
           : null
-        if (target === 'output') activateAnvilOutput()
+        if (target === 'output') deferUnlessDead(mode, activateAnvilOutput)
         return
       }
-      if (context.getInventoryMode() === 'enchanting') {
+      if (mode === 'enchanting') {
         const target = event.target instanceof Element
           ? event.target.closest('[data-operation-target]')?.getAttribute('data-operation-target')
           : null
         const slot = target === 'offer-1' ? 0 : target === 'offer-2' ? 1 : target === 'offer-3' ? 2 : undefined
-        if (slot !== undefined) activateEnchantingOffer(slot)
+        if (slot !== undefined) deferUnlessDead(mode, () => activateEnchantingOffer(slot))
         return
       }
-      if (context.getInventoryMode() === 'chest') {
+      if (mode === 'chest') {
         if (event.target instanceof Element && event.target.closest(
           '[data-interaction-target="chest-storage-close"]',
         ) !== null) {
-          if (chestStorageCloseIntent()._tag === 'CloseRequested') setInventoryOpen(false)
+          deferUnlessDead(mode, () => {
+            if (chestStorageCloseIntent()._tag === 'CloseRequested') setInventoryOpen(false)
+          })
           return
         }
         const chestTarget = chestTargetOf(event.target)
-        if (chestTarget !== undefined) activateChestSlot(chestTarget)
+        if (chestTarget !== undefined) deferUnlessDead(mode, () => activateChestSlot(chestTarget))
         return
       }
-      if (context.getInventoryMode() === 'furnace') {
+      if (mode === 'furnace') {
         const furnaceTarget = furnaceTargetOf(event.target)
-        if (furnaceTarget !== undefined) activateFurnaceSlot(furnaceTarget)
+        if (furnaceTarget !== undefined) deferUnlessDead(mode, () => activateFurnaceSlot(furnaceTarget))
         return
       }
       const target = targetOf(event.target)
       const actionTarget = target === undefined ? null : inventoryActionTarget(target)
       if (actionTarget !== null) {
-        dispatchInventoryAction({
-          kind: event.shiftKey ? 'shift-click' : 'click',
-          target: actionTarget,
-        })
+        const kind = event.shiftKey ? 'shift-click' : 'click'
+        deferUnlessDead(mode, () => dispatchInventoryAction({ kind, target: actionTarget }))
       }
     })
     context.inventoryParent.addEventListener('contextmenu', (event) => {
-      if (playerIsDead()) return
-      if (['furnace', 'chest', 'anvil', 'enchanting'].includes(context.getInventoryMode())) return
+      const mode = context.getInventoryMode()
+      if (['furnace', 'chest', 'anvil', 'enchanting'].includes(mode)) return
       const target = targetOf(event.target)
       if (target === undefined) return
       event.preventDefault()
       if (target.kind !== 'slot' || target.region === 'crafting-grid') return
-      if (target.region === 'armour' || target.region === 'offhand') {
-        const actionTarget = inventoryActionTarget(target)
-        if (actionTarget !== null) dispatchInventoryAction({ kind: 'click', target: actionTarget })
-      } else {
-        activateInventoryTarget(target, 'right')
-      }
+      deferUnlessDead(mode, () => {
+        if (target.region === 'armour' || target.region === 'offhand') {
+          const actionTarget = inventoryActionTarget(target)
+          if (actionTarget !== null) dispatchInventoryAction({ kind: 'click', target: actionTarget })
+        } else {
+          activateInventoryTarget(target, 'right')
+        }
+      })
     })
     context.inventoryParent.addEventListener('dragstart', (event) => {
       if (context.getInventoryMode() !== 'player' && context.getInventoryMode() !== 'craftingTable') return
@@ -1992,43 +2018,52 @@ export const createPlayerUiRuntime = (
       const actionTarget = target === undefined ? null : inventoryActionTarget(target)
       if (source === undefined || actionTarget === null || actionTarget.kind === 'crafting-output') return
       event.preventDefault()
-      dispatchInventoryAction({ kind: 'drag', source, target: actionTarget })
+      deferForScreen(context.getInventoryMode(), () =>
+        dispatchInventoryAction({ kind: 'drag', source, target: actionTarget }))
     })
     context.inventoryParent.addEventListener('dragend', () => {
       context.setInventoryDragSource(undefined)
     })
     context.inventoryParent.addEventListener('keydown', (event) => {
-      if (playerIsDead()) return
       if (event.key !== 'Enter' && event.key !== ' ') return
-      if (context.getInventoryMode() === 'anvil' || context.getInventoryMode() === 'enchanting') return
-      if (context.getInventoryMode() === 'chest') {
+      const mode = context.getInventoryMode()
+      if (mode === 'anvil' || mode === 'enchanting') return
+      if (mode === 'chest') {
         if (event.target instanceof Element && event.target.closest(
           '[data-interaction-target="chest-storage-close"]',
         ) !== null) {
           event.preventDefault()
-          if (chestStorageCloseIntent()._tag === 'CloseRequested') setInventoryOpen(false)
+          deferUnlessDead(mode, () => {
+            if (chestStorageCloseIntent()._tag === 'CloseRequested') setInventoryOpen(false)
+          })
           return
         }
         const chestTarget = chestTargetOf(event.target)
         if (chestTarget === undefined) return
         event.preventDefault()
-        activateChestSlot(chestTarget)
-        focusRenderedTarget()
+        deferUnlessDead(mode, () => {
+          activateChestSlot(chestTarget)
+          focusRenderedTarget()
+        })
         return
       }
-      if (context.getInventoryMode() === 'furnace') {
+      if (mode === 'furnace') {
         const furnaceTarget = furnaceTargetOf(event.target)
         if (furnaceTarget === undefined) return
         event.preventDefault()
-        activateFurnaceSlot(furnaceTarget)
-        focusRenderedTarget()
+        deferUnlessDead(mode, () => {
+          activateFurnaceSlot(furnaceTarget)
+          focusRenderedTarget()
+        })
         return
       }
       const target = targetOf(event.target)
       if (target === undefined) return
       event.preventDefault()
-      activateInventoryTarget(target)
-      focusRenderedTarget()
+      deferUnlessDead(mode, () => {
+        activateInventoryTarget(target)
+        focusRenderedTarget()
+      })
     })
   }
   const installRespawnListener = (hudParent: HTMLElement, respawn: () => void): void => {
@@ -2036,7 +2071,7 @@ export const createPlayerUiRuntime = (
       if (!(event.target instanceof Element)) return
       const control = event.target.closest('[data-mx-ui="respawn"]')
       if (control === null || !hudParent.contains(control)) return
-      respawn()
+      context.deferToFrameBoundary(respawn)
     })
   }
 

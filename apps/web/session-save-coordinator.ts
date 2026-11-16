@@ -58,7 +58,8 @@ export type SessionSaveCoordinatorOptions<State> = {
   readonly initialKnownChunks: Iterable<DimensionChunk>
   readonly snapshotResidents: () => Promise<ReadonlyArray<DimensionChunk>>
   readonly currentGeneration: () => number
-  readonly snapshotState: () => State
+  /** Asynchronous so the host can take it under the frame lock instead of mid-frame. */
+  readonly snapshotState: () => Promise<State>
   readonly publish: (publication: SessionSavePublication<State>) => Promise<void>
   readonly onPublished?: (generation: number) => void
   readonly onFailure?: (error: unknown) => void
@@ -109,7 +110,7 @@ export const createSessionSaveCoordinator = <State>(
       const stateGeneration = options.currentGeneration()
       const retainedGeneration = retainedVersion
       const retainedCapture = [...retainedChunks.entries()]
-      const state = options.snapshotState()
+      const state = await options.snapshotState()
       const residents = await options.snapshotResidents()
       if (
         options.currentGeneration() === stateGeneration &&
