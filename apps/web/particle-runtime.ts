@@ -5,7 +5,7 @@ import {
   type ParticleFrameSnapshot, type ParticlePool, type ParticlePoolInputError,
   type ParticleRequest, type UnhandledParticleEvent,
 } from '@nerima-games/mc-render'
-import { Effect, Result, Schema } from 'effect'
+import { Array, Effect, Result, Schema } from 'effect'
 
 export type ParticleRequestRejected = Readonly<{
   _tag: 'ParticleRequestRejected'
@@ -22,14 +22,26 @@ export type ParticleEventOutcome = Readonly<{
   result: Result.Result<'spawned' | 'ignored', ParticleEventFailure>
 }>
 
+export type ParticleEventFailureEntry = Readonly<{
+  event: DomainEvent
+  failure: ParticleEventFailure
+}>
+
+export type ParticleEventBatchFailure = Readonly<{
+  _tag: 'ParticleEventBatchFailure'
+  failures: readonly [ParticleEventFailureEntry, ...ParticleEventFailureEntry[]]
+  outcomes: ReadonlyArray<ParticleEventOutcome>
+}>
+
 export type ParticleRuntime = Readonly<{
-  spawnEvents: (events: ReadonlyArray<DomainEvent>) => Effect.Effect<ReadonlyArray<ParticleEventOutcome>>
+  spawnEvents: (events: ReadonlyArray<DomainEvent>) => Effect.Effect<ReadonlyArray<ParticleEventOutcome>, ParticleEventBatchFailure>
 }>
 
 export type ParticleRuntimeOptions = Readonly<{
   renderContext: () => ParticleFrameSnapshot
 }>
 
+// These error reasons mirror ParticleServiceForPool; keep them aligned when upgrading mc-render.
 const readFrame = (read: () => ParticleFrameSnapshot): Effect.Effect<ParticleFrameSnapshot, ParticlePoolInputError> =>
   Effect.try({
     try: read,
@@ -47,28 +59,36 @@ const readFrame = (read: () => ParticleFrameSnapshot): Effect.Effect<ParticleFra
   }))
 
 export const makeParticleRuntime = (pool: ParticlePool, options: ParticleRuntimeOptions): ParticleRuntime => ({
-  spawnEvents: (events) => Effect.forEach(events, (event) => Effect.gen(function* () {
-    const result = yield* Effect.result(Effect.gen(function* () {
-      const frame = yield* readFrame(options.renderContext)
-      const request = particleRequestForDomainEvent(event, {
-        positionOfEntity: (id) => {
-          const entity = frame.entities.find((target) => target.id === id)
-          // The validated frame restricts dimension and finite coordinates more tightly than WorldPositionSchema.
-          return entity === undefined ? undefined : Schema.decodeUnknownSync(WorldPositionSchema)({
-            dimension: frame.dimension, ...entity.feetPosition,
-          })
-        },
-      })
-      if (request === undefined) return yield* Effect.succeed<'ignored'>('ignored')
-      if ('_tag' in request) return yield* Effect.fail(request)
-      return yield* Effect.gen(function* () {
-        const particles = yield* ParticleService
-        const accepted = yield* particles.spawn(request)
-        // mc-render declares PARTICLE_REQUEST_REJECTED as 0 but does not export the constant.
-        if (accepted === 0) return yield* Effect.fail<ParticleRequestRejected>({ _tag: 'ParticleRequestRejected', request })
-        return yield* Effect.succeed<'spawned'>('spawned')
-      }).pipe(Effect.provide(ParticleServiceForPool(pool, { renderContext: () => frame })))
+  spawnEvents: (events) => Effect.gen(function* () {
+    const outcomes = yield* Effect.forEach(events, (event) => Effect.gen(function* () {
+      const result = yield* Effect.result(Effect.gen(function* () {
+        const frame = yield* readFrame(options.renderContext)
+        const request = particleRequestForDomainEvent(event, {
+          positionOfEntity: (id) => {
+            const entity = frame.entities.find((target) => target.id === id)
+            // The validated frame restricts dimension and finite coordinates more tightly than WorldPositionSchema.
+            return entity === undefined ? undefined : Schema.decodeUnknownSync(WorldPositionSchema)({
+              dimension: frame.dimension, ...entity.feetPosition,
+            })
+          },
+        })
+        if (request === undefined) return yield* Effect.succeed<'ignored'>('ignored')
+        if ('_tag' in request) return yield* Effect.fail(request)
+        return yield* Effect.gen(function* () {
+          const particles = yield* ParticleService
+          const accepted = yield* particles.spawn(request)
+          // mc-render declares PARTICLE_REQUEST_REJECTED as 0 but does not export the constant.
+          if (accepted === 0) return yield* Effect.fail<ParticleRequestRejected>({ _tag: 'ParticleRequestRejected', request })
+          return yield* Effect.succeed<'spawned'>('spawned')
+        }).pipe(Effect.provide(ParticleServiceForPool(pool, { renderContext: () => frame })))
+      }))
+      return { event, result }
     }))
-    return { event, result }
-  })),
+    const failures = outcomes.flatMap(({ event, result }): ParticleEventFailureEntry[] =>
+      Result.isFailure(result) ? [{ event, failure: result.failure }] : [])
+    if (Array.isArrayNonEmpty(failures)) {
+      return yield* Effect.fail<ParticleEventBatchFailure>({ _tag: 'ParticleEventBatchFailure', failures, outcomes })
+    }
+    return outcomes
+  }),
 })
