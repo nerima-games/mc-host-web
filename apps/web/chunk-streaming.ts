@@ -1,4 +1,4 @@
-import { BlockAxis, ChunkAxis, chunkCoord } from '@nerima-games/mc-kernel'
+import { BlockAxis, ChunkAxis, chunkCoord, type ChunkCoord } from '@nerima-games/mc-kernel'
 import type { WorldCommitCoordinatorApi, WorldCommitCoordinatorError } from '@nerima-games/mc-sim'
 import { chunkKeyOf, type ChunkRef, syncWorld } from '@nerima-games/mc-render'
 import {
@@ -33,7 +33,7 @@ export type ChunkStreamingContext<
   readonly dimension: Dimension
   readonly chunkStore: ChunkStore
   readonly worldgenChunkStore: WorldgenChunkStore
-  readonly queueLoadedChunk: (chunk: { cx: number; cz: number }) => void
+  readonly queueLoadedChunk: (chunk: ChunkCoord) => void
   readonly streamLoaded: Set<string>
 }
 

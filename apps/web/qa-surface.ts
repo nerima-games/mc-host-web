@@ -37,6 +37,7 @@ import {
   type WorldWriteConflict,
   type WorldWriteInvalidBatch,
   type BlockPosition,
+  type ChunkCoord,
   type ClockService,
   type Position as Vec3,
 } from '@nerima-games/mc-kernel'
@@ -241,7 +242,7 @@ type QaChunkContext = {
   readonly chunkStore: ChunkStoreApi
   readonly worldgenChunkStore: ChunkStoreApi
   readonly dirtyChunks: DirtySource
-  readonly queueLoadedChunk: (chunk: { cx: number; cz: number }) => void
+  readonly queueLoadedChunk: (chunk: ChunkCoord) => void
   readonly meshChunkFromStore: ChunkMesher
   readonly colorForChunk: NonNullable<SyncOptions['colorForChunk']>
   readonly lightingSnapshot: () => RenderLightingSnapshot
