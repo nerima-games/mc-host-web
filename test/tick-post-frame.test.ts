@@ -5,6 +5,7 @@ import {
   makeWorldCommitCoordinator,
   makeWeatherService,
   maxStackCountForItem,
+  witherSkullProjectile,
   itemStack,
   EntityKind,
   type ItemStack,
@@ -259,7 +260,7 @@ const makeContext = async (primaryAttackConsumed: ReturnType<typeof cell<boolean
     isStandingOnCell: () => false,
     pressurePlateOccupancy: new Map(),
     environmentalContactsForPose: () => [],
-    isGameplayBlockSolid: () => false,
+    isGameplayBlockSolid: () => Result.succeed(false),
     applyWorldExplosion: () => Result.succeed(undefined),
     resetBowUse: () => bowUseState.state.set(IDLE_BOW_USE),
     projectileHud: { textContent: '', hidden: true },
@@ -605,6 +606,68 @@ describe('tick post-frame processing', () => {
     expect(Result.isFailure(result)).toBe(true)
     if (Result.isFailure(result)) expect(result.failure).toBe(failure)
     expect(context.state.projectileRuntimeState.get()).toBe(advanced)
+  })
+
+  it('fails the frame with a wither solidity read failure before committing the advance', async () => {
+    const harness = await makeContext(cell(false))
+    const failure = { _tag: 'EntityWorldWindowUnavailable', cell: { x: BlockAxis(0), y: BlockAxis(64), z: BlockAxis(0) } } as const
+    const before = harness.context.state.witherRuntimeState.get()
+    const advanced = initialWitherRuntimeState()
+    const skullOrigin = position(PositionAxis(0), PositionAxis(70), PositionAxis(0))
+    const skull = {
+      id: 'skull-fixture',
+      ownerId: 'wither-fixture',
+      dimension: 'overworld',
+      descriptor: witherSkullProjectile(skullOrigin, position(PositionAxis(0), PositionAxis(64), PositionAxis(0)), 'normal'),
+      position: skullOrigin,
+      ageSecs: 0,
+    }
+    const answers: boolean[] = []
+    const context: H5bPostFrameContext = {
+      ...inOverworld(harness.context),
+      isGameplayBlockSolid: () => Result.fail(failure),
+      advanceWitherRuntime: (_state, _dimension, _target, _deltaSecs, skullHitsWorld) => {
+        answers.push(skullHitsWorld(skull, { x: 0.5, y: 64.5, z: 0.5 }))
+        return { state: advanced, meleeDamage: 0, explosions: [] }
+      },
+    }
+
+    const result = Effect.runSync(Effect.result(runTickPostFrameEffect(context, {
+      frame: harness.input,
+      movement: inOverworldMovement(harness.movement),
+      framesTotal: 5,
+    })))
+
+    expect(Result.isFailure(result)).toBe(true)
+    if (Result.isFailure(result)) expect(result.failure).toBe(failure)
+    expect(answers).toEqual([true])
+    expect(context.state.witherRuntimeState.get()).toBe(before)
+  })
+
+  it('fails the frame with a projectile solidity read failure before committing the advance', async () => {
+    const harness = await makeContext(cell(false))
+    const failure = { _tag: 'EntityWorldWindowUnavailable', cell: { x: BlockAxis(0), y: BlockAxis(64), z: BlockAxis(0) } } as const
+    const before = harness.context.state.projectileRuntimeState.get()
+    const advanced = initialProjectileRuntimeState()
+    const context: H5bPostFrameContext = {
+      ...inOverworld(harness.context),
+      isGameplayBlockSolid: () => Result.fail(failure),
+      advanceProjectileRuntime: (_state, world) => {
+        const point = position(PositionAxis(0.5), PositionAxis(64.5), PositionAxis(0.5))
+        expect(world.blockBounds(point, point)).toHaveLength(1)
+        return { state: advanced, impacts: [] }
+      },
+    }
+
+    const result = Effect.runSync(Effect.result(runTickPostFrameEffect(context, {
+      frame: harness.input,
+      movement: inOverworldMovement(harness.movement),
+      framesTotal: 5,
+    })))
+
+    expect(Result.isFailure(result)).toBe(true)
+    if (Result.isFailure(result)) expect(result.failure).toBe(failure)
+    expect(context.state.projectileRuntimeState.get()).toBe(before)
   })
 
   it('preserves the bow reset when the reset callback mutates state and throws', async () => {

@@ -157,7 +157,7 @@ export type H5bPostFrameContext = {
   readonly environmentalContactsForPose: (
     pose: Readonly<{ readonly feetPosition: Readonly<{ readonly x: number; readonly y: number; readonly z: number }> }>,
   ) => ReadonlyArray<import('@nerima-games/mx-gameplay').EnvironmentalContact>
-  readonly isGameplayBlockSolid: (position: Readonly<{ readonly x: number; readonly y: number; readonly z: number }>) => boolean
+  readonly isGameplayBlockSolid: ReturnType<typeof import('@nerima-games/mx-gameplay').solidityFromStore>
   readonly applyWorldExplosion: (
     center: Readonly<{ readonly x: number; readonly y: number; readonly z: number }>,
     radius: number,

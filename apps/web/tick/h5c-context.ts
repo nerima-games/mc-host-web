@@ -1,6 +1,6 @@
-import type { BlockId, BlockPosition, MonotonicTimeSecs } from '@nerima-games/mc-kernel'
+import type { BlockId, BlockPosition, MonotonicTimeSecs, Position } from '@nerima-games/mc-kernel'
 import type { ItemStack, Vehicle } from '@nerima-games/mc-sim'
-import type { Effect, Result } from 'effect'
+import type { Brand, Effect, Result, Schema } from 'effect'
 import type { GameplayFrameState, ItemUseResult, MobDropEvent } from '@nerima-games/mx-gameplay'
 
 import type {
@@ -118,9 +118,9 @@ export type H5cTickContext = {
     readonly presentWeather: (state: import('@nerima-games/mc-sim').WeatherState) => void
     readonly presentWeatherRuntime: (
       state: import('@nerima-games/mc-sim').WeatherState,
-      pose: Readonly<{ readonly feetPosition: Readonly<{ readonly x: number; readonly y: number; readonly z: number }> }>,
-      nowSecs: number,
-    ) => void
+      pose: Readonly<{ readonly feetPosition: Position }>,
+      nowSecs: MonotonicTimeSecs,
+    ) => Effect.Effect<void, Brand.BrandError | Schema.SchemaError>
     readonly syncRenderedEntities: () => void
     readonly registerPortal: (portal: PersistedPortalState) => boolean
     readonly requiredSleepRatio: number

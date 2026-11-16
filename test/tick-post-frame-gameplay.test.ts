@@ -336,7 +336,7 @@ const makeHarness = async (options: HarnessOptions = {}) => {
       return Effect.void
     },
     presentWeather: () => undefined,
-    presentWeatherRuntime: () => undefined,
+    presentWeatherRuntime: () => Effect.void,
     syncRenderedEntities: () => undefined,
     registerPortal: () => false,
     requiredSleepRatio: 1,
@@ -947,6 +947,27 @@ describe('tick post-frame gameplay processing', () => {
       })
 
       expect(harness.streamCalls).toEqual([{ dimension: 'overworld', x: 12.346, z: -7.891 }])
+    })
+  })
+
+  it('returns a weather presentation failure as the frame failure', async () => {
+    await withHarness({}, (harness) => {
+      const rejected = PositionAxis.result(Number.NaN)
+      if (Result.isSuccess(rejected)) throw new Error('PositionAxis accepted NaN')
+      const context: H5cTickContext = {
+        ...harness.context,
+        services: { ...harness.context.services, presentWeatherRuntime: () => Effect.fail(rejected.failure) },
+      }
+
+      const result = Effect.runSync(Effect.result(runTickPostFrameGameplayEffect(context, {
+        frame: harness.frame,
+        movement: harness.movement,
+        postFrame: harness.postFrame,
+        nowSecs: MonotonicTimeSecs(2),
+      })))
+
+      expect(Result.isFailure(result)).toBe(true)
+      if (Result.isFailure(result)) expect(result.failure).toBe(rejected.failure)
     })
   })
 

@@ -73,6 +73,7 @@ type TickGameplayFailure = Effect.Error<
   | ReturnType<H5cTickContext['services']['useEndFeature']>
   | ReturnType<H5cTickContext['services']['targetedBlock']>
   | ReturnType<H5cTickContext['services']['fishingEnvironmentAt']>
+  | ReturnType<H5cTickContext['services']['presentWeatherRuntime']>
 > | Result.Result.Failure<ReturnType<H5cTickContext['h5b']['applyWorldExplosion']>>
 
 export const runTickPostFrameGameplay = (
@@ -1031,7 +1032,7 @@ export const runTickPostFrameGameplay = (
     sleepHud.hidden = true
     document.body.setAttribute('data-sleep-result', 'morning-skipped')
   }
-  presentWeatherRuntime(
+  yield* presentWeatherRuntime(
     weatherAdvanced ?? Effect.runSync(weather.snapshot),
     postFramePose,
     nowSecs,

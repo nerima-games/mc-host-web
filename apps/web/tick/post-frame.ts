@@ -16,7 +16,10 @@ export const runTickPostFrame = (
 ): Effect.Effect<H5bPostFrameResult, Effect.Error<
   | ReturnType<H5bPostFrameContext['resolveTargetedPrimaryAttack']>
   | ReturnType<H5bPostFrameContext['applyPortalTravels']>
-> | Result.Result.Failure<ReturnType<H5bPostFrameContext['applyWorldExplosion']>>> => Effect.gen(function* () {
+> | Result.Result.Failure<
+  | ReturnType<H5bPostFrameContext['applyWorldExplosion']>
+  | ReturnType<H5bPostFrameContext['isGameplayBlockSolid']>
+>> => Effect.gen(function* () {
   const { frame, movement, framesTotal } = input
   const h5a = context.h5a
   const targeting = h5a.targeting
@@ -558,18 +561,40 @@ export const runTickPostFrame = (
     deadAfterFrame = playerIsDead()
     syncTouchControls()
 
+    // mc-server's advanceWitherRuntime and mc-sim's ProjectileWorld.blockBounds
+    // take synchronous boolean answers, so a failed solidity read cannot leave
+    // their callbacks as a typed failure. The callback keeps the first failure
+    // and answers solid, as mx-gameplay answers for an unloaded chunk; the frame
+    // then fails with the kept failure before the advance result is committed,
+    // so that answer never reaches runtime state.
+    const recordingSolidity = () => {
+      let failure: Option.Option<Result.Result.Failure<ReturnType<typeof isGameplayBlockSolid>>> = Option.none()
+      return {
+        isSolid: (cell: Readonly<{ x: number; y: number; z: number }>): boolean => {
+          const reading = isGameplayBlockSolid(cell)
+          if (Result.isSuccess(reading)) return reading.success
+          if (Option.isNone(failure)) failure = Option.some(reading.failure)
+          return true
+        },
+        failure: () => failure,
+      }
+    }
+
     if (!deadAfterFrame && !dimensionChanged) {
+      const witherSolidity = recordingSolidity()
       const advancedWither = advanceWitherRuntime(
         witherRuntimeState,
         dimensionAfterFrame,
         postFramePose.feetPosition,
         Math.min(deltaSecs, 0.1),
-        (_skull, position) => isGameplayBlockSolid({
+        (_skull, position) => witherSolidity.isSolid({
           x: Math.floor(position.x),
           y: Math.floor(position.y),
           z: Math.floor(position.z),
         }),
       )
+      const witherSolidityFailure = witherSolidity.failure()
+      if (Option.isSome(witherSolidityFailure)) yield* Effect.fail(witherSolidityFailure.value)
       witherRuntimeState = advancedWither.state
       if (advancedWither.meleeDamage > 0) {
         applyPlayerDamage({ amount: advancedWither.meleeDamage, cause: 'generic' })
@@ -592,6 +617,7 @@ export const runTickPostFrame = (
       eyeOfEnderRuntimeState = initialEyeOfEnderRuntimeState()
     } else if (!dimensionChanged && multiplayer === undefined) {
       const projectileEntities = Effect.runSync(world.entities.entities)
+      const projectileSolidity = recordingSolidity()
       const projectileWorld = {
         blockBounds: (
           start: Readonly<{ x: number; y: number; z: number }>,
@@ -601,7 +627,7 @@ export const runTickPostFrame = (
           for (let x = Math.floor(Math.min(start.x, end.x)); x <= Math.floor(Math.max(start.x, end.x)); x += 1) {
             for (let y = Math.floor(Math.min(start.y, end.y)); y <= Math.floor(Math.max(start.y, end.y)); y += 1) {
               for (let z = Math.floor(Math.min(start.z, end.z)); z <= Math.floor(Math.max(start.z, end.z)); z += 1) {
-                if (isGameplayBlockSolid({ x, y, z })) {
+                if (projectileSolidity.isSolid({ x, y, z })) {
                   bounds.push({ minX: PositionAxis(x), minY: PositionAxis(y), minZ: PositionAxis(z), maxX: PositionAxis(x + 1), maxY: PositionAxis(y + 1), maxZ: PositionAxis(z + 1) })
                 }
               }
@@ -671,6 +697,8 @@ export const runTickPostFrame = (
         dimensionAfterFrame,
         DeltaTimeSecs(Math.min(deltaSecs, 0.1)),
       )
+      const projectileSolidityFailure = projectileSolidity.failure()
+      if (Option.isSome(projectileSolidityFailure)) yield* Effect.fail(projectileSolidityFailure.value)
       projectileRuntimeState = advancedProjectiles.state
       for (const impact of advancedProjectiles.impacts) {
         if (impact.hit.kind !== 'entity' || impact.hit.entityId === 'player') continue

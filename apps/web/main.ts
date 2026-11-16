@@ -258,6 +258,7 @@ import {
 } from '@nerima-games/mx-multiplayer'
 import {
   AudioBackendPort,
+  AudioEventId,
   AudioVolume,
   decodeMusicScenePlaylistManifest,
   MinecraftSoundNamespace,
@@ -1133,12 +1134,15 @@ const bootGame = async (
   const weatherDaylight = (timeOfDay: number): number =>
     Math.max(0.08, Math.sin(Math.PI * 2 * (timeOfDay - 0.25)))
 
+  // The eye-level and thunder-fallback offsets are arithmetic on PositionAxis
+  // values; the brand check rejects a non-finite sum, and that failure reaches
+  // the frame-failure path through runTickPostFrameGameplay.
   const presentWeatherRuntime = (
     state: WeatherState,
     pose: { readonly feetPosition: Vec3 },
-    nowSecs: number,
-  ): void => {
-    const timeState = Effect.runSync(time.snapshot)
+    nowSecs: MonotonicTimeSecs,
+  ) => Effect.gen(function* () {
+    const timeState = yield* time.snapshot
     const receivedLightning = authoritativeLightning !== undefined && authoritativeLightning.expiresAtSecs >= nowSecs
       ? authoritativeLightning
       : undefined
@@ -1146,15 +1150,15 @@ const bootGame = async (
       ? Math.floor(timeState.ticks / (60 * 8))
       : undefined)
     const intensity = state.weather === 'clear' ? AudioVolume(0) : AudioVolume(1)
-    const camera = {
-      x: pose.feetPosition.x,
-      y: pose.feetPosition.y + EYE_LEVEL_OFFSET,
-      z: pose.feetPosition.z,
-    }
-    const renderPlan = Effect.runSync(worldRenderer.weather.frame({
+    const camera = worldPosition(
+      pose.feetPosition.x,
+      yield* Effect.fromResult(PositionAxis.result(pose.feetPosition.y + EYE_LEVEL_OFFSET)),
+      pose.feetPosition.z,
+    )
+    const renderPlan = yield* worldRenderer.weather.frame({
       mode: state.weather,
       intensity,
-      daylight: weatherDaylight(Effect.runSync(time.timeOfDay)),
+      daylight: weatherDaylight(yield* time.timeOfDay),
       temperature: 1,
       seed: activeSeed,
       // The renderer plans sky, sun and fog from this every frame — see
@@ -1164,13 +1168,17 @@ const bootGame = async (
       // render, not a second notion of where the player is.
       dimension: currentChunkContext.dimension,
       ...(lightningSequence === undefined ? {} : { lightningSequence }),
-    }, camera))
+    }, camera)
     const thunder = lightningSequence === undefined
       ? undefined
       : {
-          id: `weather-thunder-${String(lightningSequence)}`,
+          id: yield* Effect.fromResult(AudioEventId.result(`weather-thunder-${String(lightningSequence)}`)),
           occurredAtSecs: nowSecs,
-          position: receivedLightning?.at ?? { x: camera.x + 24, y: camera.y + 12, z: camera.z + 12 },
+          position: receivedLightning?.at ?? worldPosition(
+            yield* Effect.fromResult(PositionAxis.result(camera.x + 24)),
+            yield* Effect.fromResult(PositionAxis.result(camera.y + 12)),
+            yield* Effect.fromResult(PositionAxis.result(camera.z + 12)),
+          ),
         }
     weatherAudio.update({
       mode: state.weather,
@@ -1183,7 +1191,7 @@ const bootGame = async (
     canvas.setAttribute('data-weather-particles', String(renderPlan.particles.length))
     canvas.setAttribute('data-weather-lightning', String(renderPlan.lightningFlash > 0))
     canvas.setAttribute('data-weather-audio-mode', weatherAudio.state().mode)
-  }
+  })
 
   const MAX_CHUNK_UPDATES_PER_FRAME = 4
   const makeDimensionChunkContext = (
