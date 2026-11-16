@@ -702,6 +702,7 @@ describe('tick post-frame processing', () => {
       pendingItemUses: harvestRequests,
       requestPotatoHarvest: (state, requestId, position) => gameplay.requestPotatoHarvest(state, requestId, position, 0.25),
     }
+    harness.canvasAttributes.set('data-breaks-completed', '0')
 
     runTickPostFrame(context, {
       frame: { ...harness.input, attackTriggered: true, attackHeld: true },
@@ -711,6 +712,7 @@ describe('tick post-frame processing', () => {
 
     expect(Effect.runSync(world.chunkStore.getBlock(at))).toMatchObject({ _tag: 'Block', block: Option.getOrThrow(blockIdOf('potato_crop')) })
     expect(harvestRequests.get('item-use-1')).toMatchObject({ kind: 'harvest', dimension: 'overworld', position: at })
+    expect(context.state.blockBreakCounters.get().completed).toBe(0)
     expect(context.pendingBlockBreakConfirmations).toHaveLength(1)
     expect(Effect.runSync(Ref.get(context.h5a.gameplayState.pendingItemUses))).toEqual([
       expect.objectContaining({ action: 'HarvestPotato', requestId: 'item-use-1', positionKey: blockPositionKeyOf(at), roll: 0.25 }),
