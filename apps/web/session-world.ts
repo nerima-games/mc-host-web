@@ -2,6 +2,7 @@ import { Option } from 'effect'
 import {
   chunkSnapshotOf,
   generatedChunkSource,
+  NoiseSeed,
   type Chunk,
   type ChunkSource,
   type Dimension,
@@ -19,7 +20,7 @@ import {
   type SessionHead,
   type SessionState,
 } from './session-persistence'
-import { makeSessionChunkSourceFor } from './session-restoration'
+import { makeSessionChunkSourceFor, requireSessionChunkBlockStates } from './session-restoration'
 
 export type SessionWorldInitialization<World> = {
   readonly activeSeed: number
@@ -62,13 +63,13 @@ export const initializeSessionWorld = async <World>(context: {
   const activeSeed = Option.isSome(context.loadedSession)
     ? context.loadedSession.value.state.seed
     : context.worldSeed
-  const generatedSource = generatedChunkSource(activeSeed)
+  const generatedSource = generatedChunkSource(NoiseSeed(activeSeed))
   const restored = Option.isSome(context.loadedSession)
     ? await context.loadSavedChunks(context.loadedSession.value, context.initialDimension, generatedSource)
     : undefined
   const initialKnownChunks = (restored?.chunks ?? []).map(({ dimension, chunk }) => ({
     dimension,
-    chunk: chunkSnapshotOf(chunk),
+    chunk: chunkSnapshotOf(requireSessionChunkBlockStates(chunk)),
   }))
   const persistedChunks = new Map<string, Chunk>(
     (restored?.chunks ?? []).map(({ dimension, chunk }) => [

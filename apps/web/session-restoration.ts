@@ -2,6 +2,7 @@ import { Effect } from 'effect'
 import {
   chunkSnapshotOf,
   type Chunk,
+  type ChunkWithBlockStates,
   type ChunkSource,
   type Dimension,
 } from '@nerima-games/mc-worldgen'
@@ -56,6 +57,13 @@ export const restoreLoadedSessionServices = async <State>(
   await actions.restoreEnderDragon(state)
 }
 
+export const requireSessionChunkBlockStates = (chunk: Chunk): ChunkWithBlockStates => {
+  // CHUNK_FORMAT decode (including v2 migration) and resident snapshots materialize states.
+  // session-persistence widens those values to Chunk, so enforce that invariant here.
+  if (chunk.blockStates === undefined) throw new Error('Session chunk has no block states')
+  return { ...chunk, blockStates: chunk.blockStates }
+}
+
 export const makeSessionChunkSourceFor = (
   dimension: Dimension,
   persistedChunks: ReadonlyMap<string, Chunk>,
@@ -66,5 +74,5 @@ export const makeSessionChunkSourceFor = (
   )
   return persisted === undefined
     ? generatedSource(coord)
-    : Effect.sync(() => chunkSnapshotOf(persisted))
+    : Effect.sync(() => chunkSnapshotOf(requireSessionChunkBlockStates(persisted)))
 }
