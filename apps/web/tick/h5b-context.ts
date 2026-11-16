@@ -165,7 +165,6 @@ export type H5bPostFrameContext = {
   readonly bowDamage: typeof import('@nerima-games/mx-gameplay').bowDamage
   readonly bowDamageWithEnchantments: typeof import('@nerima-games/mx-gameplay').bowDamageWithEnchantments
   readonly advanceFootstepRuntime: typeof import('../footstep-runtime').advanceFootstepRuntime
-  readonly surfaceForBlockType: typeof import('../footstep-runtime').surfaceForBlockType
   readonly audio: Pick<import('../audio-runtime').AudioRuntime, 'play'>
   readonly advanceWitherRuntime: typeof import('@nerima-games/mc-server/shared').advanceWitherRuntime
   readonly damageRuntimeWither: typeof import('@nerima-games/mc-server/shared').damageRuntimeWither

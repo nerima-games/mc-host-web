@@ -1,4 +1,3 @@
-import { AudioGain } from '@nerima-games/mc-audio'
 import { WorldId } from '@nerima-games/mx-multiplayer'
 import { Effect, Option, Ref, Result } from 'effect'
 import { AngleRadians, blockIdOf, blockPositionKeyOf, EnchantmentLevel, EntityId, position, PositionAxis, StackCount } from '@nerima-games/mc-kernel'
@@ -69,7 +68,6 @@ export const runTickPostFrame = (
     bowDamage,
     bowDamageWithEnchantments,
     advanceFootstepRuntime,
-    surfaceForBlockType,
     audio,
     advanceWitherRuntime,
     damageRuntimeWither,
@@ -855,17 +853,14 @@ export const runTickPostFrame = (
       footstepRuntimeState = advanceFootstepRuntime(footstepRuntimeState, {
         grounded: groundedAfterFrame && !h5aState.swimmingState.get().active,
         horizontalDistance,
-        surface: surfaceForBlockType(
-          footstepBlock._tag === 'Block' && typeof footstepBlock.block === 'number'
-            ? Result.getOrThrow(blockTypeOfId(footstepBlock.block)) ?? 'air'
-            : 'air',
-        ),
+        standingOnBlockId: footstepBlock._tag === 'Block'
+          ? footstepBlock.block
+          : Option.getOrThrow(blockIdOf('air')),
         sneaking: held('sneak') > 0,
         dead: deadAfterFrame,
         dimensionChanged,
         position: postFramePose.feetPosition,
-        play: (cueId, options) => audio.play(cueId, { ...options, gainScale: AudioGain(options.gainScale) }),
-      })
+      }, audio)
       if (!isCreativeMode && horizontalDistance > 0) {
         if (multiplayer === undefined) survivalHunger.submit(h5aState.swimmingState.get().active
           ? { _tag: 'swim', distance: horizontalDistance }

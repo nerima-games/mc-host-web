@@ -29,7 +29,7 @@ import { isDroppedItemPickupEligible } from '../apps/web/dropped-item-pickup'
 import { droppedItemMetadataFromBehaviour } from '../apps/web/dropped-item-metadata'
 import { IDLE_BOW_USE, advanceBowUse } from '../apps/web/bow-use'
 import { advanceEyeOfEnderRuntime, initialEyeOfEnderRuntimeState } from '../apps/web/eye-of-ender-runtime'
-import { advanceFootstepRuntime, initialFootstepRuntimeState, surfaceForBlockType } from '../apps/web/footstep-runtime'
+import { advanceFootstepRuntime, initialFootstepRuntimeState } from '../apps/web/footstep-runtime'
 import { EMPTY_BLOCK_BREAK_COUNTERS, observeBlockBreakCompletion, recordBlockBreakRequest } from '../apps/web/mining-completion'
 import { projectEnchantedItem } from '../apps/web/enchanted-item-state'
 import {
@@ -275,7 +275,6 @@ const makeContext = async (primaryAttackConsumed: ReturnType<typeof cell<boolean
     bowDamage: gameplay.bowDamage,
     bowDamageWithEnchantments: gameplay.bowDamageWithEnchantments,
     advanceFootstepRuntime,
-    surfaceForBlockType,
     audio: { play: () => undefined },
     advanceWitherRuntime,
     damageRuntimeWither,
