@@ -4,57 +4,56 @@ import {
   emptyInventory,
   itemStack,
   makeInventoryService,
+  type CraftGrid,
+  type CraftResult,
   type Inventory,
+  type InventoryClick,
+  type InventoryClickResult,
+  type RecipeMatch,
 } from '@nerima-games/mc-sim'
+import {
+  RecipeGridDimension,
+  RecipeId,
+  shapelessRecipe,
+  type ItemType,
+} from '@nerima-games/mc-kernel'
 
 import {
   createInventoryInteraction,
-  type InventoryInteractionClick,
-  type InteractionCraftGrid,
-  type InteractionCraftResult,
-  type InteractionInventory,
-  type InteractionRecipeMatch,
+  type InventoryInteractionController,
 } from '../apps/web/inventory-interaction'
-import type { ItemType } from '@nerima-games/mc-kernel'
 
-// Fixture literals are in-range stack counts.
+// Fixture literals are in-range stack counts. Expected stacks are full mc-kernel
+// `ItemStack` values (`item`, `count`, `components`): the carried stack is
+// `InventoryCarriedStack = Inv.ItemStack & { durability? }`
+// (@nerima-games/mc-sim@0.11.1 dist/application/inventory-interaction.d.ts) and
+// crafting draft cells come from `splitItemStack`, whose `ItemStack` carries
+// `components` (@nerima-games/mc-kernel@0.17.0 dist/domain/item/item-stack.d.ts).
 const stackOf = (item: ItemType, count: number) => Result.getOrThrow(itemStack(item, count))
 
-type Item = 'oak_log' | 'oak_planks' | 'stone'
+const planksRecipe = Result.getOrThrow(
+  shapelessRecipe(RecipeId('oak_planks'), ['oak_log'], stackOf('oak_planks', 4)),
+)
 
-type Recipe = {
-  readonly id: string
+const logs: Inventory = {
+  slots: [stackOf('oak_log', 4), undefined],
 }
 
-const logs: InteractionInventory<Item> = {
-  slots: [{ item: 'oak_log', count: 4 }, undefined],
-}
-
-const noMatch: InteractionRecipeMatch<Item, Recipe> = { _tag: 'NoMatch' }
+const noMatch: RecipeMatch = { _tag: 'NoMatch' }
 
 const makeService = (options: {
-  readonly inventory?: InteractionInventory<Item>
-  readonly preview?: InteractionRecipeMatch<Item, Recipe>
-  readonly previews?: ReadonlyArray<InteractionRecipeMatch<Item, Recipe>>
-  readonly craft?: InteractionCraftResult<Item>
-  readonly crafts?: ReadonlyArray<InteractionCraftResult<Item>>
-  readonly clickResult?: {
-    readonly _tag:
-      | 'PickedUp'
-      | 'Placed'
-      | 'Merged'
-      | 'Swapped'
-      | 'NoChange'
-      | 'InvalidSlot'
-      | 'InvalidCount'
-    readonly carried: { readonly item: Item; readonly count: number } | undefined
-  }
+  readonly inventory?: Inventory
+  readonly preview?: RecipeMatch
+  readonly previews?: ReadonlyArray<RecipeMatch>
+  readonly craft?: CraftResult
+  readonly crafts?: ReadonlyArray<CraftResult>
+  readonly clickResult?: InventoryClickResult
   readonly addLeftover?: number
 } = {}) => {
   const inventory = options.inventory ?? logs
-  const addCalls: Array<{ readonly item: Item; readonly count: number }> = []
-  const previewCalls: Array<InteractionCraftGrid<Item>> = []
-  const craftCalls: Array<InteractionCraftGrid<Item>> = []
+  const addCalls: Array<{ readonly item: ItemType; readonly count: number }> = []
+  const previewCalls: Array<CraftGrid> = []
+  const craftCalls: Array<CraftGrid> = []
   let previewIndex = 0
   let craftIndex = 0
   return {
@@ -63,29 +62,31 @@ const makeService = (options: {
     previewCalls,
     craftCalls,
     service: {
-      add: (item: Item, count: number) => Effect.sync(() => {
+      add: (item: ItemType, count: number) => Effect.sync(() => {
         addCalls.push({ item, count })
         return options.addLeftover ?? 0
       }),
-      click: (click: InventoryInteractionClick<Item>) =>
-        Effect.succeed(options.clickResult ?? { _tag: 'NoChange' as const, carried: click.carried }),
+      click: (click: InventoryClick) =>
+        Effect.succeed<InventoryClickResult>(
+          options.clickResult ?? { _tag: 'NoChange', carried: click.carried },
+        ),
       snapshot: Effect.succeed(inventory),
-      previewCraft: (grid: InteractionCraftGrid<Item>) =>
-        Effect.sync(() => {
+      previewCraft: (grid: CraftGrid) =>
+        Effect.sync((): RecipeMatch => {
           previewCalls.push(grid)
           return options.previews?.[previewIndex++] ?? options.preview ?? noMatch
         }),
-      craft: (grid: InteractionCraftGrid<Item>) =>
-        Effect.sync(() => {
+      craft: (grid: CraftGrid) =>
+        Effect.sync((): CraftResult => {
           craftCalls.push(grid)
-          return options.crafts?.[craftIndex++] ?? options.craft ?? ({ _tag: 'NoMatch' } as const)
+          return options.crafts?.[craftIndex++] ?? options.craft ?? { _tag: 'NoMatch' }
         }),
     },
   }
 }
 
 const placeLog = (
-  interaction: ReturnType<typeof createInventoryInteraction<Item, Recipe>>,
+  interaction: InventoryInteractionController,
   cell: number,
 ): void => {
   Effect.runSync(interaction.pickupInventoryItem(0))
@@ -94,10 +95,10 @@ const placeLog = (
 
 describe('inventory interaction', () => {
   it('drafts four logs and previews a match without mutating canonical inventory', () => {
-    const match: InteractionRecipeMatch<Item, Recipe> = {
+    const match: RecipeMatch = {
       _tag: 'Match',
-      recipe: { id: 'oak_planks' },
-      output: { item: 'oak_planks', count: 4 },
+      recipe: planksRecipe,
+      output: stackOf('oak_planks', 4),
     }
     const fixture = makeService({ preview: match })
     const interaction = createInventoryInteraction(fixture.service)
@@ -106,7 +107,7 @@ describe('inventory interaction', () => {
     const previewed = Effect.runSync(interaction.preview())
 
     expect(previewed.grid.cells).toEqual(
-      Array.from({ length: 4 }, () => ({ item: 'oak_log', count: 1 })),
+      Array.from({ length: 4 }, () => stackOf('oak_log', 1)),
     )
     expect(previewed.preview).toEqual(match)
     expect(fixture.previewCalls).toHaveLength(1)
@@ -115,10 +116,10 @@ describe('inventory interaction', () => {
 
   it('retains the draft and marks dirty once after a successful craft', () => {
     let dirtyCount = 0
-    const crafted: InteractionCraftResult<Item> = {
+    const crafted: CraftResult = {
       _tag: 'Crafted',
-      recipeId: 'oak_planks',
-      output: { item: 'oak_planks', count: 4 },
+      recipeId: planksRecipe.id,
+      output: stackOf('oak_planks', 4),
     }
     const fixture = makeService({ craft: crafted, preview: noMatch })
     const interaction = createInventoryInteraction(fixture.service, {
@@ -131,7 +132,7 @@ describe('inventory interaction', () => {
     expect(fixture.craftCalls).toHaveLength(1)
     expect(fixture.previewCalls).toHaveLength(1)
     expect(result.grid.cells).toEqual([
-      { item: 'oak_log', count: 1 },
+      stackOf('oak_log', 1),
       undefined,
       undefined,
       undefined,
@@ -161,14 +162,14 @@ describe('inventory interaction', () => {
   })
 
   it('crafts the same output twice while ingredients remain', () => {
-    const crafted: InteractionCraftResult<Item> = {
+    const crafted: CraftResult = {
       _tag: 'Crafted',
-      recipeId: 'oak_planks',
-      output: { item: 'oak_planks', count: 4 },
+      recipeId: planksRecipe.id,
+      output: stackOf('oak_planks', 4),
     }
-    const match: InteractionRecipeMatch<Item, Recipe> = {
+    const match: RecipeMatch = {
       _tag: 'Match',
-      recipe: { id: 'oak_planks' },
+      recipe: planksRecipe,
       output: crafted.output,
     }
     let dirtyCount = 0
@@ -191,13 +192,13 @@ describe('inventory interaction', () => {
   })
 
   it('rejects concurrent craft attempts and notifies once', async () => {
-    const crafted: InteractionCraftResult<Item> = {
+    const crafted: CraftResult = {
       _tag: 'Crafted',
-      recipeId: 'oak_planks',
-      output: { item: 'oak_planks', count: 4 },
+      recipeId: planksRecipe.id,
+      output: stackOf('oak_planks', 4),
     }
-    let resolveCraft!: (result: InteractionCraftResult<Item>) => void
-    const pendingCraft = new Promise<InteractionCraftResult<Item>>((resolve) => {
+    let resolveCraft!: (result: CraftResult) => void
+    const pendingCraft = new Promise<CraftResult>((resolve) => {
       resolveCraft = resolve
     })
     let dirtyCount = 0
@@ -229,13 +230,13 @@ describe('inventory interaction', () => {
   })
 
   it('rejects crafting cell changes while a craft is pending', async () => {
-    const crafted: InteractionCraftResult<Item> = {
+    const crafted: CraftResult = {
       _tag: 'Crafted',
-      recipeId: 'oak_planks',
-      output: { item: 'oak_planks', count: 4 },
+      recipeId: planksRecipe.id,
+      output: stackOf('oak_planks', 4),
     }
-    let resolveCraft!: (result: InteractionCraftResult<Item>) => void
-    const pendingCraft = new Promise<InteractionCraftResult<Item>>((resolve) => {
+    let resolveCraft!: (result: CraftResult) => void
+    const pendingCraft = new Promise<CraftResult>((resolve) => {
       resolveCraft = resolve
     })
     const fixture = makeService()
@@ -263,14 +264,14 @@ describe('inventory interaction', () => {
   })
 
   it('keeps a successful craft when the follow-up preview defects', () => {
-    const crafted: InteractionCraftResult<Item> = {
+    const crafted: CraftResult = {
       _tag: 'Crafted',
-      recipeId: 'oak_planks',
-      output: { item: 'oak_planks', count: 4 },
+      recipeId: planksRecipe.id,
+      output: stackOf('oak_planks', 4),
     }
     let dirtyCount = 0
     const fixture = makeService({ crafts: [crafted] })
-    const interaction = createInventoryInteraction<Item, Recipe>({
+    const interaction = createInventoryInteraction({
       ...fixture.service,
       previewCraft: () => Effect.die(new Error('preview defect')),
     }, {
@@ -282,15 +283,15 @@ describe('inventory interaction', () => {
 
     expect(result.status).toEqual(crafted)
     expect(result.preview).toBeUndefined()
-    expect(result.grid.cells[0]).toEqual({ item: 'oak_log', count: 1 })
+    expect(result.grid.cells[0]).toEqual(stackOf('oak_log', 1))
     expect(dirtyCount).toBe(1)
   })
 
   it('clears a stale match preview after an unsuccessful craft', () => {
-    const match: InteractionRecipeMatch<Item, Recipe> = {
+    const match: RecipeMatch = {
       _tag: 'Match',
-      recipe: { id: 'oak_planks' },
-      output: { item: 'oak_planks', count: 4 },
+      recipe: planksRecipe,
+      output: stackOf('oak_planks', 4),
     }
     const fixture = makeService({ previews: [match], crafts: [noMatch] })
     const interaction = createInventoryInteraction(fixture.service)
@@ -306,7 +307,7 @@ describe('inventory interaction', () => {
   it('configures a 3x3 grid without changing canonical carried inventory or dirty state', () => {
     let dirtyCount = 0
     const fixture = makeService({
-      clickResult: { _tag: 'PickedUp', carried: { item: 'stone', count: 2 } },
+      clickResult: { _tag: 'PickedUp', carried: stackOf('stone', 2) },
     })
     const interaction = createInventoryInteraction(fixture.service, {
       onInventoryChanged: () => { dirtyCount += 1 },
@@ -316,10 +317,10 @@ describe('inventory interaction', () => {
     Effect.runSync(interaction.preview())
     const dirtyBeforeConfigure = dirtyCount
 
-    const configured = interaction.configureGrid(3, 3)
+    const configured = interaction.configureGrid(RecipeGridDimension(3), RecipeGridDimension(3))
 
     expect(configured).toEqual({
-      inventoryCarried: { item: 'stone', count: 2 },
+      inventoryCarried: stackOf('stone', 2),
       carried: undefined,
       grid: {
         width: 3,
@@ -336,28 +337,28 @@ describe('inventory interaction', () => {
   it('uses the configured cell count for interaction boundaries and craft previews', () => {
     const fixture = makeService()
     const interaction = createInventoryInteraction(fixture.service)
-    interaction.configureGrid(3, 3)
+    interaction.configureGrid(RecipeGridDimension(3), RecipeGridDimension(3))
     Effect.runSync(interaction.pickupInventoryItem(0))
 
     const placed = interaction.interactCraftingCell(8)
     const unchanged = interaction.interactCraftingCell(9)
     Effect.runSync(interaction.preview())
 
-    expect(placed.grid.cells[8]).toEqual({ item: 'oak_log', count: 1 })
+    expect(placed.grid.cells[8]).toEqual(stackOf('oak_log', 1))
     expect(unchanged).toEqual(placed)
     expect(fixture.previewCalls[0]).toMatchObject({ width: 3, height: 3 })
     expect(fixture.previewCalls[0]?.cells).toHaveLength(9)
   })
 
   it('preserves configured grid dimensions after a successful craft', () => {
-    const crafted: InteractionCraftResult<Item> = {
+    const crafted: CraftResult = {
       _tag: 'Crafted',
-      recipeId: 'oak_planks',
-      output: { item: 'oak_planks', count: 4 },
+      recipeId: planksRecipe.id,
+      output: stackOf('oak_planks', 4),
     }
     const fixture = makeService({ craft: crafted, preview: noMatch })
     const interaction = createInventoryInteraction(fixture.service)
-    interaction.configureGrid(3, 3)
+    interaction.configureGrid(RecipeGridDimension(3), RecipeGridDimension(3))
     placeLog(interaction, 8)
 
     const result = Effect.runSync(interaction.craftOnce())
@@ -365,14 +366,14 @@ describe('inventory interaction', () => {
     expect(result.grid).toEqual({
       width: 3,
       height: 3,
-      cells: [...Array.from({ length: 8 }, () => undefined), { item: 'oak_log', count: 1 }],
+      cells: [...Array.from({ length: 8 }, () => undefined), stackOf('oak_log', 1)],
     })
     expect(fixture.craftCalls[0]).toMatchObject({ width: 3, height: 3 })
     expect(fixture.previewCalls[0]).toMatchObject({ width: 3, height: 3 })
     expect(fixture.previewCalls[0]?.cells).toHaveLength(9)
   })
 
-  it.each<InteractionCraftResult<Item>>([
+  it.each<CraftResult>([
     { _tag: 'NoMatch' },
     { _tag: 'MissingIngredients', missing: [{ item: 'oak_log', short: 1 }] },
     { _tag: 'NoRoom' },
@@ -457,7 +458,7 @@ describe('inventory interaction', () => {
   })
 
   it('notifies the complete inventory transition after a successful click', () => {
-    const result = { _tag: 'PickedUp' as const, carried: { item: 'stone' as const, count: 2 } }
+    const result: InventoryClickResult = { _tag: 'PickedUp', carried: stackOf('stone', 2) }
     const fixture = makeService({ clickResult: result })
     const transitions: Array<unknown> = []
     const interaction = createInventoryInteraction(fixture.service, {
@@ -468,7 +469,7 @@ describe('inventory interaction', () => {
 
     expect(transitions).toEqual([{
       slotIndex: 0,
-      slotBefore: { item: 'oak_log', count: 4 },
+      slotBefore: stackOf('oak_log', 4),
       carriedBefore: undefined,
       result,
     }])
@@ -499,7 +500,7 @@ describe('inventory interaction', () => {
       click: () => Effect.sync(() => {
         clickCount += 1
         return clickCount === 1
-          ? { _tag: 'PickedUp' as const, carried: { item: 'stone' as const, count: 2 } }
+          ? { _tag: 'PickedUp' as const, carried: stackOf('stone', 2) }
           : { _tag: 'NoChange' as const, carried: undefined }
       }),
     })
@@ -520,7 +521,7 @@ describe('inventory interaction', () => {
       ...fixture.service,
       click: () => Effect.sync(() => {
         clickCount += 1
-        return { _tag: 'PickedUp' as const, carried: { item: 'stone' as const, count: 2 } }
+        return { _tag: 'PickedUp' as const, carried: stackOf('stone', 2) }
       }),
     }, {
       canInventoryClick: (transition) => {
@@ -534,7 +535,7 @@ describe('inventory interaction', () => {
 
     expect(preflights).toEqual([{
       slotIndex: 0,
-      slotBefore: { item: 'oak_log', count: 4 },
+      slotBefore: stackOf('oak_log', 4),
       carriedBefore: undefined,
     }])
     expect(clickCount).toBe(0)
@@ -575,7 +576,7 @@ describe('inventory interaction', () => {
     const drafted = Effect.runSync(interaction.interactCraftingCellFromInventory(0))
 
     expect(drafted.inventoryCarried).toBeUndefined()
-    expect(drafted.grid.cells[0]).toEqual({ item: 'oak_log', count: 1 })
+    expect(drafted.grid.cells[0]).toEqual(stackOf('oak_log', 1))
     expect(Effect.runSync(service.snapshot).slots[0]).toEqual(stackOf('oak_log', 4))
   })
 
@@ -616,7 +617,7 @@ describe('inventory interaction', () => {
     expect(slotNames.get(1)).toBe('second')
     expect(carriedName).toBeUndefined()
     expect(drafted.inventoryCarried).toBeUndefined()
-    expect(drafted.grid.cells[0]).toEqual({ item: 'stone', count: 1 })
+    expect(drafted.grid.cells[0]).toEqual(stackOf('stone', 1))
   })
 
   it('returns a real carried stack to canonical inventory on close', () => {
@@ -666,11 +667,14 @@ describe('inventory interaction', () => {
     Effect.runSync(interaction.clickInventoryItem(0, 'left'))
 
     const closed = Effect.runSync(interaction.close())
-    const configured = interaction.configureGrid(3, 3)
+    const configured = interaction.configureGrid(RecipeGridDimension(3), RecipeGridDimension(3))
 
     expect(Effect.runSync(service.snapshot).slots[0]).toBeUndefined()
-    expect(closed.inventoryCarried).toEqual({ item: 'stone', count: 2 })
-    expect(configured.inventoryCarried).toEqual({ item: 'stone', count: 2 })
+    // mc-sim's `InventoryServiceApi.click` returns `InventoryClickResult.carried` as an
+    // `InventoryCarriedStack`, which includes mc-kernel `ItemStack.components`
+    // (@nerima-games/mc-sim@0.11.1 dist/application/inventory-interaction.d.ts).
+    expect(closed.inventoryCarried).toEqual(stackOf('stone', 2))
+    expect(configured.inventoryCarried).toEqual(stackOf('stone', 2))
     expect(configured.grid).toEqual({
       width: 3,
       height: 3,
@@ -682,8 +686,8 @@ describe('inventory interaction', () => {
     const fixture = makeService({
       inventory: {
         slots: [
-          { item: 'oak_log', count: 4 },
-          { item: 'stone', count: 2 },
+          stackOf('oak_log', 4),
+          stackOf('stone', 2),
         ],
       },
     })
@@ -691,13 +695,13 @@ describe('inventory interaction', () => {
     placeLog(interaction, 0)
 
     const pickedUp = interaction.interactCraftingCell(0)
-    expect(pickedUp.carried).toEqual({ item: 'oak_log', count: 1 })
+    expect(pickedUp.carried).toEqual(stackOf('oak_log', 1))
     expect(pickedUp.grid.cells[0]).toBeUndefined()
 
     interaction.interactCraftingCell(0)
     Effect.runSync(interaction.pickupInventoryItem(1))
     const swapped = interaction.interactCraftingCell(0)
-    expect(swapped.grid.cells[0]).toEqual({ item: 'stone', count: 1 })
-    expect(swapped.carried).toEqual({ item: 'oak_log', count: 1 })
+    expect(swapped.grid.cells[0]).toEqual(stackOf('stone', 1))
+    expect(swapped.carried).toEqual(stackOf('oak_log', 1))
   })
 })
