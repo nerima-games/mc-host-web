@@ -2060,11 +2060,10 @@ const bootGame = async (
       }
       return { floorY: destination.y - 1, carved: true }
     })
-  // mx-gameplay's portal stage has already committed the player's
-  // destination pose and dimension before this drain. Here the destination
-  // portal and landing edits commit as one batch BEFORE the portal ledger
-  // changes or the landing correction moves the player, so a failed write
-  // leaves both untouched and reaches the caller as a typed failure.
+  // The stage commits the destination before this drain. Commit its world
+  // edits before updating the ledger and finalizing the player's destination
+  // through the owner-backed view. h5b restores the pre-frame player on failure;
+  // earlier successful travel batches and ledger entries remain committed.
   const applyPortalTravels = () =>
     Effect.gen(function* () {
       const travels = yield* drainPortalTravels(gameplayState)
@@ -2090,10 +2089,15 @@ const bootGame = async (
         registerPortal({ dimension: travel.sourceDimension, position: travel.sourcePosition })
         registerPortal(destinationPortal)
         if (portalLayout !== undefined || landing?.carved === true) markSessionDirty()
-        if (landing !== undefined) {
-          const pose = yield* playerApi.pose
-          yield* playerApi.moveTo({ ...pose.feetPosition, y: PositionAxis(landing.floorY + 1) })
-        }
+        const pose = yield* playerApi.pose
+        yield* playerApi.restore({
+          ...pose,
+          feetPosition: {
+            x: PositionAxis(destination.x),
+            y: PositionAxis(landing === undefined ? destination.y : landing.floorY + 1),
+            z: PositionAxis(destination.z),
+          },
+        }, toDimension)
       }
     })
   Effect.runSync(syncPortalCandidateSnapshots())

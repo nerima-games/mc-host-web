@@ -15,6 +15,20 @@ const positionOf = (source: string, marker: string, fromIndex = 0): number => {
 }
 
 describe('H4b main.ts wiring', () => {
+  it('finalizes the portal destination through the player view after its world batch', () => {
+    const start = positionOf(mainSource, 'const applyPortalTravels = () =>')
+    const end = positionOf(mainSource, 'Effect.runSync(syncPortalCandidateSnapshots())', start)
+    const portalSource = mainSource.slice(start, end)
+    expect(portalSource).toContain('drainPortalTravels(gameplayState)')
+    expect(portalSource).toContain('for (const travel of travels)')
+    expect(positionOf(portalSource, 'yield* commitPlannedEdits(toDimension, edits)'))
+      .toBeLessThan(positionOf(portalSource, 'yield* playerApi.restore({'))
+    expect(portalSource).toContain('PositionAxis(destination.x)')
+    expect(portalSource).toContain('PositionAxis(landing === undefined ? destination.y : landing.floorY + 1)')
+    expect(portalSource).toContain('PositionAxis(destination.z)')
+    expect(portalSource).toContain('}, toDimension)')
+  })
+
   it('connects the main-owned inventory state and commands before installing listeners and starting tick', () => {
     const clientContextStart = positionOf(mainSource, 'const multiplayerClientContext: MultiplayerClientContext = {')
     const clientCreation = positionOf(mainSource, '} = createMultiplayerClient(multiplayerClientContext)')
