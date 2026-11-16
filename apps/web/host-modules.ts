@@ -2,13 +2,12 @@ import { Context, Effect } from 'effect'
 import { WorldWritePort, type QaNamespace, type SaveSliceRegistration } from '@nerima-games/mc-kernel'
 import { renderModule, InputService, type ChunkSyncPort, type DrawPort, type GraphicsQuality } from '@nerima-games/mc-render'
 import {
-  CropService,
   entityManagerTag,
+  makeCropService,
   PlayerService,
   simStages,
   TimeService,
   VehicleService,
-  type CropServiceApi,
   type EntityManager,
   type EntityManagerApi,
   type PlayerServiceApi,
@@ -42,7 +41,6 @@ export const MobEntityManager: Context.Service<EntityManager, EntityManagerApi<M
 export type HostServices =
   | TimeService
   | PlayerService
-  | CropService
   | VehicleService
   | EntityManager
   | ChunkStore
@@ -65,7 +63,6 @@ export type HostServices =
 export type HostServiceInstances = {
   readonly time: TimeServiceApi
   readonly player: PlayerServiceApi
-  readonly crops: CropServiceApi
   readonly vehicles: VehicleServiceApi
   readonly entities: EntityManagerApi<MobBehaviour>
   readonly chunkStore: ChunkStoreApi
@@ -80,7 +77,6 @@ export const makeHostServiceContext = (instances: HostServiceInstances): Context
     instances.redstoneContext,
     Context.make(TimeService, instances.time),
     Context.make(PlayerService, instances.player),
-    Context.make(CropService, instances.crops),
     Context.make(VehicleService, instances.vehicles),
     Context.make(MobEntityManager, instances.entities),
     Context.make(ChunkStore, instances.chunkStore),
@@ -188,7 +184,9 @@ export const registerHostModules = (deps: HostModulesDeps): Effect.Effect<Readon
     frameStages: Effect.gen(function* () {
       const time = yield* TimeService
       const player = yield* PlayerService
-      const crops = yield* CropService
+      // Only gameplay advances crop owners. This private empty service keeps
+      // mc-sim's required crop tick from holding a second copy of their state.
+      const crops = yield* makeCropService()
       return simStages(simState, time, player, crops)
     }),
   })

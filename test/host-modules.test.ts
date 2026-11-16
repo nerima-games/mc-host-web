@@ -19,8 +19,8 @@ import {
 import { composeGame } from '@nerima-games/mc-compose'
 import {
   CropService,
+  CropSnapshotSchema,
   InventoryService,
-  makeCropService,
   makeBrewingService,
   makeSimFrameState,
   makeTimeService,
@@ -51,6 +51,7 @@ import {
   makeGeneratedWorld,
   requestStatusEffect,
   snapshotStatusEffects,
+  type GameplayOwnerInitialState,
   type MobBehaviour,
 } from '@nerima-games/mx-gameplay'
 import { disconnectedTransport, makeMultiplayerHost, TransportPort } from '@nerima-games/mx-multiplayer'
@@ -99,11 +100,11 @@ const SMOKE_STAGE_ORDER = [
 // platform-adapters.ts does, so the scope of the test owns them. The player and
 // entity services are wired as main.ts wires them: the owner-backed adapters
 // over one coordinator, with the generated world's services behind the views.
-const makeHost = Effect.gen(function* () {
+const makeHostWithInitial = (initial: GameplayOwnerInitialState) => Effect.gen(function* () {
   const chunkStore = yield* makeChunkStore(generatedChunkSource(NoiseSeed(1)), ChunkCapacity(16))
   const hostWorldWrite = yield* makeHostWorldWrite({
     world: yield* Schema.decodeEffect(WorldIdSchema)('host-modules-test'),
-    owners: gameplayOwnerRegistrations(),
+    owners: yield* Effect.fromResult(gameplayOwnerRegistrations(initial)),
     chunkStores: { forDimension: () => chunkStore },
   })
   const generated = yield* makeGeneratedWorld<MobBehaviour>({ dimension: 'overworld' })
@@ -120,7 +121,6 @@ const makeHost = Effect.gen(function* () {
   const instances: HostServiceInstances = {
     time: yield* makeTimeService(),
     player: owned.stagePlayer,
-    crops: yield* makeCropService(),
     vehicles: yield* makeVehicleService(),
     entities: owned.entityManager,
     chunkStore,
@@ -143,6 +143,8 @@ const makeHost = Effect.gen(function* () {
   }
   return { instances, owned, generated, hostWorldWrite, gameplayCommit, coordinator: hostWorldWrite.coordinator }
 })
+
+const makeHost = makeHostWithInitial({})
 
 const makeInstances = Effect.map(makeHost, ({ instances }) => instances)
 
@@ -212,6 +214,28 @@ const runRegisteredHungerStage = (mode: 'single-player survival' | 'creative' | 
   })
 
 describe('host modules', () => {
+  it.effect('keeps crop state out of the Context and advances its owner once per frame', () =>
+    Effect.gen(function* () {
+      const crops = yield* Schema.decodeUnknownEffect(CropSnapshotSchema)({
+        crops: [{ dimension: 'overworld', position: { x: 1, y: 65, z: 2 }, crop: 'potato_crop', growthSecs: 120 }],
+      })
+      const host = yield* makeHostWithInitial({ crops })
+      const deps = yield* makeDeps(host)
+      expect(Option.isNone(Context.getOption(deps.services, CropService))).toBe(true)
+      const game = yield* composeGame(yield* registerHostModules(deps))
+
+      for (let frame = 0; frame < 3; frame += 1) {
+        yield* Effect.provide(
+          game.runFrame(DeltaTimeSecs(0.05)),
+          FixedClockLayer({ monotonicSecs: MonotonicTimeSecs(0), wallClockEpochMillis: EpochMillis(0) }),
+        )
+      }
+
+      const saved = (yield* host.coordinator.snapshot(GAMEPLAY_CROPS_OWNER_ID, CropSnapshotSchema)).state
+      expect(saved.crops).toHaveLength(1)
+      expect(saved.crops[0]?.growthSecs).toBeCloseTo(120.15)
+    }))
+
   it.effect('commits gameplay stage changes and Context port batches through the same coordinator', () =>
     Effect.gen(function* () {
       const host = yield* makeHost
@@ -270,7 +294,7 @@ describe('host modules', () => {
 
       expect(Context.get(services, TimeService)).toBe(instances.time)
       expect(Context.get(services, PlayerService)).toBe(instances.player)
-      expect(Context.get(services, CropService)).toBe(instances.crops)
+      expect(Option.isNone(Context.getOption(services, CropService))).toBe(true)
       expect(Context.get(services, VehicleService)).toBe(instances.vehicles)
       expect(Context.get(services, MobEntityManager)).toBe(instances.entities)
       expect(Context.get(services, ChunkStore)).toBe(instances.chunkStore)

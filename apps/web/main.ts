@@ -123,7 +123,6 @@ import {
   emptyPlayerStorage,
   itemStack,
   makeBrewingService,
-  makeCropService,
   makeSimFrameState,
   makeTimeService,
   makeWeatherService,
@@ -970,7 +969,6 @@ const bootGame = async (
   const loadedSessionState = Option.isSome(loadedSession) ? loadedSession.value.state : undefined
   const time = await Effect.runPromise(makeTimeService())
   const weather = await Effect.runPromise(makeWeatherService())
-  const crops = await Effect.runPromise(makeCropService())
   // The owners are the only store of the player, its storage, vitals,
   // entities, villager trades and the brewing stand, so the loaded session (or
   // the generated world) seeds them here and nothing restores them later.
@@ -1105,7 +1103,6 @@ const bootGame = async (
   await restoreLoadedSessionServices(loadedSessionState, {
     restoreTime: (state) => Effect.runPromise(time.restore(state.time)),
     restoreWeather: (state) => Effect.runPromise(weather.restore(state.weather)),
-    restoreCrops: (state) => Effect.runPromise(crops.restore(state.crops)),
     // Also sets the frame state's movement and modifier caches, which seeding
     // the status-effects owner alone would leave at their defaults.
     restoreStatusEffects: (state) =>
@@ -1428,7 +1425,6 @@ const bootGame = async (
         redstone: { levers: [...leverStates.values()] },
         furnaces: [...furnaceStates.values()],
         portals: [...portalStates.values()],
-        crops: yield* crops.snapshot,
         villagers: {
           residents: [...villagerResidents.values()],
           trades: yield* snapshotGameplayVillagerTrades,
@@ -2398,7 +2394,6 @@ const bootGame = async (
   const services = makeHostServiceContext({
     time,
     player: ownerBacked.stagePlayer,
-    crops,
     vehicles: vehicleService,
     entities: ownerBacked.entityManager,
     chunkStore: currentChunkStore,
@@ -3270,7 +3265,6 @@ const bootGame = async (
       simState,
       playerApi,
       currentChunkStore,
-      crops,
       weather,
       vehicleService,
       saveCoordinator,

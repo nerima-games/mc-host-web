@@ -31,7 +31,7 @@ export type GeneratedOwnerState = Readonly<{
  * schema rather than asserted to be a `PlayerPose`.
  */
 export const gameplayOwnerInitialState = (
-  loaded: Pick<SessionState, 'dimension' | 'player' | 'storage' | 'vitals' | 'villagers' | 'brewing' | 'statusEffects'> | undefined,
+  loaded: Pick<SessionState, 'dimension' | 'player' | 'storage' | 'vitals' | 'villagers' | 'brewing' | 'statusEffects' | 'crops'> | undefined,
   generated: GeneratedOwnerState,
   entities: MobRoster,
 ): Result.Result<GameplayOwnerInitialState, Schema.SchemaError> => {
@@ -63,6 +63,7 @@ export const gameplayOwnerInitialState = (
       villagerTrades: loaded.villagers.trades,
       brewing: loaded.brewing,
       statusEffects: loaded.statusEffects,
+      crops: loaded.crops,
     }),
   )
 }
@@ -93,7 +94,6 @@ export const restoreInitialWorld = async <State>(
 export type LoadedSessionServiceRestoreActions<State> = {
   readonly restoreTime: (state: State) => Promise<unknown>
   readonly restoreWeather: (state: State) => Promise<unknown>
-  readonly restoreCrops: (state: State) => Promise<unknown>
   readonly restoreStatusEffects: (state: State) => Promise<unknown>
   readonly restoreEnderDragon: (state: State) => Promise<unknown>
 }
@@ -106,7 +106,6 @@ export const restoreLoadedSessionServices = async <State>(
 
   await actions.restoreTime(state)
   await actions.restoreWeather(state)
-  await actions.restoreCrops(state)
   await actions.restoreStatusEffects(state)
   await actions.restoreEnderDragon(state)
 }

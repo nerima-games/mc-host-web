@@ -148,7 +148,10 @@ test('matures, persists, harvests, eats, and replants potatoes', async ({ page }
   expect(restored.farming.crops[0]?.growthSecs).toBe(POTATO_MATURITY_SECS)
 
   const potatoesBeforeHarvest = inventoryCount(restored, 'potato')
-  await callQa(page, 'gameplay.harvestFarmingCrop')
+  const pendingHarvest = await callQa<GameplaySnapshot>(page, 'gameplay.harvestFarmingCrop')
+  expect(pendingHarvest.farming.cropBlock).toBe(POTATO_CROP_BLOCK_ID)
+  expect(pendingHarvest.farming.crops).toHaveLength(1)
+  expect(inventoryCount(pendingHarvest, 'potato')).toBe(potatoesBeforeHarvest)
   // Harvesting, eating, and planting are each item-use actions that only
   // resolve once the frame loop processes them — see
   // waitForSimulationProgress.

@@ -13,6 +13,7 @@ import {
 } from '@nerima-games/mc-kernel'
 import {
   BrewingStateSchema,
+  CropSnapshotSchema,
   emptyBrewingState,
   EntitySerial,
   INVENTORY_SLOT_COUNT,
@@ -33,6 +34,7 @@ import {
 import {
   ExperienceOrbVitalsOwnerSnapshotSchema,
   GAMEPLAY_BREWING_OWNER_ID,
+  GAMEPLAY_CROPS_OWNER_ID,
   GAMEPLAY_ENTITIES_OWNER_ID,
   GAMEPLAY_PLAYER_OWNER_ID,
   GAMEPLAY_PLAYER_STORAGE_OWNER_ID,
@@ -175,7 +177,6 @@ describe('session restoration', () => {
         calls.push('weather')
         throw new Error('weather restore failed')
       },
-      restoreCrops: async () => { calls.push('crops') },
       restoreStatusEffects: async () => { calls.push('status-effects') },
       restoreEnderDragon: async () => { calls.push('ender-dragon') },
     }
@@ -193,7 +194,6 @@ describe('session restoration', () => {
     const actions = {
       restoreTime: async () => { calls.push('time') },
       restoreWeather: async () => { calls.push('weather') },
-      restoreCrops: async () => { calls.push('crops') },
       restoreStatusEffects: async () => { calls.push('status-effects') },
       restoreEnderDragon: async () => { calls.push('ender-dragon') },
     }
@@ -203,7 +203,6 @@ describe('session restoration', () => {
     expect(calls).toEqual([
       'time',
       'weather',
-      'crops',
       'status-effects',
       'ender-dragon',
     ])
@@ -243,7 +242,7 @@ const zombie = (serial: number): MobEntity => ({
 describe('owner initial state', () => {
   it.effect('seeds every owner with the loaded session, including the player pose and dimension', () =>
     Effect.gen(function* () {
-      const loaded: Pick<SessionState, 'dimension' | 'player' | 'storage' | 'vitals' | 'villagers' | 'brewing' | 'statusEffects'> = {
+      const loaded: Pick<SessionState, 'dimension' | 'player' | 'storage' | 'vitals' | 'villagers' | 'brewing' | 'statusEffects' | 'crops'> = {
         dimension: 'nether',
         player: { feetPosition: { x: 3.5, y: 70, z: -4.5 }, yawRadians: 0.5, pitchRadians: -0.25 },
         storage: storageFromInventory({
@@ -254,6 +253,9 @@ describe('owner initial state', () => {
         villagers: { residents: [], trades: emptyVillagerTradeState() },
         brewing: Result.getOrThrow(emptyBrewingState()),
         statusEffects: { effects: [{ type: 'speed', remainingSecs: 30, pulseClockSecs: 0, amplifier: 0 }] },
+        crops: yield* Schema.decodeUnknownEffect(CropSnapshotSchema)({
+          crops: [{ dimension: 'nether', position: { x: 1, y: 65, z: 2 }, crop: 'nether_wart_crop', growthSecs: 120 }],
+        }),
       }
       const entities: MobRoster = {
         entities: [{ ...zombie(0), dimension: 'nether' }],
@@ -287,6 +289,7 @@ describe('owner initial state', () => {
         statusEffectsOwnerId: GAMEPLAY_STATUS_EFFECTS_OWNER_ID,
       })).toEqual(loaded.statusEffects)
       expect(initial.droppedItems).toEqual({ items: [] })
+      expect(initial.crops).toEqual(loaded.crops)
     }))
 
   it.effect('seeds a new session with the generated spawn rather than the registrations\' origin', () =>
@@ -295,6 +298,8 @@ describe('owner initial state', () => {
         gameplayOwnerInitialState(undefined, generatedOwnerState, { entities: [], nextSerial: EntitySerial(0) }),
       )
       const coordinator = yield* coordinatorFor(initial)
+
+      expect('crops' in initial).toBe(false)
 
       const player = yield* coordinator.snapshot(GAMEPLAY_PLAYER_OWNER_ID, PlayerServiceSnapshotSchema)
       expect(player.state.pose).toEqual({
@@ -314,6 +319,7 @@ describe('owner initial state', () => {
         villagers: { residents: [], trades: emptyVillagerTradeState() },
         brewing: Result.getOrThrow(emptyBrewingState()),
         statusEffects: emptyStatusEffectState(),
+        crops: { crops: [] },
       },
       generatedOwnerState,
       { entities: [], nextSerial: EntitySerial(0) },
@@ -322,6 +328,32 @@ describe('owner initial state', () => {
     assert.isTrue(Result.isFailure(initial))
     if (Result.isFailure(initial)) expect(initial.failure._tag).toBe('SchemaError')
   })
+
+  it.effect('returns the typed crop registration failure for an invalid saved crop', () =>
+    Effect.gen(function* () {
+      const valid = yield* Schema.decodeUnknownEffect(CropSnapshotSchema)({
+        crops: [{ dimension: 'overworld', position: { x: 1, y: 65, z: 2 }, crop: 'potato_crop', growthSecs: 120 }],
+      })
+      const initial = yield* Effect.fromResult(gameplayOwnerInitialState({
+        dimension: 'overworld',
+        player: generatedOwnerState.pose,
+        storage: emptyStorage(),
+        vitals: SPAWN_PLAYER_VITALS,
+        villagers: { residents: [], trades: emptyVillagerTradeState() },
+        brewing: Result.getOrThrow(emptyBrewingState()),
+        statusEffects: emptyStatusEffectState(),
+        crops: { crops: valid.crops.map((crop) => ({ ...crop, growthSecs: -1 })) },
+      }, generatedOwnerState, { entities: [], nextSerial: EntitySerial(0) }))
+      const registered = gameplayOwnerRegistrations(initial)
+      assert.isTrue(Result.isFailure(registered))
+      if (Result.isFailure(registered)) {
+        expect(registered.failure).toMatchObject({
+          _tag: 'InvalidGameplayOwnerRegistration',
+          ownerId: GAMEPLAY_CROPS_OWNER_ID,
+          error: { _tag: 'SchemaError' },
+        })
+      }
+    }))
 })
 
 describe('saved entity rosters and the entities owner', () => {
