@@ -1,5 +1,5 @@
 import { Result } from 'effect'
-import { type MonotonicTimeSecs } from '@nerima-games/mc-kernel'
+import { type BlockRegistryResolutionFailure, type MonotonicTimeSecs } from '@nerima-games/mc-kernel'
 import { addExperience as addVitalsExperience, EQUIPMENT_SLOTS, ExperienceDelta } from '@nerima-games/mc-sim'
 import {
   crosshairViewModel,
@@ -15,7 +15,7 @@ import { deathDropsFromPlayerStorage } from './player-death'
 import { type DroppedItemMetadata } from './dropped-item-metadata'
 import { type PlayerSettingsV1 } from './settings'
 import { type SessionState } from './session-persistence'
-import { type SleepLocation } from './sleep-runtime'
+import { type BedRespawnLocation } from './sleep-runtime'
 
 type CrosshairView = {
   readonly render: (viewModel: Result.Result.Success<ReturnType<typeof crosshairViewModel>>) => void
@@ -151,10 +151,10 @@ export type H4aRespawnContext = {
   readonly resetSwimming: () => void
   readonly respawnVitals: () => void
   readonly clearGameplayDeathState: () => void
-  readonly validRespawnLocation: () => SleepLocation | null
+  readonly validRespawnLocation: () => Result.Result<BedRespawnLocation | null, BlockRegistryResolutionFailure>
   readonly clearRespawnLocation: () => void
   readonly leaveSleep: () => void
-  readonly restorePlayerForRespawn: (location: SleepLocation | null) => void
+  readonly restorePlayerForRespawn: (location: BedRespawnLocation | null) => void
   readonly clearDeathDropDimension: () => void
   readonly resetSimState: (physicsEnabled: boolean) => void
   readonly setInventoryOpen: (open: boolean) => void
@@ -163,7 +163,12 @@ export type H4aRespawnContext = {
   readonly markSessionDirty: () => void
 }
 
-export const respawnPlayer = (context: H4aRespawnContext): void => {
+// The bed check only reads the world, so it runs before any reset: a failed
+// read returns with the dead player's state untouched.
+export const respawnPlayer = (context: H4aRespawnContext): Result.Result<void, BlockRegistryResolutionFailure> => {
+  const checkedRespawn = context.validRespawnLocation()
+  if (Result.isFailure(checkedRespawn)) return Result.fail(checkedRespawn.failure)
+  const validRespawn = checkedRespawn.success
   context.resetPrimaryAttackGesture()
   context.resetBowUse()
   context.resetProjectileStates()
@@ -172,7 +177,6 @@ export const respawnPlayer = (context: H4aRespawnContext): void => {
   context.resetSwimming()
   context.respawnVitals()
   context.clearGameplayDeathState()
-  const validRespawn = context.validRespawnLocation()
   if (validRespawn === null) context.clearRespawnLocation()
   context.leaveSleep()
   context.restorePlayerForRespawn(validRespawn)
@@ -182,6 +186,7 @@ export const respawnPlayer = (context: H4aRespawnContext): void => {
   context.syncTouchControls()
   context.renderPlayerUi()
   context.markSessionDirty()
+  return Result.void
 }
 
 type PauseSettingsView = {

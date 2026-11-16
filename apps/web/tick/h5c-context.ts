@@ -12,7 +12,7 @@ import type {
 import type { H5bPostFrameContext, H5bPostFrameResult } from './h5b-context'
 import type { MultiplayerClientApi } from '../multiplayer-client'
 import type { PersistedLeverState, PersistedPortalState, PersistedVillager, SessionPosition, SessionState } from '../session-persistence'
-import type { SleepLocation } from '../sleep-runtime'
+import type { BedRespawnLocation } from '../sleep-runtime'
 import type { SleepClientState } from '@nerima-games/mc-server/shared'
 import type { PlatformAdapters } from '../platform-adapters'
 import type { RedstoneContainerRuntime } from '../redstone-container-runtime'
@@ -66,7 +66,7 @@ export type H5cTickContext = {
     readonly activeBrewingStandAt: MutableState<SessionPosition | undefined>
     readonly brewingStatus: MutableState<string>
     readonly sleepRuntimeState: MutableState<ReturnType<typeof import('../sleep-runtime').initialSleepRuntimeState>>
-    readonly respawnLocation: MutableState<SleepLocation | null>
+    readonly respawnLocation: MutableState<BedRespawnLocation | null>
     readonly networkSleepState: MutableState<SleepClientState>
     readonly nextSleepRequest: MutableState<number>
     readonly appliedNightSkipRevision: MutableState<number | null>

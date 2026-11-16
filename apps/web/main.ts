@@ -82,7 +82,7 @@
  * block edits and mc-render meshing all observe the same mc-worldgen store;
  * dirty chunk notifications are the only render synchronization path.
  */
-import { Cause, Context, Effect, Exit, Option, Ref, Result, Schema } from 'effect'
+import { type Brand, Cause, Context, Effect, Exit, Option, Ref, Result, Schema } from 'effect'
 import {
   AngleRadians,
   BLOCK_PROPERTY_DEFAULTS,
@@ -340,7 +340,7 @@ import {
   initialSleepRuntimeState,
   leaveSleep,
   validRespawnLocation,
-  type SleepLocation,
+  type BedRespawnLocation,
 } from './sleep-runtime'
 import {
   DEFAULT_PLAYER_SETTINGS,
@@ -752,7 +752,7 @@ const bootGame = async (
     moveItemMetadata,
   } = createItemMetadataStore()
   const droppedItemLifetime = createDroppedItemLifetimeTracker()
-  let respawnLocation: SleepLocation | null = null
+  let respawnLocation: BedRespawnLocation | null = null
   let sleepRuntimeState = initialSleepRuntimeState()
   let anvilName = ''
   let anvilStatus = ''
@@ -908,17 +908,28 @@ const bootGame = async (
     if (restored !== null) enchantedItems.set(slot, restored)
   }
   const restoredRespawn = restoredWorkstations?.respawn
-  respawnLocation = restoredRespawn == null
-    ? null
-    : {
-        dimension: 'overworld',
-        position: restoredRespawn.position,
-        bedPosition: {
-          x: Math.floor(restoredRespawn.position.x),
-          y: Math.floor(restoredRespawn.position.y) - 1,
-          z: Math.floor(restoredRespawn.position.z),
-        },
-      }
+  // The session stores plain coordinates; a respawn point needs finite
+  // position axes and an integral bed cell, and a failed check fails the boot.
+  const restoredRespawnLocation: Result.Result<BedRespawnLocation | null, Brand.BrandError> = restoredRespawn == null
+    ? Result.succeed(null)
+    : Result.gen(function* () {
+        const position = worldPosition(
+          yield* PositionAxis.result(restoredRespawn.position.x),
+          yield* PositionAxis.result(restoredRespawn.position.y),
+          yield* PositionAxis.result(restoredRespawn.position.z),
+        )
+        const bedPosition = blockPosition(
+          yield* BlockAxis.result(Math.floor(position.x)),
+          yield* BlockAxis.result(Math.floor(position.y) - 1),
+          yield* BlockAxis.result(Math.floor(position.z)),
+        )
+        return { dimension: 'overworld', position, bedPosition }
+      })
+  if (Result.isFailure(restoredRespawnLocation)) {
+    failBoot('respawn location decoding failed', restoredRespawnLocation.failure)
+    return
+  }
+  respawnLocation = restoredRespawnLocation.success
   const sessionWorld = await initializeSessionWorld({
     loadedSession,
     initialDimension,
@@ -3030,69 +3041,76 @@ const bootGame = async (
 
   installInventoryListeners()
 
-  const respawnPlayer = (): void => respawnPlayerUi({
-    resetPrimaryAttackGesture,
-    resetBowUse,
-    resetProjectileStates: () => {
-      projectileRuntimeState = initialProjectileRuntimeState()
-      eyeOfEnderRuntimeState = initialEyeOfEnderRuntimeState()
-    },
-    unmountVehicle: () => {
-      if (mountedVehicleId !== undefined) {
-        const vehicle = vehicleById(mountedVehicleId)
-        if (vehicle !== undefined) Effect.runSync(vehicleService.dismount(vehicle.id, localVehicleOccupant))
-        mountedVehicleId = undefined
-      }
-    },
-    cancelFishing: () => {
-      if (fishingSession !== undefined) cancelFishing(fishingSession)
-      fishingSession = undefined
-      fishingWater = undefined
-      setFishingResult('idle')
-    },
-    resetSwimming: () => {
-      swimmingState = initialPlayerSwimmingRuntimeState()
-      presentSwimmingState()
-    },
-    respawnVitals: () => {
-      if (multiplayer === undefined) survivalHunger.respawn()
-      else sendVitalsCommand('respawn')
-    },
-    clearGameplayDeathState: () => {
-      Effect.runSync(Ref.set(gameplayState.hostileContactCooldowns, new Map()))
-      Effect.runSync(Ref.set(gameplayState.playerDamages, []))
-      Effect.runSync(Ref.set(gameplayState.spawnAttempts, []))
-      Effect.runSync(Ref.set(gameplayState.mobDrops, []))
-      observedMobDrops.splice(0)
-    },
-    validRespawnLocation: () => validRespawnLocation(respawnLocation, (location) => {
-      const context = getOrCreateDimensionChunkContext(location.dimension)
-      const reading = Effect.runSync(context.chunkStore.getBlock(blockPosition(location.bedPosition.x, location.bedPosition.y, location.bedPosition.z)))
-      return reading._tag === 'Block' && blockTypeOfId(reading.block) === 'bed'
-    }),
-    clearRespawnLocation: () => {
-      respawnLocation = null
-    },
-    leaveSleep: () => {
-      sleepRuntimeState = leaveSleep(sleepRuntimeState, multiplayer?.query.player ?? 'local')
-    },
-    restorePlayerForRespawn: (validRespawn) => {
-      const respawnDimension = validRespawn?.dimension ?? initialSpawnDimension
-      const respawnPose = validRespawn === null
-        ? initialSpawnPose
-        : { ...initialSpawnPose, feetPosition: validRespawn.position }
-      Effect.runSync(world.player.restore(respawnPose, respawnDimension))
-      alignActiveDimension(respawnDimension)
-    },
-    clearDeathDropDimension: () => {
-      deathDropDimension = undefined
-    },
-    resetSimState,
-    setInventoryOpen: (open) => setInventoryOpen(open),
-    syncTouchControls,
-    renderPlayerUi,
-    markSessionDirty,
-  })
+  // A respawn is a UI action with no caller to return to; a failed bed check
+  // leaves the player dead and is reported like a failed screenshot capture.
+  const respawnPlayer = (): void => {
+    const respawned = respawnPlayerUi({
+      resetPrimaryAttackGesture,
+      resetBowUse,
+      resetProjectileStates: () => {
+        projectileRuntimeState = initialProjectileRuntimeState()
+        eyeOfEnderRuntimeState = initialEyeOfEnderRuntimeState()
+      },
+      unmountVehicle: () => {
+        if (mountedVehicleId !== undefined) {
+          const vehicle = vehicleById(mountedVehicleId)
+          if (vehicle !== undefined) Effect.runSync(vehicleService.dismount(vehicle.id, localVehicleOccupant))
+          mountedVehicleId = undefined
+        }
+      },
+      cancelFishing: () => {
+        if (fishingSession !== undefined) cancelFishing(fishingSession)
+        fishingSession = undefined
+        fishingWater = undefined
+        setFishingResult('idle')
+      },
+      resetSwimming: () => {
+        swimmingState = initialPlayerSwimmingRuntimeState()
+        presentSwimmingState()
+      },
+      respawnVitals: () => {
+        if (multiplayer === undefined) survivalHunger.respawn()
+        else sendVitalsCommand('respawn')
+      },
+      clearGameplayDeathState: () => {
+        Effect.runSync(Ref.set(gameplayState.hostileContactCooldowns, new Map()))
+        Effect.runSync(Ref.set(gameplayState.playerDamages, []))
+        Effect.runSync(Ref.set(gameplayState.spawnAttempts, []))
+        Effect.runSync(Ref.set(gameplayState.mobDrops, []))
+        observedMobDrops.splice(0)
+      },
+      validRespawnLocation: () => validRespawnLocation(respawnLocation, (location) => {
+        const context = getOrCreateDimensionChunkContext(location.dimension)
+        const reading = Effect.runSync(context.chunkStore.getBlock(location.bedPosition))
+        return reading._tag === 'Block'
+          ? Result.map(blockTypeOfId(reading.block), (type) => type === 'bed')
+          : Result.succeed(false)
+      }),
+      clearRespawnLocation: () => {
+        respawnLocation = null
+      },
+      leaveSleep: () => {
+        sleepRuntimeState = leaveSleep(sleepRuntimeState, multiplayer?.query.player ?? 'local')
+      },
+      restorePlayerForRespawn: (validRespawn) => {
+        const respawnDimension = validRespawn?.dimension ?? initialSpawnDimension
+        const respawnPose = validRespawn === null
+          ? initialSpawnPose
+          : { ...initialSpawnPose, feetPosition: validRespawn.position }
+        Effect.runSync(world.player.restore(respawnPose, respawnDimension))
+        alignActiveDimension(respawnDimension)
+      },
+      clearDeathDropDimension: () => {
+        deathDropDimension = undefined
+      },
+      resetSimState,
+      setInventoryOpen: (open) => setInventoryOpen(open),
+      syncTouchControls,
+      renderPlayerUi,
+      markSessionDirty,
+    })
+    if (Result.isFailure(respawned)) console.error('[mc-compose] respawn failed', respawned.failure)
+  }
 
   inventoryRuntime.installRespawnListener(hudParent, respawnPlayer)
 

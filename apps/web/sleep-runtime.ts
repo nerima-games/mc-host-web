@@ -1,7 +1,20 @@
+import type { BlockPosition, Position } from '@nerima-games/mc-kernel'
+import { Result } from 'effect'
+
 export type SleepLocation = {
   readonly dimension: 'overworld'
   readonly position: Readonly<{ x: number; y: number; z: number }>
   readonly bedPosition: Readonly<{ x: number; y: number; z: number }>
+}
+
+/**
+ * A local player's bed respawn point. Unlike a roster SleepLocation, which can
+ * carry a peer's unvalidated network coordinates, its axes are branded so a
+ * respawn restores the pose and reads the bed cell without another check.
+ */
+export type BedRespawnLocation = SleepLocation & {
+  readonly position: Position
+  readonly bedPosition: BlockPosition
 }
 
 export type SleepingPlayer = {
@@ -76,10 +89,12 @@ export const advanceSleep = (
   }
 }
 
-export const validRespawnLocation = (
-  location: SleepLocation | null,
-  bedExists: (location: SleepLocation) => boolean,
-): SleepLocation | null => location !== null && bedExists(location) ? location : null
+export const validRespawnLocation = <Location extends SleepLocation, Failure>(
+  location: Location | null,
+  bedExists: (location: Location) => Result.Result<boolean, Failure>,
+): Result.Result<Location | null, Failure> => location === null
+  ? Result.succeed(null)
+  : Result.map(bedExists(location), (exists) => exists ? location : null)
 
 export const isDangerNearby = (
   bedPosition: Readonly<{ x: number; y: number; z: number }>,

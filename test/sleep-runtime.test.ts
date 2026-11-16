@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { Result } from 'effect'
 import {
   advanceSleep,
   enterSleep,
@@ -41,7 +42,10 @@ describe('sleep runtime', () => {
   it('validates hostile safety distance and respawn beds deterministically', () => {
     expect(isDangerNearby(bed.bedPosition, [{ x: 11, y: 68, z: 8 }])).toBe(true)
     expect(isDangerNearby(bed.bedPosition, [{ x: 13, y: 64, z: 8 }])).toBe(false)
-    expect(validRespawnLocation(bed, () => true)).toEqual(bed)
-    expect(validRespawnLocation(bed, () => false)).toBeNull()
+    expect(validRespawnLocation(bed, () => Result.succeed(true))).toEqual(Result.succeed(bed))
+    expect(validRespawnLocation(bed, () => Result.succeed(false))).toEqual(Result.succeed(null))
+    expect(validRespawnLocation(null, () => Result.succeed(true))).toEqual(Result.succeed(null))
+    const failure = { _tag: 'FixtureBedReadFailure' } as const
+    expect(validRespawnLocation(bed, () => Result.fail(failure))).toEqual(Result.fail(failure))
   })
 })

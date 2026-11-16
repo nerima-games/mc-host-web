@@ -11,7 +11,7 @@ import { makeUiFrameState } from '@nerima-games/mx-ui'
 import { makeSurvivalHungerCoordinator } from '../apps/web/survival-hunger-runtime'
 import { DEFAULT_PLAYER_SETTINGS } from '../apps/web/settings'
 import { IDLE_BOW_USE } from '../apps/web/bow-use'
-import { enterSleep, initialSleepRuntimeState, type SleepLocation } from '../apps/web/sleep-runtime'
+import { enterSleep, initialSleepRuntimeState, type BedRespawnLocation, type SleepLocation } from '../apps/web/sleep-runtime'
 import { initialSleepClientState } from '@nerima-games/mc-server/shared'
 import type { PersistedVillager, SessionPosition } from '../apps/web/session-persistence'
 import { mutableState, type H5aFrameInputResult, type H5aMovementResult, type H5aTickContext } from '../apps/web/tick/h5a-context'
@@ -367,7 +367,7 @@ const makeHarness = async (options: HarnessOptions = {}) => {
     activeBrewingStandAt: cell<SessionPosition | undefined>(undefined).state,
     brewingStatus: cell('closed').state,
     sleepRuntimeState: cell(initialSleepRuntimeState()).state,
-    respawnLocation: cell<SleepLocation | null>(null).state,
+    respawnLocation: cell<BedRespawnLocation | null>(null).state,
     networkSleepState: cell(initialSleepClientState()).state,
     nextSleepRequest: cell(0).state,
     appliedNightSkipRevision: cell<number | null>(null).state,

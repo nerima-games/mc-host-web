@@ -382,11 +382,11 @@ describe('H4a player UI', () => {
     expect(activeElement).toBe(canvas)
   })
 
-  it('preserves respawn action order and clears a missing bed before restoring the player', () => {
+  it('checks the bed first, then preserves respawn action order and clears a missing bed before restoring the player', () => {
     const order: Array<string> = []
     const record = (name: string) => () => { order.push(name) }
 
-    respawnPlayer({
+    const result = respawnPlayer({
       resetPrimaryAttackGesture: record('attack'),
       resetBowUse: record('bow'),
       resetProjectileStates: record('projectiles'),
@@ -395,7 +395,7 @@ describe('H4a player UI', () => {
       resetSwimming: record('swimming'),
       respawnVitals: record('vitals'),
       clearGameplayDeathState: record('death-state'),
-      validRespawnLocation: () => { order.push('validate-bed'); return null },
+      validRespawnLocation: () => { order.push('validate-bed'); return Result.succeed(null) },
       clearRespawnLocation: record('clear-bed'),
       leaveSleep: record('leave-sleep'),
       restorePlayerForRespawn: (location) => order.push(`restore:${String(location)}`),
@@ -407,7 +407,9 @@ describe('H4a player UI', () => {
       markSessionDirty: record('dirty'),
     })
 
+    expect(Result.isSuccess(result)).toBe(true)
     expect(order).toEqual([
+      'validate-bed',
       'attack',
       'bow',
       'projectiles',
@@ -416,7 +418,6 @@ describe('H4a player UI', () => {
       'swimming',
       'vitals',
       'death-state',
-      'validate-bed',
       'clear-bed',
       'leave-sleep',
       'restore:null',
@@ -427,5 +428,35 @@ describe('H4a player UI', () => {
       'render-ui',
       'dirty',
     ])
+  })
+
+  it('returns a failed bed check before resetting or restoring anything', () => {
+    const order: Array<string> = []
+    const record = (name: string) => () => { order.push(name) }
+    const failure = { _tag: 'BlockDefinitionFailure', reason: 'invalid-shape', message: 'fixture bed read failure' } as const
+
+    const result = respawnPlayer({
+      resetPrimaryAttackGesture: record('attack'),
+      resetBowUse: record('bow'),
+      resetProjectileStates: record('projectiles'),
+      unmountVehicle: record('vehicle'),
+      cancelFishing: record('fishing'),
+      resetSwimming: record('swimming'),
+      respawnVitals: record('vitals'),
+      clearGameplayDeathState: record('death-state'),
+      validRespawnLocation: () => Result.fail(failure),
+      clearRespawnLocation: record('clear-bed'),
+      leaveSleep: record('leave-sleep'),
+      restorePlayerForRespawn: record('restore'),
+      clearDeathDropDimension: record('clear-death-dimension'),
+      resetSimState: record('physics'),
+      setInventoryOpen: record('inventory'),
+      syncTouchControls: record('touch'),
+      renderPlayerUi: record('render-ui'),
+      markSessionDirty: record('dirty'),
+    })
+
+    expect(result).toEqual(Result.fail(failure))
+    expect(order).toEqual([])
   })
 })
