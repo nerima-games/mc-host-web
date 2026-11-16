@@ -118,7 +118,6 @@ import {
 import {
   addExperience as addVitalsExperience,
   containerIdAt,
-  CropSnapshotSchema,
   emptyPlayerStorage,
   itemStack,
   makeBrewingService,
@@ -199,7 +198,6 @@ import {
   EYE_LEVEL_OFFSET,
   fishingPhase,
   GAMEPLAY_BREWING_OWNER_ID,
-  GAMEPLAY_CROPS_OWNER_ID,
   GAMEPLAY_ENTITIES_OWNER_ID,
   GAMEPLAY_PLAYER_OWNER_ID,
   GAMEPLAY_PLAYER_STORAGE_OWNER_ID,
@@ -213,7 +211,7 @@ import {
   insertBrewingFuel,
   insertBrewingIngredient,
   INITIAL_ENVIRONMENTAL_CONTACT_DAMAGE_STATE,
-  makeGameplayFrameStateForOwner,
+  makeGameplayFrameState,
   makeGeneratedWorld,
   isDroppedItemBehaviour,
   isHoeItem,
@@ -987,17 +985,9 @@ const bootGame = async (
   // `gameplayOwnerRegistrations(undefined)` is a typed failure, so a fresh
   // session passes an object without those fields.
   const gameplayOwners = gameplayOwnerRegistrations({
-    // The gameplay stages read and commit the player, storage and vitals
-    // through these owners, so they start from the state just restored into
-    // the host services (or the fresh-world state).
-    playerPose: await Effect.runPromise(world.player.pose),
-    dimension: await Effect.runPromise(world.player.dimension),
-    playerStorage: await Effect.runPromise(world.inventory.storageSnapshot),
-    vitals: await Effect.runPromise(world.vitals.snapshot),
     ...(loadedSessionState === undefined ? {} : {
       villagerTrades: loadedSessionState.villagers.trades,
       brewing: loadedSessionState.brewing,
-      crops: loadedSessionState.crops,
     }),
   })
   if (Result.isFailure(gameplayOwners)) {
@@ -1055,15 +1045,13 @@ const bootGame = async (
     })
   const gameplayBrewingService = await Effect.runPromise(makeBrewingService(GAMEPLAY_BREWING_OWNER_ID))
   // The one set of commit services every reader of the gameplay owners shares.
-  // Owners the host still simulates in its own services (entities, dropped
-  // items) stay unset, as before this wiring. Crops live only in their owner:
-  // without `cropOwnerId` the gameplay stages reject planting and harvest.
+  // Owners the host still simulates in its own services (crops, entities,
+  // dropped items) stay unset, as before this wiring.
   const gameplayCommit: GameplayCommitServices = {
     coordinator: hostWorldWrite.coordinator,
     playerOwnerId: GAMEPLAY_PLAYER_OWNER_ID,
     playerStorageOwnerId: GAMEPLAY_PLAYER_STORAGE_OWNER_ID,
     vitalsOwnerId: GAMEPLAY_VITALS_OWNER_ID,
-    cropOwnerId: GAMEPLAY_CROPS_OWNER_ID,
     statusEffectsOwnerId: GAMEPLAY_STATUS_EFFECTS_OWNER_ID,
     villagerTradesOwnerId: GAMEPLAY_VILLAGER_TRADES_OWNER_ID,
     brewingOwnerId: GAMEPLAY_BREWING_OWNER_ID,
@@ -1072,15 +1060,9 @@ const bootGame = async (
   const snapshotGameplayVillagerTrades = gameplayCommit.coordinator
     .snapshot(GAMEPLAY_VILLAGER_TRADES_OWNER_ID, GameplayVillagerTradeSnapshotSchema)
     .pipe(Effect.map(({ state }) => state))
-  const snapshotGameplayCrops = gameplayCommit.coordinator
-    .snapshot(GAMEPLAY_CROPS_OWNER_ID, CropSnapshotSchema)
-    .pipe(Effect.map(({ state }) => state))
   const snapshotGameplayBrewing = gameplayBrewingService.snapshot
     .pipe(Effect.provideService(WorldCommitCoordinator, gameplayCommit.coordinator))
-  const gameplayState = await Effect.runPromise(makeGameplayFrameStateForOwner({
-    coordinator: hostWorldWrite.coordinator,
-    vitalsOwnerId: GAMEPLAY_VITALS_OWNER_ID,
-  }))
+  const gameplayState = await Effect.runPromise(makeGameplayFrameState)
   const villagerResidents = new Map<string, PersistedVillager>(
     (Option.isSome(loadedSession) ? loadedSession.value.state.villagers.residents : [])
       .map((villager) => [villager.id, villager]),
@@ -1088,9 +1070,7 @@ const bootGame = async (
   await restoreLoadedSessionServices(loadedSessionState, {
     restoreTime: (state) => Effect.runPromise(time.restore(state.time)),
     restoreWeather: (state) => Effect.runPromise(weather.restore(state.weather)),
-    // The crop owner was seeded from this session state at registration; the
-    // sim stage's own CropService stays empty so no second crop state exists.
-    restoreCrops: () => Promise.resolve(),
+    restoreCrops: (state) => Effect.runPromise(crops.restore(state.crops)),
     // Also sets the frame state's movement and modifier caches, which seeding
     // the status-effects owner alone would leave at their defaults.
     restoreStatusEffects: (state) =>
@@ -1397,7 +1377,7 @@ const bootGame = async (
       redstone: { levers: [...leverStates.values()] },
       furnaces: [...furnaceStates.values()],
       portals: [...portalStates.values()],
-      crops: Effect.runSync(snapshotGameplayCrops),
+      crops: Effect.runSync(crops.snapshot),
       entities: snapshotEntityRosters(),
       villagers: {
         residents: [...villagerResidents.values()],
@@ -2417,7 +2397,6 @@ const bootGame = async (
         uiFrameState,
         simState,
         gameplayState,
-        gameplayCommit,
         isActiveDimension: (dimension) => dimension === currentChunkContext.dimension,
         poweredRails,
         leverKeyOf,
