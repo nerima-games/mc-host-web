@@ -376,7 +376,7 @@ const main = async (): Promise<void> => {
     )
 
     const active = (action: Parameters<typeof input.isActionActive>[0]): number =>
-      Effect.runSync(input.isActionActive(action)) ? 1 : 0
+      Effect.runSync(input.isActionActive(action, snapshot)) ? 1 : 0
 
     const forward = active('moveForward') - active('moveBackward')
     const strafe = active('moveRight') - active('moveLeft')

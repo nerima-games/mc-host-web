@@ -1,5 +1,12 @@
 import { AngleRadians, AttackRangeDistance, BlockAxis, blockIdOf, blockPosition, blockPositionKeyOf, blockTypeOfId, ChunkAxis, chunkCoord, DeltaTimeSecs, EntityHealthPoints, EntityId, FixedDurationSecs, MonotonicTimeSecs, position, PositionAxis, WorldId, WorldWriteBatchSchema } from '@nerima-games/mc-kernel'
-import { EMPTY_SYNC_REPORT, makeChunkStoreLightColor, type InputAction, type InputSnapshot } from '@nerima-games/mc-render'
+import {
+  EMPTY_SYNC_REPORT,
+  makeChunkStoreLightColor,
+  type InputAction,
+  type InputSnapshot,
+  defaultBindings,
+  INITIAL_INPUT_SEQUENCE,
+} from '@nerima-games/mc-render'
 import {
   makeSimFrameState,
   makeWorldCommitCoordinator,
@@ -72,6 +79,8 @@ const cell = <Value,>(initial: Value) => {
 }
 
 const inputSnapshot: InputSnapshot = {
+  sequence: INITIAL_INPUT_SEQUENCE,
+  bindings: defaultBindings(),
   pressed: new Set(),
   justPressed: new Set(),
   uiClicks: new Set(),

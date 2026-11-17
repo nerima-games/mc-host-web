@@ -1,5 +1,9 @@
 import { AngleRadians, BlockAddressSchema, InterpolationFraction, SimulationTick, BlockAxis, BlockId, ClockPort, EntityId, EntityIdSchema, EpochMillis, fixedClock, blockIdOf, blockTypeOfId, blockPosition as kernelBlockPosition, ChunkAxis, chunkCoord as kernelChunkCoord, DeltaTimeSecs, itemStack, MonotonicTimeSecs, position, PositionAxis, SimulationTickSchema, StackCount, WorldId, MAX_PORTAL_WIDTH, WorldWriteChunkUnavailableSchema, WorldWriteConflict, WorldWriteInvalidBatch, type WorldWriteBatch, type WorldWritePort } from '@nerima-games/mc-kernel'
-import { type InputSnapshot } from '@nerima-games/mc-render'
+import {
+  type InputSnapshot,
+  defaultBindings,
+  INITIAL_INPUT_SEQUENCE,
+} from '@nerima-games/mc-render'
 import { CropSnapshotSchema, DomainEventBus, DomainEventBusLayer, EventSubscriberCapacitySchema, PlayerServiceSnapshotSchema, PlayerStorageSnapshotSchema, WorldCommitCoordinator, makeBrewingService, makeTimeService, makeWeatherService, makeWorldCommitCoordinator, HungerPoints, POTATO_MATURITY_SECS, type CropSnapshot } from '@nerima-games/mc-sim'
 import { CHUNK_SIZE_XZ, CHUNK_VOLUME, BIOMES, type ChunkSource } from '@nerima-games/mc-worldgen'
 import { type ItemUseResult, type MobBehaviour } from '@nerima-games/mx-gameplay'
@@ -41,6 +45,8 @@ const cell = <Value,>(initial: Value) => {
 }
 
 const inputSnapshot: InputSnapshot = {
+  sequence: INITIAL_INPUT_SEQUENCE,
+  bindings: defaultBindings(),
   pressed: new Set(),
   justPressed: new Set(),
   uiClicks: new Set(),

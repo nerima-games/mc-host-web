@@ -2,7 +2,15 @@ import { describe, expect, it } from '@effect/vitest'
 import { Effect, Result } from 'effect'
 
 import { DeltaTimeSecs, MonotonicTimeSecs, position, PositionAxis, WorldId } from '@nerima-games/mc-kernel'
-import { ESCAPE_KEY_CODE, wrapHotbarSelection, type InputAction, type InputSnapshot } from '@nerima-games/mc-render'
+import {
+  ESCAPE_KEY_CODE,
+  wrapHotbarSelection,
+  type InputAction,
+  type InputSnapshot,
+  defaultBindings,
+  INITIAL_INPUT_SEQUENCE,
+  makeInputService,
+} from '@nerima-games/mc-render'
 import { makeWorldCommitCoordinator, PlayerServiceSnapshotSchema } from '@nerima-games/mc-sim'
 import { GAMEPLAY_ENTITIES_OWNER_ID, GAMEPLAY_PLAYER_OWNER_ID, GAMEPLAY_PLAYER_STORAGE_OWNER_ID, GAMEPLAY_VITALS_OWNER_ID, gameplayOwnerRegistrations, makeInMemoryWorld, type MobBehaviour } from '@nerima-games/mx-gameplay'
 
@@ -129,6 +137,8 @@ const makeFrameInputFixture = (options: FrameInputFixtureOptions = {}) => {
     },
   }
   const frameInput: InputSnapshot = {
+    sequence: INITIAL_INPUT_SEQUENCE,
+    bindings: defaultBindings(),
     pressed: new Set(),
     justPressed: new Set(options.escapePressed ? [ESCAPE_KEY_CODE] : []),
     uiClicks: new Set(),
@@ -431,6 +441,8 @@ describe('tick frame timing', () => {
       playerApi: { look: () => Effect.succeed(playerPose) },
     }
     const frameInput: InputSnapshot = {
+      sequence: INITIAL_INPUT_SEQUENCE,
+      bindings: defaultBindings(),
       pressed: new Set(),
       justPressed: new Set([ESCAPE_KEY_CODE]),
       uiClicks: new Set(),
@@ -449,6 +461,49 @@ describe('tick frame timing', () => {
     expect(previousSecs).toBe(MonotonicTimeSecs(2))
     expect(calls).toEqual(['pause', 'crosshair:2'])
   })
+})
+
+describe('tick input from its reading', () => {
+  // A reading, then live input that moves on: the key is released and the
+  // frame ends before the tick consumes the reading.
+  const readThenRelease = (code: string) => Effect.gen(function* () {
+    const service = yield* makeInputService()
+    yield* service.dispatch({ kind: 'keydown', code, target: 'window' })
+    const reading = yield* service.snapshot
+    yield* service.dispatch({ kind: 'keyup', code, target: 'window' })
+    yield* service.endFrame(reading)
+    return { service, reading }
+  })
+
+  it.effect('reads a held action from the tick reading, not from live input', () =>
+    Effect.gen(function* () {
+      const { service, reading } = yield* readThenRelease('KeyW')
+      const fixture = makeFrameInputFixture()
+      let controls = { throttle: 0, steering: 0 }
+      const context: H5aFrameInputContext = {
+        ...fixture.context,
+        inputApi: service,
+        state: {
+          ...fixture.context.state,
+          vehicleControls: mutableState(() => controls, (value) => { controls = value }),
+        },
+      }
+
+      runTickFrameInput(context, MonotonicTimeSecs(10), reading)
+
+      expect(yield* service.isActionActive('moveForward')).toBe(false)
+      expect(controls).toStrictEqual({ throttle: 1, steering: 0 })
+    }))
+
+  it.effect('reads a just-pressed action from the tick reading after the frame ended', () =>
+    Effect.gen(function* () {
+      const { service, reading } = yield* readThenRelease('KeyE')
+      const fixture = makeFrameInputFixture()
+
+      runTickFrameInput({ ...fixture.context, inputApi: service }, MonotonicTimeSecs(10), reading)
+
+      expect(fixture.calls).toContain('inventory:true:player')
+    }))
 })
 
 describe('tick frame input branches', () => {

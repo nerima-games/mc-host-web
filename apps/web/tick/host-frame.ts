@@ -1,4 +1,4 @@
-import { bindingFor, type InputServiceApi, type InputSnapshot } from '@nerima-games/mc-render'
+import type { InputServiceApi, InputSnapshot } from '@nerima-games/mc-render'
 import type { DeltaTimeSecs, MonotonicTimeSecs } from '@nerima-games/mc-kernel'
 import type { FixedStepFailure } from '@nerima-games/mc-sim'
 
@@ -6,7 +6,7 @@ import { Effect } from 'effect'
 
 import type { FixedStepFrame, FixedStepFrameLoop, FixedStepTick } from './fixed-step-frame'
 import { readFrameTiming, type FrameTiming } from './frame-input'
-import type { H5aFrameInputContext, MutableState } from './h5a-context'
+import type { MutableState } from './h5a-context'
 
 /** `halt` ends the frame's ticks and skips its presentation. */
 export type HostFrameTickOutcome = 'continue' | 'halt'
@@ -59,22 +59,4 @@ export const runHostFrame = <TickError, PresentError>(
     if (halted || !context.presents()) return
     yield* context.present({ ...stepped, timing, nowSecs })
   }).pipe(Effect.ensuring(context.input.endFrame(frameInput)))
-})
-
-/**
- * The input queries one tick reads, answered from that tick's input rather than
- * from the input service. The fixed-step loop gives a frame's edges to its first
- * tick only and carries them over a frame with no tick, while the service keeps
- * them until the frame's single `endFrame`. Actions resolve through the
- * service's bindings, as the service's own `wasActionJustTriggered` does.
- */
-export const tickInputQueries = (
-  inputApi: Pick<InputServiceApi, 'bindings' | 'isActionActive'>,
-  input: InputSnapshot,
-): H5aFrameInputContext['inputApi'] => ({
-  isActionActive: inputApi.isActionActive,
-  wasActionJustTriggered: (action) => Effect.map(inputApi.bindings, (bindings) => {
-    const code = bindingFor(bindings, action)
-    return code !== undefined && input.justPressed.has(code)
-  }),
 })

@@ -2,7 +2,11 @@ import { describe, expect, it } from '@effect/vitest'
 import { Brand, Effect, Result } from 'effect'
 
 import { MonotonicTimeSecs, SimulationTick } from '@nerima-games/mc-kernel'
-import type { InputSnapshot } from '@nerima-games/mc-render'
+import {
+  type InputSnapshot,
+  defaultBindings,
+  INITIAL_INPUT_SEQUENCE,
+} from '@nerima-games/mc-render'
 import { DEFAULT_TICK_DURATION } from '@nerima-games/mc-sim'
 
 import {
@@ -14,6 +18,8 @@ import {
 } from '../apps/web/tick/fixed-step-frame'
 
 const reading = (overrides: Partial<InputSnapshot> = {}): InputSnapshot => ({
+  sequence: INITIAL_INPUT_SEQUENCE,
+  bindings: defaultBindings(),
   pressed: new Set(),
   justPressed: new Set(),
   uiClicks: new Set(),

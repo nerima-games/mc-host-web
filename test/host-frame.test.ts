@@ -8,7 +8,6 @@ import { HOST_MAX_CATCH_UP_TICKS, makeFixedStepFrameLoop } from '../apps/web/tic
 import { mutableState } from '../apps/web/tick/h5a-context'
 import {
   runHostFrame,
-  tickInputQueries,
   type HostFrameContext,
   type HostFrameTickOutcome,
   type HostPresentedFrame,
@@ -66,7 +65,7 @@ const makeFrame = Effect.gen(function* () {
     },
     tick: ({ input }) => Effect.gen(function* () {
       log.events.push('tick')
-      log.tickEdges.push(yield* tickInputQueries(service, input).wasActionJustTriggered('openInventory'))
+      log.tickEdges.push(yield* service.wasActionJustTriggered('openInventory', input))
       return tickOutcome
     }),
     presents: () => !paused,
@@ -200,14 +199,17 @@ describe('runHostFrame', () => {
     }))
 })
 
-describe('tickInputQueries', () => {
+// mc-render 0.15.0 resolves an edge from the reading it is given. Each tick's
+// input is the fixed-step loop's copy of the frame reading, with the frame's
+// edges on its first tick only.
+describe('tick input edges', () => {
   it.effect('a key pressed before a two-tick frame triggers its action on the first tick only', () =>
     Effect.gen(function* () {
       const { service, log, frameAt } = yield* makeFrame
       yield* frameAt(10)
       yield* service.dispatch({ kind: 'keydown', code: 'KeyE', target: 'window' })
-      // The service itself reports the edge for the whole frame.
-      expect(yield* service.wasActionJustTriggered('openInventory')).toBe(true)
+      // The frame's own reading carries the edge for the whole frame.
+      expect(yield* service.wasActionJustTriggered('openInventory', yield* service.snapshot)).toBe(true)
       // Timestamps sit off tick boundaries: mc-sim truncates each delta to
       // whole 1/60,000,000 s units, so an exact 0.1 s can come out as one tick.
       yield* frameAt(10.11)
@@ -222,22 +224,10 @@ describe('tickInputQueries', () => {
       yield* frameAt(10)
       yield* service.dispatch({ kind: 'keydown', code: 'KeyE', target: 'window' })
       yield* frameAt(10.02)
-      // The frame's end cleared the service's edge; the loop carried it.
-      expect(yield* service.wasActionJustTriggered('openInventory')).toBe(false)
+      // The frame's end consumed the service's edge; the loop carried it.
+      expect(yield* service.wasActionJustTriggered('openInventory', yield* service.snapshot)).toBe(false)
       yield* frameAt(10.06)
 
       expect(log.tickEdges).toStrictEqual([true])
-    }))
-
-  it.effect('reads held actions from the service and never resolves escape', () =>
-    Effect.gen(function* () {
-      const service = yield* makeInputService()
-      yield* service.dispatch({ kind: 'keydown', code: 'KeyW', target: 'window' })
-      const reading = yield* service.snapshot
-      const queries = tickInputQueries(service, reading)
-
-      expect(yield* queries.isActionActive('moveForward')).toBe(true)
-      expect(yield* queries.wasActionJustTriggered('moveForward')).toBe(true)
-      expect(yield* queries.wasActionJustTriggered('escape')).toBe(false)
     }))
 })
