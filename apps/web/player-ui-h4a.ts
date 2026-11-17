@@ -20,6 +20,7 @@ import { deathDropsFromPlayerStorage } from './player-death'
 import { type DroppedItemMetadata } from './dropped-item-metadata'
 import { type PlayerSettingsV1 } from './settings'
 import { type SessionState } from './session-persistence'
+import { sessionSaveFailureMessage } from './session-save-coordinator'
 import { type BedRespawnLocation } from './sleep-runtime'
 
 type CrosshairView = {
@@ -194,6 +195,8 @@ export const respawnPlayer = (context: H4aRespawnContext): Result.Result<void, B
   return Result.void
 }
 
+const SAVE_AND_QUIT_SETTINGS_FAILURE_MESSAGE = 'Save failed. Your world is still open; please try again.'
+
 export type PointerLockPauseFailure = {
   readonly _tag: 'PointerLockPauseFailure'
   readonly cause: unknown
@@ -201,7 +204,8 @@ export type PointerLockPauseFailure = {
 
 export type PauseSaveQuitFailure = {
   readonly _tag: 'PauseSaveQuitFailure'
-  readonly cause: unknown
+  // One rejection reason per failed write, the world save first.
+  readonly cause: ReadonlyArray<unknown>
 }
 
 type PauseButton = DomInteractiveElement & Pick<HTMLElement, 'getAttribute' | 'hasAttribute'>
@@ -349,12 +353,23 @@ export const installPlayerPauseMenu = <Button extends PauseButton>(context: Play
     saveQuitButton.setAttribute('aria-busy', 'true')
     saveQuitButton.setAttribute('disabled', '')
     clearError()
-    void Promise.all([context.requestFlush(), context.drainSettingsWrites()])
-      .then(() => { if (!disposed) context.window.location.assign('/') })
-      .catch((cause: unknown) => {
+    // allSettled keeps one result per write, so the message names each failed
+    // write and the button stays busy until both have settled.
+    void Promise.allSettled([context.requestFlush(), context.drainSettingsWrites()])
+      .then(([session, settings]) => {
         if (disposed) return
-        reportError('Save failed. Your world is still open; please try again.')
-        context.onFailure({ _tag: 'PauseSaveQuitFailure', cause })
+        if (session.status === 'fulfilled' && settings.status === 'fulfilled') {
+          context.window.location.assign('/')
+          return
+        }
+        reportError([
+          ...(session.status === 'rejected' ? [sessionSaveFailureMessage(session.reason)] : []),
+          ...(settings.status === 'rejected' ? [SAVE_AND_QUIT_SETTINGS_FAILURE_MESSAGE] : []),
+        ].join(' '))
+        context.onFailure({
+          _tag: 'PauseSaveQuitFailure',
+          cause: [session, settings].flatMap((result) => result.status === 'rejected' ? [result.reason] : []),
+        })
       })
       .finally(() => {
         saveQuitButton.removeAttribute('aria-busy')

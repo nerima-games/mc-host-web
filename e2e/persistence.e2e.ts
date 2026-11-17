@@ -1,9 +1,19 @@
 import { expect, test, type ConsoleMessage, type Page } from '@playwright/test'
 import { DROPPED_ITEM_PICKUP_RADIUS, isDroppedItemBehaviour, isHostileMobSnapshot } from '@nerima-games/mx-gameplay'
+import { Result, Schema } from 'effect'
+import { SaveEnvelopeSchema, SaveFormatVersion, sealSaveEnvelope, type SaveEnvelope } from '@nerima-games/mc-save'
 
 import type { SessionHead } from '../apps/web/session-persistence'
 import { callQa, callQaWithFrames } from './helpers/qa'
-import { clearDatabase } from './helpers/database'
+import { clearDatabase, DATABASE_NAME } from './helpers/database'
+import {
+  SESSION_SAVE_INCOMPATIBLE_MESSAGE,
+  SESSION_SAVE_STORAGE_FAILURE_MESSAGE,
+} from '../apps/web/session-save-coordinator'
+import {
+  SESSION_CHECKPOINT_OPENED_MESSAGE,
+  SESSION_FUTURE_VERSION_MESSAGE,
+} from '../apps/web/session-restoration'
 import { startGameSession } from './helpers/session'
 import { waitForSimulationProgress } from './helpers/simulation-wait'
 
@@ -144,6 +154,139 @@ const seedGroundedMiningEncounter = async (page: Page): Promise<void> => {
   await callQa(page, 'gameplay.seedSmokeGroundingEncounter')
   await callQa(page, 'gameplay.setPose', STONE_BLOCK_ID)
   await expect(page.locator('#game-canvas')).toHaveAttribute('data-player-grounded', 'true')
+}
+
+const SAVE_STORE_NAME = 'saves'
+// One above the session format this build writes (SESSION_FORMAT_VERSION).
+const NEWER_SESSION_FORMAT_VERSION = 19
+
+const sessionHeadKey = (sessionId: string): string =>
+  `mc-compose/session/${encodeURIComponent(sessionId)}/head`
+const sessionCheckpointHeadKey = (sessionId: string): string =>
+  `mc-compose/session/${encodeURIComponent(sessionId)}/checkpoint/head`
+// The autosave runs every 5 s (AUTOSAVE_INTERVAL_MS in main.ts) whether or not
+// anything changed; a checkpoint needs a second save after the first.
+const STORED_RECORD_WAIT = { timeout: 30_000 }
+
+// mc-save's IndexedDB record: the key path, the insertion sequence, the envelope.
+const StoredSaveRecordSchema = Schema.Struct({
+  key: Schema.String,
+  seq: Schema.Number,
+  envelope: SaveEnvelopeSchema,
+})
+type StoredSaveRecord = typeof StoredSaveRecordSchema.Type
+
+const readStoredRecord = async (page: Page, key: string): Promise<StoredSaveRecord | undefined> => {
+  const stored: unknown = await page.evaluate(async ({ databaseName, storeName, recordKey }) => {
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open(databaseName)
+      request.addEventListener('success', () => resolve(request.result), { once: true })
+      request.addEventListener('error', () => reject(request.error), { once: true })
+    })
+    try {
+      return await new Promise<unknown>((resolve, reject) => {
+        const request = database.transaction(storeName).objectStore(storeName).get(recordKey)
+        request.addEventListener('success', () => resolve(request.result), { once: true })
+        request.addEventListener('error', () => reject(request.error), { once: true })
+      })
+    } finally {
+      database.close()
+    }
+  }, { databaseName: DATABASE_NAME, storeName: SAVE_STORE_NAME, recordKey: key })
+  return stored === undefined ? undefined : Result.getOrThrow(Schema.decodeUnknownResult(StoredSaveRecordSchema)(stored))
+}
+
+const requireStoredRecord = async (page: Page, key: string): Promise<StoredSaveRecord> => {
+  const record = await readStoredRecord(page, key)
+  if (record === undefined) throw new Error(`no stored record at ${key}`)
+  return record
+}
+
+const waitForStoredRecord = async (page: Page, key: string): Promise<void> => {
+  await expect.poll(async () => (await readStoredRecord(page, key)) !== undefined, STORED_RECORD_WAIT).toBe(true)
+}
+
+const writeStoredRecord = (page: Page, record: StoredSaveRecord): Promise<void> =>
+  page.evaluate(async ({ databaseName, storeName, value }) => {
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open(databaseName)
+      request.addEventListener('success', () => resolve(request.result), { once: true })
+      request.addEventListener('error', () => reject(request.error), { once: true })
+    })
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const transaction = database.transaction(storeName, 'readwrite')
+        transaction.objectStore(storeName).put(value)
+        transaction.addEventListener('complete', () => resolve(), { once: true })
+        transaction.addEventListener('error', () => reject(transaction.error), { once: true })
+        transaction.addEventListener('abort', () => reject(transaction.error), { once: true })
+      })
+    } finally {
+      database.close()
+    }
+  }, { databaseName: DATABASE_NAME, storeName: SAVE_STORE_NAME, value: record })
+
+const replaceStoredEnvelope = async (
+  page: Page,
+  key: string,
+  replace: (envelope: SaveEnvelope) => SaveEnvelope,
+): Promise<void> => {
+  const record = await requireStoredRecord(page, key)
+  await writeStoredRecord(page, { ...record, envelope: replace(record.envelope) })
+}
+
+// The same head as a newer build would seal it: valid integrity, newer version.
+const sealedAtNewerVersion = (envelope: SaveEnvelope): SaveEnvelope =>
+  Result.getOrThrow(sealSaveEnvelope(
+    {
+      format: envelope.format,
+      version: SaveFormatVersion(NEWER_SESSION_FORMAT_VERSION),
+      payload: envelope.payload,
+    },
+    envelope.extensions,
+  ))
+
+// The integrity still describes the original payload, so the checksum fails.
+const tamperedPayload = (envelope: SaveEnvelope): SaveEnvelope => ({ ...envelope, payload: { tampered: true } })
+
+// A same-origin page that does not run the game, so no save can replace a
+// record written from it before the next boot reads it.
+const leaveGame = async (page: Page): Promise<void> => {
+  await page.goto('/@vite/client')
+}
+
+// Every readwrite transaction throws while armed. The fault stays armed until
+// the test disarms it, so an autosave that takes the fault first does not let
+// the Save and Quit under test through.
+const installStorageWriteFault = async (page: Page): Promise<void> => {
+  await page.addInitScript(() => {
+    const faultState = { armed: false }
+    const originalTransaction = IDBDatabase.prototype.transaction
+    const transactionWithFault = function (
+      this: IDBDatabase,
+      ...arguments_: Parameters<IDBDatabase['transaction']>
+    ): IDBTransaction {
+      if (arguments_[1] === 'readwrite' && faultState.armed) {
+        throw new DOMException('Injected session write failure', 'InvalidStateError')
+      }
+      return originalTransaction.apply(this, arguments_)
+    }
+    IDBDatabase.prototype.transaction = transactionWithFault
+    ;(globalThis as unknown as { setStorageWriteFault: (armed: boolean) => void }).setStorageWriteFault = (armed) => {
+      faultState.armed = armed
+    }
+  })
+}
+
+const setStorageWriteFault = (page: Page, armed: boolean): Promise<void> =>
+  page.evaluate((next) => {
+    ;(globalThis as unknown as { setStorageWriteFault: (armed: boolean) => void }).setStorageWriteFault(next)
+  }, armed)
+
+const openPauseMenu = async (page: Page): Promise<void> => {
+  await page.keyboard.press('Escape')
+  await expect(page.locator('body')).toHaveAttribute('data-session-paused', 'true')
+  await expect(page.getByTestId('save-quit-button')).toBeVisible()
 }
 
 test('restores a dynamic entity with stable identity and state', async ({ page }) => {
@@ -691,4 +834,140 @@ test('reaches saved after an autosave, even while the player keeps drifting', as
 
   expect(faults.pageErrors).toEqual([])
   expect(faults.consoleErrors).toEqual([])
+})
+
+test('sends a world saved by a newer version to the title screen with its message', async ({ page }) => {
+  const faults = watchForFaults(page)
+  const sessionId = 'future-version-e2e'
+  await clearDatabase(page)
+
+  await startGameSession(page, sessionId)
+  const body = page.locator('body')
+  await expect(body).toHaveAttribute('data-mc-compose-boot', 'running')
+  await waitForStoredRecord(page, sessionHeadKey(sessionId))
+
+  await leaveGame(page)
+  await replaceStoredEnvelope(page, sessionHeadKey(sessionId), sealedAtNewerVersion)
+  await page.goto(`/?session=${sessionId}`)
+
+  await expect(page).toHaveURL('/?loadError=future-version-session')
+  await expect(body).toHaveAttribute('data-mc-compose-route', 'title')
+  await expect(page.locator('#title-status')).toHaveText(SESSION_FUTURE_VERSION_MESSAGE)
+  expect(faults.pageErrors).toEqual([])
+  expect(faults.consoleErrors).toEqual([])
+})
+
+test('reopens a world from its checkpoint when the latest save is unreadable', async ({ page }) => {
+  const faults = watchForFaults(page)
+  const sessionId = 'checkpoint-recovery-e2e'
+  await clearDatabase(page)
+
+  await startGameSession(page, sessionId)
+  const body = page.locator('body')
+  await expect(body).toHaveAttribute('data-mc-compose-boot', 'running')
+  // The second save copies the first one to the checkpoint before replacing it.
+  await waitForStoredRecord(page, sessionCheckpointHeadKey(sessionId))
+
+  await leaveGame(page)
+  await replaceStoredEnvelope(page, sessionHeadKey(sessionId), tamperedPayload)
+  await page.goto(`/?session=${sessionId}`)
+
+  await expect(page).toHaveURL(new RegExp(`\\?session=${sessionId}$`, 'u'))
+  await expect(body).toHaveAttribute('data-mc-compose-boot', 'running')
+  await expect(body).toHaveAttribute('data-session-source', 'checkpoint')
+  await expect(page.locator('#game-canvas')).toHaveAttribute('data-world-source', 'persisted')
+  await expect(page.locator('[data-pause-error]')).toHaveText(SESSION_CHECKPOINT_OPENED_MESSAGE)
+  expect(faults.pageErrors).toEqual([])
+  expect(faults.consoleErrors).toEqual([])
+})
+
+// The message the Save and Quit handler wrote before #45's typed messages.
+const GENERIC_SAVE_FAILURE_MESSAGE = 'Save failed. Your world is still open; please try again.'
+
+// Clicks Save and Quit with every text written to the pause error line
+// recorded from before the click. The autosave keeps running while paused and
+// can overwrite the line, so the final text alone cannot show what the Save and
+// Quit handler wrote. With `armFault`, the storage write fault is armed in the
+// same evaluation, so no autosave runs between arming and the click.
+const clickSaveQuitRecordingErrors = (page: Page, armFault: boolean): Promise<void> =>
+  page.evaluate((arm) => {
+    const errorLine = document.querySelector('[data-pause-error]')
+    if (errorLine === null) throw new Error('missing pause error line')
+    const button = document.querySelector<HTMLButtonElement>('[data-testid="save-quit-button"]')
+    if (button === null) throw new Error('missing save-quit button')
+    const texts: Array<string> = []
+    ;(globalThis as unknown as { pauseErrorTexts: Array<string> }).pauseErrorTexts = texts
+    new MutationObserver(() => { texts.push(errorLine.textContent ?? '') })
+      .observe(errorLine, { childList: true, characterData: true, subtree: true })
+    if (arm) {
+      ;(globalThis as unknown as { setStorageWriteFault: (armed: boolean) => void }).setStorageWriteFault(true)
+    }
+    button.click()
+  }, armFault)
+
+// The non-empty texts written to the pause error line since the click.
+const recordedPauseErrors = async (page: Page): Promise<ReadonlyArray<string>> =>
+  (await page.evaluate(() => [...(globalThis as unknown as { pauseErrorTexts: Array<string> }).pauseErrorTexts]))
+    .filter((text) => text !== '')
+
+test('keeps the world open with the storage message when Save and Quit cannot write', async ({ page }) => {
+  const faults = watchForFaults(page)
+  const sessionId = 'save-quit-storage-failure-e2e'
+  await installStorageWriteFault(page)
+  await clearDatabase(page)
+
+  await startGameSession(page, sessionId)
+  await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
+  await waitForStoredRecord(page, sessionHeadKey(sessionId))
+  await openPauseMenu(page)
+
+  const saveQuitButton = page.getByTestId('save-quit-button')
+  // The fault stays armed until this Save and Quit is seen failing, so an
+  // autosave already waiting to write cannot use it up first.
+  await clickSaveQuitRecordingErrors(page, true)
+  await expect(saveQuitButton).not.toHaveAttribute('aria-busy', 'true')
+  await expect(page.locator('[data-pause-error]')).toHaveText(SESSION_SAVE_STORAGE_FAILURE_MESSAGE)
+  const written = await recordedPauseErrors(page)
+  expect(written).not.toContain(GENERIC_SAVE_FAILURE_MESSAGE)
+  expect(written.at(-1)).toBe(SESSION_SAVE_STORAGE_FAILURE_MESSAGE)
+  await expect(page).toHaveURL(new RegExp(`\\?session=${sessionId}$`, 'u'))
+  await setStorageWriteFault(page, false)
+
+  await saveQuitButton.click()
+  await expect(page).toHaveURL('/')
+  expect(faults.pageErrors).toEqual([])
+})
+
+test('keeps the world open with the incompatible-save message when Save and Quit meets a newer save', async ({ page }) => {
+  const faults = watchForFaults(page)
+  const sessionId = 'save-quit-incompatible-e2e'
+  await clearDatabase(page)
+
+  await startGameSession(page, sessionId)
+  await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
+  await waitForStoredRecord(page, sessionHeadKey(sessionId))
+  await openPauseMenu(page)
+
+  // An autosave that read the old head before the replacement can save over the
+  // newer one; every later save then succeeds. So the head is replaced again
+  // until a save fails against it. Saves are serial and a failed save writes
+  // nothing, so after that failure the newer head stays.
+  await expect(async () => {
+    await replaceStoredEnvelope(page, sessionHeadKey(sessionId), sealedAtNewerVersion)
+    // One autosave interval (5 s) plus margin.
+    await expect(page.locator('body')).toHaveAttribute('data-session-persistence', 'failed', { timeout: 7_000 })
+  }).toPass({ timeout: 30_000 })
+  expect((await requireStoredRecord(page, sessionHeadKey(sessionId))).envelope.version).toBe(NEWER_SESSION_FORMAT_VERSION)
+  const saveQuitButton = page.getByTestId('save-quit-button')
+  await clickSaveQuitRecordingErrors(page, false)
+
+  await expect(saveQuitButton).not.toHaveAttribute('aria-busy', 'true')
+  await expect(page.locator('[data-pause-error]')).toHaveText(SESSION_SAVE_INCOMPATIBLE_MESSAGE)
+  const written = await recordedPauseErrors(page)
+  expect(written).not.toContain(GENERIC_SAVE_FAILURE_MESSAGE)
+  expect(written.at(-1)).toBe(SESSION_SAVE_INCOMPATIBLE_MESSAGE)
+  await expect(page).toHaveURL(new RegExp(`\\?session=${sessionId}$`, 'u'))
+  // No save replaced the newer head while the test wrote it.
+  expect((await requireStoredRecord(page, sessionHeadKey(sessionId))).envelope.version).toBe(NEWER_SESSION_FORMAT_VERSION)
+  expect(faults.pageErrors).toEqual([])
 })

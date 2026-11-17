@@ -1,6 +1,6 @@
 import type { Page } from '@playwright/test'
 
-const DATABASE_NAME = 'nerima-games-minecraft'
+export const DATABASE_NAME = 'nerima-games-minecraft'
 const RESET_DOCUMENT = '/__e2e__/database-reset'
 
 export const clearDatabase = async (page: Page): Promise<void> => {

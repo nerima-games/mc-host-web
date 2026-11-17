@@ -17,7 +17,12 @@ import {
 } from '@nerima-games/mc-sim'
 import type { EnchantedItem } from '@nerima-games/mx-gameplay'
 import type { DroppedItemMetadata } from '../apps/web/dropped-item-metadata'
+import { StorageError } from '@nerima-games/mc-save'
 import { DEFAULT_PLAYER_SETTINGS } from '../apps/web/settings'
+import {
+  SESSION_SAVE_FAILURE_MESSAGE,
+  SESSION_SAVE_STORAGE_FAILURE_MESSAGE,
+} from '../apps/web/session-save-coordinator'
 
 const mocks = vi.hoisted(() => ({ hudViewModel: vi.fn() }))
 
@@ -446,13 +451,13 @@ describe('pointer lock pause menu', () => {
 
   it('keeps the world paused after a failed save and allows a successful retry', async () => {
     const state = makePauseMenu(false)
-    const cause = new Error('world save failed')
+    const cause = new StorageError({ operation: 'put', key: 'mc-compose/session/w/head' })
     state.requestFlush.mockRejectedValueOnce(cause)
     state.menu.handleEscape()
     state.frame()
     state.click('save-and-quit')
-    await vi.waitFor(() => expect(state.onFailure).toHaveBeenCalledExactlyOnceWith({ _tag: 'PauseSaveQuitFailure', cause }))
-    expect(state.errorText()).toBe('Save failed. Your world is still open; please try again.')
+    await vi.waitFor(() => expect(state.onFailure).toHaveBeenCalledExactlyOnceWith({ _tag: 'PauseSaveQuitFailure', cause: [cause] }))
+    expect(state.errorText()).toBe(SESSION_SAVE_STORAGE_FAILURE_MESSAGE)
     expect(state.errorRole()).toBe('alert')
     expect(state.getPaused()).toBe(true)
     expect(state.assign).not.toHaveBeenCalled()
@@ -460,6 +465,54 @@ describe('pointer lock pause menu', () => {
     state.click('save-and-quit')
     await vi.waitFor(() => expect(state.assign).toHaveBeenCalledExactlyOnceWith('/'))
     expect(state.errorText()).toBe('')
+  })
+
+  it('keeps the settings message when only the settings drain fails', async () => {
+    const state = makePauseMenu(false)
+    const cause = new Error('settings write failed')
+    state.drainSettingsWrites.mockRejectedValueOnce(cause)
+    state.menu.handleEscape()
+    state.frame()
+    state.click('save-and-quit')
+    await vi.waitFor(() => expect(state.onFailure).toHaveBeenCalledExactlyOnceWith({ _tag: 'PauseSaveQuitFailure', cause: [cause] }))
+    expect(state.errorText()).toBe('Save failed. Your world is still open; please try again.')
+    expect(state.assign).not.toHaveBeenCalled()
+  })
+
+  it('names both failed writes, the world save first, and passes both reasons on', async () => {
+    const state = makePauseMenu(false)
+    const sessionCause = new Error('unclassified world save failure')
+    const settingsCause = new Error('settings write failed')
+    state.requestFlush.mockRejectedValueOnce(sessionCause)
+    state.drainSettingsWrites.mockRejectedValueOnce(settingsCause)
+    state.menu.handleEscape()
+    state.frame()
+    state.click('save-and-quit')
+    await vi.waitFor(() => expect(state.onFailure).toHaveBeenCalledExactlyOnceWith({
+      _tag: 'PauseSaveQuitFailure',
+      cause: [sessionCause, settingsCause],
+    }))
+    expect(state.errorText()).toBe(`${SESSION_SAVE_FAILURE_MESSAGE} Save failed. Your world is still open; please try again.`)
+    expect(state.assign).not.toHaveBeenCalled()
+  })
+
+  it('stays busy after a world save failure until the settings drain settles', async () => {
+    const state = makePauseMenu(false)
+    const worldSave = Promise.withResolvers<void>()
+    const settingsSave = Promise.withResolvers<void>()
+    state.requestFlush.mockReturnValueOnce(worldSave.promise)
+    state.drainSettingsWrites.mockReturnValueOnce(settingsSave.promise)
+    state.menu.handleEscape()
+    state.frame()
+    state.click('save-and-quit')
+    const quit = state.parent.findAction('save-and-quit')
+    worldSave.reject(new StorageError({ operation: 'put', key: 'mc-compose/session/w/head' }))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(quit.getAttribute('aria-busy')).toBe('true')
+    expect(state.onFailure).not.toHaveBeenCalled()
+    settingsSave.resolve()
+    await vi.waitFor(() => expect(quit.hasAttribute('aria-busy')).toBe(false))
+    expect(state.errorText()).toBe(SESSION_SAVE_STORAGE_FAILURE_MESSAGE)
   })
 
   it('removes listeners and cancels queued transitions on destroy', () => {

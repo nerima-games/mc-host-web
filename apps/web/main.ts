@@ -353,7 +353,11 @@ import {
 } from './native-input-queue'
 import { selectedHotbarAfterInput } from './player-experience'
 import { createDroppedItemLifetimeTracker } from './dropped-item-lifetime'
-import { createSessionSaveCoordinator, snapshotOwnedSessionState } from './session-save-coordinator'
+import {
+  createSessionSaveCoordinator,
+  sessionSaveFailureMessage,
+  snapshotOwnedSessionState,
+} from './session-save-coordinator'
 import {
   advanceFootstepRuntime,
   initialFootstepRuntimeState,
@@ -411,6 +415,7 @@ import {
 } from './session-navigation'
 import {
   RequestedSessionNotFoundError,
+  RequestedSessionUnavailableError,
   makePlatformAdapters,
   type SettingsWriteQueue,
 } from './platform-adapters'
@@ -1517,8 +1522,12 @@ const bootGame = async (
   const deferToFrameBoundary = (work: () => void): void => {
     frameBoundary.enqueue(Effect.sync(work))
   }
+  // Bound once the pause menu exists, as `markSessionDirty` is.
+  let showSessionSaveFailure = (_message: string): void => {}
+  let clearSessionSaveFailure = (): void => {}
   const reportPersistenceFailure = (error: unknown): void => {
     document.body.setAttribute('data-session-persistence', 'failed')
+    showSessionSaveFailure(sessionSaveFailureMessage(error))
     console.error('[mc-compose] session persistence failed', error)
   }
   const saveCoordinator = createSessionSaveCoordinator<SessionState>({
@@ -3165,7 +3174,10 @@ const bootGame = async (
       const indicate = dirtyGeneration !== savedGeneration
       if (indicate) enterSaveState('saving')
       return saveCoordinator.requestSave().then(
-        () => { if (indicate || saveIndicatorStatus.state === 'failed') enterSaveState('saved') },
+        () => {
+          if (indicate || saveIndicatorStatus.state === 'failed') enterSaveState('saved')
+          clearSessionSaveFailure()
+        },
         (error: unknown) => {
           enterSaveState('failed')
           throw error
@@ -3386,15 +3398,35 @@ const bootGame = async (
     },
     onFailure: (failure) => console.error('[mc-compose] pause menu failed', failure),
   })
+  // The pause menu has one error line. A successful save clears it only when
+  // the save path wrote the last failure it shows, as far as this flag knows:
+  // a settings message written after that failure is cleared too, and so is a
+  // message written after Save and Quit cleared the line itself.
+  let shownSaveFailure: string | undefined
+  showSessionSaveFailure = (message) => {
+    shownSaveFailure = message
+    pauseMenu.reportError(message)
+  }
+  clearSessionSaveFailure = () => {
+    if (shownSaveFailure === undefined) return
+    shownSaveFailure = undefined
+    pauseMenu.clearError()
+  }
   // The session runs with the defaults, and the next change replaces the
   // unreadable record. The settings dialog repeats the warning on every open
   // until that replacement is saved.
   if (adapters.playerSettingsLoadFailure !== undefined) {
     settingsView.reportLoadFailure()
-    pauseMenu.reportError(PLAYER_SETTINGS_LOAD_FAILURE_MESSAGE)
     document.body.setAttribute('data-player-settings-persistence', 'error')
     console.error('[mc-compose] player settings could not be read', adapters.playerSettingsLoadFailure)
   }
+  // Both boot notices share the one error line, so they are written together.
+  const bootNotices = [
+    ...(adapters.playerSettingsLoadFailure === undefined ? [] : [PLAYER_SETTINGS_LOAD_FAILURE_MESSAGE]),
+    ...Option.toArray(adapters.sessionOpenNotice),
+  ]
+  if (bootNotices.length > 0) pauseMenu.reportError(bootNotices.join(' '))
+  if (Option.isSome(adapters.sessionOpenNotice)) document.body.setAttribute('data-session-source', 'checkpoint')
 
   // -------------------------------------------------------------------------
   // 5. QA surface
@@ -4093,6 +4125,10 @@ const boot = (): Promise<void> => {
 boot().catch((error: unknown) => {
   if (error instanceof RequestedSessionNotFoundError) {
     window.location.replace('/?loadError=missing-session')
+    return
+  }
+  if (error instanceof RequestedSessionUnavailableError) {
+    window.location.replace(`/?loadError=${error.loadError}`)
     return
   }
   failBoot('boot threw', error)

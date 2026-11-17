@@ -1,6 +1,13 @@
 import { Brand, Effect, Layer, Result, Schema } from 'effect'
 import { InputAction, KeyCode } from '@nerima-games/mc-kernel'
-import { defineFormat, makeInMemoryStorage, saveTo, StoragePort } from '@nerima-games/mc-save'
+import {
+  defineFormat,
+  makeInMemoryStorage,
+  SaveKey,
+  saveTo,
+  StorageError,
+  StoragePort,
+} from '@nerima-games/mc-save'
 import type { DomNode } from '@nerima-games/mx-ui'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -17,9 +24,16 @@ import {
   PLAYER_SETTINGS_KEY,
   type PlayerSettingsV1,
 } from '../apps/web/settings'
+import { SessionIncompatibleError, type UnavailableSession } from '../apps/web/session-persistence'
+import {
+  SESSION_FUTURE_VERSION_MESSAGE,
+  SESSION_STORAGE_FAILURE_MESSAGE,
+} from '../apps/web/session-restoration'
 
 const mocks = vi.hoisted(() => ({
   sessions: [{ sessionId: 'saved-world', metadata: { name: 'Saved World' } }],
+  unavailable: [] as Array<UnavailableSession>,
+  listFailure: { error: undefined as StorageError | undefined },
   storage: { layer: undefined as Layer.Layer<StoragePort> | undefined },
   createMainMenuView: vi.fn(() => ({ render: vi.fn() })),
   createSettingsView: vi.fn((
@@ -57,7 +71,9 @@ vi.mock('../apps/web/session-persistence', async (importOriginal) => {
   const { Effect } = await import('effect')
   return {
     ...actual,
-    listSessions: () => Effect.succeed(mocks.sessions),
+    listSessionEntries: () => mocks.listFailure.error === undefined
+      ? Effect.succeed({ sessions: mocks.sessions, unavailable: mocks.unavailable })
+      : Effect.fail(mocks.listFailure.error),
   }
 })
 
@@ -230,6 +246,8 @@ const makeTitleMenuContext = () => {
 describe('title menu boot', () => {
   afterEach(() => {
     mocks.sessions.splice(1)
+    mocks.unavailable.splice(0)
+    mocks.listFailure.error = undefined
     mocks.storage.layer = undefined
     vi.restoreAllMocks()
     vi.clearAllMocks()
@@ -285,6 +303,70 @@ describe('title menu boot', () => {
       '[mc-compose] saved session has an invalid world id',
       expect.any(Brand.BrandError),
     )
+  })
+
+  const futureVersionWorld = (): UnavailableSession => ({
+    sessionId: 'future-world',
+    failure: new SessionIncompatibleError({
+      reason: 'future-version',
+      key: SaveKey('mc-compose/session/future-world/head'),
+      storedVersion: 19,
+      currentVersion: 18,
+    }),
+  })
+
+  it('shows the message for the failure class a game redirect names', async () => {
+    const state = makeTitleMenuContext()
+    state.location.search = '?loadError=future-version-session'
+
+    await bootTitleMenu(state.context)
+
+    expect(state.titleStatus.textContent).toBe(SESSION_FUTURE_VERSION_MESSAGE)
+  })
+
+  it('shows nothing for a loadError value no redirect produces', async () => {
+    const state = makeTitleMenuContext()
+    state.location.search = '?loadError=toString'
+
+    await bootTitleMenu(state.context)
+
+    expect(state.titleStatus.textContent).toBe('')
+  })
+
+  it('says why a stored world that cannot be opened is missing from the list', async () => {
+    mocks.unavailable.push(futureVersionWorld())
+    const state = makeTitleMenuContext()
+    state.location.search = ''
+
+    await bootTitleMenu(state.context)
+
+    expect(state.titleStatus.textContent).toBe(SESSION_FUTURE_VERSION_MESSAGE)
+    expect(state.multiplayerWorld.children.map(({ value }) => value)).toEqual(['saved-world'])
+  })
+
+  it('keeps a redirect message over the unavailable-world message', async () => {
+    mocks.unavailable.push(futureVersionWorld())
+    const state = makeTitleMenuContext()
+
+    await bootTitleMenu(state.context)
+
+    expect(state.titleStatus.textContent).toBe('The requested saved world could not be found.')
+  })
+
+  it('reports a storage failure while listing worlds and still finishes the title boot', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const error = new StorageError({ operation: 'get', key: 'mc-compose/session/saved-world/head' })
+    mocks.listFailure.error = error
+    const state = makeTitleMenuContext()
+    state.location.search = ''
+
+    await bootTitleMenu(state.context)
+
+    expect(state.titleStatus.textContent).toBe(SESSION_STORAGE_FAILURE_MESSAGE)
+    expect(state.multiplayerWorld.children).toEqual([])
+    expect(state.multiplayerJoinButton.disabled).toBe(true)
+    expect(state.body.attributes.get('data-mc-compose-boot')).toBe('running')
+    expect(consoleError).toHaveBeenCalledWith('[mc-compose] saved worlds could not be listed', error)
   })
 
   it('shows current bindings on the first visit and hides them after dismissal', async () => {
