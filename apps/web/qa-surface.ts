@@ -14,7 +14,8 @@
  * `bootGame`-local — the constructed services, the local helper closures, and
  * the live-state accessors — crosses the dep boundary.
  */
-import { Effect, Option, Ref, Result, Schema } from 'effect'
+import { Data, Effect, Option, Ref, Result, Schema } from 'effect'
+import type { YieldableError } from 'effect/Cause'
 import {
   BlockId,
   blockIdOf as lookupBlockId,
@@ -79,10 +80,12 @@ import {
   WorldCommitCoordinator,
   type BrewingServiceApi,
   type WorldCommitCoordinatorApi,
+  type WorldCommitCoordinatorError,
 } from '@nerima-games/mc-sim'
 import {
   BLAZE_KIND,
   CREEPER_KIND,
+  advanceVillagerRestock,
   ENDERMAN_KIND,
   EYE_LEVEL_OFFSET,
   PLAYER_HALF_WIDTH,
@@ -190,6 +193,7 @@ import {
   QA_REDSTONE_PLATE_WIRE,
   QA_REDSTONE_RAIL,
   QA_REDSTONE_REPEATER,
+  QA_VILLAGER_RESTOCK_ELAPSED_SECS,
   QA_WATER_CELLS,
   QA_WATER_ORIGIN,
   QA_WATER_PLACEMENT_POSE,
@@ -233,6 +237,12 @@ export type QaBridgeCompositionFailure =
   | ComposeOptionsError
   | Schema.SchemaError
   | StageOrderError
+
+/** The composed QA dispatcher and the namespace table it was built from. */
+export type QaComposition = {
+  readonly qaBridge: QaBridgeApi<unknown>
+  readonly qaNamespaces: ReadonlyArray<ModuleQaNamespace>
+}
 
 /** The chunk context QA helpers stream around. Structurally identical to the
  * `DimensionChunkContext` `bootGame` builds, so the `streamAround` and
@@ -301,7 +311,7 @@ type QaSurfaceDeps = {
     readonly weather: WeatherServiceApi
     readonly getLightingSnapshot: () => RenderLightingSnapshot
   }
-  readonly makeQaBridge: (namespaces: ReadonlyArray<ModuleQaNamespace>) => Result.Result<QaBridgeApi<unknown>, QaBridgeCompositionFailure>
+  readonly makeQaBridge: (namespaces: ReadonlyArray<ModuleQaNamespace>) => Result.Result<QaComposition, QaBridgeCompositionFailure>
   readonly gameplay: {
     readonly commit: NonNullable<Parameters<typeof gameplayStages>[8]>
     readonly targetingEntitiesOwnerId: NonNullable<Parameters<typeof requestTargetedBlockBreak>[2]['entitiesOwnerId']>
@@ -430,6 +440,8 @@ type QaSurfaceDeps = {
     readonly getStopBrowserPreview: () => (() => Promise<void>) | undefined
     /** Runs `run` at the next frame boundary and settles with its result or what it threw. */
     readonly atFrameBoundary: <A>(run: () => A) => Promise<A>
+    /** Runs `work` at the next frame boundary, keeping its typed failure. */
+    readonly atFrameBoundaryEffect: <A, E>(work: Effect.Effect<A, E>) => Effect.Effect<A, E>
   }
 }
 
@@ -536,6 +548,70 @@ export const observeQaBrewing = (
   coordinator: WorldCommitCoordinatorApi,
 ): Effect.Effect<Effect.Success<BrewingServiceApi['snapshot']>, Effect.Error<BrewingServiceApi['snapshot']>> =>
   service.snapshot.pipe(Effect.provideService(WorldCommitCoordinator, coordinator))
+
+/** Every fully qualified operation name in a composed namespace table. */
+export const qaCatalogOf = (namespaces: ReadonlyArray<ModuleQaNamespace>): ReadonlyArray<string> =>
+  namespaces.flatMap(({ name, observe, command }) =>
+    [...Object.keys(observe), ...Object.keys(command)].map((operation) => `${name}.${operation}`))
+
+/**
+ * Composes `namespaces` plus the `runtime` namespace, whose `qaCatalog` lists
+ * the composed table. The table includes every module registration that
+ * `makeQaBridge` adds, so the catalog cannot drift from what dispatch serves.
+ */
+export const composeQaBridge = (
+  makeQaBridge: QaSurfaceDeps['makeQaBridge'],
+  namespaces: ReadonlyArray<ModuleQaNamespace>,
+): Result.Result<QaBridgeApi<unknown>, QaBridgeCompositionFailure> => {
+  const runtime = makeQaNamespaces([{
+    namespace: 'runtime',
+    observe: { qaCatalog: makeQaOperation('qaCatalog', Schema.Null, () => catalog) },
+    command: {},
+  }])
+  const composition = makeQaBridge([...namespaces, ...runtime])
+  if (Result.isFailure(composition)) return Result.fail(composition.failure)
+  const catalog = qaCatalogOf(composition.success.qaNamespaces)
+  return Result.succeed(composition.success.qaBridge)
+}
+
+type QaVillagerRestockNotFreshFields = {
+  readonly restockElapsedSecs: number
+}
+
+/** The villager-trades owner's restock clock had already advanced before the fixture ran. */
+export type QaVillagerRestockNotFresh = YieldableError &
+  QaVillagerRestockNotFreshFields & { readonly _tag: 'QaVillagerRestockNotFresh' }
+
+export const QaVillagerRestockNotFresh: new (fields: QaVillagerRestockNotFreshFields) => QaVillagerRestockNotFresh =
+  Data.TaggedError('QaVillagerRestockNotFresh')
+
+/**
+ * Advances the production villager-trades owner from a zero restock clock by
+ * QA_VILLAGER_RESTOCK_ELAPSED_SECS in one coordinator commit, so every other
+ * owner and every villager offer keeps its state.
+ */
+export const seedQaVillagerRestock = <Snapshot>(context: {
+  readonly coordinator: WorldCommitCoordinatorApi
+  readonly markSessionDirty: () => void
+  readonly snapshot: () => Snapshot
+}): Effect.Effect<Snapshot, QaVillagerRestockNotFresh | WorldCommitCoordinatorError> =>
+  context.coordinator.commitFromSnapshot(
+    GAMEPLAY_VILLAGER_TRADES_OWNER_ID,
+    GameplayVillagerTradeSnapshotSchema,
+    (current) => current.state.restockElapsedSecs === 0
+      ? Effect.succeed({
+          expectedRevision: current.revision,
+          expectedDimensions: [],
+          changes: [{
+            ownerId: GAMEPLAY_VILLAGER_TRADES_OWNER_ID,
+            state: advanceVillagerRestock(current.state, QA_VILLAGER_RESTOCK_ELAPSED_SECS),
+          }],
+        })
+      : Effect.fail(new QaVillagerRestockNotFresh({ restockElapsedSecs: current.state.restockElapsedSecs })),
+  ).pipe(Effect.andThen(Effect.sync(() => {
+    context.markSessionDirty()
+    return context.snapshot()
+  })))
 
 export const makeQaSurface = (
   deps: QaSurfaceDeps,
@@ -748,6 +824,17 @@ export const makeQaSurface = (
         leaveSubmergedSwimmingEncounter: frameOperation('leaveSubmergedSwimmingEncounter', Schema.Null, () => leaveSubmergedSwimmingEncounter()),
         seedVillageTradingEncounter: frameOperation('seedVillageTradingEncounter', Schema.Null, () => seedVillageTradingEncounter()),
         grantNearestVillagerTradeInput: frameOperation('grantNearestVillagerTradeInput', Schema.Null, () => grantNearestVillagerTradeInput()),
+        // An Effect end to end, so the owner commit runs inside the frame boundary without a nested run.
+        seedVillagerRestockPersistence: {
+          name: Schema.decodeUnknownSync(QaOperationNameSchema)('seedVillagerRestockPersistence'),
+          input: Schema.Null,
+          output: Schema.Unknown,
+          run: () => lifecycle.atFrameBoundaryEffect(seedQaVillagerRestock({
+            coordinator: commit.coordinator,
+            markSessionDirty,
+            snapshot: gameplaySnapshot,
+          })).pipe(Effect.map(jsonValue)),
+        },
         harvestFarmingCrop: frameOperation('harvestFarmingCrop', Schema.Null, () => harvestFarmingCrop()),
         seedCactusApproach: frameOperation('seedCactusApproach', Schema.Null, () => seedEnvironmentalContactEncounter('cactus')),
         seedDuplicateLavaContact: frameOperation('seedDuplicateLavaContact', Schema.Null, () => seedEnvironmentalContactEncounter('duplicateLava')),
@@ -1031,7 +1118,7 @@ export const makeQaSurface = (
       command: { stop: makeQaOperation('stop', Schema.Null, () => getStopBrowserPreview()?.()) },
     },
   ])
-  const bridge = deps.makeQaBridge(moduleNamespaces)
+  const bridge = composeQaBridge(deps.makeQaBridge, moduleNamespaces)
   if (Result.isFailure(bridge)) return Result.fail(bridge.failure)
 
   const { render, gameplay, persistence, audio, lifecycle } = deps

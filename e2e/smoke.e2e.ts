@@ -353,6 +353,7 @@ test.describe('smoke — the composed frame in a real browser', () => {
       'gameplay.leaveSubmergedSwimmingEncounter',
       'gameplay.seedVillageTradingEncounter',
       'gameplay.grantNearestVillagerTradeInput',
+      'gameplay.seedVillagerRestockPersistence',
       'gameplay.harvestFarmingCrop',
       'gameplay.seedCactusApproach',
       'gameplay.seedDuplicateLavaContact',
