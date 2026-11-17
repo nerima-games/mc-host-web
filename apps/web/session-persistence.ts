@@ -8,6 +8,8 @@ import {
   encodeSave,
   isFromFuture,
   loadFrom,
+  saveBatchEntry,
+  type StorageMutation,
   loadRetainedRevision,
   SaveDecodeError,
   SaveEnvelopeSchema,
@@ -57,6 +59,7 @@ import {
 } from '@nerima-games/mc-sim'
 import {
   CHUNK_FORMAT,
+  NoiseSeed,
   chunkSnapshotOf,
   type ChunkSource,
   type ChunkStoreApi,
@@ -81,8 +84,17 @@ import {
   type VillagerTradeState,
 } from '@nerima-games/mx-gameplay'
 
+import {
+  makeSessionTerrainSources,
+  protectedTerrainChunks,
+  reconcileTerrainMigrationState,
+  restoreDimensionTerrain,
+  type SessionTerrainRestorationFailure,
+  type SessionTerrainMigrationUnsafePosition,
+} from './session-restoration'
+
 export const SESSION_FORMAT_NAME = '@nerima-games/mc-compose/session'
-export const SESSION_FORMAT_VERSION = 18
+export const SESSION_FORMAT_VERSION = 19
 
 // Effect 4 runs a schema's checks on encode as well as decode, so a plain
 // `check` keeps the old "validate before encoding too" guarantee.
@@ -1106,13 +1118,19 @@ const SESSION_V17_MIGRATION: SaveFormatMigration = {
   migrate: migrateV17SessionHead,
 }
 
+const SESSION_V18_MIGRATION: SaveFormatMigration = {
+  fromVersion: SaveFormatVersion(18),
+  // The envelope payload stays encoded; loadFrom validates it before terrain completion.
+  migrate: Result.succeed,
+}
+
 // `defineFormat` only rejects a malformed name, version, or migration chain;
 // all three are the constants above, so a failure here is a programming error.
 export const SESSION_FORMAT: SaveFormat<SessionHead, unknown> = Result.getOrThrow(defineFormat({
   name: SESSION_FORMAT_NAME,
   version: SESSION_FORMAT_VERSION,
   schema: SessionHeadSchema,
-  migrations: [SESSION_V17_MIGRATION],
+  migrations: [SESSION_V17_MIGRATION, SESSION_V18_MIGRATION],
 }))
 
 type SessionManifestErrorFields =
@@ -1170,8 +1188,10 @@ export type SessionPersistenceError =
   | InstanceType<typeof SessionManifestError>
   | SessionIncompatibleError
   | SessionCorruptError
+  | SessionTerrainRestorationFailure
+  | InstanceType<typeof SessionTerrainMigrationUnsafePosition>
 
-export type SessionOpenError = StorageError | SessionIncompatibleError | SessionCorruptError
+export type SessionOpenError = SessionPersistenceError
 
 const SESSION_KEY_PREFIX = 'mc-compose/session/'
 const SESSION_HEAD_KEY_PATTERN = /^mc-compose\/session\/([^/]+)\/head$/u
@@ -1562,7 +1582,7 @@ const withHealthyCheckpoint = (error: SaveDecodeError): SaveDecodeError =>
  * An incompatible live head or chunk fails without consulting the checkpoint,
  * because opening an older copy would hide that a newer build owns this session.
  */
-export const openSession = (
+const readOpenedSession = (
   sessionId: string,
 ): Effect.Effect<Option.Option<OpenedSession>, SessionOpenError, StoragePort> =>
   Effect.gen(function* () {
@@ -1586,6 +1606,30 @@ export const openSession = (
       liveFailure: withHealthyCheckpoint(liveFailure),
     })
   })
+
+
+export const openSession = (
+  sessionId: string,
+): Effect.Effect<Option.Option<OpenedSession>, SessionOpenError, StoragePort> => Effect.gen(function* () {
+  const storage = yield* StoragePort
+  const originals = new Map<SaveKey, Option.Option<SaveEnvelope>>()
+  const snapshotStorage: StorageService = {
+    ...storage,
+    get: (key) => Effect.suspend(() => {
+      const known = originals.get(key)
+      if (known !== undefined) return Effect.succeed(known)
+      return storage.get(key).pipe(Effect.tap((stored) => Effect.sync(() => { originals.set(key, stored) })))
+    }),
+  }
+  const opened = yield* readOpenedSession(sessionId).pipe(Effect.provideService(StoragePort, snapshotStorage))
+  if (Option.isNone(opened)) return opened
+  const sourceKey = opened.value._tag === 'Live' ? sessionHeadKey(sessionId) : sessionCheckpointHeadKey(sessionId)
+  // A selected revision was validated by readOpenedSession, which read this exact head.
+  const sourceHead = Option.getOrThrow(Option.getOrThrow(Option.fromUndefinedOr(originals.get(sourceKey))))
+  if (sourceHead.version >= SESSION_FORMAT_VERSION) return opened
+  const head = yield* completeV18TerrainMigration(opened.value, sourceHead, originals, snapshotStorage, storage)
+  return Option.some<OpenedSession>({ ...opened.value, head })
+})
 
 /**
  * The head `openSession` opened, so a caller that only needs the head still
@@ -1932,6 +1976,73 @@ export const makeSessionChunkSource = (
       })),
     }
   })
+
+
+const completeV18TerrainMigration = (
+  opened: OpenedSession,
+  sourceHead: SaveEnvelope,
+  originals: Map<SaveKey, Option.Option<SaveEnvelope>>,
+  snapshotStorage: StorageService,
+  storage: StorageService,
+): Effect.Effect<SessionHead, SessionPersistenceError> => Effect.gen(function* () {
+  const head = opened.head
+  const sources = makeSessionTerrainSources(NoiseSeed(head.state.seed))
+  const saved = yield* makeSessionChunkSource(head, head.state.dimension, sources[head.state.dimension]).pipe(
+    Effect.provideService(StoragePort, snapshotStorage),
+  )
+  const terrain = yield* restoreDimensionTerrain(sources, saved.chunks, protectedTerrainChunks(head.state, saved.chunks))
+  const reconciled = yield* reconcileTerrainMigrationState(head.state, terrain, sources)
+  // A checkpoint can be recovered repeatedly after a later live revision is damaged.
+  const revision = `${head.revision}-terrain-v19-${crypto.randomUUID()}`
+  const manifest = reconciled.chunks.map(({ dimension, chunk }): SessionChunkManifestEntry => ({
+    dimension, coord: chunk.coord, key: sessionChunkKey(head.sessionId, revision, dimension, chunk.coord),
+  }))
+  const migrated: SessionHead = { ...head, revision, state: reconciled.state, chunks: manifest }
+  const mutations = new Map<SaveKey, StorageMutation>()
+  const expectedAt = (key: SaveKey): Effect.Effect<Option.Option<SaveEnvelope>, StorageError> => snapshotStorage.get(key)
+  if (opened._tag === 'Live') {
+    const checkpointKey = sessionCheckpointHeadKey(head.sessionId)
+    const previousCheckpoint = yield* readSessionHead(snapshotStorage, head.sessionId, checkpointKey)
+    if (Option.isSome(previousCheckpoint) && Result.isSuccess(previousCheckpoint.value)) {
+      for (const { checkpoint } of previousCheckpoint.value.success.keys) {
+        mutations.set(checkpoint, { _tag: 'Remove', key: checkpoint, expected: yield* expectedAt(checkpoint) })
+      }
+    }
+    // Copy the healthy live revision to the checkpoint in the same atomic publication.
+    for (const entry of head.chunks) {
+      const key = SaveKey(entry.key)
+      // makeSessionChunkSource validated every manifest record and captured its envelope.
+      const expected = Option.getOrThrow(Option.fromUndefinedOr(originals.get(key)))
+      const envelope = Option.getOrThrow(expected)
+      const checkpoint = sessionCheckpointChunkKey(head.sessionId, head.revision, entry.dimension, entry.coord)
+      mutations.set(checkpoint, { _tag: 'Put', key: checkpoint, envelope, expected: yield* expectedAt(checkpoint) })
+      mutations.set(key, { _tag: 'Remove', key, expected })
+    }
+    mutations.set(checkpointKey, { _tag: 'Put', key: checkpointKey, envelope: sourceHead, expected: yield* expectedAt(checkpointKey) })
+  } else {
+    const checkpointKey = sessionCheckpointHeadKey(head.sessionId)
+    mutations.set(checkpointKey, { _tag: 'Put', key: checkpointKey, envelope: sourceHead, expected: yield* expectedAt(checkpointKey) })
+    for (const entry of head.chunks) {
+      const key = SaveKey(entry.key)
+      const expected = Option.getOrThrow(Option.fromUndefinedOr(originals.get(key)))
+      const envelope = Option.getOrThrow(expected)
+      // The source checkpoint remains a recoverable copy after live publication.
+      mutations.set(key, { _tag: 'Put', key, envelope, expected })
+    }
+  }
+  for (let index = 0; index < reconciled.chunks.length; index += 1) {
+    const key = SaveKey(manifest[index]!.key)
+    const envelope = yield* saveBatchEntry(CHUNK_FORMAT, key, reconciled.chunks[index]!.chunk).prepare
+    mutations.set(key, { _tag: 'Put', key, envelope, expected: Option.none() })
+  }
+  const key = sessionHeadKey(head.sessionId)
+  // readOpenedSession always reads the live head before considering a checkpoint.
+  const expected = Option.getOrThrow(Option.fromUndefinedOr(originals.get(key)))
+  const envelope = yield* saveBatchEntry(SESSION_FORMAT, key, migrated).prepare
+  mutations.set(key, { _tag: 'Put', key, envelope, expected })
+  yield* storage.commitBatch([...mutations.values()])
+  return migrated
+})
 
 export const snapshotResidentChunks = (
   store: Pick<ChunkStoreApi, 'loadedCoords' | 'snapshot'>,

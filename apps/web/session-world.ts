@@ -1,7 +1,6 @@
 import { Array as Arr, Option, Result } from 'effect'
 import {
   chunkSnapshotOf,
-  generatedChunkSource,
   NoiseSeed,
   type ChunkWithBlockStates,
   type ChunkSource,
@@ -28,7 +27,10 @@ import {
   type SessionHead,
   type SessionState,
 } from './session-persistence'
-import { makeSessionChunkSourceFor } from './session-restoration'
+import {
+  makeSessionChunkSourceFor,
+  makeSessionTerrainSources,
+} from './session-restoration'
 
 const SAVED_DIMENSIONS: ReadonlyArray<Dimension> = ['overworld', 'nether', 'end']
 
@@ -110,9 +112,10 @@ export const initializeSessionWorld = async <
   const activeSeed = Option.isSome(context.loadedSession)
     ? context.loadedSession.value.state.seed
     : context.worldSeed
-  const generatedSource = generatedChunkSource(NoiseSeed(activeSeed))
+  const seed = NoiseSeed(activeSeed)
+  const generatedSources = makeSessionTerrainSources(seed)
   const restored = Option.isSome(context.loadedSession)
-    ? await context.loadSavedChunks(context.loadedSession.value, context.initialDimension, generatedSource)
+    ? await context.loadSavedChunks(context.loadedSession.value, context.initialDimension, generatedSources[context.initialDimension])
     : undefined
   const initialKnownChunks = (restored?.chunks ?? []).map(({ dimension, chunk }) => ({
     dimension,
@@ -125,7 +128,7 @@ export const initializeSessionWorld = async <
     ]),
   )
   const chunkSourceFor = (dimension: Dimension): ChunkSource =>
-    makeSessionChunkSourceFor(dimension, persistedChunks, generatedSource)
+    makeSessionChunkSourceFor(dimension, persistedChunks, generatedSources[dimension])
   const world = await context.makeWorld({
     seed: activeSeed,
     chunkSource: chunkSourceFor(context.initialDimension),
@@ -226,7 +229,7 @@ export const initializeSessionWorld = async <
   return Result.succeed({
     activeSeed,
     initialKnownChunks,
-    restored,
+    restored: restored === undefined ? undefined : { chunks: initialKnownChunks },
     world,
     chunkSourceFor,
     entities: {
