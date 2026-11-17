@@ -295,45 +295,45 @@ export const makeBrowserWebSocketTransport = (
       }
       const sleepMessage = decodeSleepWireMessage(event.data)
       if (sleepMessage !== undefined) {
-        Queue.unsafeOffer(sleepInbound, sleepMessage)
+        Queue.offerUnsafe(sleepInbound, sleepMessage)
         return
       }
       const witherMessage = decodeWitherWireMessage(event.data)
       if (witherMessage !== undefined) {
-        Queue.unsafeOffer(witherInbound, witherMessage)
+        Queue.offerUnsafe(witherInbound, witherMessage)
         return
       }
       const enderDragonMessage = decodeEnderDragonWireMessage(event.data)
       if (enderDragonMessage !== undefined) {
-        Queue.unsafeOffer(enderDragonInbound, enderDragonMessage)
+        Queue.offerUnsafe(enderDragonInbound, enderDragonMessage)
         return
       }
       const playerDamageMessage = decodePlayerDamageWireMessage(event.data)
       if (playerDamageMessage !== undefined) {
-        Queue.unsafeOffer(playerDamageInbound, playerDamageMessage)
+        Queue.offerUnsafe(playerDamageInbound, playerDamageMessage)
         return
       }
       const craftingMessage = decodeCraftingWireMessage(event.data)
       if (craftingMessage !== undefined) {
-        Queue.unsafeOffer(craftingInbound, craftingMessage)
+        Queue.offerUnsafe(craftingInbound, craftingMessage)
         return
       }
       const brewingMessage = decodeBrewingWireMessage(event.data)
       if (brewingMessage !== undefined) {
-        Queue.unsafeOffer(brewingInbound, brewingMessage)
+        Queue.offerUnsafe(brewingInbound, brewingMessage)
         return
       }
       const anvilMessage = decodeAnvilWireMessage(event.data)
       if (anvilMessage !== undefined) {
-        Queue.unsafeOffer(anvilInbound, anvilMessage)
+        Queue.offerUnsafe(anvilInbound, anvilMessage)
         return
       }
       const enchantingMessage = decodeEnchantingWireMessage(event.data)
       if (enchantingMessage !== undefined) {
-        Queue.unsafeOffer(enchantingInbound, enchantingMessage)
+        Queue.offerUnsafe(enchantingInbound, enchantingMessage)
         return
       }
-      Queue.unsafeOffer(inbound, event.data)
+      Queue.offerUnsafe(inbound, event.data)
     }
 
     function handleClose(event: WebSocketCloseEvent): void {

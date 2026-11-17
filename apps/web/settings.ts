@@ -1,4 +1,5 @@
 import {
+  AudioVolume,
   DEFAULT_VOLUME_SETTINGS,
 } from '@nerima-games/mc-audio'
 import {
@@ -14,68 +15,184 @@ import {
   SaveKey,
   saveTo,
   defineFormat,
+  defineFormatMigration,
   type SaveDecodeError,
   type SaveFormat,
   type StorageError,
   type StoragePort,
 } from '@nerima-games/mc-save'
-import { Effect, Option, Schema } from 'effect'
+import { decodeSettings } from '@nerima-games/mc-sim'
+import { Effect, Option, Result, Schema } from 'effect'
 
 export const PLAYER_SETTINGS_FORMAT_NAME = '@nerima-games/mc-compose/player-settings'
 export const PLAYER_SETTINGS_KEY: SaveKey = SaveKey('mc-compose/player-settings')
 
-export const PLAYER_BINDING_ACTIONS: ReadonlyArray<Exclude<InputAction, 'escape'>> = INPUT_ACTIONS.filter(
-  (action): action is Exclude<InputAction, 'escape'> => action !== 'escape',
+type BindableAction = Exclude<InputAction, 'escape'>
+
+export const PLAYER_BINDING_ACTIONS: ReadonlyArray<BindableAction> = INPUT_ACTIONS.filter(
+  (action): action is BindableAction => action !== 'escape',
 )
 
 export type PlayerSettingsV1 = {
   readonly sensitivity: number
   readonly bindings: Bindings
-  readonly masterVolume: number
-  readonly sfxVolume: number
+  readonly masterVolume: AudioVolume
+  readonly sfxVolume: AudioVolume
   readonly audioEnabled: boolean
   readonly captionsEnabled: boolean
 }
+
+// AudioVolume accepts every finite number in [0, 1] and 1 is inside it, so a
+// failure means the brand's contract changed; throwing at module load surfaces
+// that instead of carrying an unbranded volume into audio.
+const FULL_SFX_VOLUME = Result.getOrThrowWith(
+  AudioVolume.result(1),
+  (error) => new Error(`player settings volume outside the AudioVolume range: ${error.message}`),
+)
 
 export const DEFAULT_PLAYER_SETTINGS: PlayerSettingsV1 = {
   sensitivity: 1,
   bindings: { ...DEFAULT_BINDINGS },
   masterVolume: DEFAULT_VOLUME_SETTINGS.master,
-  sfxVolume: 1,
+  sfxVolume: FULL_SFX_VOLUME,
   audioEnabled: true,
   captionsEnabled: true,
 }
 
-export const PLAYER_SETTINGS_FORMAT: SaveFormat<unknown, unknown> = defineFormat({
-  name: PLAYER_SETTINGS_FORMAT_NAME,
-  version: 1,
-  schema: Schema.Unknown,
+export type PlayerBindingRejected = {
+  readonly _tag: 'PlayerBindingRejected'
+  readonly action: BindableAction
+  readonly code: string
+  readonly reason: 'blank-key' | 'reserved-key'
+}
+
+const bindingCodeRejection = (code: string): PlayerBindingRejected['reason'] | undefined => {
+  if (code.trim().length === 0) return 'blank-key'
+  if (code === ESCAPE_KEY_CODE || code === FOCUS_NAVIGATION_KEY_CODE) return 'reserved-key'
+  return undefined
+}
+
+const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value)
+
+// mc-save decodes with default parse options, under which a struct drops
+// unknown keys; checking the raw record first makes an unknown key a decode
+// failure instead of something silently discarded.
+const withExactKeys = <S extends Schema.Top>(keys: ReadonlyArray<string>, schema: S) =>
+  Schema.Unknown.check(Schema.makeFilter((input) => {
+    if (!isRecord(input)) return 'Expected a record'
+    const unknownKey = Reflect.ownKeys(input).find((key) => typeof key !== 'string' || !keys.includes(key))
+    return unknownKey === undefined ? undefined : `Unexpected key ${String(unknownKey)}`
+  })).pipe(Schema.decodeTo(schema))
+
+const BindingCodeSchema = Schema.String.check(Schema.makeFilter((code) => {
+  const reason = bindingCodeRejection(code)
+  return reason === undefined ? undefined : `Binding code rejected: ${reason}`
+}))
+
+// The stored record holds exactly the bindable actions. 'escape' is owned by
+// the frame-level handler and absent from DEFAULT_BINDINGS, and v1 builds only
+// ever wrote PLAYER_BINDING_ACTIONS on top of DEFAULT_BINDINGS, so a stored
+// 'escape' key is rejected like any other unknown key.
+const PlayerBindingsSchema = withExactKeys(
+  PLAYER_BINDING_ACTIONS,
+  Schema.Struct(Object.fromEntries(PLAYER_BINDING_ACTIONS.map((action) => [action, BindingCodeSchema])))
+    .check(Schema.makeFilter((bindings) => {
+      const codes = Object.values(bindings)
+      return new Set(codes).size === codes.length || 'Each binding code must belong to one action'
+    })),
+)
+
+const AudioVolumeSchema = Schema.Number.pipe(Schema.fromBrand('AudioVolume', AudioVolume))
+
+const PlayerSettingsFieldsSchema = Schema.Struct({
+  sensitivity: Schema.Number,
+  bindings: PlayerBindingsSchema,
+  masterVolume: AudioVolumeSchema,
+  sfxVolume: AudioVolumeSchema,
+  audioEnabled: Schema.Boolean,
+  captionsEnabled: Schema.Boolean,
 })
+
+// mc-sim owns the ranges of the settings it shares with the host, so the raw
+// values are checked there before the volumes are branded for mc-audio.
+// decodeSettings fills every setting the candidate omits with mc-sim's
+// defaults and rejects any supplied value outside its schema.
+const StoredPlayerSettingsSchema = Schema.toEncoded(PlayerSettingsFieldsSchema).check(
+  Schema.makeFilter((settings) => Result.match(decodeSettings({
+    mouseSensitivity: settings.sensitivity,
+    masterVolume: settings.masterVolume,
+    sfxVolume: settings.sfxVolume,
+    audioEnabled: settings.audioEnabled,
+    captionsEnabled: settings.captionsEnabled,
+  }), {
+    onFailure: (error) => `mc-sim rejected the player settings: ${error.message}`,
+    onSuccess: () => undefined,
+  })),
+)
+
+const PlayerSettingsSchema = withExactKeys(
+  Object.keys(PlayerSettingsFieldsSchema.fields),
+  StoredPlayerSettingsSchema,
+).pipe(Schema.decodeTo(PlayerSettingsFieldsSchema))
+
+const decodePlayerSettings = Schema.decodeUnknownResult(PlayerSettingsSchema)
+
+const fillOmitted = (
+  record: Readonly<Record<string, unknown>>,
+  defaults: Readonly<Record<string, unknown>>,
+): Readonly<Record<string, unknown>> => ({
+  ...record,
+  ...Object.fromEntries(Object.entries(defaults).filter(([key]) => !Object.hasOwn(record, key))),
+})
+
+// Builds before v2 stored a record without a schema and older ones wrote fewer
+// fields. Only omitted fields and omitted binding actions are filled; a present
+// value is carried as is, so an invalid one still fails the v2 decode.
+const migrateFromV1 = (record: Readonly<Record<string, unknown>>): Readonly<Record<string, unknown>> => {
+  const bindings = record['bindings']
+  return fillOmitted(
+    isRecord(bindings) ? { ...record, bindings: fillOmitted(bindings, DEFAULT_BINDINGS) } : record,
+    DEFAULT_PLAYER_SETTINGS,
+  )
+}
+
+// defineFormatMigration only rejects an invalid fromVersion or a migrate that
+// is not a function, and defineFormat only rejects a blank name or a version
+// that is not a safe integer >= 1. All inputs here are module constants that
+// satisfy that, so a failure means they were edited into an invalid state;
+// failing at module load surfaces that before any settings are read or written.
+const formatDefinitionError = (problems: ReadonlyArray<string>): Error =>
+  new Error(`invalid player settings save format: ${problems.join('; ')}`)
+
+export const PLAYER_SETTINGS_FORMAT: SaveFormat<PlayerSettingsV1, unknown> = Result.getOrThrowWith(
+  defineFormat({
+    name: PLAYER_SETTINGS_FORMAT_NAME,
+    version: 2,
+    schema: PlayerSettingsSchema,
+    migrations: [
+      Result.getOrThrowWith(
+        defineFormatMigration({
+          fromVersion: 1,
+          schema: Schema.declare(isRecord, { expected: 'Player settings v1 record' }),
+          migrate: migrateFromV1,
+        }),
+        formatDefinitionError,
+      ),
+    ],
+  }),
+  formatDefinitionError,
+)
 
 export type PlayerSettingsPersistenceError = StorageError | SaveDecodeError
 
-const asRecord = (value: unknown): Readonly<Record<string, unknown>> | undefined =>
-  typeof value === 'object' && value !== null && !Array.isArray(value)
-    ? value as Readonly<Record<string, unknown>>
-    : undefined
-
-const boundedNumber = (value: unknown, fallback: number, min: number, max: number): number =>
-  typeof value === 'number' && Number.isFinite(value)
-    ? Math.min(max, Math.max(min, value))
-    : fallback
-
-const validBindingCode = (value: unknown): value is string =>
-  typeof value === 'string'
-  && value.trim().length > 0
-  && value !== ESCAPE_KEY_CODE
-  && value !== FOCUS_NAVIGATION_KEY_CODE
-
 export const rebindPlayerSettings = (
   bindings: Bindings,
-  action: Exclude<InputAction, 'escape'>,
+  action: BindableAction,
   code: string,
-): Bindings => {
-  if (!validBindingCode(code) || !PLAYER_BINDING_ACTIONS.includes(action)) return bindings
+): Result.Result<Bindings, PlayerBindingRejected> => {
+  const reason = bindingCodeRejection(code)
+  if (reason !== undefined) return Result.fail({ _tag: 'PlayerBindingRejected', action, code, reason })
 
   const previousCode = bindings[action] ?? DEFAULT_BINDINGS[action]
   const conflictingAction = PLAYER_BINDING_ACTIONS.find(
@@ -83,52 +200,86 @@ export const rebindPlayerSettings = (
   )
   const next = { ...bindings, [action]: code }
   if (conflictingAction !== undefined) next[conflictingAction] = previousCode
-  return next
+  return Result.succeed(next)
 }
 
-export const normalizeBindings = (value: unknown): Bindings => {
-  const record = asRecord(value)
-  if (record === undefined) return { ...DEFAULT_BINDINGS }
-
-  return PLAYER_BINDING_ACTIONS.reduce<Bindings>((bindings, action) => {
-    const code = record[action]
-    return validBindingCode(code) ? rebindPlayerSettings(bindings, action, code) : bindings
-  }, { ...DEFAULT_BINDINGS })
-}
-
-export const normalizePlayerSettings = (value: unknown): PlayerSettingsV1 => {
-  const record = asRecord(value)
-  if (record === undefined) return { ...DEFAULT_PLAYER_SETTINGS, bindings: { ...DEFAULT_BINDINGS } }
-
-  return {
-    sensitivity: boundedNumber(record['sensitivity'], 1, 0.1, 3),
-    bindings: normalizeBindings(record['bindings']),
-    masterVolume: boundedNumber(
-      record['masterVolume'],
-      DEFAULT_VOLUME_SETTINGS.master,
-      0,
-      1,
-    ),
-    sfxVolume: boundedNumber(record['sfxVolume'], 1, 0, 1),
-    audioEnabled: typeof record['audioEnabled'] === 'boolean' ? record['audioEnabled'] : true,
-    captionsEnabled: typeof record['captionsEnabled'] === 'boolean'
-      ? record['captionsEnabled']
-      : true,
-  }
-}
+export const updatePlayerSettings = (
+  current: PlayerSettingsV1,
+  patch: Partial<Omit<PlayerSettingsV1, 'bindings'>>,
+): Result.Result<PlayerSettingsV1, Schema.SchemaError> => decodePlayerSettings({ ...current, ...patch })
 
 export const loadPlayerSettings = (): Effect.Effect<
   PlayerSettingsV1,
   PlayerSettingsPersistenceError,
   StoragePort
 > => loadFrom(PLAYER_SETTINGS_FORMAT, PLAYER_SETTINGS_KEY).pipe(
-  Effect.map(Option.match({
-    onNone: () => normalizePlayerSettings(undefined),
-    onSome: normalizePlayerSettings,
-  })),
+  Effect.map(Option.getOrElse(() => DEFAULT_PLAYER_SETTINGS)),
 )
+
+export type PlayerSettingsLoad = {
+  readonly settings: PlayerSettingsV1
+  readonly failure: PlayerSettingsPersistenceError | undefined
+}
+
+// A session whose stored settings cannot be read starts with the defaults, but
+// keeps the failure beside them: the host warns the player, and the stored
+// record stays untouched until a change the player makes replaces it.
+export const loadPlayerSettingsForSession = (): Effect.Effect<PlayerSettingsLoad, never, StoragePort> =>
+  loadPlayerSettings().pipe(Effect.match({
+    onSuccess: (settings): PlayerSettingsLoad => ({ settings, failure: undefined }),
+    onFailure: (failure): PlayerSettingsLoad => ({ settings: DEFAULT_PLAYER_SETTINGS, failure }),
+  }))
+
+/**
+ * The settings a session runs with and the settings storage holds.
+ *
+ * `applied` is the value of the newest queued write: the dialog and the runtime
+ * show it as soon as it is queued. `saved` is the value of the newest write that
+ * succeeded, or the value the session started with before any write succeeded.
+ * Writes run one at a time in queue order, so each write settles after every
+ * write queued before it.
+ */
+export type PlayerSettingsWrites = {
+  readonly applied: PlayerSettingsV1
+  readonly saved: PlayerSettingsV1
+}
+
+export const initialPlayerSettingsWrites = (settings: PlayerSettingsV1): PlayerSettingsWrites => ({
+  applied: settings,
+  saved: settings,
+})
+
+export const queuePlayerSettingsWrite = (
+  writes: PlayerSettingsWrites,
+  next: PlayerSettingsV1,
+): PlayerSettingsWrites => ({ applied: next, saved: writes.saved })
+
+export type PlayerSettingsWriteSettled = {
+  readonly writes: PlayerSettingsWrites
+  // No newer write was queued after this one. Only the latest write reports
+  // its outcome as the session's settings state.
+  readonly latest: boolean
+}
+
+export const playerSettingsWriteSucceeded = (
+  writes: PlayerSettingsWrites,
+  written: PlayerSettingsV1,
+): PlayerSettingsWriteSettled => ({
+  writes: { applied: writes.applied, saved: written },
+  latest: writes.applied === written,
+})
+
+// A failed latest write takes the session back to the saved value. A failed
+// older write changes nothing: a newer write is queued after it and settles
+// later, so restoring here would undo a value the player chose after it.
+export const playerSettingsWriteFailed = (
+  writes: PlayerSettingsWrites,
+  written: PlayerSettingsV1,
+): PlayerSettingsWriteSettled => writes.applied === written
+  ? { writes: { applied: writes.saved, saved: writes.saved }, latest: true }
+  : { writes, latest: false }
 
 export const savePlayerSettings = (
   settings: PlayerSettingsV1,
 ): Effect.Effect<void, StorageError | SaveDecodeError, StoragePort> =>
-  saveTo(PLAYER_SETTINGS_FORMAT, PLAYER_SETTINGS_KEY, normalizePlayerSettings(settings))
+  saveTo(PLAYER_SETTINGS_FORMAT, PLAYER_SETTINGS_KEY, settings)

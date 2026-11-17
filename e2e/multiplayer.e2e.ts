@@ -4,15 +4,17 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { blockIdOf, defaultBlockState, encodeBlockState } from '@nerima-games/mc-kernel'
 import type { NetworkMessage } from '@nerima-games/mx-multiplayer'
 import { expect, test, type Browser, type BrowserContext, type Page } from '@playwright/test'
+import { Option, Result } from 'effect'
 import { tsImport } from 'tsx/esm/api'
 import { WebSocket } from 'ws'
 
+import { callQa } from './helpers/qa'
 import { startGameSession } from './helpers/session'
 import { E2E_MULTIPLAYER_URL } from '../playwright.config'
 
-const QA_GLOBAL_KEY = '__NERIMA_GAMES_QA__'
 const LEGACY_SECRETS = {
   'alice-e2e': 'alice-e2e-registration-secret',
   'bob-e2e': 'bob-e2e-registration-secret',
@@ -51,16 +53,6 @@ type GameplaySnapshot = {
   }
 }
 
-const callQa = <A>(page: Page, command: string): Promise<A> =>
-  page.evaluate(async ({ key, commandName }) => {
-    const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-      | Record<string, () => unknown>
-      | undefined
-    const operation = surface?.[commandName]
-    if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
-    return await operation()
-  }, { key: QA_GLOBAL_KEY, commandName: command }) as Promise<A>
-
 const snapshot = (page: Page): Promise<GameplaySnapshot> =>
   callQa(page, 'gameplay.snapshot')
 
@@ -93,7 +85,8 @@ const useTargetedBlock = async (page: Page): Promise<void> => {
 
 const createCreativeWorld = async (page: Page, name: string): Promise<string> => {
   await page.goto('/')
-  await page.locator('[data-menu-entry="new-world"]').click()
+  await page.locator('[data-menu-entry="single-player"]').click()
+  await page.locator('[data-menu-action="new-world"]').click()
   await page.locator('input[data-mx-ui="menu-world-name"]').fill(name)
   await page.locator('[data-mx-ui="menu-game-mode"]').click()
   await expect(page.locator('[data-mx-ui="menu-game-mode"]')).toHaveAttribute(
@@ -108,7 +101,8 @@ const createCreativeWorld = async (page: Page, name: string): Promise<string> =>
 
 const createSurvivalWorld = async (page: Page, name: string): Promise<string> => {
   await page.goto('/')
-  await page.locator('[data-menu-entry="new-world"]').click()
+  await page.locator('[data-menu-entry="single-player"]').click()
+  await page.locator('[data-menu-action="new-world"]').click()
   await page.locator('input[data-mx-ui="menu-world-name"]').fill(name)
   await expect(page.locator('[data-mx-ui="menu-game-mode"]')).toHaveAttribute(
     'aria-label',
@@ -118,6 +112,7 @@ const createSurvivalWorld = async (page: Page, name: string): Promise<string> =>
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
   await callQa(page, 'gameplay.seedCreativePlacementEncounter')
   await page.keyboard.press('Escape')
+  await expect(page.locator('body')).toHaveAttribute('data-session-paused', 'true')
   await callQa(page, 'persistence.flush')
   await expect(page.locator('body')).toHaveAttribute('data-session-persistence', 'saved')
   expect((await snapshot(page)).mode).toBe('survival')
@@ -149,8 +144,8 @@ const { encodeFrame } = await tsImport(
 
 const encode = (message: NetworkMessage): string => {
   const result = encodeFrame(message)
-  if (result._tag === 'Left') throw result.left
-  return result.right
+  if (result._tag === 'Failure') throw result.failure
+  return result.success
 }
 
 type WireMessageReader = {
@@ -264,11 +259,17 @@ const expectOutOfBoundsPlacementRejection = async (
     } as NetworkMessage))
     expect(await reader.next()).toMatchObject({ _tag: 'WorldSnapshot', revision })
 
+    const stone = Option.getOrThrow(blockIdOf('stone'))
+    const state = Result.getOrThrow(Result.flatMap(
+      defaultBlockState(stone),
+      (values) => encodeBlockState(stone, values),
+    ))
     socket.send(encode({
       _tag: 'BlockPlace',
       player: 'invalid-mutation-e2e',
       at: { x: 30_000_001, y: 64, z: 0 },
       block: 'stone',
+      state,
     } as NetworkMessage))
     expect(await receiveMessageWithTag(reader, 'BlockMutationRejected')).toMatchObject({
       _tag: 'BlockMutationRejected',
@@ -394,6 +395,7 @@ const openPlayer = async (
   if (createWorld !== createSurvivalWorld) {
     await callQa<GameplaySnapshot>(page, 'gameplay.seedCreativePlacementEncounter')
     await page.keyboard.press('Escape')
+    await expect(page.locator('body')).toHaveAttribute('data-session-paused', 'true')
     await callQa(page, 'persistence.flush')
     await expect(page.locator('body')).toHaveAttribute('data-session-persistence', 'saved')
   }
@@ -407,7 +409,7 @@ test('joins a saved world from the title screen multiplayer form', async ({ page
   await page.keyboard.press('Escape')
   await Promise.all([
     page.waitForURL((url) => url.pathname === '/'),
-    page.locator('#save-quit-button').click(),
+    page.getByTestId('save-quit-button').click(),
   ])
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-route', 'title')
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
@@ -464,6 +466,7 @@ test('does not explode or mutate a Nether bed in multiplayer', async ({ page }) 
     expect(seeded.bedExplosionProbe.block).not.toBeNull()
     expect(seeded.bedExplosionProbe.block).not.toBe(0)
     await page.keyboard.press('Escape')
+    await expect(page.locator('body')).toHaveAttribute('data-session-paused', 'true')
     await callQa(page, 'persistence.flush')
     await expect(page.locator('body')).toHaveAttribute('data-session-persistence', 'saved')
     await connectPage(
@@ -779,6 +782,7 @@ test('multiplayer hotbar selection updates before the network round trip, not af
   try {
     const sessionUrl = await createCreativeWorld(page, 'Hotbar Race E2E')
     await page.keyboard.press('Escape')
+    await expect(page.locator('body')).toHaveAttribute('data-session-paused', 'true')
     await callQa(page, 'persistence.flush')
     await expect(page.locator('body')).toHaveAttribute('data-session-persistence', 'saved')
     await connectPage(page, multiplayerUrl(sessionUrl, player, 'Alice', server.url), LEGACY_SECRETS[player])
@@ -862,6 +866,7 @@ test('a connected multiplayer player can craft (regression for the empty-grid de
     await startGameSession(page, 'mp-crafting-e2e')
     await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
     await page.keyboard.press('Escape')
+    await expect(page.locator('body')).toHaveAttribute('data-session-paused', 'true')
     await callQa(page, 'persistence.flush')
     await expect(page.locator('body')).toHaveAttribute('data-session-persistence', 'saved')
     const sessionUrl = page.url()
@@ -882,7 +887,7 @@ test('a connected multiplayer player can craft (regression for the empty-grid de
 
     await page.keyboard.press('KeyE')
     await expect(inventory).toBeVisible()
-    await expect(hotbarSlot).toHaveAttribute('aria-label', /oak_planks/)
+    await expect(hotbarSlot).toHaveAttribute('aria-label', 'Hotbar slot 1, Oak Planks, 4')
 
     // One click selects the whole plank stack as the multiplayer move-source
     // (the same selection `activateInventoryTarget` already uses for
@@ -898,7 +903,7 @@ test('a connected multiplayer player can craft (regression for the empty-grid de
     // against the grid's actual contents, never by network-pending status.
     await expect(outcome).toHaveAttribute('data-crafting-state', 'match')
     await expect(output).toHaveAttribute('aria-disabled', 'false')
-    await expect(output).toHaveAttribute('aria-label', /stick, 4/)
+    await expect(output).toHaveAttribute('aria-label', 'Crafting output, Stick, 4')
 
     // The real gate this defect broke: a genuine click on a genuinely
     // enabled button reaching the server.
@@ -959,18 +964,9 @@ test('closing a chest is honored once a facility command already in flight resol
     // test above for the same lesson).
     await startGameSession(page, 'chest-close-race-e2e')
     await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
-    // `callQa` above takes no arguments; `gameplay.setPose` needs the chest
-    // block id, so this calls it directly rather than widening the shared
-    // helper's signature for one call site.
-    await page.evaluate(({ key, targetBlock }) => {
-      const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-        | Record<string, (block: number) => unknown>
-        | undefined
-      const operation = surface?.['gameplay.setPose']
-      if (operation === undefined) throw new Error('missing QA command: gameplay.setPose')
-      return operation(targetBlock)
-    }, { key: QA_GLOBAL_KEY, targetBlock: CHEST_BLOCK_ID })
+    await callQa(page, 'gameplay.setPose', CHEST_BLOCK_ID)
     await page.keyboard.press('Escape')
+    await expect(page.locator('body')).toHaveAttribute('data-session-paused', 'true')
     await callQa(page, 'persistence.flush')
     await expect(page.locator('body')).toHaveAttribute('data-session-persistence', 'saved')
     const sessionUrl = page.url()
@@ -1076,15 +1072,9 @@ test('breaking a chest through the authoritative multiplayer server drops its st
     // never completes within the test's timeout.
     await createCreativeWorld(page, 'Chest Break Drop E2E')
     await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
-    await page.evaluate(({ key, targetBlock }) => {
-      const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-        | Record<string, (block: number) => unknown>
-        | undefined
-      const operation = surface?.['gameplay.setPose']
-      if (operation === undefined) throw new Error('missing QA command: gameplay.setPose')
-      return operation(targetBlock)
-    }, { key: QA_GLOBAL_KEY, targetBlock: CHEST_BLOCK_ID })
+    await callQa(page, 'gameplay.setPose', CHEST_BLOCK_ID)
     await page.keyboard.press('Escape')
+    await expect(page.locator('body')).toHaveAttribute('data-session-paused', 'true')
     await callQa(page, 'persistence.flush')
     await expect(page.locator('body')).toHaveAttribute('data-session-persistence', 'saved')
     const sessionUrl = page.url()

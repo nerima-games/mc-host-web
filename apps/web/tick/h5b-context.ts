@@ -1,17 +1,24 @@
-import type { BlockPosition, MonotonicTimeSecs } from '@nerima-games/mc-kernel'
+import type { MonotonicTimeSecs } from '@nerima-games/mc-kernel'
 import type { ItemStack } from '@nerima-games/mc-sim'
 import type { GameplayFrameState } from '@nerima-games/mx-gameplay'
-import type { Effect } from 'effect'
+import type { Effect, Result } from 'effect'
 
 import type { H5aFrameInputResult, H5aMovementResult, H5aTickContext, MutableState } from './h5a-context'
 
 type EffectValue<T> = T extends Effect.Effect<infer A, infer _E, infer _R> ? A : never
 type LegacyGameplayItemType = Exclude<ItemStack['item'], 'arrow' | 'bow'>
+type WorldExplosionFailure =
+  | import('effect').Brand.BrandError
+  | Result.Result.Failure<ReturnType<typeof import('@nerima-games/mc-sim').planExplosion>>
+  | import('@nerima-games/mc-kernel').BlockRegistryResolutionFailure
+  | Effect.Error<ReturnType<import('@nerima-games/mc-kernel').WorldWritePort['Service']['applyBatch']>>
+  | import('../owner-backed-services').OwnerBackedPlayerSyncError
 
 export type H5bPostFrameInput = Readonly<{
   readonly frame: H5aFrameInputResult
   readonly movement: H5aMovementResult
-  readonly framesTotal: number
+  /** Fixed ticks run this session; dropped-item pickup eligibility counts these. */
+  readonly ticksTotal: number
 }>
 
 export type H5bPostFrameResult = Readonly<{
@@ -28,6 +35,7 @@ export type H5bPostFrameContext = {
   readonly h5a: Omit<Pick<
     H5aTickContext,
     | 'world'
+    | 'entityManager'
     | 'playerApi'
     | 'simState'
     | 'currentChunkContext'
@@ -35,6 +43,7 @@ export type H5bPostFrameContext = {
     | 'blockPosition'
     | 'blockTypeOfId'
     | 'gameplayState'
+    | 'targeting'
     | 'multiplayer'
     | 'isCreativeMode'
     | 'survivalHunger'
@@ -64,7 +73,7 @@ export type H5bPostFrameContext = {
   }
   readonly state: {
     readonly blockBreakCounters: MutableState<import('../mining-completion').BlockBreakCounters>
-    readonly environmentalContactDamageState: MutableState<ReturnType<typeof import('@nerima-games/mx-gameplay').resolveEnvironmentalContactDamage>['state']>
+    readonly environmentalContactDamageState: MutableState<import('@nerima-games/mx-gameplay').EnvironmentalContactDamageState>
     readonly witherRuntimeState: MutableState<ReturnType<typeof import('@nerima-games/mc-server/shared').restoreWitherRuntime>>
     readonly projectileRuntimeState: MutableState<ReturnType<typeof import('../projectile-runtime').initialProjectileRuntimeState>>
     readonly eyeOfEnderRuntimeState: MutableState<ReturnType<typeof import('../eye-of-ender-runtime').initialEyeOfEnderRuntimeState>>
@@ -120,10 +129,19 @@ export type H5bPostFrameContext = {
   readonly renderTradeUi: () => void
   readonly enqueueMultiplayerPlayerMove: (nowSecs: MonotonicTimeSecs) => void
   readonly sendEntityCommand: import('../multiplayer-client').MultiplayerClientApi['sendEntityCommand']
-  readonly applyPortalTravels: () => Effect.Effect<void>
+  readonly applyPortalTravels: () => Effect.Effect<void,
+    | import('@nerima-games/mc-sim').PlayerServiceInputError
+    | import('../owner-backed-services').OwnerBackedPlayerWriteError
+    | import('effect').Schema.SchemaError
+    | import('@nerima-games/mc-kernel').WorldWriteChunkUnavailable
+    | import('@nerima-games/mc-kernel').WorldWriteConflict
+    | import('@nerima-games/mc-kernel').BlockRegistryResolutionFailure
+    | import('@nerima-games/mc-worldgen').ChunkStoreError
+    | import('@nerima-games/mc-kernel').WorldWriteInvalidBatch
+  >
   readonly applyPlayerDamage: (
     damage: Parameters<H5aTickContext['world']['vitals']['damage']>[0],
-    minimumHealthPoints?: number,
+    minimumHealthPoints?: import('@nerima-games/mc-kernel').EntityHealthPoints,
   ) => void
   readonly settleMeleeAttackResults: () => void
   readonly alignActiveDimension: (dimension: import('../session-persistence').SessionState['dimension']) => boolean
@@ -143,13 +161,13 @@ export type H5bPostFrameContext = {
   readonly environmentalContactsForPose: (
     pose: Readonly<{ readonly feetPosition: Readonly<{ readonly x: number; readonly y: number; readonly z: number }> }>,
   ) => ReadonlyArray<import('@nerima-games/mx-gameplay').EnvironmentalContact>
-  readonly isGameplayBlockSolid: (position: Readonly<{ readonly x: number; readonly y: number; readonly z: number }>) => boolean
+  readonly isGameplayBlockSolid: ReturnType<typeof import('@nerima-games/mx-gameplay').solidityFromStore>
   readonly applyWorldExplosion: (
     center: Readonly<{ readonly x: number; readonly y: number; readonly z: number }>,
     radius: number,
     seed: number,
     destroysResistantBlocks: boolean,
-  ) => void
+  ) => Result.Result<void, WorldExplosionFailure>
   readonly resetBowUse: () => void
   readonly projectileHud: Pick<HTMLElement, 'textContent' | 'hidden'>
   readonly projectedInventoryEnchantedItem: (slotIndex: number) => import('@nerima-games/mx-gameplay').EnchantedItem | null
@@ -164,7 +182,6 @@ export type H5bPostFrameContext = {
   readonly bowDamage: typeof import('@nerima-games/mx-gameplay').bowDamage
   readonly bowDamageWithEnchantments: typeof import('@nerima-games/mx-gameplay').bowDamageWithEnchantments
   readonly advanceFootstepRuntime: typeof import('../footstep-runtime').advanceFootstepRuntime
-  readonly surfaceForBlockType: typeof import('../footstep-runtime').surfaceForBlockType
   readonly audio: Pick<import('../audio-runtime').AudioRuntime, 'play'>
   readonly advanceWitherRuntime: typeof import('@nerima-games/mc-server/shared').advanceWitherRuntime
   readonly damageRuntimeWither: typeof import('@nerima-games/mc-server/shared').damageRuntimeWither
@@ -186,10 +203,6 @@ export type H5bPostFrameContext = {
   readonly requestMeleeAttack: typeof import('@nerima-games/mx-gameplay').requestMeleeAttack
   readonly requestBlockBreak: typeof import('@nerima-games/mx-gameplay').requestBlockBreak
   readonly requestPotatoHarvest: typeof import('@nerima-games/mx-gameplay').requestPotatoHarvest
-  readonly crops: {
-    readonly matureYieldsAt: (location: { readonly dimension: import('../session-persistence').SessionState['dimension']; readonly position: BlockPosition }) => Effect.Effect<unknown>
-    readonly remove: (location: { readonly dimension: import('../session-persistence').SessionState['dimension']; readonly position: BlockPosition }) => Effect.Effect<void>
-  }
   readonly pendingItemUses: {
     readonly set: (
       requestId: string,

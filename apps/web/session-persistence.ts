@@ -1,31 +1,54 @@
-import { Data, Effect, Option, Schema } from 'effect'
+import { Array as Arr, Data, Effect, Option, Result, Schema, SchemaIssue, SchemaTransformation } from 'effect'
 import type { YieldableError } from 'effect/Cause'
 import { isValidWitherRuntimeSnapshot, type WitherRuntimeSnapshot } from '@nerima-games/mc-server/shared'
 
-import { ChunkAxis, isItemType, type ChunkCoord } from '@nerima-games/mc-kernel'
+import { ChunkAxis, isItemStack, isItemType, type ChunkCoord } from '@nerima-games/mc-kernel'
 import {
+  decodeSave,
+  encodeSave,
+  isFromFuture,
   loadFrom,
+  loadRetainedRevision,
+  SaveDecodeError,
+  SaveEnvelopeSchema,
   SaveKey,
-  saveTo,
+  sealSaveEnvelope,
   StoragePort,
   defineFormat,
-  type SaveDecodeError,
+  SaveFormatVersion,
+  validateSaveEnvelope,
+  writeRevisionedSave,
+  writeRevisionedSaveWithCheckpoint,
+  type RevisionStorage,
+  type SaveEnvelope,
   type SaveFormat,
+  type SaveFormatMigration,
   type StorageError,
+  type StorageService,
 } from '@nerima-games/mc-save'
 import {
-  advanceFurnace,
   isValidTimeState,
+  isValidVitals,
   isValidWeatherState,
   durabilityForItem,
   maxStackCountForItem,
   validateContainerStorageSnapshot,
+  validateFurnaceSnapshot,
   validatePlayerStorageSnapshot,
   validateCropSnapshot,
   type ContainerStorageSnapshot,
   type CropSnapshot,
+  BREWING_FUEL_CHARGES,
+  BREWING_FUEL_ITEM,
+  BREWING_MAX_FUEL_CHARGES,
+  LegacyItemStackSchema,
+  itemStack,
+  validateBrewingSnapshot,
+  type BrewingState,
+  type ItemStackFailure,
+  type Durability,
+  type EquipmentItem,
   type FurnaceState,
-  type ItemStack,
   type PlayerStorage,
   type TimeState,
   type WeatherState,
@@ -35,15 +58,15 @@ import {
 import {
   CHUNK_FORMAT,
   chunkSnapshotOf,
-  type Chunk,
   type ChunkSource,
   type ChunkStoreApi,
+  type ChunkWithBlockStates,
   type Dimension,
 } from '@nerima-games/mc-worldgen'
 import {
   emptyVillagerTradeState,
+  collectBrewingBottle,
   isValidBrewingStandState,
-  isValidPlayerVitals,
   isValidStatusEffectState,
   isValidVillagerTradeState,
   decodeEnchantedItem,
@@ -59,60 +82,37 @@ import {
 } from '@nerima-games/mx-gameplay'
 
 export const SESSION_FORMAT_NAME = '@nerima-games/mc-compose/session'
-export const SESSION_FORMAT_VERSION = 17
+export const SESSION_FORMAT_VERSION = 18
 
-const filterBoth = <A, I, R>(
-  source: Schema.Schema<A, I, R>,
-  issueFor: (value: A) => string | undefined,
-): Schema.Schema<A, I, R> => {
-  // Effectful filters are decode-only, so the declaration validates before encoding too.
-  const filtered = source.pipe(
-    Schema.filterEffect((value) => Effect.succeed(issueFor(value))),
-  )
-  return Schema.declare([filtered], {
-    decode: (schema) => (input, options) =>
-      Schema.decode(schema)(input as I, options).pipe(
-        Effect.mapError((error) => error.issue),
-      ),
-    encode: (schema) => (value, options) =>
-      Schema.decode(schema)(value as unknown as I, options).pipe(
-        Effect.flatMap((decoded) => Schema.encode(schema)(decoded, options)),
-        Effect.mapError((error) => error.issue),
-      ),
-  })
-}
+// Effect 4 runs a schema's checks on encode as well as decode, so a plain
+// `check` keeps the old "validate before encoding too" guarantee.
+const invariant = <T>(issueFor: (value: T) => string | undefined) =>
+  Schema.makeFilter<T>((value) => issueFor(value))
 
-const makeBoundaryCodec = <A, I>(
-  target: Schema.Schema<A, I>,
+// Swaps happen on the whole field value before the target schema sees it, so
+// the target still validates the restored domain value in both directions.
+const makeBoundaryCodec = <Target extends Schema.Top>(
+  target: Target,
   decodeValue: (input: unknown) => unknown,
-  encodeValue: (input: I) => unknown,
-): Schema.Schema<A, unknown> => Schema.declare([target], {
-  decode: (schema) => (input, options) =>
-    Schema.decode(schema)(decodeValue(input) as I, options).pipe(
-      Effect.mapError((error) => error.issue),
-    ),
-  encode: (schema) => (value, options) =>
-    Schema.encode(schema)(value as A, options).pipe(
-      Effect.map(encodeValue),
-      Effect.mapError((error) => error.issue),
-    ),
+  encodeValue: (input: unknown) => unknown,
+) =>
+  Schema.Unknown.pipe(
+    Schema.decodeTo(Schema.Unknown, SchemaTransformation.transform({ decode: decodeValue, encode: encodeValue })),
+    Schema.decodeTo(target, SchemaTransformation.passthrough({ strict: false })),
+  )
+
+const WitherRuntimeSnapshotSchema = Schema.declare(isValidWitherRuntimeSnapshot, {
+  expected: 'Wither runtime snapshot that satisfies persistence invariants',
 })
 
-const WitherRuntimeSnapshotSchema = filterBoth(
-  Schema.Unknown,
-  (value) => isValidWitherRuntimeSnapshot(value)
-    ? undefined
-    : 'Wither runtime snapshot violates persistence invariants',
-) as unknown as Schema.Schema<WitherRuntimeSnapshot>
-
-// mx-gameplay's `BrewingStandState.{bottle,ingredient,brewing}` are `X |
+// v17 stored mx-gameplay's `BrewingStandState`, whose `{bottle,ingredient,brewing}` are `X |
 // undefined` (never `null` — see `node_modules/@nerima-games/mx-gameplay/dist/
-// domain/brewing.d.ts`), and mc-save 0.3.0's integrity checksum rejects a bare
+// domain/brewing.d.ts`), and mc-save's integrity checksum rejects a bare
 // `undefined` anywhere in the encoded payload (`integrity-canonical.ts`'s
-// `canonicalize`; see the longer `exact: true` comment further down in this
-// file for the same gap on `Schema.optionalWith` fields). Swapping
-// `undefined` for `null` on encode and back on decode is unambiguous here
-// because these three fields never use `null` for anything else.
+// `canonicalize`; see the longer `optionalKey` comment further down in this
+// file for the same gap on optional fields). Swapping `undefined` for `null`
+// on encode and back on decode is unambiguous here because these three fields
+// never use `null` for anything else.
 const restoreBrewingUndefined = (value: unknown): unknown => {
   if (value === null || typeof value !== 'object') return value
   const record = value as Record<string, unknown>
@@ -124,14 +124,8 @@ const restoreBrewingUndefined = (value: unknown): unknown => {
   }
 }
 
-// Untyped rather than `(state: BrewingStandState) => unknown`: this also runs,
-// via `toStoredSessionState`, over the deliberately-malformed fixtures the
-// test suite's decode-rejection tests seed directly into `StoragePort`
-// (bypassing `saveSession`/this schema's own encode). A malformed fixture is
-// exactly a `BrewingStandState`-shaped value with an invalid VALUE at one of
-// its fields, never a differently-SHAPED value, so a defensive property read
-// here is enough — it mirrors `restoreBrewingUndefined`'s decode-side
-// looseness rather than trusting the nominal type.
+// Untyped because `makeBoundaryCodec` swaps on the raw field value before the
+// target schema has validated it.
 const encodeBrewingUndefined = (value: unknown): unknown => {
   if (value === null || typeof value !== 'object') return value
   const record = value as Record<string, unknown>
@@ -143,30 +137,19 @@ const encodeBrewingUndefined = (value: unknown): unknown => {
   }
 }
 
-const BrewingStandStateSchema = makeBoundaryCodec(
-  filterBoth(
-    Schema.Unknown,
-    (value) => isValidBrewingStandState(value)
-      ? undefined
-      : 'Brewing stand state violates gameplay invariants',
-  ) as unknown as Schema.Schema<BrewingStandState>,
+const V17BrewingStandStateSchema = makeBoundaryCodec(
+  Schema.declare(isValidBrewingStandState, { expected: 'Brewing stand state that satisfies gameplay invariants' }),
   restoreBrewingUndefined,
   encodeBrewingUndefined,
 )
 
-const StatusEffectStateSchema = filterBoth(
-  Schema.Unknown,
-  (value) => isValidStatusEffectState(value)
-    ? undefined
-    : 'Status effects violate gameplay invariants',
-) as unknown as Schema.Schema<StatusEffectState>
+const StatusEffectStateSchema = Schema.declare(isValidStatusEffectState, {
+  expected: 'Status effects that satisfy gameplay invariants',
+})
 
-const VillagerTradeStateSchema = filterBoth(
-  Schema.Unknown,
-  (value) => isValidVillagerTradeState(value)
-    ? undefined
-    : 'Villager trades violate gameplay invariants',
-) as unknown as Schema.Schema<VillagerTradeState>
+const VillagerTradeStateSchema = Schema.declare(isValidVillagerTradeState, {
+  expected: 'Villager trades that satisfy gameplay invariants',
+})
 
 export type SessionPosition = {
   readonly x: number
@@ -261,18 +244,15 @@ const normalizePersistedEntityBehaviour = (kind: string, behaviour: unknown): un
   })
   if (!enchantedItem.ok || (enchantedItem.value.durability !== null && count !== 1)) return behaviour
 
-  const eligibleFromFrame = drop['eligibleFromFrame']
   const customName = drop['customName']
   return {
     _tag: 'DroppedItem',
     item: enchantedItem.value.item,
     count,
     durability: enchantedItem.value.durability,
-    ...(typeof eligibleFromFrame === 'number'
-      && Number.isInteger(eligibleFromFrame)
-      && eligibleFromFrame >= 0
-      ? { eligibleFromFrame }
-      : {}),
+    // A saved `eligibleFromFrame` is not restored: it counts ticks of the session
+    // that dropped the item, and the new session counts from 0 again. It only
+    // ever held a one-tick grace, so a restored drop is pickable at once.
     ...(typeof customName === 'string' && customName.trim().length > 0 ? { customName } : {}),
     enchantments: enchantedItem.value.enchantments.map((enchantment) => ({ ...enchantment })),
     elapsedSecs: persistedItemDropLifetime(drop).elapsedSecs,
@@ -415,18 +395,17 @@ export const EMPTY_END_STATE: PersistedEndState = {
   dragonEggRewarded: false,
 }
 
-const PositionSchema: Schema.Schema<SessionPosition> = Schema.Struct({
+const PositionSchema = Schema.Struct({
   x: Schema.Number,
   y: Schema.Number,
   z: Schema.Number,
 })
 
-const BlockCoordinateSchema = filterBoth(
-  Schema.Number.pipe(Schema.finite()),
-  (value) => Number.isInteger(value) ? undefined : 'Block coordinate must be an integer',
+const BlockCoordinateSchema = Schema.Finite.check(
+  invariant<number>((value) => Number.isInteger(value) ? undefined : 'Block coordinate must be an integer'),
 )
 
-const BlockPositionSchema: Schema.Schema<SessionPosition> = Schema.Struct({
+const BlockPositionSchema = Schema.Struct({
   x: BlockCoordinateSchema,
   y: BlockCoordinateSchema,
   z: BlockCoordinateSchema,
@@ -453,7 +432,7 @@ export type SessionState = {
   readonly crops: CropSnapshot
   readonly entities: PersistedEntityRosters
   readonly villagers: PersistedVillagerState
-  readonly brewing: BrewingStandState
+  readonly brewing: BrewingState
   readonly statusEffects: StatusEffectState
   readonly end: PersistedEndState
   readonly workstations?: {
@@ -471,13 +450,13 @@ export type SessionState = {
   readonly mountedVehicleId?: string | null | undefined
 }
 
-const FiniteNumberSchema = Schema.Number.pipe(Schema.finite())
+const FiniteNumberSchema = Schema.Finite
 
-// Same undefined-vs-null gap as `PlayerStorageSchema`/`BrewingStandStateSchema`/
-// `PersistedEntityRostersSchema` above, but on a REQUIRED field rather than an
+// Same undefined-vs-null gap as `UndefinedSlotSchema`/`V17BrewingStandStateSchema`/
+// `PersistedEntityRostersSchema` in this file, but on a REQUIRED field rather than an
 // absent one: `PlayerVitals.lastDamageCause: DamageCause | undefined` is
 // always present (there is no death cause yet, not an omitted property), so
-// `Schema.optionalWith(..., { exact: true })` — which is about KEY absence —
+// `Schema.optionalKey` — which is about KEY absence —
 // does not apply here. `Schema.UndefinedOr` lets a present `undefined` VALUE
 // through validation (that is the whole point of the field's type), which is
 // exactly what mc-save's integrity checksum then rejects. The struct/filter
@@ -498,8 +477,14 @@ const encodeVitalsLastDamageCause = (value: unknown): unknown => {
   return { ...record, lastDamageCause: record['lastDamageCause'] ?? null }
 }
 
+// mx-gameplay's `PlayerVitals` is mc-sim's `Vitals`, whose branded fields have
+// exactly `isValidVitals` as their runtime contract (mx-gameplay's
+// `isValidPlayerVitals` delegates to it), so the guard narrows the
+// structurally checked record to that branded type.
+const isPersistablePlayerVitals = (value: unknown): value is PlayerVitals => isValidVitals(value)
+
 const PlayerVitalsSchema = makeBoundaryCodec(
-  filterBoth(Schema.Struct({
+  Schema.Struct({
     healthPoints: FiniteNumberSchema,
     maxHealthPoints: FiniteNumberSchema,
     hungerPoints: FiniteNumberSchema,
@@ -509,28 +494,27 @@ const PlayerVitalsSchema = makeBoundaryCodec(
     foodTimerSecs: FiniteNumberSchema,
     totalExperience: FiniteNumberSchema,
     lastDamageCause: Schema.UndefinedOr(Schema.String),
-  }), (value) => isValidPlayerVitals(value)
-    ? undefined
-    : 'Player vitals violate gameplay invariants'),
+  }).pipe(Schema.refine(isPersistablePlayerVitals, { expected: 'Player vitals that satisfy gameplay invariants' })),
   restoreVitalsLastDamageCause,
   encodeVitalsLastDamageCause,
 )
 
-const TimeStateSchema: Schema.Schema<TimeState> = filterBoth(Schema.Struct({
+const TimeStateSchema = Schema.Struct({
   ticks: FiniteNumberSchema,
   dayLengthTicks: FiniteNumberSchema,
-}), (value) => isValidTimeState(value)
+}).check(invariant<TimeState>((value) => isValidTimeState(value)
   ? undefined
-  : 'Time state violates simulation invariants')
+  : 'Time state violates simulation invariants'))
 
-const WeatherStateSchema: Schema.Schema<WeatherState> = filterBoth(Schema.Struct({
-  weather: Schema.Literal('clear', 'rain', 'thunder'),
+const WeatherStateSchema = Schema.Struct({
+  weather: Schema.Literals(['clear', 'rain', 'thunder']),
   remainingSecs: FiniteNumberSchema,
-}), (value) => isValidWeatherState(value)
-  ? undefined
-  : 'Weather state violates simulation invariants')
+}).pipe(Schema.refine(
+  (value): value is WeatherState => isValidWeatherState(value),
+  { expected: 'Weather state that satisfies simulation invariants' },
+))
 
-const DimensionSchema: Schema.Schema<Dimension> = Schema.Literal('overworld', 'nether', 'end')
+const DimensionSchema = Schema.Literals(['overworld', 'nether', 'end'])
 
 const PersistedEntitySchema = Schema.Struct({
   id: Schema.String,
@@ -545,8 +529,8 @@ const PersistedEntityRosterSchema = Schema.Struct({
   nextSerial: Schema.Number,
 })
 
-// Same undefined-vs-null gap as `PlayerStorageSchema`/`BrewingStandStateSchema`
-// above, one level further down: an entity's `behaviour` is `unknown` here
+// Same undefined-vs-null gap as `UndefinedSlotSchema`/`V17BrewingStandStateSchema`
+// in this file, one level further down: an entity's `behaviour` is `unknown` here
 // (there is no shared schema for the whole `MobBehaviour` union across every
 // mx-gameplay mob kind), so nothing upstream catches a passive mob's
 // `behaviour: undefined` — "a pig keeps its `undefined`" — before mc-save's
@@ -598,117 +582,139 @@ const PersistedEntityRostersSchema = makeBoundaryCodec(
   encodePersistedEntityRosters,
 )
 
-// Same undefined-vs-null gap as `BrewingStandStateSchema` above: mc-sim's
-// `Inventory.slots: ReadonlyArray<Slot>` models an empty slot as `undefined`
-// (`Slot = ItemStack | undefined`), never `null`, so the swap is unambiguous
-// for this one field.
-const restorePlayerStorageSlots = (value: unknown): unknown => {
-  if (value === null || typeof value !== 'object') return value
-  const record = value as Record<string, unknown>
-  const inventory = record['inventory']
-  if (inventory === null || typeof inventory !== 'object') return value
-  const inventoryRecord = inventory as Record<string, unknown>
-  const slots = inventoryRecord['slots']
-  if (!Array.isArray(slots)) return value
-  return {
-    ...record,
-    inventory: {
-      ...inventoryRecord,
-      slots: slots.map((slot) => (slot === null ? undefined : slot)),
-    },
-  }
+// Every item stack is persisted in mc-sim's `LegacyItemStackSchema` form
+// (`components: null` for the item's default components, otherwise the
+// components with `undefined` written as `null`); the host adds no stack codec
+// of its own.
+//
+// mc-sim models an empty player inventory or furnace slot as `undefined`
+// (`Slot = ItemStack | undefined`), which mc-save's checksum cannot store, so
+// this is the one place such a slot is written as `null` and read back.
+// Container and equipment slots already use `null` and need no swap.
+const UndefinedSlotSchema = Schema.NullOr(LegacyItemStackSchema).pipe(Schema.decodeTo(
+  Schema.UndefinedOr(Schema.toType(LegacyItemStackSchema)),
+  SchemaTransformation.transform({
+    decode: (slot) => slot ?? undefined,
+    encode: (slot) => slot ?? null,
+  }),
+))
+
+const isDurability = (value: unknown): value is Durability => {
+  const record = asRecord(value)
+  return typeof record?.['current'] === 'number' && typeof record['max'] === 'number'
 }
 
-// Untyped for the same reason as `encodeBrewingUndefined` above: it also runs
-// over the test suite's deliberately-malformed `PlayerStorage`-shaped
-// fixtures via `toStoredSessionState`, which never differ in SHAPE from a
-// real `PlayerStorage`, only in the values a real one would reject.
-const encodePlayerStorageSlots = (value: unknown): unknown => {
-  if (value === null || typeof value !== 'object') return value
-  const record = value as Record<string, unknown>
-  const inventory = record['inventory']
-  if (inventory === null || typeof inventory !== 'object') return value
-  const inventoryRecord = inventory as Record<string, unknown>
-  const slots = inventoryRecord['slots']
-  if (!Array.isArray(slots)) return value
-  return {
-    ...record,
-    inventory: {
-      ...inventoryRecord,
-      slots: slots.map((slot: unknown) => slot ?? null),
-    },
-  }
+const isStoredStack = (value: unknown): value is EquipmentItem => {
+  const record = asRecord(value)
+  return record !== undefined
+    && isItemStack({ item: record['item'], count: record['count'], components: record['components'] })
+    && (record['durability'] === null || isDurability(record['durability']))
 }
 
-const PlayerStorageSchema = makeBoundaryCodec(
-  filterBoth(Schema.Unknown, (value) =>
-    validatePlayerStorageSnapshot(value)._tag === 'Valid'
-      ? undefined
-      : 'Player storage violates persistence invariants') as unknown as Schema.Schema<PlayerStorage>,
-  restorePlayerStorageSlots,
-  encodePlayerStorageSlots,
-)
+// Equipment and container stacks carry a `durability` next to the stack
+// fields; the stack part goes through `LegacyItemStackSchema` and the
+// durability is copied as recorded. The full storage validators below check
+// the durability values.
+const StoredStackSchema = Schema.Unknown.pipe(Schema.decodeTo(
+  Schema.declare(isStoredStack, { expected: 'Item stack with its durability' }),
+  SchemaTransformation.transformEffect({
+    decode: (wire: unknown) => {
+      const durability = asRecord(wire)?.['durability']
+      return Schema.decodeUnknownEffect(LegacyItemStackSchema)(wire).pipe(
+        Effect.mapError((error) => error.issue),
+        Effect.flatMap((stack) =>
+          durability === null || isDurability(durability)
+            ? Effect.succeed({ ...stack, durability })
+            : Effect.fail(new SchemaIssue.InvalidValue(
+              { message: 'Stored stack durability must be null or { current, max }' },
+              durability,
+            ))),
+      )
+    },
+    encode: ({ durability, ...stack }: EquipmentItem) =>
+      Schema.encodeEffect(LegacyItemStackSchema)(stack).pipe(
+        Effect.mapError((error) => error.issue),
+        Effect.map((encoded): unknown => ({ ...asRecord(encoded), durability })),
+      ),
+  }),
+))
 
-const ContainerStorageSchema = filterBoth(Schema.Unknown, (value) =>
+const StoredSlotSchema = Schema.NullOr(StoredStackSchema)
+
+const isPersistablePlayerStorage = (value: unknown): value is PlayerStorage =>
+  validatePlayerStorageSnapshot(value)._tag === 'Valid'
+
+const PlayerStorageSchema = Schema.Struct({
+  inventory: Schema.Struct({ slots: Schema.Array(UndefinedSlotSchema) }),
+  equipment: Schema.Struct({
+    slots: Schema.Struct({
+      head: StoredSlotSchema,
+      chest: StoredSlotSchema,
+      legs: StoredSlotSchema,
+      feet: StoredSlotSchema,
+      offhand: StoredSlotSchema,
+    }),
+  }),
+  inventoryDurability: Schema.Array(Schema.Unknown),
+}).pipe(Schema.refine(isPersistablePlayerStorage, { expected: 'Player storage that satisfies persistence invariants' }))
+
+const isPersistableContainerStorage = (value: unknown): value is ContainerStorageSnapshot =>
   validateContainerStorageSnapshot(value)._tag === 'Valid'
-    ? undefined
-    : 'Container storage violates persistence invariants') as unknown as Schema.Schema<ContainerStorageSnapshot>
 
-const CropSnapshotSchema = filterBoth(Schema.Unknown, (value) =>
+const ContainerStorageSchema = Schema.Struct({
+  version: Schema.Literal(3),
+  containers: Schema.Array(Schema.Struct({
+    id: Schema.String,
+    kind: Schema.String,
+    slots: Schema.Array(StoredSlotSchema),
+  })),
+}).pipe(Schema.refine(isPersistableContainerStorage, {
+  expected: 'Container storage that satisfies persistence invariants',
+}))
+
+const isPersistableCropSnapshot = (value: unknown): value is CropSnapshot =>
   validateCropSnapshot(value)._tag === 'Valid'
-    ? undefined
-    : 'Crop snapshot violates persistence invariants') as unknown as Schema.Schema<CropSnapshot>
 
-const FurnaceStackCountSchema = filterBoth(FiniteNumberSchema, (count) => {
-  if (!Number.isInteger(count)) return 'Furnace stack count must be an integer'
-  if (count <= 0) return 'Furnace stack count must be positive'
-  return undefined
+const CropSnapshotSchema = Schema.declare(isPersistableCropSnapshot, {
+  expected: 'Crop snapshot that satisfies persistence invariants',
 })
 
-const FurnaceItemStackSchema = filterBoth(Schema.Struct({
-  item: Schema.String,
-  count: FurnaceStackCountSchema,
-}), (stack) => {
-    try {
-      const candidate = stack as ItemStack
-      advanceFurnace({
-        input: candidate,
-        fuel: null,
-        output: null,
-        cookElapsedSecs: 0,
-        burnRemainingSecs: 0,
-      }, Number.MIN_VALUE)
-      return stack.count <= maxStackCountForItem(candidate.item)
-        ? undefined
-        : 'Furnace slot violates item stack invariants'
-    } catch {
-      return 'Furnace slot violates item stack invariants'
-    }
-}) as unknown as Schema.Schema<ItemStack>
+const isPersistableFurnaceState = (value: unknown): value is FurnaceState =>
+  validateFurnaceSnapshot(value)._tag === 'Valid'
 
-const FurnaceElapsedSchema = filterBoth(FiniteNumberSchema, (seconds) =>
-  seconds >= 0 ? undefined : 'Furnace elapsed time must be non-negative')
+const FurnaceStateSchema = Schema.Struct({
+  station: Schema.String,
+  input: UndefinedSlotSchema,
+  fuel: UndefinedSlotSchema,
+  output: UndefinedSlotSchema,
+  fuelTimeRemainingSecs: Schema.Finite,
+  fuelTimeTotalSecs: Schema.Finite,
+  cookProgressSecs: Schema.Finite,
+}).pipe(Schema.refine(isPersistableFurnaceState, {
+  expected: 'Furnace state that satisfies simulation invariants',
+}))
 
-const FurnaceStateSchema = filterBoth(Schema.Struct({
-  input: Schema.NullOr(FurnaceItemStackSchema),
-  fuel: Schema.NullOr(FurnaceItemStackSchema),
-  output: Schema.NullOr(FurnaceItemStackSchema),
-  cookElapsedSecs: FurnaceElapsedSchema,
-  burnRemainingSecs: FurnaceElapsedSchema,
-}), (value) => {
-    try {
-      advanceFurnace(value, Number.MIN_VALUE)
-      return undefined
-    } catch {
-      return 'Furnace state violates simulation invariants'
-    }
-}) as unknown as Schema.Schema<FurnaceState>
+const isPersistableBrewingState = (value: unknown): value is BrewingState =>
+  validateBrewingSnapshot(value)._tag === 'Valid'
 
-const PersistedFurnacesSchema = filterBoth(Schema.Array(Schema.Struct({
+const BrewingStateSchema = Schema.Struct({
+  bottles: Schema.Tuple([UndefinedSlotSchema, UndefinedSlotSchema, UndefinedSlotSchema]),
+  ingredient: UndefinedSlotSchema,
+  fuel: UndefinedSlotSchema,
+  fuelCharges: Schema.Finite,
+  brewProgressSecs: Schema.Finite,
+}).pipe(Schema.refine(isPersistableBrewingState, {
+  expected: 'Brewing state that satisfies simulation invariants',
+}))
+
+const PersistedFurnaceSchema = Schema.Struct({
   dimension: DimensionSchema,
   position: BlockPositionSchema,
   state: FurnaceStateSchema,
-})), (furnaces) => {
+})
+
+const PersistedFurnacesSchema = Schema.Array(PersistedFurnaceSchema).check(
+  invariant<ReadonlyArray<typeof PersistedFurnaceSchema.Type>>((furnaces) => {
     const keys = new Set<string>()
     for (const furnace of furnaces) {
       const key = JSON.stringify([
@@ -721,63 +727,68 @@ const PersistedFurnacesSchema = filterBoth(Schema.Array(Schema.Struct({
       keys.add(key)
     }
     return undefined
-})
+  }),
+)
 
-const PersistedPortalsSchema: Schema.Schema<ReadonlyArray<PersistedPortalState>> = Schema.Array(
+const PersistedPortalsSchema = Schema.Array(
   Schema.Struct({
     dimension: DimensionSchema,
     position: BlockPositionSchema,
   }),
 )
 
-const PersistedVillagerStateSchema: Schema.Schema<PersistedVillagerState> = Schema.Struct({
+const PersistedVillagerStateSchema = Schema.Struct({
   residents: Schema.Array(Schema.Struct({
-    id: Schema.String.pipe(Schema.minLength(1)),
-    profession: Schema.Literal('farmer', 'toolsmith'),
+    id: Schema.String.check(Schema.isMinLength(1)),
+    profession: Schema.Literals(['farmer', 'toolsmith']),
     dimension: DimensionSchema,
     feetPosition: PositionSchema,
   })),
   trades: VillagerTradeStateSchema,
 })
 
-const PersistedEndStateSchema: Schema.Schema<PersistedEndState> = Schema.Struct({
+// mx-gameplay publishes this schema as a decoder only (its encoding services
+// are unknown); its encoded and decoded forms are the same plain record, so
+// the type guard it provides is the whole persistence contract.
+const EnderDragonSnapshotSchema = Schema.declare(Schema.is(EnderDragonEncounterSnapshotSchema), {
+  expected: 'Ender dragon encounter snapshot',
+})
+
+const PersistedEndStateSchema = Schema.Struct({
   frames: Schema.Array(Schema.Struct({
     position: BlockPositionSchema,
-    facing: Schema.Literal('north', 'south', 'east', 'west'),
+    facing: Schema.Literals(['north', 'south', 'east', 'west']),
     eye: Schema.Boolean,
   })),
   portalComplete: Schema.Boolean,
-  dragon: EnderDragonEncounterSnapshotSchema,
+  dragon: EnderDragonSnapshotSchema,
   exitPortalMaterialized: Schema.Boolean,
   dragonEggRewarded: Schema.Boolean,
 })
 
-// `exact: true` on every `Schema.optionalWith` below (in place of the plain
-// `Schema.optional` this file used before): mc-save 0.3.0's integrity
+// Every optional field below uses `Schema.optionalKey`: mc-save's integrity
 // checksum canonicalizes the encoded payload and rejects a bare `undefined`
 // anywhere in it — it is not one of the supported value kinds (see
-// `integrity-canonical.ts`'s `canonicalize`, which throws for anything that
-// is not a string/boolean/finite-or-non-finite number/null/plain
-// object/array/Uint8Array). Plain `Schema.optional` encodes an ABSENT
-// property as an explicit `undefined` key; `exact: true` omits the key
-// instead, which is also what `exactOptionalPropertyTypes` already expects
-// of every `?:` field in `SessionState`.
-const PersistedVehiclesSchema = Schema.optionalWith(
-  filterBoth(Schema.Unknown, (value) => {
-    if (!Array.isArray(value)) return 'Vehicles violate simulation invariants'
-    const highestSerial = value.reduce((highest, vehicle) => {
-      if (typeof vehicle !== 'object' || vehicle === null) return highest
-      const candidate = vehicle as { readonly id?: unknown }
-      if (typeof candidate.id !== 'string') return highest
-      const match = /^v:(\d+)$/.exec(candidate.id)
-      return match === null ? highest : Math.max(highest, Number(match[1]))
-    }, -1)
-    return validateVehicleSnapshot({ vehicles: value, nextSerial: highestSerial + 1 })._tag === 'Valid'
-      ? undefined
-      : 'Vehicles violate simulation invariants'
-  }) as unknown as Schema.Schema<ReadonlyArray<Vehicle>>,
-  { exact: true },
-) as unknown as Schema.Schema<ReadonlyArray<Vehicle> | undefined>
+// `integrity-canonical.ts`'s `canonicalize`, which fails for anything that is
+// not a string/boolean/finite-or-non-finite number/null/plain object/array/
+// Uint8Array). `optionalKey` omits an absent property instead of encoding an
+// explicit `undefined` key, which is also what `exactOptionalPropertyTypes`
+// already expects of every `?:` field in `SessionState`.
+const isPersistableVehicles = (value: unknown): value is ReadonlyArray<Vehicle> => {
+  if (!Array.isArray(value)) return false
+  const highestSerial = value.reduce((highest: number, vehicle: unknown) => {
+    const candidate = asRecord(vehicle)
+    const id = candidate?.['id']
+    if (typeof id !== 'string') return highest
+    const match = /^v:(\d+)$/.exec(id)
+    return match === null ? highest : Math.max(highest, Number(match[1]))
+  }, -1)
+  return validateVehicleSnapshot({ vehicles: value, nextSerial: highestSerial + 1 })._tag === 'Valid'
+}
+
+const PersistedVehiclesSchema = Schema.declare(isPersistableVehicles, {
+  expected: 'Vehicles that satisfy simulation invariants',
+})
 
 const SessionStateSchema = Schema.Struct({
   seed: Schema.Number,
@@ -804,39 +815,33 @@ const SessionStateSchema = Schema.Struct({
   crops: CropSnapshotSchema,
   entities: PersistedEntityRostersSchema,
   villagers: PersistedVillagerStateSchema,
-  brewing: BrewingStandStateSchema,
+  brewing: BrewingStateSchema,
   statusEffects: StatusEffectStateSchema,
   end: PersistedEndStateSchema,
-  workstations: Schema.optionalWith(Schema.Struct({
+  workstations: Schema.optionalKey(Schema.Struct({
     enchantmentSeed: Schema.Number,
-    customNames: Schema.Record({ key: Schema.String, value: Schema.String }),
-    enchantedItems: Schema.Record({ key: Schema.String, value: Schema.String }),
-    deathDropDimension: Schema.optionalWith(DimensionSchema, { exact: true }),
+    customNames: Schema.Record(Schema.String, Schema.String),
+    enchantedItems: Schema.Record(Schema.String, Schema.String),
+    deathDropDimension: Schema.optionalKey(DimensionSchema),
     respawn: Schema.NullOr(Schema.Struct({
       dimension: Schema.Literal('overworld'),
       position: PositionSchema,
     })),
-  }), { exact: true }),
-  wither: Schema.optionalWith(WitherRuntimeSnapshotSchema, { exact: true }),
-  vehicles: PersistedVehiclesSchema,
-  mountedVehicleId: Schema.optionalWith(Schema.NullOr(Schema.String), { exact: true }),
-}) as unknown as Schema.Schema<SessionState>
+  })),
+  wither: Schema.optionalKey(WitherRuntimeSnapshotSchema),
+  vehicles: Schema.optionalKey(PersistedVehiclesSchema),
+  mountedVehicleId: Schema.optionalKey(Schema.NullOr(Schema.String)),
+})
 
 /**
- * The on-disk shape of a `SessionState`, exactly as `SessionStateSchema`'s own
- * encode step produces it (`storage.inventory.slots` and `brewing`'s three
- * optional fields have `undefined` swapped for `null` — see the comments on
- * `PlayerStorageSchema`/`BrewingStandStateSchema` above). Tests that seed a
- * `StoragePort` directly with a hand-built envelope (bypassing `saveSession`,
- * to exercise `loadSession`'s rejection paths in isolation) need this rather
- * than a bare `SessionState`, since `sealSaveEnvelope`'s own integrity
- * checksum rejects raw `undefined` exactly as `saveSession` would have.
+ * The on-disk shape of a `SessionState`, produced by `SessionStateSchema`'s
+ * own encode step. Tests that seed a `StoragePort` directly with a hand-built
+ * envelope (bypassing `saveSession`, to exercise `loadSession`'s rejection
+ * paths in isolation) start from this and override single fields with
+ * malformed encoded values.
  */
-export const toStoredSessionState = (state: SessionState): unknown => ({
-  ...state,
-  storage: encodePlayerStorageSlots(state.storage),
-  brewing: encodeBrewingUndefined(state.brewing),
-})
+export const toStoredSessionState = (state: SessionState): Result.Result<unknown, Schema.SchemaError> =>
+  Schema.encodeUnknownResult(SessionStateSchema)(state)
 
 export type SessionChunkManifestEntry = {
   readonly dimension: Dimension
@@ -846,7 +851,7 @@ export type SessionChunkManifestEntry = {
 
 export type DimensionChunk = {
   readonly dimension: Dimension
-  readonly chunk: Chunk
+  readonly chunk: ChunkWithBlockStates
 }
 
 export type SessionMode = 'survival' | 'creative'
@@ -873,32 +878,24 @@ export type SessionHead = {
   readonly chunks: ReadonlyArray<SessionChunkManifestEntry>
 }
 
-type SessionHeadEncoded = Omit<SessionHead, 'chunks'> & {
-  readonly chunks: ReadonlyArray<{
-    readonly dimension: Dimension
-    readonly coord: { readonly cx: number; readonly cz: number }
-    readonly key: string
-  }>
-}
-
 const ChunkManifestEntrySchema = Schema.Struct({
   dimension: DimensionSchema,
   coord: Schema.Struct({
-    cx: Schema.Number.pipe(Schema.fromBrand(ChunkAxis)),
-    cz: Schema.Number.pipe(Schema.fromBrand(ChunkAxis)),
+    cx: Schema.Number.pipe(Schema.fromBrand('ChunkAxis', ChunkAxis)),
+    cz: Schema.Number.pipe(Schema.fromBrand('ChunkAxis', ChunkAxis)),
   }),
-  key: Schema.String.pipe(Schema.minLength(1)),
+  key: Schema.String.check(Schema.isMinLength(1)),
 })
 
-const SessionHeadSchema: Schema.Schema<SessionHead, SessionHeadEncoded> = Schema.Struct({
-  sessionId: Schema.String.pipe(Schema.minLength(1)),
-  revision: Schema.String.pipe(Schema.minLength(1)),
+const SessionHeadSchema = Schema.Struct({
+  sessionId: Schema.String.check(Schema.isMinLength(1)),
+  revision: Schema.String.check(Schema.isMinLength(1)),
   metadata: Schema.Struct({
-    name: filterBoth(Schema.String, (name) =>
+    name: Schema.String.check(invariant<string>((name) =>
       normalizeWorldName(name) === name
         ? undefined
-        : `World name must be normalized and at most ${String(MAX_WORLD_NAME_LENGTH)} characters`),
-    mode: Schema.Literal('survival', 'creative'),
+        : `World name must be normalized and at most ${String(MAX_WORLD_NAME_LENGTH)} characters`)),
+    mode: Schema.Literals(['survival', 'creative']),
   }),
   state: SessionStateSchema,
   chunks: Schema.Array(ChunkManifestEntrySchema),
@@ -909,39 +906,286 @@ const asRecord = (value: unknown): Record<string, unknown> | undefined =>
     ? value as Record<string, unknown>
     : undefined
 
-// mc-save 0.3.0 removed format migrations (org decision, Wave 0: consumers
-// require the current format version; no migration shims). A session saved by
-// an older build now fails `loadSession` with `SaveDecodeError` instead of
-// being transformed forward — see the "rejects a legacy session version"
-// coverage below, which replaces the sixteen per-transition migration tests
-// this format used to carry (v1 through v16, one per SESSION_FORMAT_VERSION
-// bump).
-export const SESSION_FORMAT: SaveFormat<SessionHead, SessionHeadEncoded> = defineFormat({
+// v17 is the last format written against mc-sim 0.4 (Effect 3). Only the
+// fields whose shape changed are described here; every other key is carried
+// to the v18 schema untouched, which then validates the whole payload. Older
+// versions (v1-v16) have no migration and stay unreadable.
+const V17_SESSION_FORMAT_VERSION = 17
+
+// mc-sim 0.4's `FurnaceState`. Slots are `ItemStack | null`.
+const V17FurnaceStateSchema = Schema.Struct({
+  input: Schema.Unknown,
+  fuel: Schema.Unknown,
+  output: Schema.Unknown,
+  cookElapsedSecs: Schema.Finite,
+  burnRemainingSecs: Schema.Finite,
+})
+
+const V17Rest = [Schema.Record(Schema.String, Schema.Unknown)] as const
+
+// v17 stack slots (`null` or `{ item, count }`, plus `durability` for
+// equipment and container stacks) are carried as recorded and only gain
+// `components` below.
+const V17SessionHeadSchema = Schema.StructWithRest(
+  Schema.Struct({
+    state: Schema.StructWithRest(
+      Schema.Struct({
+        storage: Schema.StructWithRest(
+          Schema.Struct({
+            inventory: Schema.StructWithRest(Schema.Struct({ slots: Schema.Array(Schema.Unknown) }), V17Rest),
+            equipment: Schema.StructWithRest(
+              Schema.Struct({ slots: Schema.Record(Schema.String, Schema.Unknown) }),
+              V17Rest,
+            ),
+          }),
+          V17Rest,
+        ),
+        containerStorage: Schema.StructWithRest(
+          Schema.Struct({
+            version: Schema.Literal(2),
+            containers: Schema.Array(Schema.StructWithRest(
+              Schema.Struct({ slots: Schema.Array(Schema.Unknown) }),
+              V17Rest,
+            )),
+          }),
+          V17Rest,
+        ),
+        furnaces: Schema.Array(Schema.Struct({
+          dimension: Schema.Unknown,
+          position: Schema.Unknown,
+          state: V17FurnaceStateSchema,
+        })),
+        brewing: V17BrewingStandStateSchema,
+      }),
+      [Schema.Record(Schema.String, Schema.Unknown)],
+    ),
+  }),
+  [Schema.Record(Schema.String, Schema.Unknown)],
+)
+
+// v17 had no item component concept, so every recorded stack has the item's
+// default components. `components: null` is how mc-sim's
+// `LegacyItemStackSchema` records exactly that; empty slots stay as recorded.
+const migrateV17Slot = (slot: unknown): unknown => {
+  const stack = asRecord(slot)
+  return stack === undefined ? slot : { ...stack, components: null }
+}
+
+// The container snapshot version that v18 records. mc-sim 0.11's v3 differs
+// from v2 only in each stored stack's `components`.
+const V18_CONTAINER_STORAGE_VERSION = 3
+
+// Unrecorded v18 furnace fields, built only from the v17 record:
+// - station: 'furnace'. mc-sim 0.4 furnaces had no station; only normal
+//   furnaces existed.
+// - cookProgressSecs: cookElapsedSecs.
+// - fuelTimeRemainingSecs: burnRemainingSecs.
+// - fuelTimeTotalSecs: burnRemainingSecs. v17 never recorded the burning
+//   fuel's total, so the remainder stands in for it. Only the flame-fraction
+//   display changes; the time until the fuel runs out does not.
+const migrateV17FurnaceState = (state: typeof V17FurnaceStateSchema.Type) => ({
+  station: 'furnace',
+  input: migrateV17Slot(state.input),
+  fuel: migrateV17Slot(state.fuel),
+  output: migrateV17Slot(state.output),
+  fuelTimeRemainingSecs: state.burnRemainingSecs,
+  fuelTimeTotalSecs: state.burnRemainingSecs,
+  cookProgressSecs: state.cookElapsedSecs,
+})
+
+type SessionV17MigrationFailure =
+  | {
+    readonly _tag: 'V17BrewingFuelOverflow'
+    readonly fuelUnits: number
+    readonly fuelItemCount: number
+    readonly maxStackCount: number
+  }
+  | { readonly _tag: 'V17BrewingStackRejected'; readonly item: string; readonly error: ItemStackFailure }
+  | { readonly _tag: 'V17BrewingStackUnencodable'; readonly item: string; readonly error: Schema.SchemaError }
+
+const v17BrewingStack = (
+  item: Parameters<typeof itemStack>[0],
+  count: number,
+): Result.Result<unknown, SessionV17MigrationFailure> =>
+  Result.flatMap(
+    Result.mapError(itemStack(item, count), (error) => ({ _tag: 'V17BrewingStackRejected' as const, item, error })),
+    (stack) => Result.mapError(
+      Schema.encodeResult(LegacyItemStackSchema)(stack),
+      (error) => ({ _tag: 'V17BrewingStackUnencodable' as const, item, error }),
+    ),
+  )
+
+// mx-gameplay 0.6's single-slot brewing stand -> mc-sim 0.11's `BrewingState`,
+// in its v18 encoded form:
+// - A brew in progress is completed now: its `output` becomes the bottle,
+//   exactly as the old stand's completion replaced its input bottle. The old
+//   build had already consumed the ingredient and one fuel unit when the brew
+//   started, so both stay consumed and progress restarts at 0. Under
+//   BREWING_DURATION_SECS (20 s) of brewing time is skipped.
+// - The bottle goes to slot 0; slots 1 and 2 stay empty. Its item comes from
+//   mx-gameplay's own `collectBrewingBottle`, so no potion table lives here.
+// - Fuel: one old fuel unit paid for one brew, and one new fuel charge pays
+//   for one brew, so `fuelCharges = min(fuelUnits, BREWING_MAX_FUEL_CHARGES)`.
+//   The excess goes into the fuel slot as ceil(excess / BREWING_FUEL_CHARGES)
+//   blaze powder: truncating would lose brews the player paid for, and
+//   converting every unit to a blaze powder (or every powder to charges)
+//   would multiply them by BREWING_FUEL_CHARGES; rounding up adds at most
+//   BREWING_FUEL_CHARGES - 1 brews. A count over one stack is a typed failure.
+const migrateV17Brewing = (
+  stand: BrewingStandState,
+): Result.Result<unknown, SessionV17MigrationFailure> => Result.gen(function* () {
+  const completed: BrewingStandState = stand.brewing === undefined
+    ? stand
+    : { ...stand, bottle: { potion: stand.brewing.output }, brewing: undefined }
+
+  let bottle: unknown = null
+  if (completed.bottle !== undefined) {
+    const [, collected] = collectBrewingBottle(completed)
+    // A stand with a bottle and no brew in progress is always collectable
+    // (mx-gameplay `collectBrewingBottle` rejects only 'Brewing' and 'Empty').
+    if (collected._tag !== 'Collected') throw new Error(`v17 brewing bottle was not collectable: ${collected.reason}`)
+    bottle = yield* v17BrewingStack(collected.returned.item, collected.returned.count)
+  }
+
+  const ingredient = completed.ingredient === undefined ? null : yield* v17BrewingStack(completed.ingredient, 1)
+
+  const fuelCharges = Math.min(completed.fuelUnits, BREWING_MAX_FUEL_CHARGES)
+  const fuelItemCount = Math.ceil((completed.fuelUnits - fuelCharges) / BREWING_FUEL_CHARGES)
+  const maxStackCount = maxStackCountForItem(BREWING_FUEL_ITEM)
+  if (fuelItemCount > maxStackCount) {
+    return yield* Result.fail({
+      _tag: 'V17BrewingFuelOverflow' as const,
+      fuelUnits: completed.fuelUnits,
+      fuelItemCount,
+      maxStackCount,
+    })
+  }
+  const fuel = fuelItemCount === 0 ? null : yield* v17BrewingStack(BREWING_FUEL_ITEM, fuelItemCount)
+
+  return { bottles: [bottle, null, null], ingredient, fuel, fuelCharges, brewProgressSecs: 0 }
+})
+
+const migrateV17SessionHead = (
+  payload: unknown,
+): Result.Result<unknown, Schema.SchemaError | SessionV17MigrationFailure> =>
+  Result.flatMap(Schema.decodeUnknownResult(V17SessionHeadSchema)(payload), (head) =>
+    Result.map(migrateV17Brewing(head.state.brewing), (brewing) => ({
+      ...head,
+      state: {
+        ...head.state,
+        storage: {
+          ...head.state.storage,
+          inventory: { ...head.state.storage.inventory, slots: head.state.storage.inventory.slots.map(migrateV17Slot) },
+          equipment: {
+            ...head.state.storage.equipment,
+            slots: Object.fromEntries(
+              Object.entries(head.state.storage.equipment.slots).map(([slot, stack]) => [slot, migrateV17Slot(stack)]),
+            ),
+          },
+        },
+        containerStorage: {
+          ...head.state.containerStorage,
+          version: V18_CONTAINER_STORAGE_VERSION,
+          containers: head.state.containerStorage.containers.map((container) => ({
+            ...container,
+            slots: container.slots.map(migrateV17Slot),
+          })),
+        },
+        furnaces: head.state.furnaces.map((furnace) => ({
+          ...furnace,
+          state: migrateV17FurnaceState(furnace.state),
+        })),
+        brewing,
+      },
+    })))
+
+// Built directly rather than through `defineFormatMigration` so a migration
+// failure stays a typed `Result` failure instead of a thrown value.
+const SESSION_V17_MIGRATION: SaveFormatMigration = {
+  fromVersion: SaveFormatVersion(V17_SESSION_FORMAT_VERSION),
+  migrate: migrateV17SessionHead,
+}
+
+// `defineFormat` only rejects a malformed name, version, or migration chain;
+// all three are the constants above, so a failure here is a programming error.
+export const SESSION_FORMAT: SaveFormat<SessionHead, unknown> = Result.getOrThrow(defineFormat({
   name: SESSION_FORMAT_NAME,
   version: SESSION_FORMAT_VERSION,
   schema: SessionHeadSchema,
-})
+  migrations: [SESSION_V17_MIGRATION],
+}))
 
-type SessionManifestErrorFields = {
-  readonly reason: 'duplicate-coordinate' | 'missing-chunk'
-  readonly dimension: Dimension
-  readonly coord: ChunkCoord
-  readonly key: string
-}
+type SessionManifestErrorFields =
+  | {
+    readonly reason: 'duplicate-coordinate' | 'missing-chunk'
+    readonly dimension: Dimension
+    readonly coord: ChunkCoord
+    readonly key: string
+  }
+  // mc-save reports a collision between live and checkpoint keys by key alone.
+  | { readonly reason: 'duplicate-key'; readonly key: string }
 
 export type SessionManifestError = YieldableError &
   SessionManifestErrorFields & { readonly _tag: 'SessionManifestError' }
 
+const SessionManifestErrorBase = Data.TaggedError('SessionManifestError')
+
+// Instantiated explicitly: inferring from the annotation would take the
+// error type itself, not the field union, as the constructor's argument.
 export const SessionManifestError: new (fields: SessionManifestErrorFields) => SessionManifestError =
-  Data.TaggedError('SessionManifestError')
+  SessionManifestErrorBase<SessionManifestErrorFields>
+
+type SessionIncompatibleErrorFields = {
+  readonly reason: 'future-version' | 'unsupported-version'
+  readonly key: SaveKey
+  readonly storedVersion: number
+  readonly currentVersion: number
+}
+
+/** A stored session this build must neither read nor overwrite. It is not corrupt. */
+export type SessionIncompatibleError = YieldableError &
+  SessionIncompatibleErrorFields & { readonly _tag: 'SessionIncompatibleError' }
+
+export const SessionIncompatibleError: new (fields: SessionIncompatibleErrorFields) => SessionIncompatibleError =
+  Data.TaggedError('SessionIncompatibleError')
+
+/** Why the checkpoint could not stand in for an unreadable live revision. */
+export type SessionCheckpointFailure = 'absent' | SaveDecodeError | SessionIncompatibleError
+
+type SessionCorruptErrorFields = {
+  readonly sessionId: string
+  readonly liveFailure: SaveDecodeError
+  readonly checkpoint: SessionCheckpointFailure
+}
+
+export type SessionCorruptError = YieldableError &
+  SessionCorruptErrorFields & { readonly _tag: 'SessionCorruptError' }
+
+export const SessionCorruptError: new (fields: SessionCorruptErrorFields) => SessionCorruptError =
+  Data.TaggedError('SessionCorruptError')
 
 export type SessionPersistenceError =
   | StorageError
   | SaveDecodeError
   | InstanceType<typeof SessionManifestError>
+  | SessionIncompatibleError
+  | SessionCorruptError
+
+export type SessionOpenError = StorageError | SessionIncompatibleError | SessionCorruptError
+
+const SESSION_KEY_PREFIX = 'mc-compose/session/'
+const SESSION_HEAD_KEY_PATTERN = /^mc-compose\/session\/([^/]+)\/head$/u
+
+const sessionKeyPrefix = (sessionId: string): string =>
+  `${SESSION_KEY_PREFIX}${encodeURIComponent(sessionId)}/`
 
 export const sessionHeadKey = (sessionId: string): SaveKey =>
-  SaveKey(`mc-compose/session/${encodeURIComponent(sessionId)}/head`)
+  SaveKey(`${sessionKeyPrefix(sessionId)}head`)
+
+// Neither checkpoint key matches SESSION_HEAD_KEY_PATTERN, so listing ignores
+// them, and both share the session prefix that deleteSession removes.
+const sessionCheckpointHeadKey = (sessionId: string): SaveKey =>
+  SaveKey(`${sessionKeyPrefix(sessionId)}checkpoint/head`)
 
 export const sessionChunkKey = (
   sessionId: string,
@@ -953,13 +1197,17 @@ export const sessionChunkKey = (
     `mc-compose/session/${encodeURIComponent(sessionId)}/revision/${encodeURIComponent(revision)}/dimension/${encodeURIComponent(dimension)}/chunk/${String(coord.cx)}/${String(coord.cz)}`,
   )
 
-export const loadSession = (
+// `sessionChunkKey` with `checkpoint/` inserted. It names the revision, so it is
+// revision-specific, as mc-save's checkpoint contract requires.
+const sessionCheckpointChunkKey = (
   sessionId: string,
-): Effect.Effect<Option.Option<SessionHead>, SessionPersistenceError, StoragePort> =>
-  loadFrom(SESSION_FORMAT, sessionHeadKey(sessionId))
-
-const SESSION_KEY_PREFIX = 'mc-compose/session/'
-const SESSION_HEAD_KEY_PATTERN = /^mc-compose\/session\/([^/]+)\/head$/u
+  revision: string,
+  dimension: Dimension,
+  coord: ChunkCoord,
+): SaveKey =>
+  SaveKey(
+    `${sessionKeyPrefix(sessionId)}checkpoint/revision/${encodeURIComponent(revision)}/dimension/${encodeURIComponent(dimension)}/chunk/${String(coord.cx)}/${String(coord.cz)}`,
+  )
 
 const sessionIdFromHeadKey = (key: SaveKey): string | undefined => {
   const match = SESSION_HEAD_KEY_PATTERN.exec(key)
@@ -973,12 +1221,442 @@ const sessionIdFromHeadKey = (key: SaveKey): string | undefined => {
   }
 }
 
-/** Enumerate valid session heads, ignoring malformed keys and independently corrupted sessions. */
-export const listSessions = (): Effect.Effect<
-  ReadonlyArray<SessionHead>,
-  StorageError,
-  StoragePort
+const decodeStoredRecord = <A, I>(
+  format: SaveFormat<A, I>,
+  stored: unknown,
+): Effect.Effect<A, SaveDecodeError> =>
+  Schema.decodeUnknownEffect(SaveEnvelopeSchema)(stored).pipe(
+    Effect.mapError((cause) => new SaveDecodeError({
+      format: format.name,
+      version: 0,
+      reason: 'the stored value is not a well-formed save envelope',
+      cause,
+    })),
+    Effect.flatMap((envelope) => validateSaveEnvelope(envelope)),
+    Effect.flatMap((envelope) => decodeSave(format, envelope)),
+  )
+
+const sealedRecord = <A, I>(format: SaveFormat<A, I>, value: A): Effect.Effect<SaveEnvelope, SaveDecodeError> =>
+  encodeSave(format, value).pipe(
+    Effect.flatMap((draft) => Effect.fromResult(sealSaveEnvelope(draft))),
+    Effect.flatMap((envelope) => validateSaveEnvelope(envelope)),
+  )
+
+const sessionHeadDecodeError = (reason: string): SaveDecodeError =>
+  new SaveDecodeError({ format: SESSION_FORMAT_NAME, version: SESSION_FORMAT_VERSION, reason })
+
+type SessionChunkKeys = {
+  readonly live: SaveKey
+  readonly checkpoint: SaveKey
+}
+
+// Each manifest key must be the canonical live key of its own coordinate, so no
+// manifest reaches outside its session and every live key has a checkpoint key.
+const sessionManifestKeys = (
+  sessionId: string,
+  head: SessionHead,
+): Result.Result<ReadonlyArray<SessionChunkKeys>, SaveDecodeError> => {
+  if (head.sessionId !== sessionId) {
+    return Result.fail(sessionHeadDecodeError(`the head belongs to session "${head.sessionId}"`))
+  }
+  const duplicate = duplicateManifestEntry(head.chunks)
+  if (duplicate !== undefined) {
+    return Result.fail(sessionHeadDecodeError(
+      `the manifest lists ${coordId(duplicate.dimension, duplicate.coord)} more than once`,
+    ))
+  }
+  const keys: Array<SessionChunkKeys> = []
+  for (const entry of head.chunks) {
+    const live = sessionChunkKey(sessionId, head.revision, entry.dimension, entry.coord)
+    if (entry.key !== live) {
+      return Result.fail(sessionHeadDecodeError(`the manifest key "${entry.key}" is not the chunk key "${live}"`))
+    }
+    keys.push({ live, checkpoint: sessionCheckpointChunkKey(sessionId, head.revision, entry.dimension, entry.coord) })
+  }
+  return Result.succeed(keys)
+}
+
+type DecodedSessionHead = { readonly head: SessionHead; readonly keys: ReadonlyArray<SessionChunkKeys> }
+
+const decodeSessionHead = (
+  sessionId: string,
+  stored: unknown,
+): Effect.Effect<DecodedSessionHead, SaveDecodeError> =>
+  decodeStoredRecord(SESSION_FORMAT, stored).pipe(
+    Effect.flatMap((head) =>
+      Effect.fromResult(sessionManifestKeys(sessionId, head)).pipe(Effect.map((keys) => ({ head, keys })))),
+  )
+
+/**
+ * mc-save hands its `chunkKey` callbacks a raw head and a live key. Every key
+ * it maps was first returned by one of the `chunkKeysFromHead` callbacks, which
+ * record each live key's checkpoint key here.
+ */
+const makeCheckpointKeyLookup = () => {
+  const checkpointKeys = new Map<SaveKey, SaveKey>()
+  return {
+    remember: (keys: ReadonlyArray<SessionChunkKeys>): ReadonlyArray<SaveKey> => {
+      for (const { live, checkpoint } of keys) checkpointKeys.set(live, checkpoint)
+      return keys.map(({ live }) => live)
+    },
+    // A miss means mc-save mapped a key no callback returned: a broken contract, not stored data.
+    checkpointKeyOf: (liveKey: SaveKey): SaveKey =>
+      Option.getOrThrowWith(
+        Option.fromNullishOr(checkpointKeys.get(liveKey)),
+        () => new Error(`no checkpoint key was derived for "${liveKey}"`),
+      ),
+  }
+}
+
+const checkpointHeadOf = (head: SessionHead, keys: ReadonlyArray<SessionChunkKeys>): SessionHead => ({
+  ...head,
+  chunks: Arr.zipWith(head.chunks, keys, (entry, { checkpoint }) => ({ ...entry, key: checkpoint })),
+})
+
+const hasMigrationPath = <A, I>(format: SaveFormat<A, I>, version: number): boolean => {
+  const migrations = format.migrations
+  for (let from = version; from < format.version; from += 1) {
+    if (migrations === undefined || !migrations.some((migration) => migration.fromVersion === from)) return false
+  }
+  return true
+}
+
+/**
+ * Classify a stored record this build cannot read for version reasons.
+ * Anything that is not a well-formed envelope of `format` is not classified
+ * here: the regular decode reports it as a `SaveDecodeError`.
+ */
+const recordIncompatibility = <A, I>(
+  format: SaveFormat<A, I>,
+  key: SaveKey,
+  stored: unknown,
+): Option.Option<SessionIncompatibleError> => {
+  const envelope = Schema.decodeUnknownResult(SaveEnvelopeSchema)(stored)
+  if (Result.isFailure(envelope) || envelope.success.format !== format.name) return Option.none()
+  const storedVersion = envelope.success.version
+  const reason: Option.Option<SessionIncompatibleError['reason']> = isFromFuture(envelope.success, format.version)
+    ? Option.some('future-version')
+    : hasMigrationPath(format, storedVersion) ? Option.none() : Option.some('unsupported-version')
+  return Option.map(reason, (incompatibility) => new SessionIncompatibleError({
+    reason: incompatibility,
+    key,
+    storedVersion,
+    currentVersion: format.version,
+  }))
+}
+
+const chunkIncompatibility = (
+  storage: StorageService,
+  keys: ReadonlyArray<SaveKey>,
+): Effect.Effect<Option.Option<SessionIncompatibleError>, StorageError> =>
+  Effect.gen(function* () {
+    for (const key of keys) {
+      const stored = yield* storage.get(key)
+      if (Option.isNone(stored)) continue
+      const incompatible = recordIncompatibility(CHUNK_FORMAT, key, stored.value)
+      if (Option.isSome(incompatible)) return incompatible
+    }
+    return Option.none()
+  })
+
+// Hands each record saveSession already read to mc-save once instead of
+// reading it again; a write to the key drops the copy.
+const prefetchedStorage = <Error>(
+  storage: StorageService,
+  records: ReadonlyArray<readonly [SaveKey, Option.Option<SaveEnvelope>]>,
+): RevisionStorage<SaveKey, SaveEnvelope, StorageError | Error, never> => {
+  const prefetched = new Map(records)
+  return {
+    get: (key) =>
+      Effect.suspend(() => {
+        const value = prefetched.get(key)
+        if (value === undefined) return storage.get(key)
+        prefetched.delete(key)
+        return Effect.succeed(value)
+      }),
+    put: (key, value) =>
+      Effect.suspend(() => {
+        prefetched.delete(key)
+        return storage.put(key, value)
+      }),
+    remove: (key) =>
+      Effect.suspend(() => {
+        prefetched.delete(key)
+        return storage.remove(key)
+      }),
+  }
+}
+
+const chunkRecordError = (reason: string, version: number): SaveDecodeError =>
+  new SaveDecodeError({ format: CHUNK_FORMAT.name, version, reason })
+
+/**
+ * A chunk record's envelope, format, version and checksum, without the chunk
+ * schema decode. The checksum is sealed over what this format's encoder wrote,
+ * so it catches damaged or altered bytes; the schema decode, which dominates a
+ * chunk's load cost, then runs once, where `makeSessionChunkSource` loads it.
+ */
+const validateChunkRecord = (stored: unknown): Effect.Effect<SaveEnvelope, SaveDecodeError> => {
+  const envelope = Schema.decodeUnknownResult(SaveEnvelopeSchema)(stored)
+  if (Result.isFailure(envelope)) {
+    return Effect.fail(chunkRecordError('the stored value is not a well-formed save envelope', 0))
+  }
+  const { format, version } = envelope.success
+  if (format !== CHUNK_FORMAT.name) return Effect.fail(chunkRecordError(`the record belongs to format "${format}"`, version))
+  if (isFromFuture(envelope.success, CHUNK_FORMAT.version) || !hasMigrationPath(CHUNK_FORMAT, version)) {
+    return Effect.fail(chunkRecordError(`chunk format v${String(version)} cannot be read by this build`, version))
+  }
+  return validateSaveEnvelope(envelope.success)
+}
+
+const chunkRecordIntact = (stored: unknown): Effect.Effect<boolean> =>
+  validateChunkRecord(stored).pipe(Effect.match({ onFailure: () => false, onSuccess: () => true }))
+
+// The integrity metadata covers the payload, so two intact records with equal
+// metadata hold the same payload.
+const sameRecord = (left: SaveEnvelope, right: SaveEnvelope): boolean =>
+  left.format === right.format &&
+  left.version === right.version &&
+  left.integrity.checksum === right.integrity.checksum &&
+  left.integrity.byteLength === right.integrity.byteLength
+
+type LiveChunkCopy = { readonly checkpoint: SaveKey; readonly live: Option.Option<SaveEnvelope> }
+
+/**
+ * Make the checkpoint, whose head already names the live revision, a verified
+ * copy of it. Each checkpoint record that is absent, fails its checksum, or
+ * differs from its live record is put over its own key, chunks before the
+ * head, so nothing is deleted first and no key is reused for another revision.
+ * A live revision that is itself incomplete or damaged is not copied: the
+ * checkpoint may then be the better copy, as mc-save's `isHealthy` rule keeps it.
+ */
+const ensureCheckpointCopiesLive = (
+  storage: StorageService,
+  checkpointHeadKey: SaveKey,
+  liveHead: SaveEnvelope,
+  checkpointHead: SaveEnvelope,
+  chunks: ReadonlyArray<LiveChunkCopy>,
+): Effect.Effect<void, StorageError> =>
+  Effect.gen(function* () {
+    const liveChunks: Array<{ readonly checkpoint: SaveKey; readonly live: SaveEnvelope }> = []
+    for (const { checkpoint, live } of chunks) {
+      if (Option.isNone(live) || !(yield* chunkRecordIntact(live.value))) return
+      liveChunks.push({ checkpoint, live: live.value })
+    }
+    for (const { checkpoint, live } of liveChunks) {
+      const copy = yield* storage.get(checkpoint)
+      const verified = Option.isSome(copy) &&
+        sameRecord(copy.value, live) &&
+        (yield* chunkRecordIntact(copy.value))
+      if (!verified) yield* storage.put(checkpoint, live)
+    }
+    if (!sameRecord(checkpointHead, liveHead)) yield* storage.put(checkpointHeadKey, liveHead)
+  })
+
+export type OpenedSession =
+  | { readonly _tag: 'Live'; readonly head: SessionHead }
+  | { readonly _tag: 'Checkpoint'; readonly head: SessionHead; readonly liveFailure: SaveDecodeError }
+
+type SessionRevision = 'live' | 'checkpoint'
+
+// Located like mc-save's annotated head failures. No older revision is claimed:
+// openSession sets that once the checkpoint opened.
+const headFailureAt = (key: SaveKey, error: SaveDecodeError): SaveDecodeError =>
+  new SaveDecodeError({
+    format: error.format,
+    version: error.version,
+    reason: error.reason,
+    record: { _tag: 'Head', key },
+    repair: { lastHealthyRevisionAvailable: false, discardableChunkKeys: [] },
+    ...(error.cause === undefined ? {} : { cause: error.cause }),
+  })
+
+/**
+ * `None` when the revision's head is absent. For the checkpoint, the returned
+ * head's manifest keys name the checkpoint chunk records.
+ */
+const readSessionRevision = (
+  storage: StorageService,
+  sessionId: string,
+  revision: SessionRevision,
+): Effect.Effect<
+  Option.Option<Result.Result<SessionHead, SaveDecodeError | SessionIncompatibleError>>,
+  StorageError
+> => {
+  const headKey = revision === 'live' ? sessionHeadKey(sessionId) : sessionCheckpointHeadKey(sessionId)
+  const lookup = makeCheckpointKeyLookup()
+  const chunkKeyOf = (liveKey: SaveKey): SaveKey => revision === 'live' ? liveKey : lookup.checkpointKeyOf(liveKey)
+  return Effect.gen(function* () {
+    const stored = yield* storage.get(headKey)
+    if (Option.isNone(stored)) return Option.none()
+    const incompatible = recordIncompatibility(SESSION_FORMAT, headKey, stored.value)
+    if (Option.isSome(incompatible)) return Option.some(Result.fail(incompatible.value))
+    // Decoded here because mc-save rebuilds a head failure without its cause,
+    // which for a failed migration is the only account of what went wrong.
+    const decodedHead = yield* Effect.result(decodeStoredRecord(SESSION_FORMAT, stored.value))
+    if (Result.isFailure(decodedHead)) return Option.some(Result.fail(headFailureAt(headKey, decodedHead.failure)))
+
+    const read = yield* loadRetainedRevision({
+      storage: prefetchedStorage<never>(storage, [[headKey, stored]]),
+      headKey,
+      chunkKey: (_rawHead, key) => chunkKeyOf(key),
+      // openSession re-annotates the live failure once the checkpoint opened.
+      lastHealthyRevisionAvailable: false,
+      // mc-save reads the prefetched record, which is the one decoded above.
+      decodeHead: () => Effect.succeed(decodedHead.success),
+      chunkKeysFromHead: (head) =>
+        Effect.fromResult(sessionManifestKeys(sessionId, head)).pipe(Effect.map(lookup.remember)),
+      decodeChunk: validateChunkRecord,
+      missingChunkError: (_head, key) => new SaveDecodeError({
+        format: CHUNK_FORMAT.name,
+        version: CHUNK_FORMAT.version,
+        reason: `the manifest chunk "${key}" is missing`,
+      }),
+      keyToString: (key) => key,
+    }).pipe(Effect.result)
+    if (Result.isFailure(read)) {
+      if (read.failure._tag === 'StorageError') return yield* Effect.fail(read.failure)
+      return Option.some(Result.fail(read.failure))
+    }
+    // The head vanished between the two reads.
+    if (Option.isNone(read.success)) return Option.none()
+    const { head, failures } = read.success.value
+    if (Arr.isReadonlyArrayNonEmpty(failures)) {
+      // A newer build's chunk fails decoding like a corrupt one; re-reading the
+      // failed chunks tells them apart.
+      const incompatibleChunk = yield* chunkIncompatibility(
+        storage,
+        failures.flatMap(({ record }) => record?._tag === 'Chunk' ? [record.key] : []),
+      )
+      return Option.some(Result.fail(Option.isSome(incompatibleChunk)
+        ? incompatibleChunk.value
+        : Arr.headNonEmpty(failures)))
+    }
+    return Option.some(Result.succeed(revision === 'live' ? head : {
+      ...head,
+      chunks: head.chunks.map((entry) => ({ ...entry, key: lookup.checkpointKeyOf(SaveKey(entry.key)) })),
+    }))
+  })
+}
+
+// The live read cannot know whether the checkpoint will open, so the repair
+// guidance is set once it has. Discardable keys follow mc-save's own rule.
+const withHealthyCheckpoint = (error: SaveDecodeError): SaveDecodeError =>
+  new SaveDecodeError({
+    format: error.format,
+    version: error.version,
+    reason: error.reason,
+    ...(error.record === undefined ? {} : { record: error.record }),
+    ...(error.cause === undefined ? {} : { cause: error.cause }),
+    repair: {
+      lastHealthyRevisionAvailable: true,
+      discardableChunkKeys: error.record?._tag === 'Chunk' ? [error.record.key] : [],
+    },
+  })
+
+/**
+ * Open the live revision, or its checkpoint when the live head or any live
+ * chunk cannot be read. A session without a live head is absent even if a
+ * checkpoint remains: saveSession only writes a checkpoint while replacing a
+ * live head, so a lone checkpoint is the remainder of an interrupted delete.
+ * An incompatible live head or chunk fails without consulting the checkpoint,
+ * because opening an older copy would hide that a newer build owns this session.
+ */
+export const openSession = (
+  sessionId: string,
+): Effect.Effect<Option.Option<OpenedSession>, SessionOpenError, StoragePort> =>
+  Effect.gen(function* () {
+    const storage = yield* StoragePort
+    const live = yield* readSessionRevision(storage, sessionId, 'live')
+    if (Option.isNone(live)) return Option.none()
+    if (Result.isSuccess(live.value)) return Option.some<OpenedSession>({ _tag: 'Live', head: live.value.success })
+    const liveFailure = live.value.failure
+    if (liveFailure._tag === 'SessionIncompatibleError') return yield* Effect.fail(liveFailure)
+
+    const checkpoint = yield* readSessionRevision(storage, sessionId, 'checkpoint')
+    if (Option.isNone(checkpoint)) {
+      return yield* new SessionCorruptError({ sessionId, liveFailure, checkpoint: 'absent' })
+    }
+    if (Result.isFailure(checkpoint.value)) {
+      return yield* new SessionCorruptError({ sessionId, liveFailure, checkpoint: checkpoint.value.failure })
+    }
+    return Option.some<OpenedSession>({
+      _tag: 'Checkpoint',
+      head: checkpoint.value.success,
+      liveFailure: withHealthyCheckpoint(liveFailure),
+    })
+  })
+
+/**
+ * The head `openSession` opened, so a caller that only needs the head still
+ * recovers from the checkpoint. `openSession` also says which revision opened.
+ */
+export const loadSession = (
+  sessionId: string,
+): Effect.Effect<Option.Option<SessionHead>, SessionPersistenceError, StoragePort> =>
+  openSession(sessionId).pipe(Effect.map(Option.map(({ head }) => head)))
+
+export type UnavailableSession = {
+  readonly sessionId: string
+  readonly failure: SessionIncompatibleError | SessionCorruptError
+}
+
+export type SessionEntries = {
+  readonly sessions: ReadonlyArray<SessionHead>
+  readonly unavailable: ReadonlyArray<UnavailableSession>
+}
+
+/** `None` when no head is stored at `key`; the head's manifest keys are returned alongside it. */
+const readSessionHead = (
+  storage: StorageService,
+  sessionId: string,
+  key: SaveKey,
+): Effect.Effect<
+  Option.Option<Result.Result<
+    { readonly head: SessionHead; readonly keys: ReadonlyArray<SessionChunkKeys> },
+    SaveDecodeError | SessionIncompatibleError
+  >>,
+  StorageError
 > =>
+  Effect.gen(function* () {
+    const stored = yield* storage.get(key)
+    if (Option.isNone(stored)) return Option.none()
+    const incompatible = recordIncompatibility(SESSION_FORMAT, key, stored.value)
+    if (Option.isSome(incompatible)) return Option.some(Result.fail(incompatible.value))
+    const decoded = yield* Effect.result(decodeSessionHead(sessionId, stored.value))
+    return Option.some(Result.mapError(decoded, (error) => headFailureAt(key, error)))
+  })
+
+type ListedSession = Result.Result<SessionHead, UnavailableSession>
+
+const listSessionEntry = (
+  storage: StorageService,
+  sessionId: string,
+): Effect.Effect<Option.Option<ListedSession>, StorageError> =>
+  Effect.gen(function* () {
+    const live = yield* readSessionHead(storage, sessionId, sessionHeadKey(sessionId))
+    if (Option.isNone(live)) return Option.none()
+    if (Result.isSuccess(live.value)) {
+      return Option.some<ListedSession>(Result.succeed(live.value.success.head))
+    }
+    const liveFailure = live.value.failure
+    if (liveFailure._tag === 'SessionIncompatibleError') {
+      return Option.some<ListedSession>(Result.fail({ sessionId, failure: liveFailure }))
+    }
+
+    const checkpoint = yield* readSessionHead(storage, sessionId, sessionCheckpointHeadKey(sessionId))
+    const corrupt = (failure: SessionCheckpointFailure): Option.Option<ListedSession> =>
+      Option.some(Result.fail({
+        sessionId,
+        failure: new SessionCorruptError({ sessionId, liveFailure, checkpoint: failure }),
+      }))
+    if (Option.isNone(checkpoint)) return corrupt('absent')
+    if (Result.isFailure(checkpoint.value)) return corrupt(checkpoint.value.failure)
+    const { head, keys } = checkpoint.value.success
+    return Option.some<ListedSession>(Result.succeed(checkpointHeadOf(head, keys)))
+  })
+
+const listSessionHeads = (): Effect.Effect<ReadonlyArray<ListedSession>, StorageError, StoragePort> =>
   Effect.gen(function* () {
     const storage = yield* StoragePort
     const keys = yield* storage.keys
@@ -987,25 +1665,36 @@ export const listSessions = (): Effect.Effect<
       .filter((sessionId): sessionId is string => sessionId !== undefined)
       .sort()
 
-    const sessions = yield* Effect.forEach(sessionIds, (sessionId) =>
-      loadSession(sessionId).pipe(
-        Effect.map(Option.filter((head) => head.sessionId === sessionId)),
-        Effect.matchEffect({
-          onFailure: () => Effect.succeed(Option.none<SessionHead>()),
-          onSuccess: Effect.succeed,
-        }),
-      ),
-    )
-    return sessions.flatMap(Option.toArray)
+    const entries = yield* Effect.forEach(sessionIds, (sessionId) => listSessionEntry(storage, sessionId))
+    return entries.flatMap(Option.toArray)
   })
 
-/** Remove every record belonging to one encoded session key prefix. */
+/**
+ * Enumerate sessions by their heads in lexical session id order, ignoring
+ * malformed keys. A session whose live head is unreadable is listed by its
+ * checkpoint head when that one decodes. Chunks are not read here, so a chunk
+ * that turns out unreadable is reported by `openSession`.
+ */
+export const listSessionEntries = (): Effect.Effect<SessionEntries, StorageError, StoragePort> =>
+  listSessionHeads().pipe(Effect.map((entries) => {
+    const [sessions, unavailable] = Arr.partition(entries, (entry) => entry)
+    return { sessions, unavailable }
+  }))
+
+/** The sessions `listSessionEntries` lists: those `loadSession` can open by their live or checkpoint head. */
+export const listSessions = (): Effect.Effect<
+  ReadonlyArray<SessionHead>,
+  StorageError,
+  StoragePort
+> => listSessionEntries().pipe(Effect.map(({ sessions }) => sessions))
+
+/** Remove every record belonging to one encoded session key prefix, checkpoint included. */
 export const deleteSession = (
   sessionId: string,
 ): Effect.Effect<void, StorageError, StoragePort> =>
   Effect.gen(function* () {
     const storage = yield* StoragePort
-    const prefix = `${SESSION_KEY_PREFIX}${encodeURIComponent(sessionId)}/`
+    const prefix = sessionKeyPrefix(sessionId)
     const keys = yield* storage.keys
     yield* Effect.forEach(
       keys.filter((key) => key.startsWith(prefix)),
@@ -1022,18 +1711,25 @@ export type SaveSessionInput = {
   readonly chunks: ReadonlyArray<DimensionChunk>
 }
 
-/** Write revision chunks first, atomically publish their manifest, then collect the old revision. */
+/**
+ * Write revision chunks first and publish their head last, after copying the
+ * previous healthy live revision to the session's checkpoint. A live head or
+ * chunk written by an incompatible build fails the save before anything is
+ * written. mc-save restores the previous live records when publishing fails.
+ */
 export const saveSession = (
   input: SaveSessionInput,
 ): Effect.Effect<SessionHead, SessionPersistenceError, StoragePort> =>
   Effect.gen(function* () {
-    const manifest = input.chunks.map(
-      ({ dimension, chunk }): SessionChunkManifestEntry => ({
+    const entries = input.chunks.map(({ dimension, chunk }) => ({
+      entry: {
         dimension,
         coord: chunk.coord,
         key: sessionChunkKey(input.sessionId, input.revision, dimension, chunk.coord),
-      }),
-    )
+      } satisfies SessionChunkManifestEntry,
+      chunk,
+    }))
+    const manifest = entries.map(({ entry }) => entry)
     const duplicate = duplicateManifestEntry(manifest)
     if (duplicate !== undefined) {
       return yield* new SessionManifestError({
@@ -1045,63 +1741,127 @@ export const saveSession = (
     }
 
     const storage = yield* StoragePort
-    const headKey = sessionHeadKey(input.sessionId)
-    const previousSession = yield* loadSession(input.sessionId)
-    const previousHeadEnvelope = yield* storage.get(headKey)
-    const previousChunkEnvelopes = yield* Effect.forEach(manifest, (entry) =>
-      storage.get(SaveKey(entry.key)).pipe(
-        Effect.map((envelope) => ({ key: SaveKey(entry.key), envelope })),
-      ),
-    )
+    const sessionId = input.sessionId
+    const headKey = sessionHeadKey(sessionId)
+    const checkpointHeadKey = sessionCheckpointHeadKey(sessionId)
+    const storedHead = yield* storage.get(headKey)
+    if (Option.isSome(storedHead)) {
+      const incompatible = recordIncompatibility(SESSION_FORMAT, headKey, storedHead.value)
+      if (Option.isSome(incompatible)) return yield* Effect.fail(incompatible.value)
+    }
+
+    // Heads are decoded once per save; mc-save hands the prefetched envelopes
+    // back to the callbacks, so a lookup by envelope finds them.
+    const decodedHeads = new Map<SaveEnvelope, Option.Option<DecodedSessionHead>>()
+    const decodedHead = (stored: SaveEnvelope): Effect.Effect<Option.Option<DecodedSessionHead>> =>
+      Effect.suspend(() => {
+        const known = decodedHeads.get(stored)
+        if (known !== undefined) return Effect.succeed(known)
+        // An undecodable head is one mc-save cannot inspect; the callbacks turn
+        // that into "no chunks" or "not healthy" as its contract defines.
+        return Effect.result(decodeSessionHead(sessionId, stored)).pipe(Effect.map((decoded) => {
+          const head = Result.getSuccess(decoded)
+          decodedHeads.set(stored, head)
+          return head
+        }))
+      })
+    const decodedStored = (stored: Option.Option<SaveEnvelope>): Effect.Effect<Option.Option<DecodedSessionHead>> =>
+      Option.isNone(stored) ? Effect.succeed(Option.none()) : decodedHead(stored.value)
+
+    const previous = yield* decodedStored(storedHead)
+    const previousChunks = Option.isNone(previous)
+      ? []
+      : yield* Effect.forEach(previous.value.keys, ({ live }) =>
+        storage.get(live).pipe(Effect.map((value) => ({ key: live, value }))))
+    for (const { key, value } of previousChunks) {
+      if (Option.isNone(value)) continue
+      const incompatible = recordIncompatibility(CHUNK_FORMAT, key, value.value)
+      if (Option.isSome(incompatible)) return yield* Effect.fail(incompatible.value)
+    }
+    const storedCheckpoint = yield* storage.get(checkpointHeadKey)
+    const checkpoint = yield* decodedStored(storedCheckpoint)
 
     const nextHead: SessionHead = {
-      sessionId: input.sessionId,
+      sessionId,
       revision: input.revision,
       metadata: input.metadata,
       state: input.state,
       chunks: manifest,
     }
+    const headEnvelope = yield* sealedRecord(SESSION_FORMAT, nextHead)
+    const chunkEnvelopes = yield* Effect.forEach(entries, ({ entry, chunk }) =>
+      sealedRecord(CHUNK_FORMAT, chunk).pipe(Effect.map((value) => ({ key: SaveKey(entry.key), value }))))
+    const lookup = makeCheckpointKeyLookup()
 
-    yield* Effect.gen(function* () {
-      yield* Effect.forEach(input.chunks, ({ chunk }, index) =>
-        saveTo(CHUNK_FORMAT, SaveKey(manifest[index]!.key), chunk),
-      )
-      yield* saveTo(SESSION_FORMAT, headKey, nextHead)
-    }).pipe(
-      Effect.matchEffect({
-        onFailure: (saveError) => Effect.gen(function* () {
-          yield* (Option.isSome(previousHeadEnvelope)
-            ? storage.put(headKey, previousHeadEnvelope.value)
-            : storage.remove(headKey)
-          ).pipe(Effect.matchEffect({ onFailure: () => Effect.void, onSuccess: () => Effect.void }))
-          yield* Effect.forEach(
-            previousChunkEnvelopes,
-            ({ key, envelope }) =>
-              (Option.isSome(envelope)
-                ? storage.put(key, envelope.value)
-                : storage.remove(key)
-              ).pipe(Effect.matchEffect({ onFailure: () => Effect.void, onSuccess: () => Effect.void })),
-            { discard: true },
-          )
-          return yield* Effect.fail(saveError)
-        }),
-        onSuccess: Effect.succeed,
-      }),
-    )
-
-    if (Option.isSome(previousSession)) {
-      const retainedKeys = new Set(manifest.map(({ key }) => key))
-      yield* Effect.forEach(
-        previousSession.value.chunks,
-        ({ key }) =>
-          retainedKeys.has(key)
-            ? Effect.void
-            : storage.remove(SaveKey(key)).pipe(
-                Effect.matchEffect({ onFailure: () => Effect.void, onSuccess: () => Effect.void }),
-              ),
-        { discard: true },
-      )
+    const live = {
+      storage: prefetchedStorage<SessionManifestError>(storage, [
+        [headKey, storedHead],
+        [checkpointHeadKey, storedCheckpoint],
+        ...previousChunks.map(({ key, value }): readonly [SaveKey, Option.Option<SaveEnvelope>] => [key, value]),
+      ]),
+      head: { key: headKey, value: headEnvelope },
+      chunks: chunkEnvelopes,
+      // A previous head that does not decode lists no chunks and is never
+      // healthy, so it is replaced without displacing the existing checkpoint;
+      // its chunk records are then left behind until deleteSession removes the prefix.
+      chunkKeysFromHead: (previousHead: Option.Option<SaveEnvelope>) =>
+        decodedStored(previousHead).pipe(Effect.map(Option.match({
+          onNone: (): ReadonlyArray<SaveKey> => [],
+          onSome: ({ keys }) => lookup.remember(keys),
+        }))),
+      sameKey: (left: SaveKey, right: SaveKey) => left === right,
+      duplicateKeyError: (key: SaveKey) => new SessionManifestError({ reason: 'duplicate-key', key }),
     }
+
+    // Invariant: a good copy of the overwritten revision exists before the live
+    // head moves. After a publish failed past its checkpoint copy, the
+    // checkpoint head already names the live revision; copying it through
+    // mc-save again would reuse that revision's checkpoint keys, which it
+    // rejects. Its records may have been lost or damaged since, so they are
+    // verified, and repaired in place, before the live revision is replaced.
+    // A save reusing the live revision id overwrites those live records in
+    // place, so the checkpoint, though named alike, would not hold them: it
+    // still takes the copying path.
+    if (
+      Option.isSome(previous) &&
+      Option.isSome(storedHead) &&
+      Option.isSome(storedCheckpoint) &&
+      Option.isSome(checkpoint) &&
+      checkpoint.value.head.revision === previous.value.head.revision &&
+      input.revision !== previous.value.head.revision
+    ) {
+      yield* ensureCheckpointCopiesLive(
+        storage,
+        checkpointHeadKey,
+        storedHead.value,
+        storedCheckpoint.value,
+        Arr.zipWith(previous.value.keys, previousChunks, ({ checkpoint }, { value }) => ({ checkpoint, live: value })),
+      )
+      yield* writeRevisionedSave<SaveKey, SaveEnvelope, StorageError | SessionManifestError, never>(live)
+      return nextHead
+    }
+
+    yield* writeRevisionedSaveWithCheckpoint<SaveKey, SaveEnvelope, StorageError | SessionManifestError, never>({
+      ...live,
+      checkpoint: {
+        headKey: checkpointHeadKey,
+        chunkKey: (_head, liveChunkKey) => lookup.checkpointKeyOf(liveChunkKey),
+        // An old checkpoint head that does not decode cannot name its chunks
+        // for cleanup; mc-save then leaves them in place.
+        chunkKeysFromHead: (checkpointHead) =>
+          decodedHead(checkpointHead).pipe(Effect.map(Option.map(({ keys }) => lookup.remember(keys)))),
+        // mc-save asks for a verdict, not a reason: an unreadable previous
+        // revision is simply not copied over the checkpoint.
+        isHealthy: (previousHead, chunks) =>
+          decodedHead(previousHead).pipe(Effect.flatMap(Option.match({
+            onNone: () => Effect.succeed(false),
+            onSome: () =>
+              Effect.forEach(chunks, ({ value }) => chunkRecordIntact(value)).pipe(
+                Effect.map((intact) => intact.every((chunkIntact) => chunkIntact)),
+              ),
+          }))),
+      },
+    })
     return nextHead
   })
 
@@ -1175,9 +1935,9 @@ export const makeSessionChunkSource = (
 
 export const snapshotResidentChunks = (
   store: Pick<ChunkStoreApi, 'loadedCoords' | 'snapshot'>,
-): Effect.Effect<ReadonlyArray<Chunk>> =>
+): Effect.Effect<ReadonlyArray<ChunkWithBlockStates>> =>
   Effect.gen(function* () {
     const coords = yield* store.loadedCoords
     const snapshots = yield* Effect.forEach(coords, store.snapshot)
-    return snapshots.filter((chunk): chunk is Chunk => chunk !== undefined)
+    return snapshots.filter((chunk): chunk is ChunkWithBlockStates => chunk !== undefined)
   })

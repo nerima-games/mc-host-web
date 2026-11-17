@@ -1,19 +1,26 @@
 import * as THREE from 'three'
-import { Context, Effect, Layer, Option, Scope } from 'effect'
+import { Context, Effect, Layer, Option, Result, Scope } from 'effect'
 import {
+  AudioDurationSecs,
+  AudioEventId,
+  AudioFrequencyHz,
+  AudioHandleId,
+  AudioPan,
+  AudioVolume,
   createOriginalSampleManifest,
   makeEndAudioController,
   makeWeatherAudioController,
   makeWebAudioBackend,
   type EndAudioController,
   type EndAudioEvent,
+  type OriginalSampleBankFailure,
   type WeatherAudioController,
   type WeatherAudioHandle,
   type WeatherLoopKind,
   type WebAudioBackend,
 } from '@nerima-games/mc-audio'
-import { type Position as Vec3, type StageRegistration } from '@nerima-games/mc-kernel'
-import { indexedDbStorageLayer, StoragePort } from '@nerima-games/mc-save'
+import { AngleRadians, PositionAxis, type Position as Vec3 } from '@nerima-games/mc-kernel'
+import { IndexedDbDatabaseName, indexedDbStorageLayer, StoragePort } from '@nerima-games/mc-save'
 import {
   browserInputLayer,
   generateTerrainAtlas,
@@ -21,12 +28,12 @@ import {
   makeProductionWorldRenderer,
   makeWorldRenderer,
   QUALITY_PRESETS,
+  type AtlasCoordinateError,
   type GraphicsQuality,
   type TouchControlTarget,
   type WorldRenderer,
 } from '@nerima-games/mc-render'
 import {
-  makeRuntimeRedstoneStages,
   RedstoneWorldRuntime,
   RedstoneWorldRuntimeLayer,
   type RedstoneWorldRuntimeService,
@@ -39,7 +46,11 @@ import {
   type AudioRuntime,
   type PlacementAudioLatch,
 } from './audio-runtime'
-import { DEFAULT_PLAYER_SETTINGS, loadPlayerSettings, type PlayerSettingsV1 } from './settings'
+import {
+  loadPlayerSettingsForSession,
+  type PlayerSettingsPersistenceError,
+  type PlayerSettingsV1,
+} from './settings'
 import { loadSession, type SessionHead, type SessionMetadata, type SessionState } from './session-persistence'
 import type { SessionRoute } from './session-navigation'
 
@@ -48,9 +59,34 @@ import type { SessionRoute } from './session-navigation'
  * both need. They live here rather than in `main.ts` so that `main.ts` can
  * import the factory without the factory importing `main.ts` back (a cycle).
  */
-export const DATABASE_NAME = 'nerima-games-minecraft'
+export const DATABASE_NAME: IndexedDbDatabaseName = IndexedDbDatabaseName('nerima-games-minecraft')
 export const MISSING_SESSION_ERROR = 'The requested saved world could not be found.'
 export class RequestedSessionNotFoundError extends Error {}
+
+/**
+ * A dependency rejected its own built-in data while the adapters were being
+ * built. `makePlatformAdapters` throws it, and the boot catch in `main.ts`
+ * reports it through `failBoot` like any other boot failure.
+ */
+export class PlatformAdapterBootFailure extends Error {
+  readonly _tag: 'PlatformAdapterBootFailure' = 'PlatformAdapterBootFailure'
+  readonly failure: OriginalSampleBankFailure | AtlasCoordinateError
+
+  constructor(failure: OriginalSampleBankFailure | AtlasCoordinateError) {
+    super(`Platform adapter construction failed: ${failure._tag}`)
+    this.failure = failure
+  }
+}
+
+// Tone parameters for the procedural loops and thunder. Each literal satisfies
+// its mc-audio brand's check (finite; positive frequency, non-negative
+// duration, pan within [-1, 1]), so the constructors cannot throw here.
+const AMBIENT_LOOP_DURATION_SECS = AudioDurationSecs(3600)
+const CENTERED_PAN = AudioPan(0)
+const END_AMBIENCE_FREQUENCY = AudioFrequencyHz(42)
+const RAIN_LOOP_FREQUENCY = AudioFrequencyHz(180)
+const THUNDER_CLAP_DURATION_SECS = AudioDurationSecs(1.8)
+const THUNDER_CLAP_FREQUENCY = AudioFrequencyHz(46)
 
 export type SettingsWriteQueue = {
   tail: Promise<void>
@@ -76,6 +112,10 @@ export type PlatformAdapters = {
   readonly storageContext: Context.Context<StoragePort>
   readonly runStorage: <A, E>(effect: Effect.Effect<A, E, never>) => Promise<A>
   readonly playerSettings: PlayerSettingsV1
+  // Set when the stored settings could not be read; `playerSettings` then holds
+  // the defaults, and the host must warn the player before a change replaces
+  // the stored record.
+  readonly playerSettingsLoadFailure: PlayerSettingsPersistenceError | undefined
   readonly settingsWrites: SettingsWriteQueue
   readonly setReadAudioListener: (listener: () => Vec3) => void
   readonly setReadAudioListenerForward: (listener: () => Vec3) => void
@@ -92,14 +132,14 @@ export type PlatformAdapters = {
   readonly sessionMetadata: SessionMetadata
   readonly isCreativeMode: boolean
   readonly initialDimension: SessionState['dimension']
-  readonly inputLayer: Layer.Layer<InputService>
   readonly inputContext: Context.Context<InputService>
   readonly redstoneRuntime: RedstoneWorldRuntimeService
-  readonly runtimeRedstoneStages: ReadonlyArray<StageRegistration>
+  readonly redstoneContext: Context.Context<RedstoneWorldRuntime>
   readonly atlasTexture: THREE.DataTexture
   readonly softwareRenderer: boolean
   readonly renderQuality: GraphicsQuality | undefined
   readonly worldRenderer: WorldRenderer
+  readonly bindDebugOverlayToggle: (toggle: () => void) => () => void
 }
 
 export const makePlatformAdapters = async (deps: {
@@ -126,19 +166,23 @@ export const makePlatformAdapters = async (deps: {
   )
   const runStorage = <A, E>(effect: Effect.Effect<A, E, never>): Promise<A> =>
     Effect.runPromise(effect)
-  let playerSettings: PlayerSettingsV1 = await runStorage(
-    Effect.provide(loadPlayerSettings(), storageContext),
-  ).catch(() => DEFAULT_PLAYER_SETTINGS)
+  const { settings: playerSettings, failure: playerSettingsLoadFailure } = await runStorage(
+    Effect.provide(loadPlayerSettingsForSession(), storageContext),
+  )
   const settingsWrites = makeSettingsWriteQueue()
-  let readAudioListener = (): Vec3 => ({ x: 0, y: 0, z: 0 })
-  let readAudioListenerForward = (): Vec3 => horizontalListenerForward(0)
-  const sampleManifest = createOriginalSampleManifest()
+  let readAudioListener = (): Vec3 => ({ x: PositionAxis(0), y: PositionAxis(0), z: PositionAxis(0) })
+  let readAudioListenerForward = (): Vec3 => horizontalListenerForward(AngleRadians(0))
+  const sampleManifestResult = createOriginalSampleManifest()
+  if (Result.isFailure(sampleManifestResult)) {
+    throw new PlatformAdapterBootFailure(sampleManifestResult.failure)
+  }
+  const sampleManifest = sampleManifestResult.success
   const audioBackend = Effect.runSync(makeWebAudioBackend({
     global: globalThis,
-    initialMasterGain: playerSettings.audioEnabled ? playerSettings.masterVolume : 0,
+    initialMasterGain: playerSettings.audioEnabled ? playerSettings.masterVolume : AudioVolume(0),
     sampleManifest,
   }))
-  canvas.setAttribute('data-audio-samples', String(Object.keys(sampleManifest).length))
+  canvas.setAttribute('data-audio-samples', String(sampleManifest.size))
   const audio = Effect.runSync(makeAudioRuntime({
     backend: audioBackend,
     clockLayer: BrowserClockLayer,
@@ -148,11 +192,11 @@ export const makePlatformAdapters = async (deps: {
   }))
   const endAudio = makeEndAudioController({
     createLoop: (_kind, initialGain) => Effect.runSync(audioBackend.playTone({
-      durationSecs: 3600,
-      frequency: 42,
+      durationSecs: AMBIENT_LOOP_DURATION_SECS,
+      frequency: END_AMBIENCE_FREQUENCY,
       gain: initialGain,
       loop: true,
-      pan: 0,
+      pan: CENTERED_PAN,
       wave: 'sine',
     })),
     setLoopGain: () => {},
@@ -161,42 +205,50 @@ export const makePlatformAdapters = async (deps: {
     playFallback: (request) => Effect.runSync(audioBackend.playTone({ ...request, loop: false })),
     release: () => {},
   })
-  let nextWeatherAudioHandleId = -1
-  const pendingThunder = new Map<number, number>()
+  // Thunder handles are keyed by object identity, not by id: the controller
+  // also passes its loop handles (backend tone handles, whose ids come from the
+  // same non-negative AudioHandleId space) to `release`, and an id lookup
+  // would let releasing a loop cancel an unrelated pending thunder clap.
+  let nextThunderHandleId = 0
+  const pendingThunder = new Map<WeatherAudioHandle, number>()
   const weatherAudio = makeWeatherAudioController({
-    createLoop: (kind: WeatherLoopKind, initialGain: number) => Effect.runSync(
+    // mc-audio's WeatherLoopKind has the single member 'rain', so every loop
+    // is the rain tone.
+    createLoop: (_kind: WeatherLoopKind, initialGain) => Effect.runSync(
       audioBackend.playTone({
-        durationSecs: 3600,
-        frequency: kind === 'rain' ? 180 : 72,
+        durationSecs: AMBIENT_LOOP_DURATION_SECS,
+        frequency: RAIN_LOOP_FREQUENCY,
         gain: initialGain,
         loop: true,
-        pan: 0,
-        wave: kind === 'rain' ? 'sawtooth' : 'triangle',
+        pan: CENTERED_PAN,
+        wave: 'sawtooth',
       }),
     ),
     setLoopGain: () => {},
     stopLoop: (handle) => Effect.runSync(audioBackend.stopTone(handle)),
     playThunder: ({ delaySecs, gain, pan }): WeatherAudioHandle => {
-      const handle = { id: nextWeatherAudioHandleId-- }
+      // The counter starts at 0 and only increments, so it is always a
+      // non-negative integer and AudioHandleId's check cannot fail.
+      const handle: WeatherAudioHandle = { id: AudioHandleId(nextThunderHandleId++) }
       const timeout = window.setTimeout(() => {
-        pendingThunder.delete(handle.id)
+        pendingThunder.delete(handle)
         Effect.runSync(audioBackend.playTone({
-          durationSecs: 1.8,
-          frequency: 46,
+          durationSecs: THUNDER_CLAP_DURATION_SECS,
+          frequency: THUNDER_CLAP_FREQUENCY,
           gain,
           loop: false,
           pan,
           wave: 'sawtooth',
         }))
       }, delaySecs * 1_000)
-      pendingThunder.set(handle.id, timeout)
+      pendingThunder.set(handle, timeout)
       return handle
     },
     release: (handle) => {
-      const timeout = pendingThunder.get(handle.id)
+      const timeout = pendingThunder.get(handle)
       if (timeout !== undefined) {
         window.clearTimeout(timeout)
-        pendingThunder.delete(handle.id)
+        pendingThunder.delete(handle)
       }
     },
   })
@@ -204,7 +256,8 @@ export const makePlatformAdapters = async (deps: {
   const pendingEndAudioEvents: EndAudioEvent[] = []
   const queueEndAudio = (kind: EndAudioEvent['kind'], position: Vec3): void => {
     pendingEndAudioEvents.push({
-      id: `end-${String(nextEndAudioEventId++)}`,
+      // A non-empty template literal: AudioEventId's only check is non-emptiness.
+      id: AudioEventId(`end-${String(nextEndAudioEventId++)}`),
       kind,
       position,
     })
@@ -239,6 +292,7 @@ export const makePlatformAdapters = async (deps: {
   // otherwise. Without this, `attack` never fires and no block can be broken.
   const inputLayer = browserInputLayer({
     targets: { window, document },
+    runSync: Effect.runSync,
     canvas,
     bindings: playerSettings.bindings,
     allowsPointerLock,
@@ -273,6 +327,16 @@ export const makePlatformAdapters = async (deps: {
   canvas.addEventListener('keydown', (event) => {
     if (event.isTrusted) audio.unlock()
   })
+  // F3 uses the canvas keyboard target that F2 uses and leaves pointer lock as it is.
+  const bindDebugOverlayToggle = (toggle: () => void): (() => void) => {
+    const handleKey = (event: KeyboardEvent): void => {
+      if (event.code !== 'F3' || event.repeat || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return
+      event.preventDefault()
+      toggle()
+    }
+    canvas.addEventListener('keydown', handleKey)
+    return () => canvas.removeEventListener('keydown', handleKey)
+  }
 
   // Built ONCE, into a Context, and then provided as a Context rather than as a
   // Layer. `mx-multiplayer/stages/registration.ts` records why this matters:
@@ -286,9 +350,6 @@ export const makePlatformAdapters = async (deps: {
     Effect.provideService(Layer.build(RedstoneWorldRuntimeLayer), Scope.Scope, scope),
   )
   const redstoneRuntime = Context.get(redstoneContext, RedstoneWorldRuntime)
-  const runtimeRedstoneStages = await Effect.runPromise(
-    Effect.provide(makeRuntimeRedstoneStages, redstoneContext),
-  )
 
   // The renderer. mc-render builds it; this file supplies only the two things
   // it cannot reach — the `three` namespace and the element to draw on.
@@ -307,7 +368,11 @@ export const makePlatformAdapters = async (deps: {
   // levels down, naming `GLBufferAttribute`. mc-render cannot pin either from
   // its side without naming a `three` type, which is the one thing that seam
   // exists not to do. The host has `three` in scope and pins them here.
-  const terrainAtlas = generateTerrainAtlas()
+  const terrainAtlasResult = generateTerrainAtlas()
+  if (Result.isFailure(terrainAtlasResult)) {
+    throw new PlatformAdapterBootFailure(terrainAtlasResult.failure)
+  }
+  const terrainAtlas = terrainAtlasResult.success
   const atlasData = new Uint8Array(new ArrayBuffer(terrainAtlas.data.byteLength))
   atlasData.set(terrainAtlas.data)
   const atlasTexture = new THREE.DataTexture(
@@ -380,6 +445,7 @@ export const makePlatformAdapters = async (deps: {
     storageContext,
     runStorage,
     playerSettings,
+    playerSettingsLoadFailure,
     settingsWrites,
     setReadAudioListener: (listener: () => Vec3): void => { readAudioListener = listener },
     setReadAudioListenerForward: (listener: () => Vec3): void => { readAudioListenerForward = listener },
@@ -399,13 +465,13 @@ export const makePlatformAdapters = async (deps: {
     sessionMetadata,
     isCreativeMode,
     initialDimension,
-    inputLayer,
     inputContext,
     redstoneRuntime,
-    runtimeRedstoneStages,
+    redstoneContext,
     atlasTexture,
     softwareRenderer,
     renderQuality,
     worldRenderer,
+    bindDebugOverlayToggle,
   }
 }

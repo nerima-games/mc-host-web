@@ -1,18 +1,29 @@
-import { Effect, Layer, Scope } from 'effect'
-import { indexedDbStorageLayer } from '@nerima-games/mc-save'
+import { Array as Arr, Effect, Layer, Result, Scope } from 'effect'
+import { InputAction, KeyCode, WorldId } from '@nerima-games/mc-kernel'
+import { IndexedDbDatabaseName, indexedDbStorageLayer } from '@nerima-games/mc-save'
 import {
   createMainMenuView,
+  createOnboardingView,
+  decodeWorldNameText,
   initialMainMenuState,
   mainMenuViewModel,
+  onboardingViewModel,
   type CreateWorldRequest,
   type MainMenuState,
   type SavedWorld,
+  type DomElement,
+  type DomElementFactory,
+  type QuickControlHint,
 } from '@nerima-games/mx-ui'
 
 import { validateMultiplayerUrl } from './multiplayer-url'
 import {
-  DEFAULT_PLAYER_SETTINGS,
-  loadPlayerSettings,
+  PLAYER_BINDING_ACTIONS,
+  initialPlayerSettingsWrites,
+  loadPlayerSettingsForSession,
+  playerSettingsWriteFailed,
+  playerSettingsWriteSucceeded,
+  queuePlayerSettingsWrite,
   savePlayerSettings,
   type PlayerSettingsV1,
 } from './settings'
@@ -25,6 +36,82 @@ import {
   makeSettingsWriteQueue,
   type SettingsWriteQueue,
 } from './platform-adapters'
+
+const QUICK_CONTROLS_DISMISSED_KEY = 'mc-host-web/quick-controls-dismissed'
+const QUICK_CONTROL_ACTIONS = new Set(['moveForward', 'moveBackward', 'moveLeft', 'moveRight', 'jump', 'openInventory', 'attack', 'use', 'escape'])
+
+export const playerControlHints = (bindings: PlayerSettingsV1['bindings']): {
+  readonly quickControls: ReadonlyArray<QuickControlHint>
+  readonly allControls: ReadonlyArray<QuickControlHint>
+} => {
+  // The action list is fixed; bound input codes have already passed settings validation.
+  const allControls = PLAYER_BINDING_ACTIONS.flatMap((action): Array<QuickControlHint> => {
+    const keys = bindings[action]
+    return keys === undefined ? [] : [{ action: InputAction(action), keys: KeyCode(keys) }]
+  }).concat({ action: InputAction('escape'), keys: KeyCode('Escape') })
+  return { quickControls: allControls.filter(({ action }) => QUICK_CONTROL_ACTIONS.has(action)), allControls }
+}
+
+export type OnboardingPersistenceFailure = {
+  readonly _tag: 'OnboardingPersistenceFailure'
+  readonly operation: 'read' | 'write'
+  readonly cause: unknown
+}
+
+export const onboardingFailureMessage = (failure: OnboardingPersistenceFailure): string =>
+  failure.operation === 'read'
+    ? 'Controls preferences could not be loaded.'
+    : 'Controls could not be saved. Please try again.'
+
+export const installPlayerOnboarding = (context: {
+  readonly document: DomElementFactory
+  readonly parent: DomElement
+  readonly getStorage: () => Pick<Storage, 'getItem' | 'setItem'>
+  readonly getQuickControls: () => ReadonlyArray<QuickControlHint>
+  readonly getAllControls: () => ReadonlyArray<QuickControlHint>
+  readonly onFailure: (failure: OnboardingPersistenceFailure) => void
+}): Result.Result<{ readonly showControls: () => void; readonly render: () => void }, OnboardingPersistenceFailure> => {
+  const loaded = Result.try({
+    try: () => {
+      const storage = context.getStorage()
+      return { storage, stored: storage.getItem(QUICK_CONTROLS_DISMISSED_KEY) }
+    },
+    catch: (cause): OnboardingPersistenceFailure => ({ _tag: 'OnboardingPersistenceFailure', operation: 'read', cause }),
+  })
+  if (Result.isFailure(loaded)) return Result.fail(loaded.failure)
+  const { storage, stored } = loaded.success
+  if (stored !== null && stored !== 'true') {
+    return Result.fail({ _tag: 'OnboardingPersistenceFailure', operation: 'read', cause: stored })
+  }
+  let dismissed = stored === 'true'
+  let expanded = false
+  const render = (): void => view.render(onboardingViewModel({
+    firstRun: true,
+    quickControlsDismissed: dismissed,
+    quickControls: expanded ? context.getAllControls() : context.getQuickControls(),
+  }))
+  const view = createOnboardingView(context.document, context.parent, {
+    onIntent: (intent) => {
+      if (intent._tag === 'OpenHowToPlay') {
+        expanded = true
+        render()
+        return
+      }
+      const saved = Result.try({
+        try: () => storage.setItem(QUICK_CONTROLS_DISMISSED_KEY, 'true'),
+        catch: (cause): OnboardingPersistenceFailure => ({ _tag: 'OnboardingPersistenceFailure', operation: 'write', cause }),
+      })
+      if (Result.isFailure(saved)) {
+        context.onFailure(saved.failure)
+        return
+      }
+      dismissed = true
+      render()
+    },
+  })
+  render()
+  return Result.succeed({ showControls: () => { dismissed = false; render() }, render })
+}
 
 export type TitleMenuContext = {
   readonly document: Document
@@ -85,32 +172,47 @@ export const bootTitleMenu = async (context: TitleMenuContext): Promise<void> =>
     titleStatus.textContent = MISSING_SESSION_ERROR
   }
 
+  // DATABASE_NAME is a non-empty literal, the only IndexedDbDatabaseName requirement.
+  const databaseName = IndexedDbDatabaseName(DATABASE_NAME)
   const scope = Effect.runSync(Scope.make())
   const storageContext = await Effect.runPromise(
     Effect.provideService(
-      Layer.build(indexedDbStorageLayer({ factory: indexedDB, databaseName: DATABASE_NAME })),
+      Layer.build(indexedDbStorageLayer({ factory: indexedDB, databaseName })),
       Scope.Scope,
       scope,
     ),
   )
   const sessions = await Effect.runPromise(Effect.provide(listSessions(), storageContext))
-  let playerSettings = await Effect.runPromise(
-    Effect.provide(loadPlayerSettings(), storageContext),
-  ).catch(() => DEFAULT_PLAYER_SETTINGS)
+  const playerSettingsLoad = await Effect.runPromise(
+    Effect.provide(loadPlayerSettingsForSession(), storageContext),
+  )
+  let playerSettingsWrites = initialPlayerSettingsWrites(playerSettingsLoad.settings)
   const settingsWrites = makeSettingsWriteQueue()
   let settingsView: ReturnType<typeof createSettingsView>
   const persistPlayerSettings = (next: PlayerSettingsV1): void => {
+    playerSettingsWrites = queuePlayerSettingsWrite(playerSettingsWrites, next)
     document.body.setAttribute('data-player-settings-persistence', 'dirty')
     settingsView.clearPersistenceError()
+    settingsView.reportPersistenceSaving()
     enqueueSettingsWrite(
       settingsWrites,
       () => Effect.runPromise(Effect.provide(savePlayerSettings(next), storageContext)),
       () => {
-        if (playerSettings === next) {
+        const settled = playerSettingsWriteSucceeded(playerSettingsWrites, next)
+        playerSettingsWrites = settled.writes
+        settingsView.reportStoredRecordReplaced()
+        if (settled.latest) {
           document.body.setAttribute('data-player-settings-persistence', 'saved')
+          settingsView.reportPersistenceSaved()
         }
       },
       (error) => {
+        const settled = playerSettingsWriteFailed(playerSettingsWrites, next)
+        playerSettingsWrites = settled.writes
+        if (settled.latest) {
+          settingsView.replaceSettings(settled.writes.applied)
+          if (Result.isSuccess(onboarding)) onboarding.success.render()
+        }
         document.body.setAttribute('data-player-settings-persistence', 'error')
         const message = 'Settings could not be saved.'
         titleStatus.textContent = message
@@ -119,10 +221,18 @@ export const bootTitleMenu = async (context: TitleMenuContext): Promise<void> =>
       },
     )
   }
-  const savedWorlds: ReadonlyArray<SavedWorld> = sessions.map(({ sessionId, metadata }) => ({
-    sessionId,
-    name: metadata.name,
-  }))
+  // Stored heads only guarantee a non-empty session id, while WorldId also rejects
+  // blank ids. Such a session cannot be opened through sessionHref either, so it is
+  // left out of the list and reported rather than shown under a substituted id.
+  const [savedWorlds, invalidSessionIds] = Arr.partition(sessions, ({ sessionId, metadata }) =>
+    Result.map(WorldId.result(sessionId), (worldId): SavedWorld => ({
+      sessionId: worldId,
+      // WorldNameTextSchema is an unchecked string brand, so decoding a string cannot fail.
+      name: Result.getOrThrow(decodeWorldNameText(metadata.name)),
+    })))
+  for (const failure of invalidSessionIds) {
+    console.error('[mc-compose] saved session has an invalid world id', failure)
+  }
   multiplayerWorld.replaceChildren(...savedWorlds.map(({ sessionId, name }) => {
     const option = document.createElement('option')
     option.value = sessionId
@@ -134,15 +244,43 @@ export const bootTitleMenu = async (context: TitleMenuContext): Promise<void> =>
   const existingIds = savedWorlds.map(({ sessionId }) => sessionId)
   let menuState: MainMenuState = initialMainMenuState
   let menuView: ReturnType<typeof createMainMenuView>
+  const onboardingParent = document.createElement('div')
+  titleScreen.appendChild(onboardingParent)
+  const reportOnboardingFailure = (failure: OnboardingPersistenceFailure): void => {
+    titleStatus.textContent = onboardingFailureMessage(failure)
+    console.error('[mc-compose] controls persistence failed', failure)
+  }
+  const onboarding = installPlayerOnboarding({
+    document,
+    parent: onboardingParent,
+    getStorage: () => window.localStorage,
+    getQuickControls: () => playerControlHints(playerSettingsWrites.applied.bindings).quickControls,
+    getAllControls: () => playerControlHints(playerSettingsWrites.applied.bindings).allControls,
+    onFailure: reportOnboardingFailure,
+  })
+  if (Result.isFailure(onboarding)) {
+    reportOnboardingFailure(onboarding.failure)
+  } else {
+    const controlsButton = document.createElement('button')
+    controlsButton.setAttribute('type', 'button')
+    controlsButton.setAttribute('data-title-action', 'show-controls')
+    controlsButton.textContent = 'Controls'
+    controlsButton.addEventListener('click', () => onboarding.success.showControls())
+    titleScreen.appendChild(controlsButton)
+  }
   settingsView = createSettingsView(document, settingsRoot, {
     onChange: (next) => {
-      playerSettings = next
       persistPlayerSettings(next)
+      if (Result.isSuccess(onboarding)) onboarding.success.render()
     },
     onClose: () => {
       titleScreen.inert = false
     },
   })
+  if (playerSettingsLoad.failure !== undefined) {
+    settingsView.reportLoadFailure()
+    console.error('[mc-compose] player settings could not be read', playerSettingsLoad.failure)
+  }
 
   let titleNavigationPending = false
   const setTitleNavigationPending = (pending: boolean): void => {
@@ -232,7 +370,7 @@ export const bootTitleMenu = async (context: TitleMenuContext): Promise<void> =>
         : menuParent
       titleStatus.textContent = ''
       titleScreen.inert = true
-      settingsView.open(playerSettings, returnFocus)
+      settingsView.open(playerSettingsWrites.applied, returnFocus)
     },
   })
   menuView.render(mainMenuViewModel(menuState, savedWorlds))

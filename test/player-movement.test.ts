@@ -1,16 +1,21 @@
 import { describe, expect, it } from '@effect/vitest'
-import { Effect, Option, Ref } from 'effect'
+import { Effect, Option, Ref, Result, Schema } from 'effect'
 
-import { blockIdOf, blockPosition, blockTypeOfId, chunkCoord, DeltaTimeSecs, MonotonicTimeSecs, StackCount } from '@nerima-games/mc-kernel'
-import { PLAYER_HALF_HEIGHT, PLAYER_HALF_WIDTH } from '@nerima-games/mc-physics'
+import { AngleRadians, BlockAxis, blockIdOf, blockPosition, blockTypeOfId, ChunkAxis, chunkCoord, DeltaTimeSecs, EntityHealthPoints, itemStack, InterpolationFraction, MonotonicTimeSecs, position, PositionAxis, StackCount, VehicleVelocityComponent } from '@nerima-games/mc-kernel'
+import { BlockLength, PLAYER_HALF_HEIGHT, PLAYER_HALF_WIDTH } from '@nerima-games/mc-physics'
 import type { InputAction } from '@nerima-games/mc-render'
-import { emptyFurnaceState, makeSimFrameState, makeWeatherService, VehicleId, type FurnaceState, type SimPhysicsConfig, type Vehicle } from '@nerima-games/mc-sim'
-import { CHUNK_SIZE_XZ, CHUNK_VOLUME, FALLBACK_BIOME, type ChunkSource } from '@nerima-games/mc-worldgen'
-import { advanceFishing, cancelFishing, castFishing, isDroppedItemBehaviour, makeGameplayFrameState, makeGeneratedWorld, spawnDroppedItems, type FishingSession, type MobBehaviour } from '@nerima-games/mx-gameplay'
+import { emptyFurnaceState, ExhaustionAmount, FoodTimerSecs, makeSimFrameState, makeWeatherService, VehicleId, type FurnaceState, type SimPhysicsConfig, type Vehicle } from '@nerima-games/mc-sim'
+import { BIOMES, CHUNK_SIZE_XZ, CHUNK_VOLUME, type ChunkSource } from '@nerima-games/mc-worldgen'
+import { advanceFishing, cancelFishing, castFishing, enderPearlDisplacement, EnderPearlOutcomeSchema, isDroppedItemBehaviour, makeGameplayFrameState, makeGeneratedWorld, spawnDroppedItems, type FishingSession, type MobBehaviour } from '@nerima-games/mx-gameplay'
 import { PlayerId, PlayerName, WorldId } from '@nerima-games/mx-multiplayer'
 
+import { ChunkRenderFailure } from '../apps/web/chunk-streaming'
 import { createDroppedItemLifetimeTracker, DROPPED_ITEM_LIFETIME_SECS } from '../apps/web/dropped-item-lifetime'
-import { movementInput, runTickPlayerMovement } from '../apps/web/tick/player-movement'
+import {
+  movementInput,
+  runTickPlayerMovement as runTickPlayerMovementEffect,
+  vitalsChangedByHunger,
+} from '../apps/web/tick/player-movement'
 import {
   mutableState,
   type H5aFishingWater,
@@ -23,10 +28,12 @@ import {
   initialPlayerSwimmingRuntimeState,
 } from '../apps/web/player-swimming-runtime'
 
+const runTickPlayerMovement = (...args: Parameters<typeof runTickPlayerMovementEffect>) => Effect.runSync(runTickPlayerMovementEffect(...args))
+
 const allAirChunkSource: ChunkSource = (coord) => Effect.succeed({
   coord,
-  blocks: new Uint8Array(CHUNK_VOLUME).fill(blockIdOf('air')),
-  biomes: Array.from({ length: CHUNK_SIZE_XZ * CHUNK_SIZE_XZ }, () => FALLBACK_BIOME),
+  blocks: new Uint16Array(CHUNK_VOLUME).fill(Option.getOrThrow(blockIdOf('air'))),
+  biomes: Array.from({ length: CHUNK_SIZE_XZ * CHUNK_SIZE_XZ }, () => BIOMES[0]),
 })
 
 const cell = <Value,>(initial: Value) => {
@@ -76,7 +83,7 @@ const makeHarness = async (multiplayer?: H5aMovementContext['multiplayer']) => {
   Effect.runSync(Ref.set(simState.isGrounded, true))
 
   const pose = {
-    feetPosition: { x: 1.2, y: 64.3, z: -2.1 },
+    feetPosition: position(PositionAxis(1.2), PositionAxis(64.3), PositionAxis(-2.1)),
     yawRadians: 0,
     pitchRadians: 0,
   }
@@ -105,10 +112,11 @@ const makeHarness = async (multiplayer?: H5aMovementContext['multiplayer']) => {
   const multiplayerStatus = { textContent: 'idle', hidden: true }
   const simPhysicsConfig: SimPhysicsConfig = {
     resolve: {
-      blockPropertiesAt: () => null,
+      blockPropertiesAt: () => Result.succeed(null),
+      environment: { blockAt: () => Result.succeed(null) },
       halfWidth: PLAYER_HALF_WIDTH,
       halfHeight: PLAYER_HALF_HEIGHT,
-      stepHeight: 0.6,
+      stepHeight: BlockLength(0.6),
     },
     walkSpeed: 2,
     jumpSpeed: 1,
@@ -117,7 +125,9 @@ const makeHarness = async (multiplayer?: H5aMovementContext['multiplayer']) => {
   let mountedVehicleId: string | undefined
   let vehicle: Vehicle | undefined
   let frameRunner: H5aMovementContext['runFrame'] = () => Effect.void
+  let chunkRenderFaults: H5aMovementContext['drainChunkRenderFaults'] = () => Effect.void
   let dirtyCount = 0
+  let localDeathCount = 0
   let presentedSwimmingStateCount = 0
   let pumpedDamageCount = 0
 
@@ -142,7 +152,7 @@ const makeHarness = async (multiplayer?: H5aMovementContext['multiplayer']) => {
     },
     simState,
     currentChunkStore: world.chunkStore,
-    blockPosition,
+    blockPosition: (x, y, z) => blockPosition(BlockAxis(x), BlockAxis(y), BlockAxis(z)),
     eyeLevelOffset: 1.62,
     blockTypeOfId,
     advanceSwimming: advancePlayerSwimmingRuntime,
@@ -151,7 +161,7 @@ const makeHarness = async (multiplayer?: H5aMovementContext['multiplayer']) => {
     sprintSpeedMPerSec: 5.612,
     getPlayerMovementSpeedMultiplier: () => Effect.succeed(1.5),
     gameplayState,
-    time: { timeOfDay: Effect.succeed(6000) },
+    time: world.time,
     weather: { snapshot: Effect.succeed(weather) },
     syncPortalCandidateSnapshots: () => Effect.void,
     setFishingResult: (result) => fishingResults.push(result),
@@ -176,12 +186,15 @@ const makeHarness = async (multiplayer?: H5aMovementContext['multiplayer']) => {
     runFrame: (deltaSecs) => {
       return Effect.flatMap(frameRunner(deltaSecs), () => Effect.void)
     },
+    drainChunkRenderFaults: () => chunkRenderFaults(),
     applyPlayerDamage: (damage) => damageEvents.push(damage),
     failBoot: (message, error) => failureEvents.push({ message, error }),
     markSessionDirty: () => { dirtyCount += 1 },
+    handleLocalPlayerDeath: () => { localDeathCount += 1 },
     canvas: { setAttribute: (name, value) => { canvasAttributes.set(name, value) } },
     world: {
       inventory: { storageSnapshot: Effect.succeed({ inventory: { slots: inventorySlots } }) },
+      vitals: world.vitals,
       entities: world.entities,
     },
     currentChunkContext: () => ({ dimension: 'overworld' }),
@@ -222,7 +235,9 @@ const makeHarness = async (multiplayer?: H5aMovementContext['multiplayer']) => {
     setMountedVehicleId: (value: string | undefined) => { mountedVehicleId = value },
     setVehicle: (value: Vehicle | undefined) => { vehicle = value },
     setFrameRunner: (value: H5aMovementContext['runFrame']) => { frameRunner = value },
+    setChunkRenderFaults: (value: H5aMovementContext['drainChunkRenderFaults']) => { chunkRenderFaults = value },
     dirtyCount: () => dirtyCount,
+    localDeathCount: () => localDeathCount,
     presentedSwimmingStateCount: () => presentedSwimmingStateCount,
     pumpedDamageCount: () => pumpedDamageCount,
   }
@@ -245,7 +260,76 @@ describe('tick player movement input', () => {
   })
 })
 
+describe('tick player movement hunger outcome', () => {
+  // The survival-hunger stage ticks the vitals owner inside `runFrame`, so the
+  // death and save marking the host tick used to report are read across it.
+  it('handles a death the frame caused and marks the session dirty', async () => {
+    const harness = await makeHarness()
+    const { world } = harness
+    harness.setFrameRunner(() => Effect.flatMap(world.vitals.snapshot, (vitals) =>
+      world.vitals.restore({ ...vitals, healthPoints: EntityHealthPoints(0) })))
+
+    runTickPlayerMovement(harness.context, makeFrame())
+
+    expect(harness.localDeathCount()).toBe(1)
+    expect(harness.dirtyCount()).toBe(1)
+  })
+
+  it('does not report a death for a player who was already dead before the frame', async () => {
+    const harness = await makeHarness()
+    const { world } = harness
+    const vitals = Effect.runSync(world.vitals.snapshot)
+    Effect.runSync(world.vitals.restore({ ...vitals, healthPoints: EntityHealthPoints(0) }))
+
+    runTickPlayerMovement(harness.context, makeFrame())
+
+    expect(harness.localDeathCount()).toBe(0)
+    expect(harness.dirtyCount()).toBe(0)
+  })
+
+  it('leaves death and saving to the server in multiplayer', async () => {
+    const harness = await makeHarness(makeMultiplayer('open').runtime)
+    const { world } = harness
+    harness.setFrameRunner(() => Effect.flatMap(world.vitals.snapshot, (vitals) =>
+      world.vitals.restore({ ...vitals, healthPoints: EntityHealthPoints(0) })))
+
+    runTickPlayerMovement(harness.context, makeFrame())
+
+    expect(harness.localDeathCount()).toBe(0)
+  })
+
+  it('counts a completed food tick but not the food timer advancing alone', async () => {
+    const harness = await makeHarness()
+    const before = Effect.runSync(harness.world.vitals.snapshot)
+    const timerAdvanced = { ...before, foodTimerSecs: FoodTimerSecs(before.foodTimerSecs + 0.5) }
+
+    expect(vitalsChangedByHunger(before, before)).toBe(false)
+    expect(vitalsChangedByHunger(before, timerAdvanced)).toBe(false)
+    expect(vitalsChangedByHunger(timerAdvanced, before)).toBe(true)
+    expect(vitalsChangedByHunger(before, { ...before, exhaustion: ExhaustionAmount(before.exhaustion + 0.1) })).toBe(true)
+    expect(vitalsChangedByHunger(before, { ...before, healthPoints: EntityHealthPoints(before.healthPoints - 1) })).toBe(true)
+  })
+})
+
 describe('tick player movement branches', () => {
+  it('propagates an invalid time fraction before running the frame', async () => {
+    const harness = await makeHarness()
+    let framesRun = 0
+    harness.setFrameRunner(() => Effect.sync(() => { framesRun += 1 }))
+    const invalidTime = InterpolationFraction.result(6000)
+    expect(Result.isFailure(invalidTime)).toBe(true)
+    const result = Effect.runSync(Effect.result(runTickPlayerMovementEffect({
+      ...harness.context,
+      time: { timeOfDay: Effect.fromResult(invalidTime) },
+    }, makeFrame())))
+
+    expect(Result.isFailure(result)).toBe(true)
+    if (Result.isFailure(result) && Result.isFailure(invalidTime)) {
+      expect(result.failure).toBe(invalidTime.failure)
+    }
+    expect(framesRun).toBe(0)
+  })
+
   it('swims while submerged and applies fixed drowning damage', async () => {
     const harness = await makeHarness()
     const { world, pose, swimmingState, context, simState } = harness
@@ -254,11 +338,11 @@ describe('tick player movement branches', () => {
       oxygenSecs: 0.5,
       drowningElapsedSecs: 0.75,
     })
-    await Effect.runPromise(world.worldgenChunkStore.load(chunkCoord(0, -1)))
+    await Effect.runPromise(world.worldgenChunkStore.load(chunkCoord(ChunkAxis(0), ChunkAxis(-1))))
     for (const y of [64, 65]) {
-      const position = blockPosition(1, y, -3)
-      await Effect.runPromise(world.worldgenChunkStore.setBlock(position, blockIdOf('water')))
-      await Effect.runPromise(world.chunkStore.setBlock(position, blockIdOf('water')))
+      const position = blockPosition(BlockAxis(1), BlockAxis(y), BlockAxis(-3))
+      await Effect.runPromise(world.worldgenChunkStore.setBlock(position, Option.getOrThrow(blockIdOf('water'))))
+      await Effect.runPromise(world.chunkStore.setBlock(position, Option.getOrThrow(blockIdOf('water'))))
     }
 
     runTickPlayerMovement(context, makeFrame(1))
@@ -276,11 +360,87 @@ describe('tick player movement branches', () => {
     expect(pose.feetPosition).toEqual({ x: 1.2, y: 64.3, z: -2.1 })
   })
 
+  it.each(['swimming', 'mounted'])('preserves a pearl destination committed during a %s frame', async (mode) => {
+    const harness = await makeHarness()
+    const displacement = enderPearlDisplacement(0, 0, -1, 8)
+    expect(displacement).toBeDefined()
+    const pearl = Schema.decodeUnknownSync(EnderPearlOutcomeSchema)({ displacement, damage: undefined })
+    const destination = position(
+      PositionAxis(harness.pose.feetPosition.x + pearl.displacement.x),
+      PositionAxis(harness.pose.feetPosition.y + pearl.displacement.y),
+      PositionAxis(harness.pose.feetPosition.z + pearl.displacement.z),
+    )
+    let currentPose = harness.pose
+    const overlayMoves: Array<typeof destination> = []
+    const context: H5aMovementContext = {
+      ...harness.context,
+      playerApi: {
+        ...harness.context.playerApi,
+        pose: Effect.sync(() => currentPose),
+        moveTo: (feetPosition) => Effect.sync(() => {
+          overlayMoves.push(feetPosition)
+          currentPose = { ...currentPose, feetPosition }
+        }),
+      },
+    }
+    if (mode === 'swimming') {
+      Effect.runSync(harness.world.chunkStore.load(chunkCoord(ChunkAxis(0), ChunkAxis(-1))))
+      for (const y of [64, 65]) {
+        Effect.runSync(harness.world.chunkStore.setBlock(blockPosition(BlockAxis(1), BlockAxis(y), BlockAxis(-3)), Option.getOrThrow(blockIdOf('water'))))
+      }
+    } else {
+      harness.setMountedVehicleId('v:1')
+      harness.setVehicle({
+        id: VehicleId('v:1'), type: 'boat', dimension: 'overworld',
+        position: position(PositionAxis(4.5), PositionAxis(66), PositionAxis(-3.25)),
+        velocity: { x: VehicleVelocityComponent(0), y: VehicleVelocityComponent(0), z: VehicleVelocityComponent(0) },
+        yawRadians: AngleRadians(0),
+      })
+    }
+    harness.setFrameRunner(() => Effect.gen(function* () {
+      currentPose = { ...currentPose, feetPosition: destination }
+      yield* Ref.update(harness.context.gameplayState.enderPearlOutcomes, (outcomes) => [...outcomes, pearl])
+    }))
+
+    runTickPlayerMovement(context, makeFrame())
+
+    expect(Effect.runSync(context.playerApi.pose).feetPosition).toEqual(destination)
+    expect(overlayMoves).toEqual([])
+    expect(Effect.runSync(Ref.get(harness.context.gameplayState.enderPearlOutcomes))).toEqual([pearl])
+    if (mode === 'swimming') expect(harness.swimmingState.get().active).toBe(true)
+  })
+
+  it.each(['swimming', 'mounted'])('keeps normal %s movement when a pearl outcome is stale', async (mode) => {
+    const harness = await makeHarness()
+    const displacement = enderPearlDisplacement(0, 0, -1, 8)
+    const stale = Schema.decodeUnknownSync(EnderPearlOutcomeSchema)({ displacement, damage: undefined })
+    Effect.runSync(Ref.set(harness.context.gameplayState.enderPearlOutcomes, [stale]))
+    const vehiclePosition = position(PositionAxis(4.5), PositionAxis(66), PositionAxis(-3.25))
+    if (mode === 'swimming') {
+      Effect.runSync(harness.world.chunkStore.load(chunkCoord(ChunkAxis(0), ChunkAxis(-1))))
+      for (const y of [64, 65]) {
+        Effect.runSync(harness.world.chunkStore.setBlock(blockPosition(BlockAxis(1), BlockAxis(y), BlockAxis(-3)), Option.getOrThrow(blockIdOf('water'))))
+      }
+    } else {
+      harness.setMountedVehicleId('v:1')
+      harness.setVehicle({
+        id: VehicleId('v:1'), type: 'boat', dimension: 'overworld', position: vehiclePosition,
+        velocity: { x: VehicleVelocityComponent(0), y: VehicleVelocityComponent(0), z: VehicleVelocityComponent(0) },
+        yawRadians: AngleRadians(0),
+      })
+    }
+
+    runTickPlayerMovement(harness.context, makeFrame())
+
+    expect(harness.moveToCalls).toHaveLength(1)
+    if (mode === 'mounted') expect(harness.moveToCalls[0]).toEqual(vehiclePosition)
+    expect(Effect.runSync(Ref.get(harness.context.gameplayState.enderPearlOutcomes))).toEqual([stale])
+  })
+
   it('clears a fishing session with the fixed lost-water result', async () => {
     const harness = await makeHarness()
     const cast = castFishing({
-      item: 'fishing_rod',
-      count: StackCount(1),
+      ...Result.getOrThrow(itemStack('fishing_rod', StackCount(1))),
       durability: { current: 64, max: 64 },
     }, { hasWater: true, hasSkyAccess: true, isRaining: false, isOpenWater: true }, {
       wait: 0.25,
@@ -350,7 +510,7 @@ describe('tick player movement branches', () => {
   it('requests furnace progress with deferred time and a stable request id', async () => {
     const harness = await makeHarness()
     const key = 'overworld:0,64,0'
-    const state = emptyFurnaceState()
+    const state = Result.getOrThrow(emptyFurnaceState())
     harness.furnaceStates.set(key, { dimension: 'overworld', position: { x: 0, y: 64, z: 0 }, state })
     harness.deferredFurnaceAdvanceSecs.set(key, 0.125)
 
@@ -371,7 +531,31 @@ describe('tick player movement branches', () => {
     expect(result).toBeUndefined()
     expect(harness.failureEvents).toHaveLength(1)
     expect(harness.failureEvents[0]?.message).toBe('a frame stage defected')
-    expect(harness.failureEvents[0]?.error).toMatchObject({ _tag: 'Die', defect: { message: 'fixture frame defect' } })
+    expect(harness.failureEvents[0]?.error).toMatchObject({ reasons: [{ _tag: 'Die', defect: { message: 'fixture frame defect' } }] })
+  })
+
+  it('returns chunk render faults drained after the frame as a typed failure', async () => {
+    const harness = await makeHarness()
+    const events: Array<string> = []
+    const failure = new ChunkRenderFailure({
+      faults: [{
+        dimension: 'overworld',
+        fault: {
+          _tag: 'ChunkRenderFault',
+          chunk: chunkCoord(ChunkAxis(0), ChunkAxis(0)),
+          error: { _tag: 'ChunkMeshGeometryInputFailure', field: 'fluids' },
+          occurrences: 1,
+        },
+      }],
+    })
+    harness.setFrameRunner(() => Effect.sync(() => { events.push('frame') }))
+    harness.setChunkRenderFaults(() => Effect.andThen(Effect.sync(() => { events.push('drain') }), Effect.fail(failure)))
+
+    const result = Effect.runSync(Effect.result(runTickPlayerMovementEffect(harness.context, makeFrame())))
+
+    expect(result).toEqual(Result.fail(failure))
+    expect(events).toEqual(['frame', 'drain'])
+    expect(harness.failureEvents).toEqual([])
   })
 
   it('repositions a mounted player from the vehicle pose after the frame', async () => {
@@ -381,13 +565,13 @@ describe('tick player movement branches', () => {
       id: vehicleId,
       type: 'boat',
       dimension: 'overworld',
-      position: { x: 0, y: 64, z: 0 },
-      velocity: { x: 0, y: 0, z: 0 },
-      yawRadians: 0,
+      position: position(PositionAxis(0), PositionAxis(64), PositionAxis(0)),
+      velocity: { x: VehicleVelocityComponent(0), y: VehicleVelocityComponent(0), z: VehicleVelocityComponent(0) },
+      yawRadians: AngleRadians(0),
     }
     const after: Vehicle = {
       ...before,
-      position: { x: 4.5, y: 66, z: -3.25 },
+      position: position(PositionAxis(4.5), PositionAxis(66), PositionAxis(-3.25)),
     }
     harness.setMountedVehicleId('v:1')
     harness.setVehicle(before)

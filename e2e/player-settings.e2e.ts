@@ -1,32 +1,56 @@
 import { expect, test } from '@playwright/test'
 
+import { PLAYER_SETTINGS_KEY } from '../apps/web/settings'
 import { startGameSession } from './helpers/session'
 
 const installSettingsWriteFault = async (page: import('@playwright/test').Page): Promise<void> => {
-  await page.addInitScript(() => {
+  await page.addInitScript(({ settingsKey }) => {
     const faultState = { remaining: 0 }
-    const originalTransaction = IDBDatabase.prototype.transaction
-    const transactionWithFault = function (
-      this: IDBDatabase,
-      ...arguments_: Parameters<IDBDatabase['transaction']>
-    ): IDBTransaction {
-      if (arguments_[1] === 'readwrite' && faultState.remaining > 0) {
+    const consumed: Array<{ key: string; mode: IDBTransactionMode; operation: string }> = []
+    const originalGet = IDBObjectStore.prototype.get
+    const getWithFault = function (
+      this: IDBObjectStore,
+      query: IDBValidKey | IDBKeyRange,
+    ): IDBRequest {
+      if (this.transaction.mode === 'readwrite' && typeof query === 'string'
+        && query === settingsKey && faultState.remaining > 0) {
         faultState.remaining -= 1
+        consumed.push({ key: query, mode: this.transaction.mode, operation: 'get' })
         throw new DOMException('Injected settings write failure', 'InvalidStateError')
       }
-      return originalTransaction.apply(this, arguments_)
+      return originalGet.call(this, query)
     }
-    IDBDatabase.prototype.transaction = transactionWithFault
+    IDBObjectStore.prototype.get = getWithFault
     ;(globalThis as unknown as { failNextSettingsWrite: () => void }).failNextSettingsWrite = () => {
       faultState.remaining += 1
     }
-  })
+    ;(globalThis as unknown as { settingsWriteFaultReport: () => unknown }).settingsWriteFaultReport = () => ({
+      remaining: faultState.remaining,
+      consumed: [...consumed],
+    })
+  }, { settingsKey: PLAYER_SETTINGS_KEY })
 }
 
 const failNextSettingsWrite = (page: import('@playwright/test').Page): Promise<void> =>
   page.evaluate(() => {
     ;(globalThis as unknown as { failNextSettingsWrite: () => void }).failNextSettingsWrite()
   })
+
+const expectSettingsWriteFaultConsumed = async (
+  page: import('@playwright/test').Page,
+  count: number,
+): Promise<void> => {
+  await expect.poll(() => page.evaluate(() =>
+    (globalThis as unknown as { settingsWriteFaultReport: () => unknown }).settingsWriteFaultReport(),
+  )).toEqual({
+    remaining: 0,
+    consumed: Array.from({ length: count }, () => ({
+      key: PLAYER_SETTINGS_KEY,
+      mode: 'readwrite',
+      operation: 'get',
+    })),
+  })
+}
 
 test('player settings persist and preserve Escape priority from title and pause', async ({ page }) => {
   await page.goto('/')
@@ -76,7 +100,7 @@ test('player settings persist and preserve Escape priority from title and pause'
   await startGameSession(page, 'player-settings')
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
   await page.keyboard.press('Escape')
-  await page.getByTestId('settings-button').click()
+  await page.getByTestId('options-button').click()
   await expect(settingsRoot).toBeVisible()
   await expect(page.locator('[data-settings-close]')).toBeFocused()
   await page.keyboard.press('Tab')
@@ -92,7 +116,7 @@ test('player settings persist and preserve Escape priority from title and pause'
 
   await page.keyboard.press('Escape')
   await expect(settingsRoot).toBeHidden()
-  await expect(page.getByTestId('settings-button')).toBeFocused()
+  await expect(page.getByTestId('options-button')).toBeFocused()
   await expect(page.getByTestId('pause-overlay')).toBeVisible()
   await expect(page.locator('body')).toHaveAttribute('data-session-paused', 'true')
 })
@@ -134,7 +158,10 @@ test('rapid setting changes finish saving before title navigation', async ({ pag
     }
     close.click()
 
-    const newWorld = document.querySelector<HTMLButtonElement>('[data-menu-entry="new-world"]')
+    const singlePlayer = document.querySelector<HTMLButtonElement>('[data-menu-entry="single-player"]')
+    if (singlePlayer === null) throw new Error('single player control missing')
+    singlePlayer.click()
+    const newWorld = document.querySelector<HTMLButtonElement>('[data-menu-action="new-world"]')
     if (newWorld === null) throw new Error('new world control missing')
     newWorld.click()
 
@@ -146,10 +173,10 @@ test('rapid setting changes finish saving before title navigation', async ({ pag
     confirm.click()
   })
 
-  await expect(page).toHaveURL(/\?session=rapid-settings-[^&]+&create=1/u)
+  await expect(page).toHaveURL(/\?session=rapid-settings-[^&]+$/u)
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
   await page.keyboard.press('Escape')
-  await page.getByTestId('settings-button').click()
+  await page.getByTestId('options-button').click()
   await expect(page.locator('[data-sensitivity]')).toHaveValue('245')
 })
 
@@ -159,32 +186,55 @@ test('settings write failures block navigation until a later save succeeds', asy
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
 
   await page.keyboard.press('Escape')
-  await page.getByTestId('settings-button').click()
+  await expect(page.locator('body')).toHaveAttribute('data-session-paused', 'true')
+  await expect(page.getByTestId('pause-overlay')).toBeVisible()
+  await expect(page.getByTestId('settings-root')).toBeHidden()
+  await page.getByTestId('options-button').click()
+  await expect(page.getByTestId('settings-root')).toBeVisible()
+  await expect(page.locator('[data-settings-close]')).toBeFocused()
+  await expect(page.locator('[data-audio-enabled]')).toBeChecked()
   await failNextSettingsWrite(page)
-  await page.locator('[data-audio-enabled]').uncheck()
+  await page.locator('[data-audio-enabled]').click()
+  await expectSettingsWriteFaultConsumed(page, 1)
+  await expect(page.locator('[data-audio-enabled]')).toBeChecked()
   await expect(page.locator('[data-settings-error]')).toHaveText('Settings could not be saved.')
   await expect(page.locator('[data-settings-error]')).toHaveAttribute('role', 'alert')
   await page.locator('[data-settings-close]').click()
+  await expect(page.getByTestId('settings-root')).toBeHidden()
 
   await page.getByTestId('save-quit-button').click()
   await expect(page).toHaveURL(/\?session=settings-write-failure$/u)
-  await expect(page.locator('#pause-error')).toHaveText(
+  await expect(page.locator('[data-pause-error]')).toHaveText(
     'Save failed. Your world is still open; please try again.',
   )
+  await expect(page.locator('[data-pause-error]')).toHaveAttribute('role', 'alert')
 
-  await page.getByTestId('settings-button').click()
-  await page.locator('[data-audio-enabled]').check()
+  await expect(page.getByTestId('save-quit-button')).toBeEnabled()
+  await expect(page.getByTestId('save-quit-button')).not.toHaveAttribute('aria-busy', 'true')
+  await expect(page.locator('body')).toHaveAttribute('data-session-paused', 'true')
+  await expect(page.getByTestId('pause-overlay')).toBeVisible()
+  await expect(page.getByTestId('settings-root')).toBeHidden()
+  await page.getByTestId('options-button').click()
+  await expect(page.getByTestId('settings-root')).toBeVisible()
+  await expect(page.locator('[data-settings-close]')).toBeFocused()
+  await expect(page.locator('[data-audio-enabled]')).toBeChecked()
+  await page.locator('[data-audio-enabled]').uncheck()
   await expect(page.locator('body')).toHaveAttribute('data-player-settings-persistence', 'saved')
   await page.locator('[data-settings-close]').click()
   await page.getByTestId('save-quit-button').click()
   await expect(page).toHaveURL('/')
 
   await page.locator('[data-menu-entry="settings"]').click()
+  await page.locator('[data-audio-enabled]').check()
+  await expect(page.locator('body')).toHaveAttribute('data-player-settings-persistence', 'saved')
+  await expect(page.locator('[data-audio-enabled]')).toBeChecked()
   await failNextSettingsWrite(page)
-  await page.locator('[data-audio-enabled]').uncheck()
+  await page.locator('[data-audio-enabled]').click()
+  await expectSettingsWriteFaultConsumed(page, 1)
+  await expect(page.locator('[data-audio-enabled]')).toBeChecked()
   await expect(page.locator('[data-settings-error]')).toHaveText('Settings could not be saved.')
   await page.locator('[data-settings-close]').click()
-  await page.locator('[data-menu-entry="load-world"]').click()
+  await page.locator('[data-menu-entry="single-player"]').click()
   await page.locator('[data-mx-ui="menu-world-row"][data-session-id="settings-write-failure"]').click()
   await expect(page).toHaveURL('/')
   await expect(page.locator('#title-status')).toHaveText(
@@ -193,10 +243,67 @@ test('settings write failures block navigation until a later save succeeds', asy
 
   await page.locator('[data-menu-action="back"]').click()
   await page.locator('[data-menu-entry="settings"]').click()
-  await page.locator('[data-audio-enabled]').check()
+  await expect(page.locator('[data-audio-enabled]')).toBeChecked()
+  await page.locator('[data-audio-enabled]').uncheck()
   await expect(page.locator('body')).toHaveAttribute('data-player-settings-persistence', 'saved')
   await page.locator('[data-settings-close]').click()
-  await page.locator('[data-menu-entry="load-world"]').click()
+  await page.locator('[data-menu-entry="single-player"]').click()
   await page.locator('[data-mx-ui="menu-world-row"][data-session-id="settings-write-failure"]').click()
   await expect(page).toHaveURL('/?session=settings-write-failure')
+})
+
+test('corrupt saved settings warn until a valid change replaces the record', async ({ page }) => {
+  await page.goto('/')
+  const settings = page.locator('[data-menu-entry="settings"]')
+  const error = page.locator('[data-settings-error]')
+  const sensitivity = page.locator('[data-sensitivity]')
+  await settings.click()
+  await sensitivity.fill('175')
+  await expect(page.locator('body')).toHaveAttribute('data-player-settings-persistence', 'saved')
+
+  await page.evaluate(async () => {
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open('nerima-games-minecraft')
+      request.addEventListener('success', () => resolve(request.result), { once: true })
+      request.addEventListener('error', () => reject(request.error), { once: true })
+    })
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const transaction = database.transaction('saves', 'readwrite')
+        const store = transaction.objectStore('saves')
+        const request: IDBRequest<unknown> = store.get('mc-compose/player-settings')
+        request.addEventListener('success', () => {
+          const record = request.result
+          if (typeof record !== 'object' || record === null) {
+            transaction.abort()
+            reject(new Error('saved settings record missing before corruption'))
+            return
+          }
+          store.put({ ...record, envelope: null })
+        }, { once: true })
+        transaction.addEventListener('complete', () => resolve(), { once: true })
+        transaction.addEventListener('error', () => reject(transaction.error), { once: true })
+        transaction.addEventListener('abort', () => reject(transaction.error), { once: true })
+      })
+    } finally {
+      database.close()
+    }
+  })
+
+  await page.reload()
+  await settings.click()
+  await expect(error).toBeVisible()
+  await expect(error).toHaveAttribute('role', 'alert')
+  await expect(error).toHaveText('Saved settings could not be read. Changing a setting will replace them.')
+  await page.locator('[data-settings-close]').click()
+  await settings.click()
+  await expect(error).toHaveText('Saved settings could not be read. Changing a setting will replace them.')
+
+  await sensitivity.fill('180')
+  await expect(page.locator('body')).toHaveAttribute('data-player-settings-persistence', 'saved')
+  await expect(error).toBeEmpty()
+  await page.reload()
+  await settings.click()
+  await expect(sensitivity).toHaveValue('180')
+  await expect(error).toBeEmpty()
 })

@@ -48,14 +48,18 @@
  * opening the page sees the same thing the test does.
  */
 import * as THREE from 'three'
-import { Effect } from 'effect'
+import { Effect, Result, Schema } from 'effect'
+import { BlockId, ChunkAxis, PositionAxis } from '@nerima-games/mc-kernel'
 import {
   buildChunkGeometry,
+  chunkKeyOf,
   makeChunkShaderMaterial,
   makeParticlePool,
   makeParticleSystem,
   makeWaterMaterial,
   makeWorldRenderer,
+  ParticleBurstCountSchema,
+  ParticleUvCoordinateSchema,
   spawnBurst,
   type MeshQuad,
   type MirroredCameraState,
@@ -65,7 +69,7 @@ const VIEWPORT = { width: 320, height: 180 }
 
 /** One visible face, so the chunk geometry is not empty. */
 const QUAD: MeshQuad = {
-  blockId: 1,
+  blockId: BlockId(1),
   direction: 'yPos',
   role: 'top',
   lx: 0,
@@ -147,7 +151,9 @@ const probeChunkShader = async (canvas: HTMLCanvasElement): Promise<ProbeResult>
           >(THREE, new THREE.Texture()).material,
       }),
     )
-    await Effect.runPromise(renderer.setChunk('0,0', buildChunkGeometry([QUAD], 0, 0)))
+    await Effect.runPromise(
+      renderer.setChunk(chunkKeyOf({ cx: ChunkAxis(0), cz: ChunkAxis(0) }), buildChunkGeometry([QUAD], 0, 0)),
+    )
     // Drawing is what forces the program to link. `compile()` would do for a
     // scene this file owned, but the scene here is the renderer's.
     await Effect.runPromise(renderer.draw(PROBE_CAMERA))
@@ -195,10 +201,20 @@ const probeParticleShader = async (canvas: HTMLCanvasElement): Promise<ProbeResu
     const scene = new THREE.Scene()
     const camera = new THREE.PerspectiveCamera(75, 16 / 9, 0.1, 300)
 
-    const pool = makeParticlePool({ capacity: 16 })
+    // Constant, in-range inputs: a failure here is a broken invariant, not a probe result.
+    const pool = Result.getOrThrow(makeParticlePool({ capacity: 16 }))
+    const uvOrigin = Result.getOrThrow(Schema.decodeResult(ParticleUvCoordinateSchema)(0))
     // A live particle, so `instanceCount` is non-zero and the instanced
     // attributes are actually consumed by a draw.
-    spawnBurst(pool, 0, 0, -4, 0, 0, 4)
+    Result.getOrThrow(spawnBurst(
+      pool,
+      PositionAxis(0),
+      PositionAxis(0),
+      PositionAxis(-4),
+      uvOrigin,
+      uvOrigin,
+      Result.getOrThrow(Schema.decodeResult(ParticleBurstCountSchema)(4)),
+    ))
 
     const system = await Effect.runPromise(
       makeParticleSystem<

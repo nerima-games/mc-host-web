@@ -1,9 +1,14 @@
+import { AudioVolume } from '@nerima-games/mc-audio'
 import type { InputAction } from '@nerima-games/mc-render'
+import { createSaveIndicator } from '@nerima-games/mx-ui'
+import { Result } from 'effect'
 
 import {
   DEFAULT_PLAYER_SETTINGS,
   PLAYER_BINDING_ACTIONS,
   rebindPlayerSettings,
+  updatePlayerSettings,
+  type PlayerBindingRejected,
   type PlayerSettingsV1,
 } from './settings'
 
@@ -14,10 +19,25 @@ export type SettingsView = {
   readonly close: () => void
   readonly isOpen: () => boolean
   readonly settings: () => PlayerSettingsV1
+  // Shows `settings` without publishing them, for a host that takes the
+  // session back to its saved settings after a failed write.
+  readonly replaceSettings: (settings: PlayerSettingsV1) => void
+  readonly reportPersistenceSaving: () => void
+  readonly reportPersistenceSaved: () => void
   readonly reportPersistenceError: (message: string) => void
   readonly clearPersistenceError: () => void
+  // The stored settings could not be read, so the dialog shows defaults and
+  // the next successful save replaces the stored record. The warning is shown
+  // on every open until reportPersistenceSaved reports that replacement.
+  readonly reportLoadFailure: () => void
+  // A write succeeded, so the unreadable record is gone even when a newer
+  // write is still pending or later fails; the load warning no longer applies.
+  readonly reportStoredRecordReplaced: () => void
   readonly dispose: () => void
 }
+
+export const PLAYER_SETTINGS_LOAD_FAILURE_MESSAGE =
+  'Saved settings could not be read. Changing a setting will replace them.'
 
 const ACTION_LABELS: Readonly<Record<BindableAction, string>> = {
   moveForward: 'Move forward',
@@ -42,6 +62,20 @@ const ACTION_LABELS: Readonly<Record<BindableAction, string>> = {
   hotbarSlot8: 'Hotbar 8',
   hotbarSlot9: 'Hotbar 9',
 }
+
+// The volume sliders are range inputs with min 0 and max 100, and the browser
+// sanitizes a range input's value to a number within [min, max]. Dividing by
+// 100 therefore always lands in [0, 1], which AudioVolume accepts; a failure
+// means the slider markup lost those bounds.
+const sliderVolume = (slider: HTMLInputElement): AudioVolume => Result.getOrThrowWith(
+  AudioVolume.result(Number(slider.value) / 100),
+  (error) => new Error(`settings volume slider outside the AudioVolume range: ${error.message}`),
+)
+
+const rejectionText = (rejection: PlayerBindingRejected): string =>
+  rejection.reason === 'blank-key'
+    ? `${ACTION_LABELS[rejection.action]} was not changed: the key has no code.`
+    : `${ACTION_LABELS[rejection.action]} was not changed: ${rejection.code} is reserved.`
 
 const focusableElements = (root: HTMLElement): ReadonlyArray<HTMLElement> =>
   [...root.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled])')]
@@ -101,14 +135,35 @@ export const createSettingsView = (
   const status = required<HTMLElement>('[data-settings-status]')
   const persistenceError = required<HTMLElement>('[data-settings-error]')
   const closeButton = required<HTMLButtonElement>('[data-settings-close]')
+  const saveIndicator = createSaveIndicator(document, required<HTMLElement>('.settings-dialog'))
   let current = DEFAULT_PLAYER_SETTINGS
   let returnFocus: HTMLElement | undefined
   let capturing: BindableAction | undefined
+  let loadFailed = false
+  let saveError: string | undefined
+
+  // A save failure is the newer and more specific problem, so it takes the
+  // alert while present; the load warning returns once it is cleared.
+  const renderPersistenceError = (): void => {
+    if (saveError !== undefined) persistenceError.textContent = saveError
+    else persistenceError.textContent = loadFailed ? PLAYER_SETTINGS_LOAD_FAILURE_MESSAGE : ''
+  }
 
   const publish = (next: PlayerSettingsV1): void => {
     current = next
     render()
     options.onChange(next)
+  }
+
+  // Every control is bounded by its markup: the browser sanitizes a range
+  // input's value into [min, max] (sensitivity 10-300 is 0.1-3, the volumes
+  // 0-100 are 0-1) and a checkbox yields a boolean, all of which
+  // updatePlayerSettings accepts. A failure means the markup lost those bounds.
+  const publishControl = (patch: Partial<Omit<PlayerSettingsV1, 'bindings'>>): void => {
+    publish(Result.getOrThrowWith(
+      updatePlayerSettings(current, patch),
+      (error) => new Error(`settings control produced an invalid value: ${error.message}`),
+    ))
   }
 
   const renderBindings = (): void => {
@@ -148,7 +203,7 @@ export const createSettingsView = (
     const target = event.target
     if (!(target instanceof HTMLElement)) return
     const button = target.closest<HTMLButtonElement>('[data-binding-action]')
-    const action = button?.dataset['bindingAction'] as BindableAction | undefined
+    const action = PLAYER_BINDING_ACTIONS.find((candidate) => candidate === button?.dataset['bindingAction'])
     if (action === undefined) return
     capturing = action
     status.textContent = `Press a key for ${ACTION_LABELS[action]}. Escape cancels.`
@@ -156,11 +211,11 @@ export const createSettingsView = (
     focusBinding(action)
   })
 
-  sensitivity.addEventListener('input', () => publish({ ...current, sensitivity: Number(sensitivity.value) / 100 }))
-  master.addEventListener('input', () => publish({ ...current, masterVolume: Number(master.value) / 100 }))
-  sfx.addEventListener('input', () => publish({ ...current, sfxVolume: Number(sfx.value) / 100 }))
-  audioEnabled.addEventListener('change', () => publish({ ...current, audioEnabled: audioEnabled.checked }))
-  captionsEnabled.addEventListener('change', () => publish({ ...current, captionsEnabled: captionsEnabled.checked }))
+  sensitivity.addEventListener('input', () => publishControl({ sensitivity: Number(sensitivity.value) / 100 }))
+  master.addEventListener('input', () => publishControl({ masterVolume: sliderVolume(master) }))
+  sfx.addEventListener('input', () => publishControl({ sfxVolume: sliderVolume(sfx) }))
+  audioEnabled.addEventListener('change', () => publishControl({ audioEnabled: audioEnabled.checked }))
+  captionsEnabled.addEventListener('change', () => publishControl({ captionsEnabled: captionsEnabled.checked }))
   required('[data-reset-bindings]').addEventListener('click', () => {
     capturing = undefined
     status.textContent = 'Key bindings reset.'
@@ -194,13 +249,19 @@ export const createSettingsView = (
       event.stopImmediatePropagation()
       const action = capturing
       capturing = undefined
-      const conflicting = PLAYER_BINDING_ACTIONS.find(
-        (candidate) => candidate !== action && current.bindings[candidate] === event.code,
-      )
-      status.textContent = conflicting === undefined
-        ? `${ACTION_LABELS[action]} set to ${event.code}.`
-        : `${ACTION_LABELS[action]} and ${ACTION_LABELS[conflicting]} swapped.`
-      publish({ ...current, bindings: rebindPlayerSettings(current.bindings, action, event.code) })
+      const rebound = rebindPlayerSettings(current.bindings, action, event.code)
+      if (Result.isFailure(rebound)) {
+        status.textContent = rejectionText(rebound.failure)
+        renderBindings()
+      } else {
+        const conflicting = PLAYER_BINDING_ACTIONS.find(
+          (candidate) => candidate !== action && current.bindings[candidate] === event.code,
+        )
+        status.textContent = conflicting === undefined
+          ? `${ACTION_LABELS[action]} set to ${event.code}.`
+          : `${ACTION_LABELS[action]} and ${ACTION_LABELS[conflicting]} swapped.`
+        publish({ ...current, bindings: rebound.success })
+      }
       focusBinding(action)
       return
     }
@@ -229,7 +290,9 @@ export const createSettingsView = (
       returnFocus = nextReturnFocus
       capturing = undefined
       status.textContent = ''
-      persistenceError.textContent = ''
+      saveError = undefined
+      renderPersistenceError()
+      saveIndicator.render(loadFailed ? 'failed' : undefined)
       render()
       root.hidden = false
       closeButton.focus()
@@ -237,11 +300,36 @@ export const createSettingsView = (
     close,
     isOpen: () => !root.hidden,
     settings: () => current,
+    replaceSettings: (settings) => {
+      current = settings
+      render()
+    },
+    reportPersistenceSaving: () => {
+      saveIndicator.render('saving')
+    },
+    reportPersistenceSaved: () => {
+      loadFailed = false
+      saveError = undefined
+      renderPersistenceError()
+      saveIndicator.render('saved')
+    },
     reportPersistenceError: (message) => {
-      persistenceError.textContent = message
+      saveError = message
+      renderPersistenceError()
+      saveIndicator.render('failed')
     },
     clearPersistenceError: () => {
-      persistenceError.textContent = ''
+      saveError = undefined
+      renderPersistenceError()
+    },
+    reportStoredRecordReplaced: () => {
+      loadFailed = false
+      renderPersistenceError()
+    },
+    reportLoadFailure: () => {
+      loadFailed = true
+      renderPersistenceError()
+      saveIndicator.render('failed')
     },
     dispose: () => {
       document.removeEventListener('keydown', handleDocumentKeydown, true)

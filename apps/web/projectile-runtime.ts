@@ -1,3 +1,5 @@
+import type { AngleRadians, EntityId } from '@nerima-games/mc-kernel'
+import type { BlocksPerSecond, DeltaTimeSecs, Position } from '@nerima-games/mc-physics'
 import {
   ARROW_PROFILE,
   launchProjectile,
@@ -37,13 +39,13 @@ export const launchRuntimeProjectile = (
   state: ProjectileRuntimeState,
   input: Readonly<{
     dimension: string
-    position: Readonly<{ x: number; y: number; z: number }>
-    yawRadians: number
-    pitchRadians: number
-    speed: number
+    position: Position
+    yawRadians: AngleRadians
+    pitchRadians: AngleRadians
+    speed: BlocksPerSecond
     damage: number
     knockback: number
-    shooterId?: string
+    shooterId?: EntityId
   }>,
 ): ProjectileRuntimeState => {
   const nextId = state.nextId + 1
@@ -69,7 +71,7 @@ export const advanceProjectileRuntime = (
   state: ProjectileRuntimeState,
   world: ProjectileWorld,
   dimension: string,
-  deltaSecs: number,
+  deltaSecs: DeltaTimeSecs,
 ): Readonly<{ state: ProjectileRuntimeState; impacts: ReadonlyArray<ProjectileImpact> }> => {
   const projectiles: RuntimeProjectile[] = []
   const impacts: ProjectileImpact[] = []

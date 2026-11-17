@@ -1,18 +1,21 @@
-import { blockIdOf, MonotonicTimeSecs as KernelMonotonicTimeSecs, StackCount } from '@nerima-games/mc-kernel'
-import { addExperience as addVitalsExperience, changed, emptyFurnaceState, UNCHANGED, type CropLocation, type WeatherState } from '@nerima-games/mc-sim'
-import { Effect, Option, Ref } from 'effect'
+import { AngleRadians, BlockId, BlockPositionKey, blockOfPlaceableItem, DimensionIdSchema, InterpolationFraction, blockIdOf, encodeBlockState, MonotonicTimeSecs as KernelMonotonicTimeSecs, position, PositionAxis, VehicleVelocityComponent, type WorldWriteBatch } from '@nerima-games/mc-kernel'
+import { addExperience as addVitalsExperience, ExperienceDelta, changed, emptyFurnaceState, UNCHANGED, WorldCommitCoordinator, type WeatherState } from '@nerima-games/mc-sim'
+import { Effect, Option, Ref, Result, Schema } from 'effect'
 import {
   boardVehicle,
   castFishing,
   drainBlockPlacementResults,
+  drainBlockStateRuleResults,
   drainBlockUseResults,
   drainBowKnockbacks,
   drainItemUseResults,
+  GAMEPLAY_PLAYER_STORAGE_OWNER_ID,
   drainMobDrops,
   drainMobExperience,
   isBucketItem,
   requestBlockPlacementCommand,
   requestPotatoFoodUse,
+  requestEnderPearlThrow,
   requestTargetedBlockPlacement,
   requestTargetedBlockUse,
   requestTargetedItemUse,
@@ -51,13 +54,44 @@ import {
 } from '@nerima-games/mc-server/shared'
 import { REDSTONE_PLACEMENT_ITEMS } from '../qa-fixtures'
 import { captionRenderSignature } from '../audio-runtime'
-import type { H5cPostFrameInput, H5cTickContext } from './h5c-context'
+import type {
+  H5cFramePresentationContext,
+  H5cFramePresentationInput,
+  H5cPostFrameInput,
+  H5cTickContext,
+} from './h5c-context'
+import { runTickDebugOverlayFrame } from './debug-overlay-frame'
 import type { PersistedVillager } from '../session-persistence'
 
 type Dimension = import('../session-persistence').SessionState['dimension']
 type GameplayItemType = Parameters<typeof import('@nerima-games/mx-gameplay').isPlaceableItem>[0]
 
-export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPostFrameInput): void => {
+type TickGameplayFailure = Effect.Error<
+  | ReturnType<typeof requestTargetedPotatoPlanting>
+  | ReturnType<typeof requestTargetedSoilTill>
+  | ReturnType<typeof resolveTargetedBlock>
+  | ReturnType<typeof requestTargetedItemUse>
+  | ReturnType<typeof requestTargetedBlockPlacement>
+  | ReturnType<typeof requestTargetedBlockUse>
+  | ReturnType<typeof requestEnderPearlThrow>
+  | ReturnType<typeof targetedRightClickRoute>
+  | H5cTickContext['services']['time']['timeOfDay']
+  | ReturnType<H5cTickContext['services']['worldWrite']['applyBatch']>
+  | ReturnType<H5cTickContext['services']['streamAround']>
+  | ReturnType<H5cTickContext['services']['useEndFeature']>
+  | ReturnType<H5cTickContext['services']['targetedBlock']>
+  | ReturnType<H5cTickContext['services']['fishingEnvironmentAt']>
+  | ReturnType<H5cTickContext['services']['brewingService']['advance']>
+> | Result.Result.Failure<
+  | ReturnType<H5cTickContext['h5b']['applyWorldExplosion']>
+  | ReturnType<typeof matchRuntimeWitherSummon>
+  | ReturnType<typeof summonRuntimeWither>
+>
+
+export const runTickPostFrameGameplay = (
+  context: H5cTickContext,
+  input: H5cPostFrameInput,
+): Effect.Effect<void, TickGameplayFailure> => Effect.gen(function* () {
   const { frame, movement, postFrame, nowSecs } = input
   const { deltaSecs, useTriggered } = frame
   const { poseBeforeFrame, weatherBeforeFrame } = movement
@@ -71,20 +105,31 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
     playerHeals,
   } = postFrame
   const { h5a, h5b, services, state } = context
+  const targeting = h5a.targeting
+  // Dimension is the same closed literal union as the schema; decoding only adds its brand.
+  const asDimensionId = (dimension: Dimension) => Schema.decodeUnknownSync(DimensionIdSchema)(dimension)
+  const writeBlocks = (dimension: WorldWriteBatch['dimension'], edits: WorldWriteBatch['edits']) => Effect.gen(function* () {
+    const coordinator = targeting.coordinator
+    yield* services.worldWrite.applyBatch({
+      world: coordinator.worldId,
+      expectedWorldRevision: yield* coordinator.revision,
+      dimension,
+      expectedDimensionRevision: yield* coordinator.dimensionRevision(dimension),
+      edits,
+    })
+  })
   const {
     world,
+    entityManager,
     playerApi,
     currentChunkStore,
     blockPosition,
-    blockTypeOfId,
     gameplayState,
     multiplayer,
     isCreativeMode,
-    survivalHunger,
     setBrewingOpen,
     markSessionDirty,
     setFishingResult,
-    renderCrosshair,
     canvas,
     currentChunkContext,
     vehicleById,
@@ -94,6 +139,8 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
     deferredFurnaceAdvanceSecs,
   } = h5a
   const EYE_LEVEL_OFFSET = h5a.eyeLevelOffset
+  // Targeted blocks and store readings come from the kernel registry.
+  const typeOfBlock = (id: number) => Result.getOrThrow(h5a.blockTypeOfId(BlockId(id)))
   const {
     applyPlayerDamage,
     applyWorldExplosion,
@@ -106,6 +153,10 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
     renderPlayerUi,
     dimensionContexts,
   } = h5b
+  const endDragonWorldPosition = () => {
+    const at = endDragonPosition()
+    return position(PositionAxis(at.x), PositionAxis(at.y), PositionAxis(at.z))
+  }
   const {
     nearestVillagerForTrade,
     setTradeOpen,
@@ -113,7 +164,6 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
     targetedBlock,
     fishingEnvironmentAt,
     networkFishingPhase,
-    playerSettings,
     vehicleService,
     vehicleList,
     localVehicleOccupant,
@@ -122,6 +172,7 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
     endPortalComplete,
     useEndFeature,
     renderBrewingUi,
+    brewingService,
     time,
     weather,
     redstoneContainerRuntime,
@@ -130,16 +181,11 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
     asBlockPosition,
     streamAround,
     presentWeather,
-    presentWeatherRuntime,
-    syncRenderedEntities,
     registerPortal,
     requiredSleepRatio,
     sleepHud,
     endDragonSnapshot,
     adapters,
-    uiFrameState,
-    fpsValue,
-    captionsParent,
     observedMobDrops,
     pendingItemUses,
     pendingBlockUses,
@@ -149,7 +195,6 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
     comparatorModes,
     poweredRails,
     redstoneLampTransitionLog,
-    crops,
     isGameplayUseItemType,
     isGameplayHoeItem,
     isGameplayIgnitionItem,
@@ -160,7 +205,6 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
     sendPortalUseCommand,
     sendToggleLeverCommand,
     sendFacilityCommand,
-    requestBrewing,
   } = multiplayerClient
   const {
     containerIdForStorageBlock,
@@ -169,7 +213,7 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
     applyDropperTrigger,
     applyPoweredPistonTransition,
   } = redstoneContainerRuntime
-  const { audio, endAudio, queueEndAudio, placementAudio } = adapters
+  const { endAudio, queueEndAudio, placementAudio } = adapters
   const { state: h5aState } = h5a
   const { state: h5bState } = h5b
   const increment = (reference: { readonly get: () => number; readonly set: (value: number) => void }): void => {
@@ -234,18 +278,18 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
       fishingDurability !== null &&
       fishingDurability !== undefined
     ) {
-      const target = Effect.runSync(targetedBlock())
+      const target = yield* targetedBlock()
       const dimension = Effect.runSync(playerApi.dimension)
       const environment = target === undefined
         ? { hasWater: false, hasSkyAccess: false, isRaining: false, isOpenWater: false }
-        : Effect.runSync(fishingEnvironmentAt(
+        : yield* fishingEnvironmentAt(
             target.position,
             weatherBeforeFrame.weather === 'rain' || weatherBeforeFrame.weather === 'thunder',
-          ))
+          )
       const serial = takeThenIncrement(state.nextFishingRoll)
       const cast = castFishing({
+        ...fishingHeld,
         item: 'fishing_rod',
-        count: StackCount(1),
         durability: fishingDurability,
       } satisfies FishingRod, environment, {
         wait: ((serial * 37) % 997) / 997,
@@ -298,7 +342,7 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
           y: pose.feetPosition.y + EYE_LEVEL_OFFSET,
           z: pose.feetPosition.z,
         }
-        const target = Effect.runSync(targetedBlock())
+        const target = yield* targetedBlock()
         const hitDistance = target === undefined
           ? undefined
           : Math.hypot(
@@ -306,23 +350,18 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
               target.position.y + 0.5 - origin.y,
               target.position.z + 0.5 - origin.z,
             )
-        Effect.runSync(Ref.update(gameplayState.pendingPearlThrows, (requests) => [
-          ...requests,
-          {
-            origin,
-            inventory: {
-              mode: isCreativeMode ? 'creative' as const : 'survival' as const,
-              slotIndex: h5aState.selectedHotbarIndex.get(),
-            },
-            dirX: -Math.sin(pose.yawRadians) * horizontal,
-            dirY: Math.sin(pose.pitchRadians),
-            dirZ: -Math.cos(pose.yawRadians) * horizontal,
-            ...(hitDistance === undefined ? {} : { hitDistance }),
+        increment(h5aState.nextItemUseRequestId)
+        yield* requestEnderPearlThrow(gameplayState, {
+          requestId: `item-use-${String(h5aState.nextItemUseRequestId.get())}`,
+          inventory: {
+            mode: isCreativeMode ? 'creative' : 'survival',
+            slotIndex: h5aState.selectedHotbarIndex.get(),
           },
-        ]))
-        if (!isCreativeMode) {
-          Effect.runSync(world.inventory.removeAt(h5aState.selectedHotbarIndex.get(), 'ender_pearl', 1))
-        }
+          dirX: -Math.sin(pose.yawRadians) * horizontal,
+          dirY: Math.sin(pose.pitchRadians),
+          dirZ: -Math.cos(pose.yawRadians) * horizontal,
+          ...(hitDistance === undefined ? {} : { hitDistance }),
+        })
         markSessionDirty()
         renderPlayerUi()
       }
@@ -333,12 +372,14 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
         sendEntityCommand({ _tag: 'BucketUseCommand' })
         usedSpecialItem = true
       } else {
-        const target = Effect.runSync(targetedBlock())
+        const target = yield* targetedBlock()
         if (target !== undefined) {
           const dimension = Effect.runSync(playerApi.dimension)
+          // The player storage owner is the inventory's only store, so the
+          // bucket exchange commits to it and the block in one coordinator
+          // commit; the inventory view reloads from the owner afterwards.
           const result = Effect.runSync(useBucket(
-            currentChunkStore,
-            world.inventory,
+            targeting.coordinator,
             gameplayState.fluidFrontier,
             {
               activeDimension: dimension,
@@ -347,6 +388,7 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
                 ? blockPosition(target.position.x, target.position.y, target.position.z)
                 : blockPosition(target.adjacentPosition.x, target.adjacentPosition.y, target.adjacentPosition.z)),
               heldItem: specialSelected.item,
+              playerStorageOwnerId: GAMEPLAY_PLAYER_STORAGE_OWNER_ID,
             },
           ))
           document.body.setAttribute('data-bucket-result', result._tag)
@@ -363,7 +405,7 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
       if (multiplayer !== undefined && h5aState.multiplayerHandshakeComplete.get()) {
         sendEntityCommand({ _tag: 'VehicleUseCommand' })
       } else {
-        const target = Effect.runSync(targetedBlock())
+        const target = yield* targetedBlock()
         if (target !== undefined) {
           const type = specialSelected.item === 'oak_boat' ? 'boat' : 'minecart'
           const item = specialSelected.item
@@ -382,8 +424,8 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
           // right-click placement path in e2e/boat-water.e2e.ts before
           // this fix: placed at water's own y+1, terminal speed 0.048.
           const at = (
-            (type === 'minecart' && (blockTypeOfId(target.block) === 'rail' || blockTypeOfId(target.block) === 'powered_rail'))
-            || (type === 'boat' && blockTypeOfId(target.block) === 'water')
+            (type === 'minecart' && (typeOfBlock(target.block) === 'rail' || typeOfBlock(target.block) === 'powered_rail'))
+            || (type === 'boat' && typeOfBlock(target.block) === 'water')
           )
             ? target.position
             : target.adjacentPosition
@@ -392,12 +434,12 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
             const spawned = Effect.runSync(vehicleService.spawn(
               type,
               Effect.runSync(playerApi.dimension),
-              { x: at.x + 0.5, y: at.y, z: at.z + 0.5 },
-              poseBeforeFrame.yawRadians,
+              position(PositionAxis(at.x + 0.5), PositionAxis(at.y), PositionAxis(at.z + 0.5)),
+              AngleRadians(poseBeforeFrame.yawRadians),
             ))
             replaceVehicle({
               ...spawned,
-              velocity: type === 'minecart' ? { x: 0, y: 0, z: -0.25 } : { x: 0, y: 0, z: 0 },
+              velocity: { x: VehicleVelocityComponent(0), y: VehicleVelocityComponent(0), z: VehicleVelocityComponent(type === 'minecart' ? -0.25 : 0) },
             })
             document.body.setAttribute('data-vehicle-result', `placed-${type}`)
             markSessionDirty()
@@ -408,9 +450,9 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
       usedSpecialItem = true
     }
     const portalTarget = !usedSpecialItem && multiplayer !== undefined && h5aState.multiplayerHandshakeComplete.get()
-      ? Effect.runSync(targetedBlock())
+      ? yield* targetedBlock()
       : undefined
-    const portalBlock = portalTarget === undefined ? undefined : blockTypeOfId(portalTarget.block)
+    const portalBlock = portalTarget === undefined ? undefined : typeOfBlock(portalTarget.block)
     const usedMultiplayerPortal = portalTarget !== undefined
       && (portalBlock === 'end_portal' || portalBlock === 'nether_portal')
       && sendPortalUseCommand(
@@ -418,28 +460,30 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
         portalBlock === 'end_portal' ? 'EndPortalUseCommand' : 'NetherPortalUseCommand',
       )
     const usedMultiplayerLever = portalTarget !== undefined
-      && blockTypeOfId(portalTarget.block) === 'lever'
+      && typeOfBlock(portalTarget.block) === 'lever'
     if (usedMultiplayerLever) sendToggleLeverCommand(portalTarget.position)
     const shouldAttemptEndFeature = currentChunkContext().dimension === 'end'
       || endPortalComplete()
       || specialSelected?.item === 'eye_of_ender'
-    const usedEndFeature = usedSpecialItem
-      || usedMultiplayerPortal
-      || (shouldAttemptEndFeature && Effect.runSync(useEndFeature()))
-    const brewingTarget = usedEndFeature || usedMultiplayerLever ? undefined : Effect.runSync(targetedBlock())
-    const opensBrewing = brewingTarget !== undefined && blockTypeOfId(brewingTarget.block) === 'brewing_stand'
-    const route = usedEndFeature || usedMultiplayerLever || opensBrewing
+    let usedEndFeature = usedSpecialItem || usedMultiplayerPortal
+    if (!usedEndFeature && shouldAttemptEndFeature) {
+      const result = yield* Effect.result(useEndFeature())
+      if (Result.isFailure(result)) console.warn('Unable to use End feature', result.failure)
+      usedEndFeature = yield* Effect.fromResult(result)
+    }
+    const brewingTarget = usedEndFeature || usedMultiplayerLever ? undefined : yield* targetedBlock()
+    const opensBrewing = brewingTarget !== undefined && typeOfBlock(brewingTarget.block) === 'brewing_stand'
+    const routeResult = usedEndFeature || usedMultiplayerLever || opensBrewing
       ? undefined
-      : Effect.runSync(targetedRightClickRoute(currentChunkStore, playerApi, DEFAULT_BLOCK_REACH))
+      : yield* targetedRightClickRoute(currentChunkStore, postFramePose, DEFAULT_BLOCK_REACH)
+    const route = routeResult !== undefined && 'kind' in routeResult ? routeResult : undefined
     if (usedEndFeature || usedMultiplayerLever) {
       renderPlayerUi()
     } else if (opensBrewing) {
       setBrewingOpen(true)
-      if (multiplayer !== undefined && brewingTarget !== undefined) {
-        state.activeBrewingStandAt.set({ ...brewingTarget.position })
-        if (!requestBrewing({ _tag: 'open' })) state.brewingStatus.set('Brewing stand is unavailable')
-        renderBrewingUi()
-      }
+      if (brewingTarget !== undefined) state.activeBrewingStandAt.set({ ...brewingTarget.position })
+    } else if (routeResult !== undefined && '_tag' in routeResult) {
+      console.warn('Unable to route use to an unavailable block', routeResult)
     } else if (route?.kind === 'craftingTable') {
       setInventoryOpen(true, 'craftingTable')
     } else if (route?.kind === 'anvil') {
@@ -457,13 +501,15 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
         document.body.setAttribute('data-sleep-result', 'unavailable')
       } else if (currentDimension !== 'overworld') {
         state.sleepRuntimeState.set(leaveSleep(state.sleepRuntimeState.get(), multiplayer?.query.player ?? 'local'))
-        Effect.runSync(currentChunkStore.setBlock(bedPosition, blockIdOf('air')))
-        applyWorldExplosion(
+        yield* writeBlocks(asDimensionId(currentDimension), [{ position: bedPosition, block: Option.getOrThrow(blockIdOf('air')) }])
+        const explosion = applyWorldExplosion(
           { x: bedPosition.x + 0.5, y: bedPosition.y + 0.5, z: bedPosition.z + 0.5 },
           5,
           Math.floor(h5aState.simulationElapsedSecs.get() * 20),
           false,
         )
+        if (Result.isFailure(explosion)) console.warn('Unable to apply bed explosion', explosion.failure)
+        yield* Effect.fromResult(explosion)
         document.body.setAttribute(
           'data-bed-explosion-request',
           `${currentDimension}:${bedPosition.x},${bedPosition.y},${bedPosition.z}`,
@@ -473,13 +519,14 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
         const hostilePositions = Effect.runSync(world.entities.snapshot).entities
           .filter((entity) => entity.kind !== 'dropped_item')
           .map((entity) => entity.feetPosition)
-        const decision = resolveBedSleep({
+        // The time service supplies a finite time-of-day value.
+        const decision = Result.getOrThrow(resolveBedSleep({
           bedPosition,
           dangerNearby: isDangerNearby(bedPosition, hostilePositions),
           dimension: currentDimension,
-          timeOfDay: Effect.runSync(time.timeOfDay),
+          timeOfDay: yield* time.timeOfDay,
           weather: Effect.runSync(weather.snapshot).weather,
-        })
+        }))
         if (decision._tag === 'SleepAccepted') {
           const location = { ...decision.respawnLocation, bedPosition }
           state.respawnLocation.set(location)
@@ -514,7 +561,8 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
       }
       const key = furnaceKeyOf({ dimension, position })
       if (multiplayer === undefined && !furnaceStates.has(key)) {
-        furnaceStates.set(key, { dimension, position, state: emptyFurnaceState() })
+        // The default furnace station is a supported simulation constant.
+        furnaceStates.set(key, { dimension, position, state: Result.getOrThrow(emptyFurnaceState()) })
         markSessionDirty()
       }
       if (multiplayer === undefined || furnaceStates.has(key)) {
@@ -558,13 +606,11 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
         increment(h5aState.nextItemUseRequestId)
         const requestId = `item-use-${String(h5aState.nextItemUseRequestId.get())}`
         if (selected.item === 'potato') {
-          const target = Effect.runSync(
-            requestTargetedPotatoPlanting(
-              gameplayState,
-              currentChunkStore,
-              playerApi,
-              requestId,
-            ),
+          const target = yield* requestTargetedPotatoPlanting(
+            gameplayState,
+            currentChunkStore,
+            targeting,
+            requestId,
           )
           if (Option.isSome(target)) {
             pendingItemUses.set(requestId, {
@@ -586,14 +632,12 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
           isLegacyGameplayItemType(selected.item) &&
           isGameplayHoeItem(selected.item)
         ) {
-          const target = Effect.runSync(
-            requestTargetedSoilTill(
-              gameplayState,
-              currentChunkStore,
-              playerApi,
-              requestId,
-              selected.item,
-            ),
+          const target = yield* requestTargetedSoilTill(
+            gameplayState,
+            currentChunkStore,
+            targeting,
+            requestId,
+            selected.item,
           )
           if (Option.isSome(target)) {
             pendingItemUses.set(requestId, {
@@ -606,7 +650,7 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
           isLegacyGameplayItemType(selected.item) &&
           isGameplayIgnitionItem(selected.item)
         ) {
-          const blockTarget = Effect.runSync(resolveTargetedBlock(currentChunkStore, playerApi))
+          const blockTarget = yield* resolveTargetedBlock(currentChunkStore, targeting)
           const blockReading = Option.isSome(blockTarget)
             ? Effect.runSync(currentChunkStore.getBlock(blockPosition(blockTarget.value.position.x, blockTarget.value.position.y, blockTarget.value.position.z)))
             : undefined
@@ -614,18 +658,16 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
             multiplayer !== undefined &&
             Option.isSome(blockTarget) &&
             blockReading?._tag === 'Block' &&
-            blockTypeOfId(blockReading.block) === 'tnt'
+            typeOfBlock(blockReading.block) === 'tnt'
           ) {
             sendEntityCommand({ _tag: 'IgniteTntCommand', at: blockTarget.value.position })
           } else {
-            const target = Effect.runSync(
-              requestTargetedItemUse(
-                gameplayState,
-                currentChunkStore,
-                playerApi,
-                requestId,
-                selected.item,
-              ),
+            const target = yield* requestTargetedItemUse(
+              gameplayState,
+              currentChunkStore,
+              targeting,
+              requestId,
+              selected.item,
             )
             if (Option.isSome(target)) {
               pendingItemUses.set(requestId, {
@@ -643,105 +685,96 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
 
       if (shouldAttemptPlacement) {
         placementAudio.request()
+        const placementItems: Array<import('@nerima-games/mx-gameplay').PlaceableItemType> = []
         requestPlacementFromSelectedSlot(
           inventoryBeforeUse.slots,
           h5aState.selectedHotbarIndex.get(),
           isPlaceableGameplayItem,
-          (heldItem) => {
-            if (multiplayer !== undefined) {
-              const target = Effect.runSync(
-                requestTargetedBlockPlacement(
-                  gameplayState,
-                  currentChunkStore,
-                  playerApi,
-                  heldItem,
-                ),
-              )
-              Effect.runSync(Ref.set(gameplayState.pendingPlacements, []))
-              if (Option.isSome(target)) {
-                Effect.runSync(multiplayer.host.enqueueOutbound({
-                  _tag: 'BlockPlace',
-                  player: multiplayer.query.player,
-                  world: WorldId.make(Effect.runSync(playerApi.dimension)),
-                  at: target.value.adjacentPosition,
-                  block: heldItem,
-                }))
-                increment(state.placementsRequested)
-                placementAudio.request(target.value.adjacentPosition)
-                canvas.setAttribute('data-placements-requested', String(state.placementsRequested.get()))
-              }
-              return
-            }
-            increment(state.nextBlockUseRequestId)
-            const requestId = `block-use-${String(state.nextBlockUseRequestId.get())}`
-            const target = Effect.runSync(
-              requestTargetedBlockUse(
-                gameplayState,
-                currentChunkStore,
-                playerApi,
-                requestId,
-                heldItem,
-              ),
-            )
-            if (Option.isSome(target)) {
-              const reading = Effect.runSync(currentChunkStore.getBlock(blockPosition(target.value.position.x, target.value.position.y, target.value.position.z)))
-              if (reading._tag === 'Block' && reading.block === 76) {
-                pendingBlockUses.set(requestId, {
-                  dimension: currentChunkContext().dimension,
-                  position: target.value.position,
-                })
-              } else if (reading._tag === 'Block' && reading.block === 77) {
-                Effect.runSync(redstoneRuntime.pressButton(
-                  currentChunkContext().dimension,
-                  target.value.position,
-                ))
-              } else if (reading._tag === 'Block' && reading.block === 82) {
-                const key = leverKeyOf({
-                  dimension: currentChunkContext().dimension,
-                  position: target.value.position,
-                })
-                comparatorModes.set(
-                  key,
-                  comparatorModes.get(key) === 'subtract' ? 'compare' : 'subtract',
-                )
-                h5aState.redstoneDirty.set(true)
-              } else {
-                Effect.runSync(Ref.set(gameplayState.pendingPlacements, []))
-                increment(state.nextBlockPlacementRequestId)
-                const placementRequestId = `block-placement-${String(state.nextBlockPlacementRequestId.get())}`
-                Effect.runSync(requestBlockPlacementCommand(gameplayState, {
-                  requestId: placementRequestId,
-                  positionKey: `${target.value.adjacentPosition.x},${target.value.adjacentPosition.y},${target.value.adjacentPosition.z}` as Parameters<typeof requestBlockPlacementCommand>[1]['positionKey'],
-                  heldItem,
-                  mode: isCreativeMode ? 'creative' : 'survival',
-                }))
-                pendingBlockPlacements.set(placementRequestId, {
-                  dimension: currentChunkContext().dimension,
-                  item: heldItem,
-                  position: target.value.adjacentPosition,
-                })
-                increment(state.placementsRequested)
-                placementAudio.request(target.value.adjacentPosition)
-                canvas.setAttribute('data-placements-requested', String(state.placementsRequested.get()))
-              }
-              markSessionDirty()
-            }
-          },
+          (heldItem) => { placementItems.push(heldItem) },
         )
+        for (const heldItem of placementItems) {
+          if (multiplayer !== undefined) {
+            const target = yield* requestTargetedBlockPlacement(
+              gameplayState,
+              currentChunkStore,
+              targeting,
+              heldItem,
+            )
+            Effect.runSync(Ref.set(gameplayState.pendingPlacements, []))
+            if (Option.isSome(target)) {
+              Effect.runSync(multiplayer.host.enqueueOutbound({
+                _tag: 'BlockPlace',
+                player: multiplayer.query.player,
+                world: WorldId.make(Effect.runSync(playerApi.dimension)),
+                at: target.value.adjacentPosition,
+                block: heldItem,
+                state: Result.getOrThrow(encodeBlockState(Option.getOrThrow(blockIdOf(blockOfPlaceableItem(heldItem))), {})),
+              }))
+              increment(state.placementsRequested)
+              placementAudio.request(target.value.adjacentPosition)
+              canvas.setAttribute('data-placements-requested', String(state.placementsRequested.get()))
+            }
+            continue
+          }
+          increment(state.nextBlockUseRequestId)
+          const requestId = `block-use-${String(state.nextBlockUseRequestId.get())}`
+          const target = yield* requestTargetedBlockUse(
+            gameplayState,
+            currentChunkStore,
+            targeting,
+            requestId,
+            heldItem,
+          )
+          if (Option.isSome(target)) {
+            const reading = Effect.runSync(currentChunkStore.getBlock(blockPosition(target.value.position.x, target.value.position.y, target.value.position.z)))
+            if (reading._tag === 'Block' && reading.block === 76) {
+              pendingBlockUses.set(requestId, {
+                dimension: currentChunkContext().dimension,
+                position: target.value.position,
+              })
+            } else if (reading._tag === 'Block' && reading.block === 77) {
+              Effect.runSync(redstoneRuntime.pressButton(
+                Schema.decodeUnknownSync(DimensionIdSchema)(currentChunkContext().dimension),
+                blockPosition(target.value.position.x, target.value.position.y, target.value.position.z),
+              ))
+            } else if (reading._tag === 'Block' && reading.block === 82) {
+              const key = leverKeyOf({
+                dimension: currentChunkContext().dimension,
+                position: target.value.position,
+              })
+              comparatorModes.set(
+                key,
+                comparatorModes.get(key) === 'subtract' ? 'compare' : 'subtract',
+              )
+              h5aState.redstoneDirty.set(true)
+            } else {
+              Effect.runSync(Ref.set(gameplayState.pendingPlacements, []))
+              increment(state.nextBlockPlacementRequestId)
+              const placementRequestId = `block-placement-${String(state.nextBlockPlacementRequestId.get())}`
+              Effect.runSync(requestBlockPlacementCommand(gameplayState, {
+                requestId: placementRequestId,
+                positionKey: Result.getOrThrow(BlockPositionKey(`${target.value.adjacentPosition.x},${target.value.adjacentPosition.y},${target.value.adjacentPosition.z}`)),
+                heldItem,
+                mode: isCreativeMode ? 'creative' : 'survival',
+              }))
+              pendingBlockPlacements.set(placementRequestId, {
+                dimension: currentChunkContext().dimension,
+                item: heldItem,
+                position: target.value.adjacentPosition,
+              })
+              increment(state.placementsRequested)
+              placementAudio.request(target.value.adjacentPosition)
+              canvas.setAttribute('data-placements-requested', String(state.placementsRequested.get()))
+            }
+            markSessionDirty()
+          }
+        }
       }
     }
   }
   if (multiplayer === undefined) {
-    for (const outcome of Effect.runSync(Ref.getAndSet(gameplayState.enderPearlOutcomes, []))) {
-      const pose = Effect.runSync(playerApi.pose)
-      Effect.runSync(playerApi.moveTo({
-        x: pose.feetPosition.x + outcome.displacement.x,
-        y: pose.feetPosition.y + outcome.displacement.y,
-        z: pose.feetPosition.z + outcome.displacement.z,
-      }))
-      if (outcome.damage !== undefined) applyPlayerDamage(outcome.damage)
-      markSessionDirty()
-    }
+    const pearlOutcomes = yield* Ref.getAndSet(gameplayState.enderPearlOutcomes, [])
+    if (pearlOutcomes.length > 0) markSessionDirty()
     for (const knockback of Effect.runSync(drainBowKnockbacks(gameplayState))) {
       let applied = false
       Effect.runSync(world.entities.sweep((entity) => {
@@ -752,16 +785,16 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
         return {
           transition: changed({
             feetPosition: knockback.direction._tag === 'Away'
-              ? {
-                x: entity.feetPosition.x + knockback.direction.x * 0.35,
-                y: entity.feetPosition.y,
-                z: entity.feetPosition.z + knockback.direction.z * 0.35,
-              }
-              : {
-                x: entity.feetPosition.x,
-                y: entity.feetPosition.y + 0.35,
-                z: entity.feetPosition.z,
-              },
+              ? position(
+                PositionAxis(entity.feetPosition.x + knockback.direction.x * 0.35),
+                entity.feetPosition.y,
+                PositionAxis(entity.feetPosition.z + knockback.direction.z * 0.35),
+              )
+              : position(
+                entity.feetPosition.x,
+                PositionAxis(entity.feetPosition.y + 0.35),
+                entity.feetPosition.z,
+              ),
             healthPoints: entity.healthPoints,
             behaviour: entity.behaviour,
           }),
@@ -821,22 +854,23 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
       }
       if (pending !== undefined) {
         const context = dimensionContexts.get(pending.dimension)
-        const match = context === undefined ? undefined : matchRuntimeWitherSummon(
+        const match = context === undefined ? undefined : yield* Effect.fromResult(matchRuntimeWitherSummon(
           pending.position,
           (cell) => {
             const reading = Effect.runSync(context.chunkStore.getBlock(blockPosition(cell.x, cell.y, cell.z)))
-            return reading._tag === 'Block' ? blockTypeOfId(reading.block) : undefined
+            return reading._tag === 'Block' ? typeOfBlock(reading.block) : undefined
           },
-        )
+        ))
         if (match !== undefined && context !== undefined) {
-          for (const position of match.consumedBlocks) {
-            Effect.runSync(context.chunkStore.setBlock(blockPosition(position.x, position.y, position.z), blockIdOf('air')))
-          }
-          h5bState.witherRuntimeState.set(summonRuntimeWither(
+          yield* writeBlocks(asDimensionId(pending.dimension), match.consumedBlocks.map((position) => ({
+            position: blockPosition(position.x, position.y, position.z),
+            block: Option.getOrThrow(blockIdOf('air')),
+          })))
+          h5bState.witherRuntimeState.set(yield* Effect.fromResult(summonRuntimeWither(
             h5bState.witherRuntimeState.get(),
             pending.dimension,
             match.spawnPosition,
-          ))
+          )))
           markSessionDirty()
         }
       }
@@ -845,6 +879,17 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
   placementAudio.confirm([...consumedPlacements, ...confirmedPlacementItems])
   if (consumedPlacements.some((item) => REDSTONE_PLACEMENT_ITEMS.has(item))) {
     h5aState.redstoneDirty.set(true)
+  }
+
+  // Crop-age projection, sapling growth and the block-state-rules stage append
+  // one result per attempt and nothing else reads them, so they are drained
+  // every frame. A failure is already settled (nothing was committed), so it is
+  // reported rather than retried.
+  for (const result of yield* drainBlockStateRuleResults(gameplayState)) {
+    const { _tag } = result.outcome
+    if (_tag !== 'Applied' && _tag !== 'NoChange' && _tag !== 'NotApplicable') {
+      console.warn('Unable to apply block-state rule', result)
+    }
   }
 
   for (const result of Effect.runSync(drainBlockUseResults(gameplayState))) {
@@ -874,7 +919,10 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
       const context = dimensionContexts.get(transition.dimension as Dimension)
       if (context === undefined) continue
       const lampPosition = asBlockPosition(transition.position)
-      Effect.runSync(context.chunkStore.setBlock(lampPosition, transition.lit ? blockIdOf('redstone_lamp_lit') : blockIdOf('redstone_lamp')))
+      yield* writeBlocks(transition.dimension, [{
+        position: lampPosition,
+        block: transition.lit ? Option.getOrThrow(blockIdOf('redstone_lamp_lit')) : Option.getOrThrow(blockIdOf('redstone_lamp')),
+      }])
       const confirmedRead = Effect.runSync(context.chunkStore.getBlock(lampPosition))
       const transitionKey = leverKeyOf({ dimension: transition.dimension as Dimension, position: transition.position })
       redstoneLampTransitionLog.set(transitionKey, [
@@ -909,7 +957,10 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
         position: transition.position,
       })
       if (transition.kind === 'door') {
-        Effect.runSync(context.chunkStore.setBlock(asBlockPosition(transition.position), transition.powered ? blockIdOf('door_open') : blockIdOf('door')))
+        yield* writeBlocks(transition.dimension, [{
+          position: asBlockPosition(transition.position),
+          block: transition.powered ? Option.getOrThrow(blockIdOf('door_open')) : Option.getOrThrow(blockIdOf('door')),
+        }])
       } else if (transition.kind === 'powered-rail') {
         if (transition.powered) poweredRails.add(key)
         else poweredRails.delete(key)
@@ -922,12 +973,10 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
   // Portal stages can replace both dimension and pose. Stream and present
   // only after the frame so the renderer never meshes the destination pose
   // against the source dimension's store.
-  Effect.runSync(
-    streamAround(
-      currentChunkContext(),
-      postFramePose.feetPosition.x,
-      postFramePose.feetPosition.z,
-    ),
+  yield* streamAround(
+    currentChunkContext(),
+    postFramePose.feetPosition.x,
+    postFramePose.feetPosition.z,
   )
   canvas.setAttribute(
     'data-player-feet',
@@ -966,7 +1015,7 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
     (location) => {
       const context = getOrCreateDimensionChunkContext(location.dimension)
       const reading = Effect.runSync(context.chunkStore.getBlock(blockPosition(location.bedPosition.x, location.bedPosition.y, location.bedPosition.z)))
-      return reading._tag === 'Block' && blockTypeOfId(reading.block) === 'bed'
+      return reading._tag === 'Block' && typeOfBlock(reading.block) === 'bed'
     },
   ))
   const sleepAdvance = multiplayer === undefined ? advanceSleep(
@@ -990,7 +1039,7 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
     state.appliedNightSkipRevision.set(multiplayer === undefined ? null : state.networkSleepState.get().revision)
     if (multiplayer === undefined) {
       const clearWeather: WeatherState = { weather: 'clear', remainingSecs: 300 }
-      Effect.runSync(time.setTimeOfDay(0.25))
+      yield* time.setTimeOfDay(InterpolationFraction(0.25))
       Effect.runSync(weather.applyTransition(clearWeather))
       presentWeather(clearWeather)
       markSessionDirty()
@@ -999,15 +1048,39 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
     sleepHud.hidden = true
     document.body.setAttribute('data-sleep-result', 'morning-skipped')
   }
-  presentWeatherRuntime(
-    weatherAdvanced ?? Effect.runSync(weather.snapshot),
-    postFramePose,
-    nowSecs,
-  )
+  // The public drain clears every kind. Remove only correlated brewing
+  // refusals so the other host consumers retain their own unsupported records.
+  const unsupportedBrewing = yield* Ref.modify(gameplayState.unsupportedOperations, (operations) => {
+    const matched: Array<{
+      readonly requestId: string
+      readonly action: 'insert' | 'collect' | 'drink'
+      readonly reason: (typeof operations)[number]['reason']
+    }> = []
+    const retained: Array<(typeof operations)[number]> = []
+    for (const operation of operations) {
+      const pending = operation.requestId === undefined ? undefined : pendingItemUses.get(operation.requestId)
+      if (operation.requestId !== undefined && pending?.kind === 'brewing') {
+        matched.push({ requestId: operation.requestId, action: pending.action, reason: operation.reason })
+      } else {
+        retained.push(operation)
+      }
+    }
+    return [matched, retained]
+  })
+  for (const operation of unsupportedBrewing) {
+    pendingItemUses.delete(operation.requestId)
+    state.brewingStatus.set(`Cannot ${operation.action} brewing item: ${operation.reason}`)
+    renderBrewingUi()
+  }
 
   const itemUseResults = Effect.runSync(drainItemUseResults(gameplayState))
   for (const result of itemUseResults) {
     if ('action' in result && result.action === 'AdvanceFurnace') {
+      if (!('plan' in result)) {
+        console.warn('Unable to advance furnace', result.failure)
+        pendingFurnaceAdvances.delete(result.requestId)
+        continue
+      }
       const key = pendingFurnaceAdvances.get(result.requestId)
       pendingFurnaceAdvances.delete(result.requestId)
       const furnace = key === undefined ? undefined : furnaceStates.get(key)
@@ -1030,8 +1103,37 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
     state.lastObservedItemUse.set(result)
     const pending = pendingItemUses.get(result.requestId)
     pendingItemUses.delete(result.requestId)
+    if (pending?.kind === 'brewing') {
+      if (!('action' in result)) {
+        if (result.outcome === 'PlayerDead') {
+          state.brewingStatus.set(`Cannot ${pending.action} brewing item: PlayerDead`)
+        }
+      } else if (pending.action === 'insert' && (
+        result.action === 'InsertBrewingFuel' || result.action === 'InsertBrewingBottle'
+        || result.action === 'InsertBrewingIngredient'
+      )) {
+        state.brewingStatus.set(result.success
+          ? `Inserted ${pending.item}` : `Cannot insert item: ${result.failure}`)
+      } else if (pending.action === 'collect' && result.action === 'CollectBrewingBottle') {
+        state.brewingStatus.set(result.outcome._tag === 'Collected'
+          ? `Collected ${result.outcome.item}`
+          : result.outcome._tag === 'InventoryFull'
+            ? 'Inventory is full' : `Cannot collect bottle: ${result.outcome._tag}`)
+      } else if (pending.action === 'drink' && result.action === 'DrinkPotion') {
+        state.brewingStatus.set(result.success
+          ? `Drank ${result.outcome.item}` : `Cannot drink bottle: ${result.failure._tag}`)
+      }
+      if (result.success) {
+        markSessionDirty()
+        renderPlayerUi()
+      }
+      renderBrewingUi()
+      continue
+    }
     if (pending === undefined || !result.success) continue
 
+    // Successful item-use outcomes already include their committed storage,
+    // crop, durability and vitals changes; only presentation remains here.
     if (!('action' in result) && pending.kind === 'ignition' && pending.heldItem === result.heldItem) {
       if (
         result.outcome._tag === 'Portal'
@@ -1046,83 +1148,42 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
           registerPortal({ dimension: pending.dimension, position: anchor })
         }
       }
-      if (result.heldItem === 'fire_charge') {
-        Effect.runSync(world.inventory.removeAt(pending.slotIndex, pending.heldItem, 1))
-      } else if (Effect.runSync(world.inventory.snapshot).slots[pending.slotIndex]?.item === 'flint_and_steel') {
-        Effect.runSync(world.inventory.damageAt({ _tag: 'Inventory', slotIndex: pending.slotIndex }, 1))
-      }
-    } else if ('action' in result) {
-      switch (result.action) {
-        case 'TillSoil':
-          if (
-            pending.kind === 'till'
-            && pending.heldItem === result.heldItem
-            && Effect.runSync(world.inventory.snapshot).slots[pending.slotIndex]?.item === result.heldItem
-          ) {
-            Effect.runSync(
-              world.inventory.damageAt(
-                { _tag: 'Inventory', slotIndex: pending.slotIndex },
-                result.durabilityDamage,
-              ),
-            )
-          }
-          break
-        case 'PlantPotato':
-          if (pending.kind === 'plant' && result.outcome._tag === 'planted') {
-            const planted = Effect.runSync(crops.plant({
-              dimension: pending.dimension,
-              position: result.outcome.at as CropLocation['position'],
-            }))
-            if (planted) {
-              Effect.runSync(
-                world.inventory.removeAt(pending.slotIndex, 'potato', result.consumedCount),
-              )
-            }
-          }
-          break
-        case 'HarvestPotato':
-          if (pending.kind === 'harvest' && result.outcome._tag === 'drops') {
-            const at = {
-              x: pending.position.x + 0.5,
-              y: pending.position.y + 0.5,
-              z: pending.position.z + 0.5,
-            }
-            const leftovers = result.outcome.drops.flatMap((drop) => {
-              const leftover = Effect.runSync(world.inventory.add(drop.item, drop.count))
-              return leftover > 0 ? [{ item: drop.item, count: leftover }] : []
-            })
-            if (leftovers.length > 0) {
-              Effect.runSync(spawnDroppedItems(world.entities, leftovers.map((stack) => ({ ...stack, at }))))
-            }
-          }
-          break
-        case 'EatPotato':
-          if (pending.kind === 'eat' && result.outcome._tag === 'consume') {
-            if (multiplayer !== undefined) {
-                  multiplayerClient.sendVitalsCommand({ _tag: 'eat', item: 'potato' })
-              break
-            }
-            const removal = Effect.runSync(
-              world.inventory.removeAt(pending.slotIndex, 'potato', result.consumedCount),
-            )
-            if (removal._tag === 'Removed') {
-              survivalHunger.eat(
-                result.outcome.foodPoints,
-                result.outcome.saturationModifier,
-              )
-            }
-          }
-          break
-      }
+    } else if (
+      'action' in result
+      && result.action === 'EatPotato'
+      && pending.kind === 'eat'
+      && result.outcome._tag === 'consume'
+      && multiplayer !== undefined
+    ) {
+      multiplayerClient.sendVitalsCommand({ _tag: 'eat', item: 'potato' })
     }
     markSessionDirty()
+  }
+
+  // gameplayStages omits brewing-advance; this is its sole local clock owner (I4).
+  if (multiplayer === undefined) {
+    const before = yield* brewingService.snapshot.pipe(
+      Effect.provideService(WorldCommitCoordinator, targeting.coordinator),
+    )
+    // Empty stands need no commit. An interrupted recipe still needs advance to
+    // reset its progress, even when its ingredient or bottles were removed.
+    if (before.brewProgressSecs > 0 || (
+      before.ingredient !== undefined && before.fuelCharges > 0
+      && before.bottles.some((bottle) => bottle !== undefined)
+    )) {
+      const advanced = yield* brewingService.advance(deltaSecs).pipe(
+        Effect.provideService(WorldCommitCoordinator, targeting.coordinator),
+      )
+      if (advanced.brewed > 0 || advanced.state.brewProgressSecs !== before.brewProgressSecs) markSessionDirty()
+      renderBrewingUi()
+    }
   }
 
   const mobDrops = multiplayer === undefined
     ? Effect.runSync(drainMobDrops(gameplayState))
     : []
   if (mobDrops.length > 0) {
-    Effect.runSync(spawnMobDrops(world.entities, mobDrops))
+    Effect.runSync(spawnMobDrops(entityManager, mobDrops))
     markSessionDirty()
   }
   for (const drop of mobDrops) {
@@ -1134,7 +1195,7 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
     : []
   for (const event of mobExperience) {
     const currentVitals = Effect.runSync(world.vitals.snapshot)
-    Effect.runSync(world.vitals.restore(addVitalsExperience(currentVitals, event.amount)))
+    Effect.runSync(world.vitals.restore(addVitalsExperience(currentVitals, ExperienceDelta(event.amount))))
   }
   if (mobExperience.length > 0 || (multiplayer === undefined && playerHeals.length > 0)) markSessionDirty()
 
@@ -1155,16 +1216,16 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
       }
       case 'ExperienceRewarded': {
         const currentVitals = Effect.runSync(world.vitals.snapshot)
-        Effect.runSync(world.vitals.restore(addVitalsExperience(currentVitals, event.amount)))
-        queueEndAudio('dragonReward', endDragonPosition())
+        Effect.runSync(world.vitals.restore(addVitalsExperience(currentVitals, ExperienceDelta(event.amount))))
+        queueEndAudio('dragonReward', endDragonWorldPosition())
         break
       }
       case 'DragonEggRewarded':
         if (!state.dragonEggRewarded.get()) {
-          Effect.runSync(spawnDroppedItems(world.entities, [{
+          Effect.runSync(spawnDroppedItems(entityManager, [{
             item: event.item,
             count: event.count,
-            at: endDragonPosition(),
+            at: endDragonWorldPosition(),
           }]))
           state.dragonEggRewarded.set(true)
         }
@@ -1172,17 +1233,19 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
       case 'ExitPortalMaterializationRequested':
         if (!state.exitPortalMaterialized.get()) {
           const portalY = 64
+          const edits: Array<WorldWriteBatch['edits'][number]> = []
           for (let x = -1; x <= 1; x += 1) {
             for (let z = -1; z <= 1; z += 1) {
-              Effect.runSync(currentChunkStore.setBlock(blockPosition(x, portalY, z), END_PORTAL_BLOCK.PORTAL))
+              edits.push({ position: blockPosition(x, portalY, z), block: END_PORTAL_BLOCK.PORTAL })
             }
           }
+          yield* writeBlocks(asDimensionId(dimensionAfterFrame), edits)
           state.exitPortalMaterialized.set(true)
-          queueEndAudio('exitPortal', { x: 0, y: portalY, z: 0 })
+          queueEndAudio('exitPortal', position(PositionAxis(0), PositionAxis(portalY), PositionAxis(0)))
         }
         break
       case 'DragonDamagedByPlayer':
-        queueEndAudio('dragonHurt', endDragonPosition())
+        queueEndAudio('dragonHurt', endDragonWorldPosition())
         break
     }
   }
@@ -1198,9 +1261,52 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
     listenerForward: adapters.getReadAudioListenerForward(),
     events: adapters.drainEndAudioEvents(),
   })
+})
 
-  syncRenderedEntities()
-  if (h5aState.brewingOpen.get()) renderBrewingUi()
+type FramePresentationFailure = Effect.Error<
+  | H5cTickContext['h5a']['playerApi']['pose']
+  | H5cTickContext['h5a']['playerApi']['dimension']
+  | ReturnType<H5cTickContext['services']['presentWeatherRuntime']>
+  | ReturnType<H5cTickContext['services']['syncRenderedEntities']>
+>
+
+/**
+ * The once-per-render-frame output, run after the frame's ticks. It reads the
+ * state the ticks left and writes only display and frame counters.
+ * `partialTick` and `simulationTick` are reserved for entity interpolation.
+ */
+export const runFramePresentation = <DebugOverlayFailure>(
+  context: H5cFramePresentationContext<DebugOverlayFailure>,
+  frame: H5cFramePresentationInput,
+): Effect.Effect<void, FramePresentationFailure | DebugOverlayFailure> => Effect.gen(function* () {
+  const { raw, nowSecs } = frame
+  const { h5a, h5b, services, state } = context
+  const { playerApi, renderCrosshair } = h5a
+  const { renderPlayerUi, projectileHud } = h5b
+  const {
+    weather,
+    presentWeatherRuntime,
+    syncRenderedEntities,
+    renderBrewingUi,
+    playerSettings,
+    adapters: { audio },
+    uiFrameState,
+    fpsValue,
+    captionsParent,
+  } = services
+  const pose = yield* playerApi.pose
+  const dimension = yield* playerApi.dimension
+
+  yield* presentWeatherRuntime(yield* weather.snapshot, pose, nowSecs)
+
+  const activeProjectileCount = h5b.state.projectileRuntimeState.get().projectiles
+    .filter((projectile) => projectile.dimension === dimension)
+    .length
+  projectileHud.textContent = `Arrows ${String(activeProjectileCount)}`
+  projectileHud.hidden = activeProjectileCount === 0
+
+  yield* syncRenderedEntities()
+  if (h5a.state.brewingOpen.get()) renderBrewingUi()
   renderPlayerUi()
   renderCrosshair(nowSecs)
   const captions = playerSettings().captionsEnabled ? audio.visible(KernelMonotonicTimeSecs(nowSecs)) : []
@@ -1223,4 +1329,9 @@ export const runTickPostFrameGameplay = (context: H5cTickContext, input: H5cPost
   // Readable by a test without a QA command: the frame count IS the claim
   // that the loop is running, and docs/e2e-triage.md #4 is exactly that claim.
   document.body.setAttribute('data-frames', String(state.framesTotal.get()))
-}
+
+  yield* runTickDebugOverlayFrame(context.updateDebugOverlay, {
+    framesTotal: state.framesTotal.get(),
+    raw,
+  })
+})

@@ -1,9 +1,8 @@
 import { expect, test, type Page } from '@playwright/test'
 
+import { callQa, callQaWithFrames } from './helpers/qa'
 import { startGameSession } from './helpers/session'
 import { waitForSimulationProgress } from './helpers/simulation-wait'
-
-const QA_GLOBAL_KEY = '__NERIMA_GAMES_QA__'
 
 type GameplaySnapshot = {
   readonly vitals: {
@@ -15,28 +14,15 @@ type GameplaySnapshot = {
   }
   readonly entities: ReadonlyArray<{ readonly kind: string }>
   readonly brewing: {
-    readonly fuelUnits: number
-    readonly bottle?: 'water_bottle' | { readonly potion: string }
-    readonly ingredient?: string
-    readonly brewing?: { readonly output: string; readonly remainingSecs: number }
+    readonly fuelCharges: number
+    readonly bottles: ReadonlyArray<{ readonly item: string; readonly count: number } | null>
+    readonly ingredient?: { readonly item: string; readonly count: number }
+    readonly brewProgressSecs: number
   }
   readonly statusEffects: {
     readonly effects: ReadonlyArray<{ readonly type: string; readonly remainingSecs: number }>
   }
 }
-
-const callQa = <A>(page: Page, command: string, ...arguments_: ReadonlyArray<unknown>): Promise<A> =>
-  page.evaluate(
-    async ({ key, commandName, commandArguments }) => {
-      const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-        | Record<string, (...arguments_: ReadonlyArray<unknown>) => unknown>
-        | undefined
-      const operation = surface?.[commandName]
-      if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
-      return await operation(...commandArguments)
-    },
-    { key: QA_GLOBAL_KEY, commandName: command, commandArguments: arguments_ },
-  ) as Promise<A>
 
 const snapshot = (page: Page): Promise<GameplaySnapshot> =>
   callQa(page, 'gameplay.snapshot')
@@ -45,20 +31,7 @@ const snapshot = (page: Page): Promise<GameplaySnapshot> =>
 // they can describe different frames, and a wait comparing them would then be
 // reasoning about a state that never existed.
 const readWithFrames = (page: Page): Promise<{ frames: number; value: GameplaySnapshot }> =>
-  page.evaluate(
-    async ({ key, commandName }) => {
-      const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-        | Record<string, (...arguments_: ReadonlyArray<unknown>) => unknown>
-        | undefined
-      const operation = surface?.[commandName]
-      if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
-      return {
-        frames: Number(document.body.getAttribute('data-frames')),
-        value: await operation(),
-      }
-    },
-    { key: QA_GLOBAL_KEY, commandName: 'gameplay.snapshot' },
-  ) as Promise<{ frames: number; value: GameplaySnapshot }>
+  callQaWithFrames(page, 'gameplay.snapshot')
 
 const grantPointerLock = (page: Page): Promise<void> => page.evaluate(() => {
   const canvas = document.querySelector<HTMLCanvasElement>('#game-canvas')
@@ -84,10 +57,17 @@ const openBrewingStand = async (page: Page): Promise<void> => {
   await expect(page.locator('#brewing-root')).toBeVisible()
 }
 
-const selectAndInsert = async (page: Page, digit: string): Promise<void> => {
-  const brewing = page.locator('#brewing-root')
+const selectHotbar = async (page: Page, digit: 'Digit1' | 'Digit2' | 'Digit3' | 'Digit4'): Promise<void> => {
+  const slotIndex = { Digit1: 0, Digit2: 1, Digit3: 2, Digit4: 3 }[digit]
   await page.keyboard.press(digit)
-  await page.waitForTimeout(100)
+  await expect.poll(() => page.locator('#hud-root [data-mx-ui="hotbar"] [data-mx-ui="slot"]').evaluateAll(
+    (slots) => slots.findIndex((slot) => slot.hasAttribute('data-selected')),
+  )).toBe(slotIndex)
+}
+
+const selectAndInsert = async (page: Page, digit: 'Digit1' | 'Digit2' | 'Digit3' | 'Digit4'): Promise<void> => {
+  const brewing = page.locator('#brewing-root')
+  await selectHotbar(page, digit)
   if (!(await brewing.isVisible())) await openBrewingStand(page)
   await brewing.locator('[data-brewing-action="insert"]').click()
 }
@@ -112,27 +92,26 @@ test.describe('brewing, effects, and experience', () => {
     await selectAndInsert(page, 'Digit1')
     await selectAndInsert(page, 'Digit2')
     await selectAndInsert(page, 'Digit3')
-    // Starting the brew (populating `brewing.output` and its countdown) needs
-    // the stand to process the completed ingredient set on a simulation
-    // tick, same as the completion waits below — see waitForSimulationProgress.
     await waitForSimulationProgress(
       page,
       () => readWithFrames(page),
-      (current) => current.brewing.brewing?.output === 'awkward',
+      (current) => current.brewing.brewProgressSecs > 0,
       { description: 'brewing the awkward potion starts' },
     )
 
     const beforeReload = await snapshot(page)
-    expect(beforeReload.brewing.bottle).toBe('water_bottle')
-    expect(beforeReload.brewing.ingredient).toBeUndefined()
+    expect(beforeReload.brewing.bottles).toHaveLength(3)
+    expect(beforeReload.brewing.bottles[0]?.item).toBe('water_bottle')
+    expect(beforeReload.brewing.ingredient?.item).toBe('nether_wart')
+    await expect(page.locator('#brewing-root [data-brewing-action="collect"]')).toBeDisabled()
     await callQa(page, 'persistence.flush')
     await startGameSession(page, sessionId)
     await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
     const restoredBrewing = await snapshot(page)
-    expect(restoredBrewing.brewing.brewing?.output).toBe('awkward')
-    expect(restoredBrewing.brewing.brewing?.remainingSecs).toBeLessThanOrEqual(
-      beforeReload.brewing.brewing?.remainingSecs ?? 20,
-    )
+    expect(restoredBrewing.brewing.bottles).toEqual(beforeReload.brewing.bottles)
+    expect(restoredBrewing.brewing.ingredient).toEqual(beforeReload.brewing.ingredient)
+    expect(restoredBrewing.brewing.brewProgressSecs).toBeGreaterThanOrEqual(beforeReload.brewing.brewProgressSecs)
+    expect(restoredBrewing.brewing.brewProgressSecs).toBeLessThan(20)
 
     await callQa(page, 'gameplay.seedBrewingEncounter')
     await selectAndInsert(page, 'Digit1')
@@ -146,21 +125,22 @@ test.describe('brewing, effects, and experience', () => {
     await waitForSimulationProgress(
       page,
       () => readWithFrames(page),
-      (current) => JSON.stringify(current.brewing.bottle) === JSON.stringify({ potion: 'awkward' }),
+      (current) => current.brewing.bottles[0]?.item === 'awkward_potion',
       { description: 'brewing the awkward potion' },
     )
     await selectAndInsert(page, 'Digit4')
     await waitForSimulationProgress(
       page,
       () => readWithFrames(page),
-      (current) => JSON.stringify(current.brewing.bottle) === JSON.stringify({ potion: 'poison' }),
+      (current) => current.brewing.bottles[0]?.item === 'potion_of_poison',
       { description: 'brewing the poison potion' },
     )
 
     const brewing = page.locator('#brewing-root')
+    await expect(brewing.locator('[data-brewing-action="collect"]')).toBeEnabled()
     await brewing.locator('[data-brewing-action="collect"]').click()
-    await expect.poll(async () => (await snapshot(page)).inventory.slots[0]?.item).toBe('potion_of_poison')
-    await selectAndInsert(page, 'Digit1')
+    await expect.poll(async () => (await snapshot(page)).inventory.slots[1]?.item).toBe('potion_of_poison')
+    await selectHotbar(page, 'Digit2')
     await brewing.locator('[data-brewing-action="drink"]').click()
 
     await expect(page.locator('[data-testid="status-effects"]')).toContainText('poison:')

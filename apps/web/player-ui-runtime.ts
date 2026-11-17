@@ -1,14 +1,25 @@
-import { Effect, Option } from 'effect'
+import { Brand, Effect, Option, Result } from 'effect'
+import { SoundCueId } from '@nerima-games/mc-audio'
 import {
+  BlockAxis,
+  BlockId,
   blockIdOf,
   blockPosition,
+  blockPositionKeyOf,
+  blockPositionOfPosition,
   blockTypeOfId,
+  chunkCoordOfBlock,
+  position,
+  PositionAxis,
   propertyOfBlockId,
-  chunkCoord,
-  type BlockId,
+  RecipeGridDimension,
   type BlockPosition,
+  type BlockRegistryResolutionFailure,
+  type ChunkCoord,
+  type CoordinateConversionFailure,
   type Position,
-  type StackCount,
+  type WorldWriteBlockEdit,
+  type WorldWritePort,
 } from '@nerima-games/mc-kernel'
 import { chunkKeyOf } from '@nerima-games/mc-render'
 import {
@@ -18,20 +29,28 @@ import {
   endArrivalDescriptor,
   endPortalCenterForStronghold,
   nearestStrongholdSite,
+  NoiseSeed,
   type Dimension,
 } from '@nerima-games/mc-worldgen'
 import {
   emptyFurnaceState,
+  EntityHealthPoints,
+  ExperienceLevel,
   STARTER_FUEL_RULES,
   STARTER_SMELTING_RECIPES,
   type FurnaceState,
   type ContainerTransferRequest,
   type ContainerTransferResult,
+  type ExplosionBlockPosition,
+  type ExplosionPlan,
+  type ExplosionValidationFailure,
   type ItemStack,
   itemStack,
   maxStackCountForItem,
   type PlayerStorage,
-  type InventoryServiceApi,
+  type ItemStackFailure,
+  type PlayerStorageFailure,
+  type Slot,
   type Vitals as PlayerVitals,
   planExplosion,
   equipmentDefinitionFor,
@@ -51,6 +70,7 @@ import {
   armorDurabilityWearFromPreMitigationDamage,
   durabilityWearWithEnchantments,
   type EnchantedItem,
+  type EnchantmentOffer,
   type FishingSession,
   type Damage as PlayerDamage,
 } from '@nerima-games/mx-gameplay'
@@ -71,6 +91,7 @@ import {
   type InventoryAction,
   type InventoryActionTarget,
   type InventoryDragTarget,
+  type EnchantingTableSnapshot,
   type EquipmentSlotId,
   type FurnaceSnapshot,
   type ChestStorageSlotTarget,
@@ -82,7 +103,7 @@ import type { NetworkMessage } from '@nerima-games/mx-multiplayer'
 import type { MultiplayerInventorySelection, WithoutAuthority } from './multiplayer-client'
 import { applyAnvilOperation, enchantedItemFromAnvilOutput, planAnvilOperation, spendExperienceLevels } from '@nerima-games/mc-server/shared'
 import { announceInventoryTransition } from './audio-runtime'
-import { projectEnchantedItem } from './enchanted-item-state'
+import { enchantedItemWithLevels, projectEnchantedItem } from './enchanted-item-state'
 import {
   resetTouchLook,
   touchControlsPresentation,
@@ -100,8 +121,75 @@ import type { PersistedEndPortalFrameState, SessionPosition } from './session-pe
 import {
   createInventoryInteraction,
   type InventoryInteractionController,
-  type InventoryInteractionService,
+  type InventoryInteractionError,
+  type InventoryInteractionInventory,
 } from './inventory-interaction'
+import type {
+  OwnerBackedInventory,
+  OwnerBackedInventorySyncError,
+  OwnerBackedInventoryWriteError,
+  OwnerBackedPlayerSyncError,
+  OwnerBackedPlayerWriteError,
+} from './owner-backed-services'
+
+type FailureOf<R> = R extends Result.Result<unknown, infer E> ? E : never
+type BlockTargetFailure = FailureOf<ReturnType<typeof targetBlockFromPlayerPose>>
+type ChunkLoadFailure = Effect.Error<ReturnType<DimensionChunkContext['chunkStore']['load']>>
+type WorldWriteFailure = Effect.Error<ReturnType<WorldWritePort['Service']['applyBatch']>>
+type EndArrivalFailure = ChunkLoadFailure | WorldWriteFailure | OwnerBackedPlayerWriteError
+type BlockReadingFailure = Brand.BrandError | BlockRegistryResolutionFailure
+type TargetedBlockFailure = BlockTargetFailure | CoordinateConversionFailure | OwnerBackedPlayerSyncError
+type FishingEnvironmentFailure = CoordinateConversionFailure | BlockReadingFailure
+type EndFeatureFailure =
+  | Brand.BrandError
+  | CoordinateConversionFailure
+  | TargetedBlockFailure
+  | EndArrivalFailure
+  | ItemStackFailure
+  | PlayerStorageFailure
+  | OwnerBackedInventoryWriteError
+type WorldExplosionFailure =
+  | Brand.BrandError
+  | ExplosionValidationFailure
+  | BlockRegistryResolutionFailure
+  | WorldWriteFailure
+  | OwnerBackedPlayerSyncError
+
+// The kernel vocabulary always registers 'air', so the registry lookup cannot be empty.
+const AIR_BLOCK = Option.getOrThrow(blockIdOf('air'))
+const PLAYER_HURT_CUE = SoundCueId('playerHurt')
+const NO_MINIMUM_HEALTH = EntityHealthPoints(0)
+
+// Integer block axes are finite, so every block cell is also a valid continuous position.
+const positionOfBlock = (cell: BlockPosition): Position =>
+  position(PositionAxis(cell.x), PositionAxis(cell.y), PositionAxis(cell.z))
+
+const blockCellOf = (
+  cell: { readonly x: number; readonly y: number; readonly z: number },
+): Result.Result<BlockPosition, Brand.BrandError> => Result.gen(function* () {
+  return blockPosition(
+    yield* BlockAxis.result(cell.x),
+    yield* BlockAxis.result(cell.y),
+    yield* BlockAxis.result(cell.z),
+  )
+})
+
+const OVERWORLD_RETURN_POSITION = position(PositionAxis(0.5), PositionAxis(80), PositionAxis(0.5))
+
+const isFrameCell = (
+  center: BlockPosition,
+  offset: (typeof END_PORTAL_FRAME_OFFSETS)[number],
+  cell: BlockPosition,
+): boolean =>
+  center.x + offset.dx === cell.x && center.y === cell.y && center.z + offset.dz === cell.z
+
+const blockTypeOfReading = (block: number) => Result.flatMap(BlockId.result(block), blockTypeOfId)
+
+// The WorldWritePort rejects a batch that edits one position twice. A later edit
+// replaces an earlier one, as it did when the cells were written one at a time.
+const uniqueEdits = (edits: ReadonlyArray<WorldWriteBlockEdit>): ReadonlyArray<WorldWriteBlockEdit> =>
+  [...new Map(edits.map((edit) => [blockPositionKeyOf(edit.position), edit])).values()]
+
 
 export type InventoryMode = 'player' | 'craftingTable' | 'furnace' | 'chest' | 'anvil' | 'enchanting'
 
@@ -125,6 +213,8 @@ type TargetedBlock = {
   readonly block: number
 }
 
+type TargetedCell = { readonly target: TargetedBlock; readonly cell: BlockPosition }
+
 type FishingEnvironment = {
   readonly hasWater: boolean
   readonly hasSkyAccess: boolean
@@ -133,8 +223,16 @@ type FishingEnvironment = {
 }
 
 type InventoryRemoval = { readonly _tag: 'Removed'; readonly removed: number } | { readonly _tag: 'Unavailable' }
+type InventoryRemoveFailure = Effect.Error<ReturnType<OwnerBackedInventory['removeAt']>>
+type InventoryAddFailure = Effect.Error<ReturnType<OwnerBackedInventory['add']>>
 
-export type PlayerUiRuntimeContext<Item extends ItemStack['item'], Recipe, Count extends StackCount = StackCount> = {
+export type PlayerUiRuntimeContext = {
+  /**
+   * Runs `work` at the next frame boundary. The DOM listeners installed here
+   * read and write the world, so they hand everything after the event's own
+   * synchronous needs (`preventDefault`, drag data) to it.
+   */
+  readonly deferToFrameBoundary: (work: () => void) => void
   readonly document: Document
   readonly window: Pick<Window, 'requestAnimationFrame'>
   readonly canvas: HTMLCanvasElement
@@ -149,21 +247,27 @@ export type PlayerUiRuntimeContext<Item extends ItemStack['item'], Recipe, Count
   readonly chestView: ReturnType<typeof createChestStorageView>
   readonly anvilView: ReturnType<typeof createAnvilView>
   readonly enchantingView: ReturnType<typeof createEnchantingTableView>
-  readonly inventoryService: InventoryInteractionService<Item, Recipe, Count>
-  readonly worldInventory: InventoryServiceApi
-  readonly inventoryStorageSnapshot: Effect.Effect<PlayerStorage>
-  readonly getPlayerPose: () => Effect.Effect<Parameters<typeof targetBlockFromPlayerPose>[0]>
-  readonly getPlayerDimension: () => Effect.Effect<Dimension>
+  readonly inventoryService: InventoryInteractionInventory
+  readonly worldInventory: Pick<
+    OwnerBackedInventory,
+    'removeAt' | 'equipmentSnapshot' | 'damageAt' | 'equipFromInventory' | 'unequipToInventory' | 'restoreStorage'
+  >
+  readonly inventoryStorageSnapshot: Effect.Effect<PlayerStorage, OwnerBackedInventorySyncError>
+  readonly getPlayerPose: () => Effect.Effect<Parameters<typeof targetBlockFromPlayerPose>[0], OwnerBackedPlayerSyncError>
+  readonly getPlayerDimension: () => Effect.Effect<Dimension, OwnerBackedPlayerSyncError>
   readonly restorePlayerForDimension: (
     pose: Parameters<typeof targetBlockFromPlayerPose>[0],
     dimension: Dimension,
-  ) => Effect.Effect<void>
+  ) => Effect.Effect<void, OwnerBackedPlayerWriteError>
   readonly getOrCreateDimensionChunkContext: (dimension: Dimension) => DimensionChunkContext
   readonly readBlockAt: (position: BlockPosition) => Effect.Effect<BlockReading>
   readonly getEntitiesForExplosion: () => Parameters<typeof planExplosion>[0]['entities']
-  readonly setBlockAt: (position: BlockPosition, block: BlockId) => void
-  readonly setBlockEffect: (position: BlockPosition, block: BlockId) => Effect.Effect<void>
-  readonly resolveExplosionEffects: (effects: ReturnType<typeof planExplosion>['entityEffects']) => void
+  readonly setBlockEffect: (position: BlockPosition, block: BlockId) => Effect.Effect<void, WorldWriteFailure>
+  readonly writeBlocks: (
+    dimension: Dimension,
+    edits: ReadonlyArray<WorldWriteBlockEdit>,
+  ) => Effect.Effect<void, WorldWriteFailure>
+  readonly resolveExplosionEffects: (effects: ExplosionPlan['entityEffects']) => void
   readonly getActiveSeed: () => number
   readonly endPortalFrames: Map<string, PersistedEndPortalFrameState>
   readonly endPortalFrameKey: (position: SessionPosition) => string
@@ -236,8 +340,11 @@ export type PlayerUiRuntimeContext<Item extends ItemStack['item'], Recipe, Count
   readonly equipmentMetadataKey: (slot: EquipmentSlotId) => string
   readonly setEnchantmentSeed: (seed: number) => void
   readonly getVitalsSnapshot: () => { readonly totalExperience: number }
-  readonly getInventorySnapshot: () => Effect.Effect<{ readonly slots: ReadonlyArray<ItemStack | undefined> }>
-  readonly restoreVitalsAtExperience: (totalExperience: number) => void
+  readonly getInventorySnapshot: () => Effect.Effect<
+    { readonly slots: ReadonlyArray<ItemStack | undefined> },
+    OwnerBackedInventorySyncError
+  >
+  readonly restoreVitalsAtExperience: (totalExperience: number) => Result.Result<void, Brand.BrandError>
   readonly renderHud: (storage: PlayerStorage, durabilityBySlot: ReadonlyMap<number, number>) => void
   readonly getTotalExperience: () => number
   readonly getExperienceLevel: () => number
@@ -252,15 +359,21 @@ export type PlayerUiRuntimeContext<Item extends ItemStack['item'], Recipe, Count
   readonly getFurnaceStatus: () => string
   readonly getInventoryFocus: () => InventoryInteractionTarget
   readonly getActiveChestContainer: (containerId: string) => ContainerSnapshot | null
-  readonly transferContainerItem: (request: ContainerTransferRequest) => Effect.Effect<ContainerTransferResult>
+  readonly transferContainerItem: (
+    request: ContainerTransferRequest,
+  ) => Effect.Effect<ContainerTransferResult, OwnerBackedInventoryWriteError>
   readonly containerMetadataKey: (containerId: string, slot: number) => string
   readonly sameItemMetadata: (left: string, right: string) => boolean
   readonly copyItemMetadata: (source: string, destination: string) => void
   readonly deleteItemMetadata: (key: string) => void
   readonly getActiveFurnaceState: () => FurnaceState | undefined
   readonly getActiveFurnaceKey: () => string | undefined
-  readonly removeInventoryAt: (slot: number, item: ItemStack['item'], count: number) => Effect.Effect<InventoryRemoval>
-  readonly addInventoryItem: (item: ItemStack['item'], count: number) => Effect.Effect<number>
+  readonly removeInventoryAt: (
+    slot: number,
+    item: ItemStack['item'],
+    count: number,
+  ) => Effect.Effect<InventoryRemoval, InventoryRemoveFailure>
+  readonly addInventoryItem: (item: ItemStack['item'], count: number) => Effect.Effect<number, InventoryAddFailure>
   readonly updateActiveFurnaceState: (state: FurnaceState) => boolean
   readonly sendFacilityCommand: (
     command: WithoutAuthority<Extract<NetworkMessage, { readonly _tag: 'ContainerCommand' | 'FurnaceCommand' }>>,
@@ -284,8 +397,8 @@ export type PlayerUiRuntimeContext<Item extends ItemStack['item'], Recipe, Count
   readonly renderCrosshair: () => void
 }
 
-export type PlayerUiRuntime<Item extends ItemStack['item'], Recipe, Count extends StackCount = StackCount> = {
-  readonly inventoryInteraction: InventoryInteractionController<Item, Recipe, Count>
+export type PlayerUiRuntime = {
+  readonly inventoryInteraction: InventoryInteractionController
   readonly setInventoryOpen: (open: boolean, mode?: InventoryMode) => void
   readonly projectedInventoryEnchantedItem: (slotIndex: number) => EnchantedItem | null
   readonly inventoryMeleeDamage: (slotIndex: number) => number
@@ -297,8 +410,11 @@ export type PlayerUiRuntime<Item extends ItemStack['item'], Recipe, Count extend
   readonly presentSwimmingState: () => void
   readonly setFishingResult: (result: string) => void
   readonly renderPlayerUi: () => void
-  readonly targetedBlock: () => Effect.Effect<TargetedBlock | undefined>
-  readonly fishingEnvironmentAt: (position: Position, isRaining: boolean) => Effect.Effect<FishingEnvironment>
+  readonly targetedBlock: () => Effect.Effect<TargetedBlock | undefined, TargetedBlockFailure>
+  readonly fishingEnvironmentAt: (
+    position: Position,
+    isRaining: boolean,
+  ) => Effect.Effect<FishingEnvironment, FishingEnvironmentFailure>
   readonly furnaceTargetOf: (source: EventTarget | null) => FurnaceSlotId | undefined
   readonly chestTargetOf: (source: EventTarget | null) => ChestStorageSlotTarget | undefined
   readonly sameChestTarget: (left: ChestStorageSlotTarget, right: ChestStorageSlotTarget) => boolean
@@ -310,24 +426,24 @@ export type PlayerUiRuntime<Item extends ItemStack['item'], Recipe, Count extend
   readonly dispatchInventoryAction: (action: InventoryAction) => void
   readonly installInventoryListeners: () => void
   readonly installRespawnListener: (hudParent: HTMLElement, respawn: () => void) => void
-  readonly materializeEndArrival: () => Effect.Effect<void>
-  readonly useEndFeature: () => Effect.Effect<boolean>
-  readonly applyPlayerDamage: (damage: PlayerDamage, minimumHealthPoints?: number) => void
+  readonly materializeEndArrival: () => Effect.Effect<void, EndArrivalFailure>
+  readonly useEndFeature: () => Effect.Effect<boolean, EndFeatureFailure>
+  readonly applyPlayerDamage: (damage: PlayerDamage, minimumHealthPoints?: EntityHealthPoints) => void
   readonly applyWorldExplosion: (
     center: Readonly<{ x: number; y: number; z: number }>,
     radius: number,
     seed: number,
     destroysResistantBlocks: boolean,
-  ) => void
+  ) => Result.Result<void, WorldExplosionFailure>
   readonly requestFlush: () => Promise<void>
   readonly requestBackgroundFlush: () => void
   readonly flushDirty: () => void
   readonly markSessionDirty: () => void
 }
 
-export const createPlayerUiRuntime = <Item extends ItemStack['item'], Recipe, Count extends StackCount = StackCount>(
-  context: PlayerUiRuntimeContext<Item, Recipe, Count>,
-): PlayerUiRuntime<Item, Recipe, Count> => {
+export const createPlayerUiRuntime = (
+  context: PlayerUiRuntimeContext,
+): PlayerUiRuntime => {
   let carriedEnchantedItem: EnchantedItem | undefined
   let carriedCustomName: string | undefined
   const metadataMatches = (slotIndex: number): boolean => {
@@ -393,7 +509,9 @@ export const createPlayerUiRuntime = <Item extends ItemStack['item'], Recipe, Co
   const inventoryMeleeDamage = (slotIndex: number): number => {
     const storage = Effect.runSync(context.inventoryStorageSnapshot)
     const selectedItem = storage.inventory.slots[slotIndex]?.item ?? null
-    const baseDamage = meleeDamageForItem(selectedItem)
+    // meleeDamageForItem rejects only values outside the item vocabulary; PlayerStorage comes
+    // from mc-sim's InventoryService, whose restore paths decode every slot item.
+    const baseDamage = Result.getOrThrow(meleeDamageForItem(selectedItem))
     const enchantedItem = projectEnchantedItem(
       storage.inventory.slots[slotIndex],
       storage.inventoryDurability[slotIndex],
@@ -470,14 +588,6 @@ export const createPlayerUiRuntime = <Item extends ItemStack['item'], Recipe, Co
       }
     })
     const equipment = storage.equipment.slots
-    const equipmentSlot = (slot: typeof equipment.head) =>
-      slot === null ? undefined : {
-        item: slot.item,
-        count: slot.count,
-        durability: slot.durability === null
-          ? undefined
-          : slot.durability.current / slot.durability.max,
-      }
     const draft = inventoryInteraction.state()
     context.renderHud(storage, durabilityBySlot)
     context.inventoryView.root.style.setProperty(
@@ -504,7 +614,7 @@ export const createPlayerUiRuntime = <Item extends ItemStack['item'], Recipe, Co
             index !== selectedHotbarIndex && candidate?.item === 'iron_ingot' && candidate.count > 0,
           )
         : undefined
-      const anvilPlan = selectedStack == null
+      const planned = selectedStack == null
         ? undefined
         : planAnvilOperation({
             item: selectedStack.item,
@@ -514,25 +624,30 @@ export const createPlayerUiRuntime = <Item extends ItemStack['item'], Recipe, Co
             ...(enchantedItem === undefined ? {} : { enchantedItem }),
             ...(iron === undefined ? {} : { material: { item: iron.item, count: iron.count } }),
           })
+      const anvilPlan = planned === undefined || Result.isFailure(planned) ? undefined : planned.success
       const levelCost = anvilPlan?.ok === true ? anvilPlan.levelCost : 0
       const materialCost = anvilPlan?.ok === true ? anvilPlan.materialCost : 0
-      const hasEnoughExperience = anvilPlan?.ok === true
-        && spendExperienceLevels(context.getTotalExperience(), anvilPlan.levelCost) !== undefined
-      const rejectionReason = selectedStack == null
+      const spent = anvilPlan?.ok === true
+        ? spendExperienceLevels(context.getTotalExperience(), anvilPlan.levelCost)
+        : undefined
+      const hasEnoughExperience = spent !== undefined && Result.isSuccess(spent) && spent.success !== undefined
+      const rejectionReason = planned === undefined
         ? 'Select an item in the hotbar'
-        : anvilPlan === undefined
-          ? 'Anvil operation is invalid'
-          : !anvilPlan.ok
-            ? anvilPlan.reason === 'incompatible-input' && needsRepair && iron === undefined
+        : Result.isFailure(planned)
+          ? planned.failure.message
+          : !planned.success.ok
+            ? planned.success.reason === 'incompatible-input' && needsRepair && iron === undefined
               ? 'Requires one iron ingot'
-              : anvilPlan.reason === 'nothing-to-do'
+              : planned.success.reason === 'nothing-to-do'
                 ? 'Change the name or repair a damaged item'
-                : anvilPlan.reason === 'too-expensive'
+                : planned.success.reason === 'too-expensive'
                   ? 'Anvil operation is too expensive'
                   : 'Anvil operation is invalid'
-            : !hasEnoughExperience
-              ? `Requires level ${levelCost}`
-              : undefined
+            : spent !== undefined && Result.isFailure(spent)
+              ? spent.failure.message
+              : !hasEnoughExperience
+                ? `Requires level ${levelCost}`
+                : undefined
       context.anvilView.render(anvilViewModel({
         primaryInput: selectedSlot,
         secondaryInput: anvilPlan?.ok === true && materialCost > 0 && iron !== undefined
@@ -558,27 +673,37 @@ export const createPlayerUiRuntime = <Item extends ItemStack['item'], Recipe, Co
         context.enchantedItems.get(selectedSlotKey),
       )
       const playerLevel = context.getExperienceLevel()
+      const offerSnapshot = (offer: EnchantmentOffer) => {
+        const result = applyEnchantmentOffer({
+          seed: context.getEnchantmentSeed(),
+          bookshelfCount: 15,
+          playerLevel,
+          lapis,
+          item,
+        }, offer)
+        return {
+          enchantmentId: offer.enchantment.id,
+          enchantmentLevel: offer.enchantment.level,
+          levelCost: offer.requiredPlayerLevel,
+          lapisCost: offer.lapisCost,
+          rejectionReason: result.ok ? undefined : result.reason,
+        }
+      }
       const offers = enchantmentOffers(context.getEnchantmentSeed(), 15)
-      context.enchantingView.render(enchantingTableViewModel({
+      const offerSnapshots: EnchantingTableSnapshot['offers'] = Result.isSuccess(offers)
+        ? [offerSnapshot(offers.success[0]), offerSnapshot(offers.success[1]), offerSnapshot(offers.success[2])]
+        : [undefined, undefined, undefined]
+      const snapshot: EnchantingTableSnapshot = {
         item: selectedSlot,
         lapis: lapis > 0 ? { itemId: 'lapis_lazuli', count: lapis } : undefined,
-        offers: offers.map((offer) => {
-          const result = applyEnchantmentOffer({
-            seed: context.getEnchantmentSeed(),
-            bookshelfCount: 15,
-            playerLevel,
-            lapis,
-            item,
-          }, offer)
-          return {
-            enchantmentId: offer.enchantment.id,
-            enchantmentLevel: offer.enchantment.level,
-            levelCost: offer.requiredPlayerLevel,
-            lapisCost: offer.lapisCost,
-            rejectionReason: result.ok ? undefined : result.reason,
-          }
-        }) as [NonNullable<Parameters<typeof enchantingTableViewModel>[0]['offers'][0]>, NonNullable<Parameters<typeof enchantingTableViewModel>[0]['offers'][1]>, NonNullable<Parameters<typeof enchantingTableViewModel>[0]['offers'][2]>],
-      }), { focusedTarget: 'offer-1', status: context.getEnchantingStatus() })
+        offers: offerSnapshots,
+      }
+      context.enchantingView.render(enchantingTableViewModel(snapshot), {
+        focusedTarget: 'offer-1',
+        status: Result.isFailure(offers)
+          ? offers.failure._tag
+          : context.getEnchantingStatus(),
+      })
       return
     }
     if (context.getInventoryMode() === 'chest') {
@@ -615,28 +740,30 @@ export const createPlayerUiRuntime = <Item extends ItemStack['item'], Recipe, Co
     }
     if (context.getInventoryMode() === 'furnace') {
       const furnace = context.getActiveFurnaceState()
-      const state = furnace ?? emptyFurnaceState()
-      const recipe = STARTER_SMELTING_RECIPES.find(
+      // emptyFurnaceState() with no argument builds a constant default furnace.
+      const state = furnace ?? Result.getOrThrow(emptyFurnaceState())
+      // STARTER_SMELTING_RECIPES is a package constant built from static recipe data.
+      const recipe = Result.getOrThrow(STARTER_SMELTING_RECIPES).find(
         (candidate) => candidate.input === state.input?.item,
       )
       const fuelRule = STARTER_FUEL_RULES.find(
         (candidate) => candidate.item === state.fuel?.item,
       ) ?? STARTER_FUEL_RULES[0]
       const canCook = recipe !== undefined && (
-        state.burnRemainingSecs > 0
+        state.fuelTimeRemainingSecs > 0
         || STARTER_FUEL_RULES.some((candidate) => candidate.item === state.fuel?.item)
       )
-      const slot = (stack: ItemStack | null): FurnaceSnapshot['input'] =>
-        stack === null ? undefined : { itemId: stack.item, count: stack.count }
+      const slot = (stack: Slot): FurnaceSnapshot['input'] =>
+        stack === undefined ? undefined : { itemId: stack.item, count: stack.count }
       context.furnaceView.render(furnaceViewModel({
         input: slot(state.input),
         fuel: slot(state.fuel),
         output: slot(state.output),
         cookProgress: canCook && recipe !== undefined
-          ? state.cookElapsedSecs / recipe.cookDurationSecs
+          ? state.cookProgressSecs / recipe.cookDurationSecs
           : 0,
-        burnProgress: state.burnRemainingSecs > 0 && fuelRule !== undefined
-          ? state.burnRemainingSecs / fuelRule.burnDurationSecs
+        burnProgress: state.fuelTimeRemainingSecs > 0 && fuelRule !== undefined
+          ? state.fuelTimeRemainingSecs / fuelRule.burnDurationSecs
           : 0,
       }), { focusedSlot: context.getFurnaceFocus(), status: context.getFurnaceStatus() })
       return
@@ -647,12 +774,12 @@ export const createPlayerUiRuntime = <Item extends ItemStack['item'], Recipe, Co
       durabilityBySlot,
       carried: draft.inventoryCarried ?? draft.carried,
       armour: [
-        equipmentSlot(equipment.head),
-        equipmentSlot(equipment.chest),
-        equipmentSlot(equipment.legs),
-        equipmentSlot(equipment.feet),
+        equipment.head ?? undefined,
+        equipment.chest ?? undefined,
+        equipment.legs ?? undefined,
+        equipment.feet ?? undefined,
       ],
-      offhand: equipmentSlot(equipment.offhand) ?? null,
+      offhand: equipment.offhand,
       crafting: {
         gridWidth: draft.grid.width,
         grid: draft.grid.cells,
@@ -666,82 +793,98 @@ export const createPlayerUiRuntime = <Item extends ItemStack['item'], Recipe, Co
     context.inventoryParent.querySelectorAll<HTMLElement>('[data-mx-ui="slot"][role="button"]')
       .forEach((slot) => slot.setAttribute('draggable', 'true'))
   }
-  const targetedBlock = (): Effect.Effect<TargetedBlock | undefined> => Effect.gen(function* () {
+  const targetedCell = (): Effect.Effect<TargetedCell | undefined, TargetedBlockFailure> => Effect.gen(function* () {
     const pose = yield* context.getPlayerPose()
-    const candidates: Position[] = []
+    const candidates: BlockPosition[] = []
     const visited = new Set<string>()
-    targetBlockFromPlayerPose(pose, DEFAULT_BLOCK_REACH, (x, y, z) => {
+    yield* Effect.fromResult(targetBlockFromPlayerPose(pose, DEFAULT_BLOCK_REACH, (x, y, z) => {
       const key = `${String(x)},${String(y)},${String(z)}`
       if (!visited.has(key)) {
         visited.add(key)
-        candidates.push({ x, y, z })
+        candidates.push(blockPosition(x, y, z))
       }
       return false
-    })
+    }))
     const targetable = new Set<string>()
-    for (const position of candidates) {
-      const reading = yield* context.readBlockAt(blockPosition(position.x, position.y, position.z))
+    for (const candidate of candidates) {
+      const reading = yield* context.readBlockAt(candidate)
       if (reading._tag === 'Block' && reading.block !== 0) {
-        targetable.add(coordinateKey(position.x, position.y, position.z))
+        targetable.add(coordinateKey(candidate.x, candidate.y, candidate.z))
         break
       }
     }
-    const target = targetBlockFromPlayerPose(
+    const target = yield* Effect.fromResult(targetBlockFromPlayerPose(
       pose,
       DEFAULT_BLOCK_REACH,
       (x, y, z) => targetable.has(coordinateKey(x, y, z)),
-    )
+    ))
     if (Option.isNone(target)) return undefined
-    const reading = yield* context.readBlockAt(blockPosition(target.value.position.x, target.value.position.y, target.value.position.z))
+    const cell = yield* Effect.fromResult(blockPositionOfPosition(target.value.position))
+    const reading = yield* context.readBlockAt(cell)
     return reading._tag === 'Block'
-      ? { ...target.value, block: reading.block }
+      ? { target: { ...target.value, block: reading.block }, cell }
       : undefined
   })
-  const materializeEndArrival = (): Effect.Effect<void> => Effect.gen(function* () {
-    const arrival = endArrivalDescriptor(blockPosition(0, 64, 0))
+  const targetedBlock = (): Effect.Effect<TargetedBlock | undefined, TargetedBlockFailure> =>
+    Effect.map(targetedCell(), (found) => found?.target)
+  const nearestStronghold = (feet: Position) => Effect.fromResult(Result.gen(function* () {
+    const seed = yield* NoiseSeed.result(context.getActiveSeed())
+    const cell = yield* blockPositionOfPosition(feet)
+    return nearestStrongholdSite(seed, cell.x, cell.z)
+  }))
+  const writeCells = (
+    dimension: Dimension,
+    edits: ReadonlyArray<WorldWriteBlockEdit>,
+  ): Effect.Effect<void, WorldWriteFailure> => {
+    const unique = uniqueEdits(edits)
+    // An explosion can destroy no block, and the port rejects an empty batch.
+    return unique.length === 0 ? Effect.void : context.writeBlocks(dimension, unique)
+  }
+  const materializeEndArrival = (): Effect.Effect<void, EndArrivalFailure> => Effect.gen(function* () {
+    const arrival = endArrivalDescriptor(blockPosition(BlockAxis(0), BlockAxis(64), BlockAxis(0)))
     const dimensionContext = context.getOrCreateDimensionChunkContext('end')
-    const mutations = [...arrival.platform, ...arrival.clear.map((at) => ({ at, block: blockIdOf('air') }))]
-    const chunks = new Map<string, { readonly cx: number; readonly cz: number }>()
-    for (const mutation of mutations) {
-      const chunk = { cx: Math.floor(mutation.at.x / 16), cz: Math.floor(mutation.at.z / 16) }
+    const edits = [
+      ...arrival.platform.map(({ at, block }) => ({ position: at, block })),
+      ...arrival.clear.map((position) => ({ position, block: AIR_BLOCK })),
+    ]
+    const chunks = new Map<string, ChunkCoord>()
+    for (const edit of edits) {
+      const chunk = chunkCoordOfBlock(edit.position)
       chunks.set(chunkKeyOf(chunk), chunk)
     }
     for (const [key, chunk] of chunks) {
       if (!dimensionContext.streamLoaded.has(key)) {
-        yield* dimensionContext.chunkStore.load(chunkCoord(chunk.cx, chunk.cz)).pipe(Effect.matchEffect({
-          onFailure: () => Effect.void,
-          onSuccess: () => Effect.void,
-        }))
+        yield* dimensionContext.chunkStore.load(chunk)
         dimensionContext.streamLoaded.add(key)
       }
     }
-    for (const mutation of mutations) yield* dimensionContext.chunkStore.setBlock(mutation.at, mutation.block)
+    yield* writeCells('end', edits)
     const pose = yield* context.getPlayerPose()
-    yield* context.restorePlayerForDimension({ ...pose, feetPosition: arrival.spawn, yawRadians: Math.PI }, 'end')
+    yield* context.restorePlayerForDimension(
+      { ...pose, feetPosition: positionOfBlock(arrival.spawn), yawRadians: Math.PI },
+      'end',
+    )
     context.alignActiveDimension('end')
     context.resetSimState(true)
     context.markSessionDirty()
   })
-  const useEndFeature = (): Effect.Effect<boolean> => Effect.gen(function* () {
+  const useEndFeature = (): Effect.Effect<boolean, EndFeatureFailure> => Effect.gen(function* () {
     if (context.getMultiplayer()) {
       const dimension = yield* context.getPlayerDimension()
       const inventory = yield* context.getInventorySnapshot()
       const selected = inventory.slots[context.getSelectedHotbarIndex()]
       if (dimension !== 'overworld' || selected?.item !== 'eye_of_ender') return false
-      const target = yield* targetedBlock()
-      if (target?.block === END_PORTAL_BLOCK.FRAME_EMPTY) {
+      const found = yield* targetedCell()
+      if (found?.target.block === END_PORTAL_BLOCK.FRAME_EMPTY) {
         const pose = yield* context.getPlayerPose()
-        const site = nearestStrongholdSite(context.getActiveSeed(), pose.feetPosition.x, pose.feetPosition.z)
+        const site = yield* nearestStronghold(pose.feetPosition)
         if (Option.isSome(site)) {
           const center = endPortalCenterForStronghold(site.value)
-          const offset = END_PORTAL_FRAME_OFFSETS.find((candidate) =>
-            center.x + candidate.dx === target.position.x
-            && center.y === target.position.y
-            && center.z + candidate.dz === target.position.z)
+          const offset = END_PORTAL_FRAME_OFFSETS.find((candidate) => isFrameCell(center, candidate, found.cell))
           if (offset !== undefined) {
             return context.sendEndProgressCommand({
               _tag: 'InsertEyeIntoEndPortalFrameCommand',
-              frame: target.position,
+              frame: found.target.position,
             })
           }
         }
@@ -753,7 +896,7 @@ export const createPlayerUiRuntime = <Item extends ItemStack['item'], Recipe, Co
     if (dimension === 'end' && context.getExitPortalMaterialized()) {
       const target = yield* targetedBlock()
       if (target?.block === END_PORTAL_BLOCK.PORTAL) {
-        yield* context.restorePlayerForDimension({ ...pose, feetPosition: { x: 0.5, y: 80, z: 0.5 } }, 'overworld')
+        yield* context.restorePlayerForDimension({ ...pose, feetPosition: OVERWORLD_RETURN_POSITION }, 'overworld')
         context.alignActiveDimension('overworld')
         context.resetSimState(true)
         context.queueEndAudio('exitPortal', pose.feetPosition)
@@ -773,7 +916,7 @@ export const createPlayerUiRuntime = <Item extends ItemStack['item'], Recipe, Co
     const selectedHotbarIndex = context.getSelectedHotbarIndex()
     const selected = inventory.slots[selectedHotbarIndex]
     if (dimension !== 'overworld' || selected?.item !== 'eye_of_ender') return false
-    const site = nearestStrongholdSite(context.getActiveSeed(), pose.feetPosition.x, pose.feetPosition.z)
+    const site = yield* nearestStronghold(pose.feetPosition)
     if (Option.isNone(site)) return false
     const center = endPortalCenterForStronghold(site.value)
     const isNearPortal = Math.hypot(
@@ -781,27 +924,31 @@ export const createPlayerUiRuntime = <Item extends ItemStack['item'], Recipe, Co
       center.y - pose.feetPosition.y,
       center.z - pose.feetPosition.z,
     ) <= DEFAULT_BLOCK_REACH + 4
-    const target = isNearPortal ? yield* targetedBlock() : undefined
+    const found = isNearPortal ? yield* targetedCell() : undefined
     if (isNearPortal) {
       for (const frameOffset of END_PORTAL_FRAME_OFFSETS) {
-        const position = blockPosition(center.x + frameOffset.dx, center.y, center.z + frameOffset.dz)
-        const reading = yield* context.readBlockAt(position)
+        const frameCell = yield* Effect.fromResult(blockCellOf({
+          x: center.x + frameOffset.dx,
+          y: center.y,
+          z: center.z + frameOffset.dz,
+        }))
+        const reading = yield* context.readBlockAt(frameCell)
         if (reading._tag === 'Block'
           && (reading.block === END_PORTAL_BLOCK.FRAME_EMPTY || reading.block === END_PORTAL_BLOCK.FRAME_FILLED)) {
-          context.endPortalFrames.set(context.endPortalFrameKey(position), {
-            position,
+          context.endPortalFrames.set(context.endPortalFrameKey(frameCell), {
+            position: frameCell,
             facing: frameOffset.facing,
             eye: reading.block === END_PORTAL_BLOCK.FRAME_FILLED,
           })
         }
       }
     }
-    const offset = target === undefined ? undefined : END_PORTAL_FRAME_OFFSETS.find((candidate) =>
-      center.x + candidate.dx === target.position.x
-      && center.y === target.position.y
-      && center.z + candidate.dz === target.position.z)
-    if (target?.block === END_PORTAL_BLOCK.FRAME_EMPTY && offset !== undefined) {
-      yield* context.setBlockEffect(blockPosition(target.position.x, target.position.y, target.position.z), END_PORTAL_BLOCK.FRAME_FILLED)
+    const offset = found === undefined
+      ? undefined
+      : END_PORTAL_FRAME_OFFSETS.find((candidate) => isFrameCell(center, candidate, found.cell))
+    if (found?.target.block === END_PORTAL_BLOCK.FRAME_EMPTY && offset !== undefined) {
+      const target = found.target
+      yield* context.setBlockEffect(found.cell, END_PORTAL_BLOCK.FRAME_FILLED)
       context.endPortalFrames.set(context.endPortalFrameKey(target.position), {
         position: target.position,
         facing: offset.facing,
@@ -824,11 +971,9 @@ export const createPlayerUiRuntime = <Item extends ItemStack['item'], Recipe, Co
             }
       }, dimension, center)
       if (Option.isSome(completed)) {
-        for (const mutation of completed.value.materialization) {
-          yield* context.setBlockEffect(mutation.at, mutation.block)
-        }
+        yield* writeCells(dimension, completed.value.materialization.map(({ at, block }) => ({ position: at, block })))
         context.setEndPortalComplete(true)
-        context.queueEndAudio('portalActivate', center)
+        context.queueEndAudio('portalActivate', positionOfBlock(center))
       }
       context.markSessionDirty()
       return true
@@ -853,16 +998,20 @@ export const createPlayerUiRuntime = <Item extends ItemStack['item'], Recipe, Co
     return true
   })
   const fishingEnvironmentAt = (
-    position: Position,
+    at: Position,
     isRaining: boolean,
-  ): Effect.Effect<FishingEnvironment> => Effect.gen(function* () {
-    const center = yield* context.readBlockAt(blockPosition(position.x, position.y, position.z))
-    const hasWater = center._tag === 'Block' && blockTypeOfId(center.block) === 'water'
+  ): Effect.Effect<FishingEnvironment, FishingEnvironmentFailure> => Effect.gen(function* () {
+    const isWater = (reading: BlockReading): Effect.Effect<boolean, BlockReadingFailure> =>
+      reading._tag === 'Block'
+        ? Effect.map(Effect.fromResult(blockTypeOfReading(reading.block)), (type) => type === 'water')
+        : Effect.succeed(false)
+    const origin = yield* Effect.fromResult(blockPositionOfPosition(at))
+    const hasWater = yield* isWater(yield* context.readBlockAt(origin))
     if (!hasWater) return { hasWater: false, hasSkyAccess: false, isRaining, isOpenWater: false }
 
     let hasSkyAccess = true
-    for (let y = position.y + 1; y <= 127; y += 1) {
-      const reading = yield* context.readBlockAt(blockPosition(position.x, y, position.z))
+    for (let y = origin.y + 1; y <= 127; y += 1) {
+      const reading = yield* context.readBlockAt(yield* Effect.fromResult(blockCellOf({ x: origin.x, y, z: origin.z })))
       if (reading._tag === 'Block' && reading.block !== 0) {
         hasSkyAccess = false
         break
@@ -870,14 +1019,11 @@ export const createPlayerUiRuntime = <Item extends ItemStack['item'], Recipe, Co
     }
 
     let isOpenWater = true
-    for (let x = position.x - 2; x <= position.x + 2 && isOpenWater; x += 1) {
-      for (let z = position.z - 2; z <= position.z + 2; z += 1) {
-        const water = yield* context.readBlockAt(blockPosition(x, position.y, z))
-        const above = yield* context.readBlockAt(blockPosition(x, position.y + 1, z))
-        if (
-          water._tag !== 'Block' || blockTypeOfId(water.block) !== 'water'
-          || above._tag !== 'Block' || above.block !== 0
-        ) {
+    for (let x = origin.x - 2; x <= origin.x + 2 && isOpenWater; x += 1) {
+      for (let z = origin.z - 2; z <= origin.z + 2; z += 1) {
+        const water = yield* context.readBlockAt(yield* Effect.fromResult(blockCellOf({ x, y: origin.y, z })))
+        const above = yield* context.readBlockAt(yield* Effect.fromResult(blockCellOf({ x, y: origin.y + 1, z })))
+        if (!(yield* isWater(water)) || above._tag !== 'Block' || above.block !== 0) {
           isOpenWater = false
           break
         }
@@ -1073,16 +1219,21 @@ export const createPlayerUiRuntime = <Item extends ItemStack['item'], Recipe, Co
     }
     if (slot === 'output') {
       const output = furnace.output
-      if (output !== null) {
-        const leftover = Effect.runSync(context.addInventoryItem(output.item, output.count))
-        const accepted = output.count - leftover
-        if (accepted > 0) {
-          updateActiveFurnace({
-            ...furnace,
-            output: accepted === output.count
-              ? null
-              : itemStack(output.item, output.count - accepted),
-          })
+      if (output !== undefined) {
+        const added = Effect.runSync(Effect.result(context.addInventoryItem(output.item, output.count)))
+        if (Result.isFailure(added)) {
+          context.setFurnaceStatus(added.failure._tag)
+          renderPlayerUi()
+          return
+        }
+        const accepted = output.count - added.success
+        const remainder: Result.Result<Slot, ItemStackFailure> = accepted === output.count
+          ? Result.succeed(undefined)
+          : itemStack(output.item, output.count - accepted)
+        if (Result.isFailure(remainder)) {
+          context.setFurnaceStatus(remainder.failure._tag)
+        } else if (accepted > 0) {
+          updateActiveFurnace({ ...furnace, output: remainder.success })
         } else {
           context.setFurnaceStatus('Inventory is full')
         }
@@ -1099,17 +1250,30 @@ export const createPlayerUiRuntime = <Item extends ItemStack['item'], Recipe, Co
       renderPlayerUi()
       return
     }
-    if (current !== null && (current.item !== selected.item
+    if (current !== undefined && (current.item !== selected.item
       || current.count >= maxStackCountForItem(current.item))) {
       context.setFurnaceStatus('Furnace slot is full')
       renderPlayerUi()
       return
     }
-    const removal = Effect.runSync(context.removeInventoryAt(context.getSelectedHotbarIndex(), selected.item, 1))
-    if (removal._tag === 'Removed' && removal.removed > 0) {
+    const nextSlot = itemStack(selected.item, (current?.count ?? 0) + 1)
+    if (Result.isFailure(nextSlot)) {
+      context.setFurnaceStatus(nextSlot.failure._tag)
+      renderPlayerUi()
+      return
+    }
+    const removal = Effect.runSync(Effect.result(
+      context.removeInventoryAt(context.getSelectedHotbarIndex(), selected.item, 1),
+    ))
+    if (Result.isFailure(removal)) {
+      context.setFurnaceStatus(removal.failure._tag)
+      renderPlayerUi()
+      return
+    }
+    if (removal.success._tag === 'Removed' && removal.success.removed > 0) {
       updateActiveFurnace({
         ...furnace,
-        [slot]: { item: selected.item, count: (current?.count ?? 0) + removal.removed },
+        [slot]: nextSlot.success,
       })
     }
     renderPlayerUi()
@@ -1144,14 +1308,17 @@ export const createPlayerUiRuntime = <Item extends ItemStack['item'], Recipe, Co
       `[data-mx-ui="${activeScreen}"] [role="button"][tabindex="0"]`,
     )?.focus()
   }
-  const applyPlayerDamage = (damage: PlayerDamage, minimumHealthPoints = 0): void => {
+  const applyPlayerDamage = (
+    damage: PlayerDamage,
+    minimumHealthPoints: EntityHealthPoints = NO_MINIMUM_HEALTH,
+  ): void => {
     if (context.isCreativeMode) return
     const equipment = Effect.runSync(context.worldInventory.equipmentSnapshot)
     const enchantedArmor = (['head', 'chest', 'legs', 'feet'] as const).flatMap((slot) => {
       const equippedItem = equipment.slots[slot]
       if (equippedItem === null) return []
       const projected = projectEnchantedItem(
-        itemStack(equippedItem.item, equippedItem.count),
+        equippedItem,
         equippedItem.durability ?? undefined,
         context.enchantedItems.get(context.equipmentMetadataKey(slot)),
       )
@@ -1172,10 +1339,7 @@ export const createPlayerUiRuntime = <Item extends ItemStack['item'], Recipe, Co
     context.applyVitalsDamage(reducedDamage)
     const damagedVitals = context.getVitalsDamageSnapshot()
     if (damagedVitals.healthPoints < minimumHealthPoints) {
-      context.restoreVitalsDamage({
-        ...damagedVitals,
-        healthPoints: minimumHealthPoints,
-      })
+      context.restoreVitalsDamage({ ...damagedVitals, healthPoints: minimumHealthPoints })
     }
     const healthAfter = context.getPlayerHealthPoints()
     if (healthAfter < healthBefore) {
@@ -1204,7 +1368,7 @@ export const createPlayerUiRuntime = <Item extends ItemStack['item'], Recipe, Co
           }
         }
       }
-      context.audio.play('playerHurt')
+      context.audio.play(PLAYER_HURT_CUE)
     }
     if (healthBefore > 0 && playerIsDead() && !context.getMultiplayer()) {
       context.handleLocalPlayerDeath()
@@ -1217,47 +1381,73 @@ export const createPlayerUiRuntime = <Item extends ItemStack['item'], Recipe, Co
     }
     syncTouchControls()
   }
+  const explosionBlockAt = (cell: ExplosionBlockPosition, destroysResistantBlocks: boolean) =>
+    Result.gen(function* () {
+      const reading = Effect.runSync(context.readBlockAt(yield* blockCellOf(cell)))
+      if (reading._tag !== 'Block') return undefined
+      const block = yield* BlockId.result(reading.block)
+      const type = yield* blockTypeOfId(block)
+      if (type === 'air') return { resistance: 0, destructible: false }
+      const hardness = yield* propertyOfBlockId(block, 'hardness')
+      return {
+        resistance: destroysResistantBlocks ? 0 : hardness,
+        destructible: type !== 'bedrock',
+      }
+    })
   const applyWorldExplosion = (
     center: Readonly<{ x: number; y: number; z: number }>,
     radius: number,
     seed: number,
     destroysResistantBlocks: boolean,
-  ): void => {
-    const plan = planExplosion({
-      center,
-      radius,
-      seed,
-      blocks: (position) => {
-        const reading = Effect.runSync(context.readBlockAt(blockPosition(position.x, position.y, position.z)))
-        if (reading._tag !== 'Block') return undefined
-        const type = blockTypeOfId(reading.block)
-        if (type === 'air') return { resistance: 0, destructible: false }
-        const hardness = propertyOfBlockId(reading.block, 'hardness')
-        return {
-          resistance: destroysResistantBlocks ? 0 : hardness,
-          destructible: type !== 'bedrock',
-        }
-      },
-      entities: context.getEntitiesForExplosion(),
-    })
-    for (const position of plan.destroyedBlocks) {
-      context.setBlockAt(blockPosition(position.x, position.y, position.z), blockIdOf('air'))
-    }
-    context.resolveExplosionEffects(plan.entityEffects)
-    const playerPosition = Effect.runSync(context.getPlayerPose()).feetPosition
-    const playerDistance = Math.hypot(
-      playerPosition.x - center.x,
-      playerPosition.y + 0.9 - center.y,
-      playerPosition.z - center.z,
-    )
-    if (playerDistance < radius) {
-      const exposure = 1 - playerDistance / radius
-      applyPlayerDamage({
-        amount: ((exposure * exposure + exposure) / 2) * 7 * radius + 1,
-        cause: 'generic',
+  ): Result.Result<void, WorldExplosionFailure> => {
+    // planExplosion's block reader is synchronous and has no failure channel, so the first
+    // read failure is kept here and returned instead of applying a plan over unreadable cells.
+    const readFailures: Array<WorldExplosionFailure> = []
+    const planned = Result.gen(function* () {
+      const plan = yield* planExplosion({
+        center: position(
+          yield* PositionAxis.result(center.x),
+          yield* PositionAxis.result(center.y),
+          yield* PositionAxis.result(center.z),
+        ),
+        radius,
+        seed,
+        blocks: (cell) => {
+          if (readFailures.length > 0) return undefined
+          const block = explosionBlockAt(cell, destroysResistantBlocks)
+          if (Result.isSuccess(block)) return block.success
+          readFailures.push(block.failure)
+          return undefined
+        },
+        entities: context.getEntitiesForExplosion(),
       })
-    }
-    context.markSessionDirty()
+      const readFailure = readFailures[0]
+      if (readFailure !== undefined) return yield* Result.fail(readFailure)
+      return { plan, destroyed: yield* Result.all(plan.destroyedBlocks.map(blockCellOf)) }
+    })
+    const explosion = Effect.gen(function* () {
+      const { plan, destroyed } = yield* Effect.fromResult(planned)
+      yield* writeCells(
+        yield* context.getPlayerDimension(),
+        destroyed.map((cell) => ({ position: cell, block: AIR_BLOCK })),
+      )
+      context.resolveExplosionEffects(plan.entityEffects)
+      const playerPosition = (yield* context.getPlayerPose()).feetPosition
+      const playerDistance = Math.hypot(
+        playerPosition.x - center.x,
+        playerPosition.y + 0.9 - center.y,
+        playerPosition.z - center.z,
+      )
+      if (playerDistance < radius) {
+        const exposure = 1 - playerDistance / radius
+        applyPlayerDamage({
+          amount: ((exposure * exposure + exposure) / 2) * 7 * radius + 1,
+          cause: 'generic',
+        })
+      }
+      context.markSessionDirty()
+    })
+    return Effect.runSync(Effect.result(explosion))
   }
 
   const inventorySlotOf = (target: InventoryActionTarget): number | undefined => {
@@ -1266,10 +1456,27 @@ export const createPlayerUiRuntime = <Item extends ItemStack['item'], Recipe, Co
     if (target.region === 'main') return 9 + target.index
     return undefined
   }
+  // Pointer and close interactions never set data-equipment-action, so their failures
+  // show only the status text. The next successful interaction clears that text unless
+  // a dispatched action has replaced it since.
+  let interactionRejection: string | undefined
   const rejectInventoryAction = (_action: InventoryAction, reason: string): void => {
+    interactionRejection = undefined
     context.setEquipmentActionStatus(reason)
     context.documentBody.setAttribute('data-equipment-action', `rejected:${reason}`)
     renderPlayerUi()
+  }
+  const settledInventoryInteraction = (result: Result.Result<unknown, InventoryInteractionError>): boolean => {
+    if (Result.isFailure(result)) {
+      interactionRejection = result.failure._tag
+      context.setEquipmentActionStatus(result.failure._tag)
+      return false
+    }
+    if (interactionRejection !== undefined && context.getEquipmentActionStatus() === interactionRejection) {
+      context.setEquipmentActionStatus('')
+    }
+    interactionRejection = undefined
+    return true
   }
   const completeInventoryAction = (): void => {
     context.setEquipmentActionStatus('')
@@ -1390,8 +1597,16 @@ export const createPlayerUiRuntime = <Item extends ItemStack['item'], Recipe, Co
       rejectInventoryAction(action, 'Place the carried stack first')
       return false
     }
-    Effect.runSync(inventoryInteraction.clickInventoryItem(source, 'left'))
-    Effect.runSync(inventoryInteraction.clickInventoryItem(destination, 'left'))
+    const pickedUp = Effect.runSync(Effect.result(inventoryInteraction.clickInventoryItem(source, 'left')))
+    if (Result.isFailure(pickedUp)) {
+      rejectInventoryAction(action, pickedUp.failure._tag)
+      return false
+    }
+    const placed = Effect.runSync(Effect.result(inventoryInteraction.clickInventoryItem(destination, 'left')))
+    if (Result.isFailure(placed)) {
+      rejectInventoryAction(action, placed.failure._tag)
+      return false
+    }
     completeInventoryAction()
     return true
   }
@@ -1420,10 +1635,16 @@ export const createPlayerUiRuntime = <Item extends ItemStack['item'], Recipe, Co
           } else if (inventoryInteraction.state().inventoryCarried !== undefined) {
             rejectInventoryAction(action, 'Place the carried stack first')
           } else {
-            Effect.runSync(inventoryInteraction.clickInventoryItem(sourceSlot, 'left'))
-            Effect.runSync(inventoryInteraction.interactCraftingCellFromInventory(action.target.index))
-            Effect.runSync(inventoryInteraction.preview())
-            completeInventoryAction()
+            const pickedUp = Effect.runSync(Effect.result(inventoryInteraction.clickInventoryItem(sourceSlot, 'left')))
+            const placed = Result.isFailure(pickedUp)
+              ? pickedUp
+              : Effect.runSync(Effect.result(inventoryInteraction.interactCraftingCellFromInventory(action.target.index)))
+            if (Result.isFailure(placed)) {
+              rejectInventoryAction(action, placed.failure._tag)
+            } else {
+              Effect.runSync(inventoryInteraction.preview())
+              completeInventoryAction()
+            }
           }
           return
         }
@@ -1506,7 +1727,7 @@ export const createPlayerUiRuntime = <Item extends ItemStack['item'], Recipe, Co
       return
     }
     if (target.kind === 'crafting-output') {
-      if (!context.getMultiplayer()) Effect.runSync(inventoryInteraction.craftOnce())
+      if (!context.getMultiplayer()) settledInventoryInteraction(Effect.runSync(Effect.result(inventoryInteraction.craftOnce())))
       else context.requestCrafting()
     } else if (target.region === 'crafting-grid') {
       if (context.hasPendingCrafting()) return
@@ -1517,41 +1738,51 @@ export const createPlayerUiRuntime = <Item extends ItemStack['item'], Recipe, Co
       ) {
         const selection = context.getMultiplayerInventorySelection()
         if (selection === null) return
-        Effect.runSync(inventoryInteraction.pickupInventoryItem(selection.source))
-        Effect.runSync(inventoryInteraction.interactCraftingCellFromInventory(target.index))
-        const remaining = selection.remaining - 1
-        context.setMultiplayerInventorySelection(remaining > 0 ? { ...selection, remaining } : null)
-        context.setEquipmentActionStatus('')
-        context.documentBody.setAttribute('data-equipment-action', 'accepted')
+        const pickedUp = Effect.runSync(Effect.result(inventoryInteraction.pickupInventoryItem(selection.source)))
+        const placed = Result.isFailure(pickedUp)
+          ? pickedUp
+          : Effect.runSync(Effect.result(inventoryInteraction.interactCraftingCellFromInventory(target.index)))
+        if (settledInventoryInteraction(placed)) {
+          const remaining = selection.remaining - 1
+          context.setMultiplayerInventorySelection(remaining > 0 ? { ...selection, remaining } : null)
+          context.setEquipmentActionStatus('')
+          context.documentBody.setAttribute('data-equipment-action', 'accepted')
+        }
       } else {
-        Effect.runSync(inventoryInteraction.interactCraftingCellFromInventory(target.index))
+        settledInventoryInteraction(
+          Effect.runSync(Effect.result(inventoryInteraction.interactCraftingCellFromInventory(target.index))),
+        )
       }
       Effect.runSync(inventoryInteraction.preview())
     } else if (target.region === 'hotbar') {
-      Effect.runSync(inventoryInteraction.clickInventoryItem(target.index, button))
+      settledInventoryInteraction(Effect.runSync(Effect.result(inventoryInteraction.clickInventoryItem(target.index, button))))
     } else if (target.region === 'main') {
-      Effect.runSync(inventoryInteraction.clickInventoryItem(9 + target.index, button))
+      settledInventoryInteraction(Effect.runSync(Effect.result(inventoryInteraction.clickInventoryItem(9 + target.index, button))))
     }
     renderPlayerUi()
   }
-  const removeInventoryItem = (item: ItemStack['item'], count: number): boolean => {
-    if (!Number.isSafeInteger(count) || count < 0) return false
-    if (count === 0) return true
-    let remaining = count
+  const removeInventoryItem = (
+    item: ItemStack['item'],
+    count: number,
+  ): Result.Result<boolean, ItemStackFailure | PlayerStorageFailure | OwnerBackedInventoryWriteError> => {
+    if (!Number.isSafeInteger(count) || count < 0) return Result.succeed(false)
+    if (count === 0) return Result.succeed(true)
     const slots = Effect.runSync(context.getInventorySnapshot()).slots
     const available = slots.reduce(
       (total, stack) => total + (stack?.item === item ? stack.count : 0),
       0,
     )
-    if (available < count) return false
+    if (available < count) return Result.succeed(false)
+    let remaining = count
     for (let index = 0; index < slots.length && remaining > 0; index += 1) {
       const stack = slots[index]
       if (stack?.item !== item) continue
       const removed = Math.min(stack.count, remaining)
-      Effect.runSync(context.worldInventory.removeAt(index, item, removed))
+      const removal = Effect.runSync(Effect.result(context.worldInventory.removeAt(index, item, removed)))
+      if (Result.isFailure(removal)) return Result.fail(removal.failure)
       remaining -= removed
     }
-    return remaining === 0
+    return Result.succeed(remaining === 0)
   }
   const activateAnvilOutput = (): void => {
     if (context.getMultiplayer()) {
@@ -1569,17 +1800,29 @@ export const createPlayerUiRuntime = <Item extends ItemStack['item'], Recipe, Co
     const itemKey = String(selectedHotbarIndex)
     const currentName = context.customNames.get(itemKey) ?? null
     const existingEnchantment = context.enchantedItems.get(itemKey)
-    const anvilResult = selected == null
+    const anvilOutcome = selected == null
       ? undefined
       : applyAnvilOperation(storage, selectedHotbarIndex, {
           name: normalizedName,
           currentName,
           ...(existingEnchantment === undefined ? {} : { enchantedItem: existingEnchantment }),
         })
-    const remainingExperience = anvilResult === undefined
+    if (anvilOutcome !== undefined && Result.isFailure(anvilOutcome)) {
+      context.setAnvilStatus(anvilOutcome.failure._tag)
+      renderPlayerUi()
+      return
+    }
+    const anvilResult = anvilOutcome?.success
+    const spent = anvilResult === undefined
       ? undefined
       : spendExperienceLevels(vitals.totalExperience, anvilResult.levelCost)
-    if (selected == null || anvilResult === undefined || remainingExperience === undefined) {
+    if (spent !== undefined && Result.isFailure(spent)) {
+      context.setAnvilStatus(spent.failure._tag)
+      renderPlayerUi()
+      return
+    }
+    const remainingExperience = spent?.success
+    if (anvilResult === undefined || remainingExperience === undefined) {
       context.setAnvilStatus('Repair or rename requirements are not met')
       renderPlayerUi()
       return
@@ -1587,14 +1830,33 @@ export const createPlayerUiRuntime = <Item extends ItemStack['item'], Recipe, Co
     const outputName = anvilResult.output.customName === null
       ? null
       : String(anvilResult.output.customName)
-    const outputEnchantment = enchantedItemFromAnvilOutput(anvilResult.output)
-    if (anvilResult.output.enchantments.length > 0 && outputEnchantment === undefined) {
+    const rawOutputEnchantment = enchantedItemFromAnvilOutput(anvilResult.output)
+    if (anvilResult.output.enchantments.length > 0 && rawOutputEnchantment === undefined) {
       context.setAnvilStatus('Anvil operation is invalid')
       renderPlayerUi()
       return
     }
-    Effect.runSync(context.worldInventory.restoreStorage(anvilResult.storage))
-    context.restoreVitalsAtExperience(remainingExperience)
+    const decodedOutputEnchantment = rawOutputEnchantment === undefined
+      ? undefined
+      : enchantedItemWithLevels(rawOutputEnchantment)
+    if (decodedOutputEnchantment !== undefined && Result.isFailure(decodedOutputEnchantment)) {
+      context.setAnvilStatus('Anvil operation is invalid')
+      renderPlayerUi()
+      return
+    }
+    const outputEnchantment = decodedOutputEnchantment?.success
+    const restored = Effect.runSync(Effect.result(context.worldInventory.restoreStorage(anvilResult.storage)))
+    if (Result.isFailure(restored)) {
+      context.setAnvilStatus(restored.failure._tag)
+      renderPlayerUi()
+      return
+    }
+    const experienceRestored = context.restoreVitalsAtExperience(remainingExperience)
+    if (Result.isFailure(experienceRestored)) {
+      context.setAnvilStatus(experienceRestored.failure._tag)
+      renderPlayerUi()
+      return
+    }
     if (outputEnchantment === undefined) context.enchantedItems.delete(itemKey)
     else context.enchantedItems.set(itemKey, outputEnchantment)
     if (outputName === null) context.customNames.delete(itemKey)
@@ -1624,6 +1886,12 @@ export const createPlayerUiRuntime = <Item extends ItemStack['item'], Recipe, Co
     const playerLevel = context.getExperienceLevel()
     const key = String(selectedHotbarIndex)
     const seed = context.getEnchantmentSeed()
+    const offers = enchantmentOffers(seed, 15)
+    if (Result.isFailure(offers)) {
+      context.setEnchantingStatus(offers.failure._tag)
+      renderPlayerUi()
+      return
+    }
     const result = applyEnchantmentOffer({
       seed,
       bookshelfCount: 15,
@@ -1634,91 +1902,123 @@ export const createPlayerUiRuntime = <Item extends ItemStack['item'], Recipe, Co
         storage.inventoryDurability[selectedHotbarIndex],
         context.enchantedItems.get(key),
       ),
-    }, enchantmentOffers(seed, 15)[slot])
+    }, offers.success[slot])
     if (!result.ok || result.state.item === null) {
       context.setEnchantingStatus(result.ok ? 'No item selected' : result.reason)
       renderPlayerUi()
       return
     }
-    if (!removeInventoryItem('lapis_lazuli', lapis - result.state.lapis)) {
-      context.setEnchantingStatus('Lapis cost could not be consumed')
+    const nextLevel = ExperienceLevel.result(result.state.playerLevel)
+    if (Result.isFailure(nextLevel)) {
+      context.setEnchantingStatus(nextLevel.failure._tag)
+      renderPlayerUi()
+      return
+    }
+    const consumed = removeInventoryItem('lapis_lazuli', lapis - result.state.lapis)
+    if (Result.isFailure(consumed) || !consumed.success) {
+      context.setEnchantingStatus(Result.isFailure(consumed)
+        ? consumed.failure._tag
+        : 'Lapis cost could not be consumed')
       renderPlayerUi()
       return
     }
     context.enchantedItems.set(key, result.state.item)
     context.setEnchantmentSeed(result.state.seed)
-    context.restoreVitalsAtExperience(
-      totalExperienceAtLevel(result.state.playerLevel),
-    )
+    const experienceRestored = context.restoreVitalsAtExperience(totalExperienceAtLevel(nextLevel.success))
+    if (Result.isFailure(experienceRestored)) {
+      context.setEnchantingStatus(experienceRestored.failure._tag)
+      renderPlayerUi()
+      return
+    }
     const status = `Applied ${result.state.item.enchantments.at(-1)?.id ?? 'enchantment'}`
     context.setEnchantingStatus(status)
     context.documentBody.setAttribute('data-enchanting-result', status)
     context.markSessionDirty()
     renderPlayerUi()
   }
+  // Each listener resolves its DOM target and calls the event's synchronous
+  // methods at once, then defers the rest. The frame can close or switch the
+  // screen before the deferred work runs; work for a screen that is no longer
+  // shown is dropped.
+  const deferForScreen = (mode: InventoryMode, work: () => void): void => {
+    context.deferToFrameBoundary(() => {
+      if (!context.getInventoryOpen() || context.getInventoryMode() !== mode) return
+      work()
+    })
+  }
+  const deferUnlessDead = (mode: InventoryMode, work: () => void): void => {
+    deferForScreen(mode, () => {
+      if (!playerIsDead()) work()
+    })
+  }
   const installInventoryListeners = (): void => {
     context.inventoryParent.addEventListener('input', (event) => {
       if (context.getInventoryMode() !== 'anvil' || !(event.target instanceof HTMLInputElement)) return
       if (event.target.matches('[data-operation-target="name"]')) {
-        context.setAnvilName(event.target.value.slice(0, 50))
-        renderPlayerUi()
+        const name = event.target.value.slice(0, 50)
+        deferForScreen('anvil', () => {
+          context.setAnvilName(name)
+          renderPlayerUi()
+        })
       }
     })
     context.inventoryParent.addEventListener('click', (event) => {
-      if (playerIsDead()) return
-      if (context.getInventoryMode() === 'anvil') {
+      const mode = context.getInventoryMode()
+      if (mode === 'anvil') {
         const target = event.target instanceof Element
           ? event.target.closest('[data-operation-target]')?.getAttribute('data-operation-target')
           : null
-        if (target === 'output') activateAnvilOutput()
+        if (target === 'output') deferUnlessDead(mode, activateAnvilOutput)
         return
       }
-      if (context.getInventoryMode() === 'enchanting') {
+      if (mode === 'enchanting') {
         const target = event.target instanceof Element
           ? event.target.closest('[data-operation-target]')?.getAttribute('data-operation-target')
           : null
         const slot = target === 'offer-1' ? 0 : target === 'offer-2' ? 1 : target === 'offer-3' ? 2 : undefined
-        if (slot !== undefined) activateEnchantingOffer(slot)
+        if (slot !== undefined) deferUnlessDead(mode, () => activateEnchantingOffer(slot))
         return
       }
-      if (context.getInventoryMode() === 'chest') {
+      if (mode === 'chest') {
         if (event.target instanceof Element && event.target.closest(
           '[data-interaction-target="chest-storage-close"]',
         ) !== null) {
-          if (chestStorageCloseIntent()._tag === 'CloseRequested') setInventoryOpen(false)
+          deferUnlessDead(mode, () => {
+            if (chestStorageCloseIntent()._tag === 'CloseRequested') setInventoryOpen(false)
+          })
           return
         }
         const chestTarget = chestTargetOf(event.target)
-        if (chestTarget !== undefined) activateChestSlot(chestTarget)
+        if (chestTarget !== undefined) deferUnlessDead(mode, () => activateChestSlot(chestTarget))
         return
       }
-      if (context.getInventoryMode() === 'furnace') {
+      if (mode === 'furnace') {
         const furnaceTarget = furnaceTargetOf(event.target)
-        if (furnaceTarget !== undefined) activateFurnaceSlot(furnaceTarget)
+        if (furnaceTarget !== undefined) deferUnlessDead(mode, () => activateFurnaceSlot(furnaceTarget))
         return
       }
       const target = targetOf(event.target)
       const actionTarget = target === undefined ? null : inventoryActionTarget(target)
       if (actionTarget !== null) {
-        dispatchInventoryAction({
-          kind: event.shiftKey ? 'shift-click' : 'click',
-          target: actionTarget,
-        })
+        const kind = event.shiftKey ? 'shift-click' : 'click'
+        deferUnlessDead(mode, () => dispatchInventoryAction({ kind, target: actionTarget }))
       }
     })
     context.inventoryParent.addEventListener('contextmenu', (event) => {
-      if (playerIsDead()) return
-      if (['furnace', 'chest', 'anvil', 'enchanting'].includes(context.getInventoryMode())) return
+      const mode = context.getInventoryMode()
+      if (['furnace', 'chest', 'anvil', 'enchanting'].includes(mode)) return
       const target = targetOf(event.target)
       if (target === undefined) return
       event.preventDefault()
       if (target.kind !== 'slot' || target.region === 'crafting-grid') return
-      if (target.region === 'armour' || target.region === 'offhand') {
-        const actionTarget = inventoryActionTarget(target)
-        if (actionTarget !== null) dispatchInventoryAction({ kind: 'click', target: actionTarget })
-      } else {
-        activateInventoryTarget(target, 'right')
-      }
+      deferUnlessDead(mode, () => {
+        if (target.region === 'armour' || target.region === 'offhand') {
+          const actionTarget = inventoryActionTarget(target)
+          if (actionTarget !== null) dispatchInventoryAction({ kind: 'click', target: actionTarget })
+        } else {
+          activateInventoryTarget(target, 'right')
+        }
+      })
     })
     context.inventoryParent.addEventListener('dragstart', (event) => {
       if (context.getInventoryMode() !== 'player' && context.getInventoryMode() !== 'craftingTable') return
@@ -1744,43 +2044,52 @@ export const createPlayerUiRuntime = <Item extends ItemStack['item'], Recipe, Co
       const actionTarget = target === undefined ? null : inventoryActionTarget(target)
       if (source === undefined || actionTarget === null || actionTarget.kind === 'crafting-output') return
       event.preventDefault()
-      dispatchInventoryAction({ kind: 'drag', source, target: actionTarget })
+      deferForScreen(context.getInventoryMode(), () =>
+        dispatchInventoryAction({ kind: 'drag', source, target: actionTarget }))
     })
     context.inventoryParent.addEventListener('dragend', () => {
       context.setInventoryDragSource(undefined)
     })
     context.inventoryParent.addEventListener('keydown', (event) => {
-      if (playerIsDead()) return
       if (event.key !== 'Enter' && event.key !== ' ') return
-      if (context.getInventoryMode() === 'anvil' || context.getInventoryMode() === 'enchanting') return
-      if (context.getInventoryMode() === 'chest') {
+      const mode = context.getInventoryMode()
+      if (mode === 'anvil' || mode === 'enchanting') return
+      if (mode === 'chest') {
         if (event.target instanceof Element && event.target.closest(
           '[data-interaction-target="chest-storage-close"]',
         ) !== null) {
           event.preventDefault()
-          if (chestStorageCloseIntent()._tag === 'CloseRequested') setInventoryOpen(false)
+          deferUnlessDead(mode, () => {
+            if (chestStorageCloseIntent()._tag === 'CloseRequested') setInventoryOpen(false)
+          })
           return
         }
         const chestTarget = chestTargetOf(event.target)
         if (chestTarget === undefined) return
         event.preventDefault()
-        activateChestSlot(chestTarget)
-        focusRenderedTarget()
+        deferUnlessDead(mode, () => {
+          activateChestSlot(chestTarget)
+          focusRenderedTarget()
+        })
         return
       }
-      if (context.getInventoryMode() === 'furnace') {
+      if (mode === 'furnace') {
         const furnaceTarget = furnaceTargetOf(event.target)
         if (furnaceTarget === undefined) return
         event.preventDefault()
-        activateFurnaceSlot(furnaceTarget)
-        focusRenderedTarget()
+        deferUnlessDead(mode, () => {
+          activateFurnaceSlot(furnaceTarget)
+          focusRenderedTarget()
+        })
         return
       }
       const target = targetOf(event.target)
       if (target === undefined) return
       event.preventDefault()
-      activateInventoryTarget(target)
-      focusRenderedTarget()
+      deferUnlessDead(mode, () => {
+        activateInventoryTarget(target)
+        focusRenderedTarget()
+      })
     })
   }
   const installRespawnListener = (hudParent: HTMLElement, respawn: () => void): void => {
@@ -1788,7 +2097,7 @@ export const createPlayerUiRuntime = <Item extends ItemStack['item'], Recipe, Co
       if (!(event.target instanceof Element)) return
       const control = event.target.closest('[data-mx-ui="respawn"]')
       if (control === null || !hudParent.contains(control)) return
-      respawn()
+      context.deferToFrameBoundary(respawn)
     })
   }
 
@@ -1823,7 +2132,12 @@ export const createPlayerUiRuntime = <Item extends ItemStack['item'], Recipe, Co
       && (context.getInventoryMode() === 'player' || context.getInventoryMode() === 'craftingTable')
       && (!open || switchingMode)
     ) {
-      Effect.runSync(inventoryInteraction.close())
+      // A failed close keeps the carried stack in the interaction state, so the screen stays
+      // open with the failure shown instead of hiding a stack the player still holds.
+      if (!settledInventoryInteraction(Effect.runSync(Effect.result(inventoryInteraction.close())))) {
+        renderPlayerUi()
+        return
+      }
     }
 
     context.setInventoryOpenState(open)
@@ -1835,7 +2149,11 @@ export const createPlayerUiRuntime = <Item extends ItemStack['item'], Recipe, Co
       context.setInventoryMode(mode)
       const presentation = context.inventoryPresentations[mode]
       if (mode === 'player' || mode === 'craftingTable') {
-        inventoryInteraction.configureGrid(presentation.width, presentation.height)
+        // main.ts INVENTORY_PRESENTATIONS gives the crafting modes 2x2 and 3x3 grids.
+        inventoryInteraction.configureGrid(
+          RecipeGridDimension(presentation.width),
+          RecipeGridDimension(presentation.height),
+        )
       }
       context.inventoryParent.setAttribute('aria-label', presentation.label)
       if (mode === 'furnace') {

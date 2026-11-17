@@ -1,7 +1,6 @@
 /* oxlint-disable curly, func-names, init-declarations, max-statements, no-magic-numbers, no-ternary, no-undefined, prefer-const, sort-keys -- Lifecycle orchestration is intentionally kept linear; splitting it obscures rollback order. */
-import { Cause, Deferred, Effect, Option, Ref } from 'effect'
-import { type DeltaTimeSecs, MonotonicTimeSecs } from '@nerima-games/mc-kernel'
-import { type GameLoopApi, makeGameLoop } from '@nerima-games/mc-sim'
+import { Cause, Effect, Fiber, Option, Ref, Semaphore } from 'effect'
+import { MonotonicTimeSecs } from '@nerima-games/mc-kernel'
 import { requestNextFrameIfActive } from './frame-scheduling.js'
 
 export type BrowserPreviewSurface = {
@@ -18,7 +17,11 @@ export type BrowserPreviewSurface = {
  */
 export type BrowserPreviewRuntime = {
   readonly stop: Effect.Effect<void, unknown>
-  readonly frame?: (deltaSeconds: DeltaTimeSecs) => Effect.Effect<void, unknown>
+  /**
+   * One render frame, called once per animation frame with its timestamp. The
+   * runtime derives its own deltas and fixed-step ticks from `nowSecs`.
+   */
+  readonly frame?: (nowSecs: MonotonicTimeSecs) => Effect.Effect<void, unknown>
 }
 
 export type BrowserPreviewStartError = {
@@ -79,7 +82,7 @@ export const makeBrowserPreview = (
   options: BrowserPreviewOptions,
 ): Effect.Effect<BrowserPreviewApi> => Effect.gen(function* () {
   const current = yield* Ref.make(Option.none<Generation>())
-  const mutex = yield* Effect.makeSemaphore(1)
+  const mutex = yield* Semaphore.make(1)
 
   const stopGeneration = (generation: Generation) => generation.stop
 
@@ -109,8 +112,12 @@ export const makeBrowserPreview = (
       const cleanups: Array<() => void> = []
       const rollbackFailures: Array<unknown> = []
       let runtime: BrowserPreviewRuntime | undefined
-      let gameLoop: GameLoopApi | undefined
-      const activeFrame = yield* Ref.make<Option.Option<Deferred.Deferred<void>>>(Option.none())
+      // The running frame. An animation frame that arrives while it runs is
+      // skipped, so frames never overlap; the next frame's delta covers the gap.
+      // `frameRunning` is cleared by the frame itself, which may finish inside
+      // `runFork` before its fiber could be stored.
+      let frameRunning = false
+      let activeFrame: Fiber.Fiber<void> | undefined
       let requestId: number | undefined
       let stopped = false
 
@@ -128,11 +135,7 @@ export const makeBrowserPreview = (
           scheduler.cancel(requestId)
           requestId = undefined
         }
-        if (gameLoop !== undefined) {
-          yield* gameLoop.stop
-          const runningFrame = yield* Ref.get(activeFrame)
-          if (Option.isSome(runningFrame)) yield* Deferred.await(runningFrame.value)
-        }
+        if (activeFrame !== undefined) yield* Fiber.interrupt(activeFrame)
         if (runtime !== undefined) {
           yield* Effect.match(runtime.stop, {
             onFailure: (cause) => { rollbackFailures.push(cause) },
@@ -176,31 +179,26 @@ export const makeBrowserPreview = (
 
       const { frame } = runtime
       if (frame !== undefined) {
-        const loop = yield* makeGameLoop()
-        gameLoop = loop
-        const frameHandler = (deltaSeconds: DeltaTimeSecs): Effect.Effect<void> => Effect.gen(function* () {
-          const completion = yield* Deferred.make<void>()
-          yield* Ref.set(activeFrame, Option.some(completion))
-          yield* Effect.ensuring(
-            frame(deltaSeconds).pipe(
-              Effect.matchCauseEffect({
-                onFailure: (cause) => Effect.gen(function* () {
-                  yield* Effect.logError(`Browser preview frame failed: ${Cause.pretty(cause)}`)
-                  yield* Effect.sync(() => { Effect.runFork(mutex.withPermits(1)(stopUnlocked)) })
-                }),
-                onSuccess: () => Effect.void,
-              }),
-            ),
-            Ref.set(activeFrame, Option.none()).pipe(
-              Effect.andThen(Deferred.succeed(completion, undefined)),
-              Effect.asVoid,
-            ),
-          )
-        })
-        yield* gameLoop.start(frameHandler)
+        const runFrame = (nowSecs: MonotonicTimeSecs): Effect.Effect<void> => frame(nowSecs).pipe(
+          Effect.matchCauseEffect({
+            onFailure: (cause) => Effect.gen(function* () {
+              yield* Effect.logError(`Browser preview frame failed: ${Cause.pretty(cause)}`)
+              yield* Effect.sync(() => { Effect.runFork(mutex.withPermits(1)(stopUnlocked)) })
+            }),
+            onSuccess: () => Effect.void,
+          }),
+          Effect.ensuring(Effect.sync(() => {
+            frameRunning = false
+            activeFrame = undefined
+          })),
+        )
         const tick: FrameRequestCallback = (timestamp) => {
           if (stopped) return
-          Effect.runFork(loop.submitFrame(MonotonicTimeSecs(timestamp / 1_000)))
+          if (!frameRunning) {
+            frameRunning = true
+            const fiber = Effect.runFork(runFrame(MonotonicTimeSecs(timestamp / 1_000)))
+            if (frameRunning) activeFrame = fiber
+          }
           requestId = requestNextFrameIfActive(stopped, scheduler, tick)
         }
         requestId = scheduler.request(tick)

@@ -1,9 +1,11 @@
+import { getDisplayName } from '@nerima-games/mc-kernel'
 import { expect, test, type Locator, type Page } from '@playwright/test'
+import { Result } from 'effect'
 
+import { callQa, callQaWithFrames } from './helpers/qa'
 import { startGameSession } from './helpers/session'
 import { waitForSimulationProgress } from './helpers/simulation-wait'
 
-const QA_GLOBAL_KEY = '__NERIMA_GAMES_QA__'
 const EYES_REQUIRED = 13
 
 type EntitySnapshot = {
@@ -44,35 +46,11 @@ type EndSnapshot = {
   }
 }
 
-const callQa = <A>(page: Page, command: string): Promise<A> =>
-  page.evaluate(
-    async ({ key, commandName }) => {
-      const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-        | Record<string, () => unknown>
-        | undefined
-      const operation = surface?.[commandName]
-      if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
-      return await operation()
-    },
-    { key: QA_GLOBAL_KEY, commandName: command },
-  ) as Promise<A>
-
 const snapshot = (page: Page): Promise<EndSnapshot> =>
   callQa(page, 'gameplay.snapshot')
 
 const snapshotWithFrames = (page: Page): Promise<{ frames: number; value: EndSnapshot }> =>
-  page.evaluate(
-    async ({ key, commandName }) => {
-      const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-        | Record<string, () => unknown>
-        | undefined
-      const operation = surface?.[commandName]
-      if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
-      const value = await operation()
-      return { frames: Number(document.body.getAttribute('data-frames')), value }
-    },
-    { key: QA_GLOBAL_KEY, commandName: 'gameplay.snapshot' },
-  ) as Promise<{ frames: number; value: EndSnapshot }>
+  callQaWithFrames(page, 'gameplay.snapshot')
 
 const grantPointerLock = async (page: Page): Promise<void> => {
   await page.evaluate(() => {
@@ -92,11 +70,13 @@ const itemCount = (current: EndSnapshot, item: string): number =>
     0,
   )
 
-const inventoryItemSlot = (inventory: Locator, item: string): Locator =>
-  inventory.locator(
-    `[data-region="hotbar"] [data-mx-ui="slot"][aria-label*="${item}"], `
-    + `[data-region="main"] [data-mx-ui="slot"][aria-label*="${item}"]`,
+const inventoryItemSlot = (inventory: Locator, item: string): Locator => {
+  const displayName = Result.getOrThrow(getDisplayName({ kind: 'item', id: item, language: 'en' }))
+  return inventory.locator(
+    `[data-region="hotbar"] [data-mx-ui="slot"][aria-label*=", ${displayName}, "], `
+    + `[data-region="main"] [data-mx-ui="slot"][aria-label*=", ${displayName}, "]`,
   ).first()
+}
 
 const selectedSlotIndex = async (hotbar: Locator): Promise<number> =>
   hotbar.locator('[data-mx-ui="slot"]').evaluateAll((slots) =>
@@ -193,7 +173,7 @@ test('completes and persists a survival End journey without progression-state se
     await craftingCells.nth(0).click()
     await inventoryItemSlot(inventory, 'blaze_powder').click()
     await craftingCells.nth(1).click()
-    await expect(output).toHaveAttribute('aria-label', /eye_of_ender, 1/)
+    await expect(output).toHaveAttribute('aria-label', 'Crafting output, Eye Of Ender, 1')
     await output.click()
   }
   await expect.poll(async () => itemCount(await snapshot(page), 'eye_of_ender')).toBe(EYES_REQUIRED)

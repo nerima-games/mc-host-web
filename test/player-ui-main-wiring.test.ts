@@ -15,16 +15,34 @@ const positionOf = (source: string, marker: string, fromIndex = 0): number => {
 }
 
 describe('H4b main.ts wiring', () => {
+  it('finalizes the portal destination through the player view after its world batch', () => {
+    const start = positionOf(mainSource, 'const applyPortalTravels = () =>')
+    const end = positionOf(mainSource, 'Effect.runSync(syncPortalCandidateSnapshots())', start)
+    const portalSource = mainSource.slice(start, end)
+    expect(portalSource).toContain('drainPortalTravels(gameplayState)')
+    expect(portalSource).toContain('for (const travel of travels)')
+    expect(positionOf(portalSource, 'yield* commitPlannedEdits(toDimension, edits)'))
+      .toBeLessThan(positionOf(portalSource, 'yield* playerApi.restore({'))
+    expect(portalSource).toContain('PositionAxis(destination.x)')
+    expect(portalSource).toContain('PositionAxis(landing === undefined ? destination.y : landing.floorY + 1)')
+    expect(portalSource).toContain('PositionAxis(destination.z)')
+    expect(portalSource).toContain('}, toDimension)')
+  })
+
   it('connects the main-owned inventory state and commands before installing listeners and starting tick', () => {
     const clientContextStart = positionOf(mainSource, 'const multiplayerClientContext: MultiplayerClientContext = {')
-    const clientCreation = positionOf(mainSource, '} = createMultiplayerClient(multiplayerClientContext)')
+    const clientCreation = positionOf(mainSource, 'const multiplayerClientApi = createMultiplayerClient(multiplayerClientContext)')
+    const clientDestructure = positionOf(mainSource, '} = multiplayerClientApi', clientCreation)
     const runtimeCreation = positionOf(mainSource, 'const inventoryRuntime = createPlayerUiRuntime({')
     const runtimeDestructure = positionOf(mainSource, '} = inventoryRuntime')
     const listenerInstallation = positionOf(mainSource, 'installInventoryListeners()')
-    const pauseInstallation = positionOf(mainSource, 'const handlePauseRequest = installPauseControls({')
+    const pauseInstallation = positionOf(mainSource, 'const pauseMenu = installPlayerPauseMenu({')
     const tickStart = positionOf(mainSource, 'const tick = (() => {')
 
     expect(clientCreation).toBeLessThan(runtimeCreation)
+    expect(clientContextStart).toBeLessThan(clientCreation)
+    expect(clientCreation).toBeLessThan(clientDestructure)
+    expect(clientDestructure).toBeLessThan(runtimeCreation)
     expect(runtimeCreation).toBeLessThan(runtimeDestructure)
     expect(runtimeDestructure).toBeLessThan(listenerInstallation)
     expect(listenerInstallation).toBeLessThan(pauseInstallation)
@@ -67,6 +85,29 @@ describe('H4b main.ts wiring', () => {
     expect(runtimeSetup).toContain('sendFacilityCommand,')
   })
 
+  it('routes the frame Escape and session disposal through the pause menu adapter', () => {
+    const pauseInstallation = positionOf(mainSource, 'const pauseMenu = installPlayerPauseMenu({')
+    const lifecycle = positionOf(mainSource, '= installPlayerLifecycle({')
+    const tickStart = positionOf(mainSource, 'const tick = (() => {')
+    expect(pauseInstallation).toBeLessThan(lifecycle)
+    expect(positionOf(mainSource, 'pauseMenu,', lifecycle)).toBeLessThan(tickStart)
+    expect(positionOf(mainSource, 'handlePauseRequest: pauseMenu.handleEscape,', tickStart)).toBeGreaterThan(tickStart)
+    expect(frameInputSource).toContain('context.handlePauseRequest()')
+  })
+
+  it('runs the frame presentation once, right after the gameplay step, in place of the overlay call', () => {
+    const tickStart = positionOf(mainSource, 'const tick = (() => {')
+    const gameplay = positionOf(mainSource, 'yield* runTickPostFrameGameplay(h5cTickContext,', tickStart)
+    const presentation = positionOf(mainSource, 'yield* runFramePresentation(', tickStart)
+    const music = positionOf(mainSource, 'yield* music.update({', tickStart)
+    expect(gameplay).toBeLessThan(presentation)
+    expect(presentation).toBeLessThan(music)
+    expect(mainSource.indexOf('yield* runFramePresentation(', presentation + 1)).toBe(-1)
+    // The presentation step updates the debug overlay; a second direct call
+    // would update it twice per frame.
+    expect(mainSource).not.toContain('runTickDebugOverlayFrame')
+  })
+
   it('keeps inventory input gated before calling the extracted runtime', () => {
     const tickStart = positionOf(frameInputSource, 'export const runTickFrameInput = (')
     const tickInput = frameInputSource.slice(
@@ -75,7 +116,7 @@ describe('H4b main.ts wiring', () => {
     )
     const deadGate = positionOf(tickInput, '!dead &&')
     const bowGate = positionOf(tickInput, '!context.bowInteractionLocked()')
-    const openInput = positionOf(tickInput, "wasActionJustTriggered('openInventory')")
+    const openInput = positionOf(tickInput, "wasActionJustTriggered('openInventory', frameInput)")
     const runtimeCall = positionOf(tickInput, "context.setInventoryOpen(!state.inventoryOpen.get(), 'player')")
 
     expect(deadGate).toBeLessThan(bowGate)

@@ -22,8 +22,13 @@
         display: none !important;
       }
 
+      /* body never scrolls (the game owns the viewport), so the title screen
+         scrolls itself on short viewports to keep Controls and the onboarding
+         list reachable. */
       #title-screen {
         min-height: 100vh;
+        max-height: 100vh;
+        overflow-y: auto;
         display: grid;
         place-items: center;
         padding: 24px;
@@ -239,6 +244,25 @@
         pointer-events: auto;
       }
 
+      #save-indicator-root [data-mx-ui="save-indicator"] {
+        position: fixed;
+        right: 10px;
+        bottom: 10px;
+        z-index: 30;
+        pointer-events: none;
+      }
+
+      /* mx-ui keeps the loading screen up for a minimum time even after the
+         world is ready, so it must not take clicks meant for the game. */
+      #loading-root [data-mx-ui="loading"] {
+        position: fixed;
+        inset: 0;
+        z-index: 40;
+        display: grid;
+        place-content: center;
+        pointer-events: none;
+      }
+
       #inventory-root {
         position: fixed;
         top: 50%;
@@ -402,39 +426,92 @@
         text-shadow: 0 1px 1px #000;
       }
 
-      #pause-overlay {
+      /* Below the boot, multiplayer, and touch menu controls on the left edge,
+         clear of the HUD's top-centre bars and the bottom-left chat. */
+      #session-onboarding {
+        position: fixed;
+        top: 96px;
+        left: max(18px, env(safe-area-inset-left));
+        z-index: 27;
+        display: grid;
+        justify-items: start;
+        gap: 6px;
+        width: min(360px, calc(100vw - 36px));
+        max-height: max(120px, calc(100vh - 300px));
+        overflow-y: auto;
+        pointer-events: none;
+      }
+
+      #session-onboarding > * {
+        pointer-events: auto;
+      }
+
+      #session-onboarding [data-mx-ui="onboarding"] {
+        padding: 10px 14px;
+        border: 1px solid rgba(255, 255, 255, 0.28);
+        background: rgba(0, 0, 0, 0.72);
+      }
+
+      /* mx-ui renders the pause view without placement or button surfaces; the
+         adapter hides #pause-root while the game runs. */
+      [data-mx-ui="pause-menu"] {
         position: fixed;
         inset: 0;
         z-index: 50;
         display: grid;
-        place-items: center;
-        background: rgba(0, 0, 0, 0.72);
+        place-content: center;
+        justify-items: center;
+        background: var(--mx-ui-scrim);
       }
 
-      #pause-dialog {
+      [data-mx-ui="pause-menu"]:not(:has(> [role="dialog"]:not([hidden]))) {
+        display: none;
+      }
+
+      [data-mx-ui="pause-panel"],
+      [data-mx-ui="pause-settings-modal"] {
+        grid-area: 1 / 1;
+        display: grid;
+        gap: 10px;
         width: min(360px, calc(100vw - 48px));
+        box-sizing: border-box;
         padding: 28px;
         border: 1px solid rgba(255, 255, 255, 0.28);
-        background: #171914;
         box-shadow: 0 18px 70px rgba(0, 0, 0, 0.55);
       }
 
-      #pause-actions {
-        display: grid;
-        gap: 10px;
+      [data-mx-ui="pause-panel"] h1,
+      [data-mx-ui="pause-settings-modal"] h2 {
+        margin: 0 0 6px;
       }
 
-      #pause-actions button {
+      /* The host settings view replaces mx-ui's empty Options panel. */
+      body:has(#settings-root:not([hidden])) [data-mx-ui="pause-settings-modal"] {
+        display: none;
+      }
+
+      [data-mx-ui="pause-menu-action"] {
         min-height: 44px;
-        border: 1px solid #aeb89e;
-        background: #293123;
-        color: #fff;
+        border: 1px solid var(--mx-ui-slot-border);
+        background: var(--mx-ui-surface-raised);
         font: inherit;
         cursor: pointer;
       }
 
-      #pause-error {
+      [data-mx-ui="pause-menu-action"]:focus-visible {
+        outline: 3px solid var(--mx-ui-focus-ring);
+        outline-offset: 2px;
+      }
+
+      [data-mx-ui="pause-menu-action"]:disabled {
+        cursor: progress;
+        opacity: 0.6;
+      }
+
+      [data-pause-error] {
+        grid-area: 2 / 1;
         min-height: 1.4em;
+        margin: 10px 0 0;
         color: #ff9b91;
       }
 
@@ -632,9 +709,11 @@
         </div>
       </div>
       <div id="hud-root"></div>
+      <div id="save-indicator-root"></div>
       <div id="inventory-root" hidden></div>
       <div id="trade-root" hidden></div>
       <div id="brewing-root" hidden></div>
+      <div id="session-onboarding" data-testid="session-onboarding"></div>
       <div
         id="sound-captions"
         role="status"
@@ -653,20 +732,9 @@
         </form>
       </section>
     </div>
-    <div id="pause-overlay" data-testid="pause-overlay" hidden>
-      <section id="pause-dialog" role="dialog" aria-modal="true" aria-labelledby="pause-title">
-        <h1 id="pause-title">Game Paused</h1>
-        <div id="pause-actions">
-          <button id="resume-button" type="button" data-testid="resume-button">Resume</button>
-          <button id="settings-button" type="button" data-testid="settings-button">Settings</button>
-          <button id="save-quit-button" type="button" data-testid="save-quit-button">
-            Save &amp; Quit
-          </button>
-        </div>
-        <p id="pause-error" role="alert" aria-live="assertive"></p>
-      </section>
-    </div>
+    <div id="pause-root" hidden></div>
     <div id="settings-root" data-testid="settings-root" hidden></div>
+    <div id="loading-root"></div>
     <div id="boot-status" role="status" aria-live="polite"></div>
     <script type="module" src="/apps/web/main.ts"></script>
   </body>

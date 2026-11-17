@@ -1,22 +1,24 @@
-import { emptyFurnaceState, itemStack, type FurnaceState } from '@nerima-games/mc-sim'
+import { Result } from 'effect'
+import type { ItemType } from '@nerima-games/mc-kernel'
+import { emptyFurnaceState, furnaceState, itemStack, type FurnaceState } from '@nerima-games/mc-sim'
 import { planFurnaceAdvance } from '@nerima-games/mx-gameplay'
 import { describe, expect, it } from 'vitest'
 import { advanceFurnaceRuntime } from '../apps/web/furnace-runtime'
-import type { DeltaTimeSecs } from '@nerima-games/mc-kernel'
 
-const fueledFurnace = (): FurnaceState => ({
-  input: itemStack('raw_iron', 1),
-  fuel: itemStack('coal', 1),
-  output: null,
-  cookElapsedSecs: 0,
-  burnRemainingSecs: 0,
-})
+// Fixture literals are in-range stack counts, a valid furnace snapshot and finite non-negative seconds.
+const stackOf = (item: ItemType, count: number) => Result.getOrThrow(itemStack(item, count))
+const planOf = (...args: Parameters<typeof planFurnaceAdvance>) => Result.getOrThrow(planFurnaceAdvance(...args))
+
+const fueledFurnace = (): FurnaceState => Result.getOrThrow(furnaceState({
+  input: stackOf('raw_iron', 1),
+  fuel: stackOf('coal', 1),
+}))
 
 describe('furnace web runtime', () => {
   it('leaves an empty furnace unchanged', () => {
-    const state = emptyFurnaceState()
+    const state = Result.getOrThrow(emptyFurnaceState())
 
-    const outcome = advanceFurnaceRuntime(state, planFurnaceAdvance(state, 1 as DeltaTimeSecs))
+    const outcome = advanceFurnaceRuntime(state, planOf(state, 1))
 
     expect(outcome.state).toEqual(state)
     expect(outcome._tag).toBe('Applied')
@@ -25,18 +27,19 @@ describe('furnace web runtime', () => {
 
   it('advances a fueled furnace through the gameplay plan boundary', () => {
     const state = fueledFurnace()
-    const outcome = advanceFurnaceRuntime(state, planFurnaceAdvance(state, 10 as DeltaTimeSecs))
+    const outcome = advanceFurnaceRuntime(state, planOf(state, 10))
 
     expect(outcome._tag).toBe('Applied')
     expect(outcome.changed).toBe(true)
-    expect(outcome.state.input).toBeNull()
-    expect(outcome.state.fuel).toBeNull()
-    expect(outcome.state.output).toEqual(itemStack('iron_ingot', 1))
+    // mc-kernel 0.17.0 ItemSlot = ItemStack | undefined (dist/domain/item/item-stack.d.ts): FurnaceState.input/fuel empty slots are `undefined`, not `null`.
+    expect(outcome.state.input).toBeUndefined()
+    expect(outcome.state.fuel).toBeUndefined()
+    expect(outcome.state.output).toEqual(stackOf('iron_ingot', 1))
   })
 
   it('reports time deferred by the bounded gameplay plan', () => {
     const state = fueledFurnace()
-    const outcome = advanceFurnaceRuntime(state, planFurnaceAdvance(state, 12 as DeltaTimeSecs))
+    const outcome = advanceFurnaceRuntime(state, planOf(state, 12))
 
     expect(outcome.advancedSecs).toBe(10)
     expect(outcome.deferredSecs).toBe(2)
@@ -44,8 +47,8 @@ describe('furnace web runtime', () => {
 
   it('rejects a plan when the host-owned snapshot changed before apply', () => {
     const state = fueledFurnace()
-    const plan = planFurnaceAdvance(state, 1 as DeltaTimeSecs)
-    const changed = { ...state, fuel: null }
+    const plan = planOf(state, 1)
+    const changed = { ...state, fuel: undefined }
 
     const outcome = advanceFurnaceRuntime(changed, plan)
 

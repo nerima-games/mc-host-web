@@ -1,9 +1,10 @@
 import { expect, test, type Page } from '@playwright/test'
 
+import { callQa, callQaWithFrames } from './helpers/qa'
+import { clearDatabase } from './helpers/database'
 import { startGameSession } from './helpers/session'
 import { waitForSimulationProgress } from './helpers/simulation-wait'
 
-const DATABASE_NAME = 'nerima-games-minecraft'
 const SESSION_ID = 'block-placement-persistence-e2e'
 const AIR_BLOCK_ID = 0
 const STONE_BLOCK_ID = 2
@@ -19,51 +20,17 @@ type GameplaySnapshot = {
   }
 }
 
-const callQa = <Result>(page: Page, command: string): Promise<Result> =>
-  page.evaluate(async (commandName) => {
-    const qa = (globalThis as unknown as Record<string, unknown>)['__NERIMA_GAMES_QA__'] as
-      | Record<string, () => unknown>
-      | undefined
-    const operation = qa?.[commandName]
-    if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
-    return await operation()
-  }, command) as Promise<Result>
-
 const snapshot = (page: Page): Promise<GameplaySnapshot> =>
   callQa(page, 'gameplay.snapshot')
 
 const snapshotWithFrames = (page: Page): Promise<{ frames: number; value: GameplaySnapshot }> =>
-  page.evaluate(async () => {
-    const qa = (globalThis as unknown as Record<string, unknown>)['__NERIMA_GAMES_QA__'] as
-      | Record<string, () => unknown>
-      | undefined
-    const operation = qa?.['gameplay.snapshot']
-    if (operation === undefined) throw new Error('missing QA command: gameplay.snapshot')
-    return {
-      frames: Number(document.body.getAttribute('data-frames')),
-      value: await operation() as GameplaySnapshot,
-    }
-  })
+  callQaWithFrames(page, 'gameplay.snapshot')
 
 const inventoryCount = (current: GameplaySnapshot, item: string): number =>
   current.inventory.slots.reduce(
     (total, slot) => total + (slot?.item === item ? slot.count : 0),
     0,
   )
-
-const clearDatabase = async (page: Page): Promise<void> => {
-  await page.goto('/@vite/client')
-  await page.evaluate(async (databaseName) => {
-    await new Promise<void>((resolve, reject) => {
-      const request = indexedDB.deleteDatabase(databaseName)
-      request.addEventListener('success', () => resolve(), { once: true })
-      request.addEventListener('error', () => reject(request.error), { once: true })
-      request.addEventListener('blocked', () => reject(new Error('database deletion blocked')), {
-        once: true,
-      })
-    })
-  }, DATABASE_NAME)
-}
 
 const grantPointerLock = async (page: Page): Promise<void> => {
   await page.evaluate(() => {

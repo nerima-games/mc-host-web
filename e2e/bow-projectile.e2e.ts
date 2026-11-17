@@ -1,10 +1,17 @@
 import { expect, test, type ConsoleMessage, type Page } from '@playwright/test'
+import {
+  DeltaTimeSecs,
+  FixedDurationSecs,
+  PositionAxis,
+  type Position as WorldPosition,
+} from '@nerima-games/mc-kernel'
+import { velocityVectorResult, type AABB, type VelocityVector } from '@nerima-games/mc-physics'
 import { ARROW_PROFILE, stepProjectile, type Projectile, type ProjectileWorld } from '@nerima-games/mc-sim'
+import { Result } from 'effect'
 
+import { callQa, callQaWithFrames } from './helpers/qa'
 import { startGameSession } from './helpers/session'
 import { waitForSimulationProgress } from './helpers/simulation-wait'
-
-const QA_GLOBAL_KEY = '__NERIMA_GAMES_QA__'
 
 type Position = Readonly<{ x: number; y: number; z: number }>
 type InventorySlot = Readonly<{ item: string; count: number }> | null
@@ -28,18 +35,6 @@ type GameplaySnapshot = Readonly<{
   projectiles: ReadonlyArray<ProjectileSnapshot>
 }>
 
-const callQa = <A>(page: Page, command: string): Promise<A> => page.evaluate(
-  async ({ key, commandName }) => {
-    const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-      | Record<string, () => unknown>
-      | undefined
-    const operation = surface?.[commandName]
-    if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
-    return await operation()
-  },
-  { key: QA_GLOBAL_KEY, commandName: command },
-) as Promise<A>
-
 const snapshot = (page: Page): Promise<GameplaySnapshot> =>
   callQa(page, 'gameplay.snapshot')
 
@@ -48,20 +43,8 @@ const snapshot = (page: Page): Promise<GameplaySnapshot> =>
 // then reasoning about a state that never existed.
 const readGameplayWithFrames = (
   page: Page,
-): Promise<{ frames: number; value: GameplaySnapshot }> => page.evaluate(
-  async ({ key, commandName }) => {
-    const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-      | Record<string, () => unknown>
-      | undefined
-    const operation = surface?.[commandName]
-    if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
-    return {
-      frames: Number(document.body.getAttribute('data-frames')),
-      value: await operation(),
-    }
-  },
-  { key: QA_GLOBAL_KEY, commandName: 'gameplay.snapshot' },
-) as Promise<{ frames: number; value: GameplaySnapshot }>
+): Promise<{ frames: number; value: GameplaySnapshot }> =>
+  callQaWithFrames(page, 'gameplay.snapshot')
 
 const itemCount = (current: GameplaySnapshot, item: string): number =>
   current.inventory.slots.reduce(
@@ -115,14 +98,7 @@ const grantPointerLock = async (page: Page): Promise<void> => {
 // distinction under an actual stall.
 const FIXTURE_WALL_WORLD: ProjectileWorld = {
   blockBounds: (start, end) => {
-    const bounds: Array<{
-      minX: number
-      minY: number
-      minZ: number
-      maxX: number
-      maxY: number
-      maxZ: number
-    }> = []
+    const bounds: Array<AABB> = []
     const minXi = Math.floor(Math.min(start.x, end.x))
     const maxXi = Math.floor(Math.max(start.x, end.x))
     const minYi = Math.floor(Math.min(start.y, end.y))
@@ -132,7 +108,14 @@ const FIXTURE_WALL_WORLD: ProjectileWorld = {
     for (let x = Math.max(6, minXi); x <= Math.min(10, maxXi); x += 1) {
       for (let y = Math.max(62, minYi); y <= Math.min(69, maxYi); y += 1) {
         if (minZi <= 2 && maxZi >= 2) {
-          bounds.push({ minX: x, minY: y, minZ: 2, maxX: x + 1, maxY: y + 1, maxZ: 3 })
+          bounds.push({
+            minX: PositionAxis(x),
+            minY: PositionAxis(y),
+            minZ: PositionAxis(2),
+            maxX: PositionAxis(x + 1),
+            maxY: PositionAxis(y + 1),
+            maxZ: PositionAxis(3),
+          })
         }
       }
     }
@@ -140,8 +123,27 @@ const FIXTURE_WALL_WORLD: ProjectileWorld = {
   },
   entities: [],
   isInWater: () => false,
-  bounds: { minX: -10_000, minY: -10_000, minZ: -10_000, maxX: 10_000, maxY: 10_000, maxZ: 10_000 },
+  bounds: {
+    minX: PositionAxis(-10_000),
+    minY: PositionAxis(-10_000),
+    minZ: PositionAxis(-10_000),
+    maxX: PositionAxis(10_000),
+    maxY: PositionAxis(10_000),
+    maxZ: PositionAxis(10_000),
+  },
 }
+
+// The QA snapshot reports plain numbers; a non-finite component means the
+// snapshot itself is broken, so throwing (failing the test) is intended.
+const observedPosition = (value: Position): WorldPosition =>
+  Result.getOrThrow(Result.all({
+    x: PositionAxis.result(value.x),
+    y: PositionAxis.result(value.y),
+    z: PositionAxis.result(value.z),
+  }))
+
+const observedVelocity = (value: Position): VelocityVector =>
+  Result.getOrThrow(velocityVectorResult(value.x, value.y, value.z))
 
 // Replays from an observed (position, velocity) for `flightSecs` of simulated
 // time, at a fixed `stepSecs` per call. Used both to produce the oracle's
@@ -155,15 +157,16 @@ const replayFlight = (
   stepSecs: number,
 ): Projectile => {
   let state: Projectile = {
-    position: origin.position,
-    velocity: origin.velocity,
-    ageSeconds: 0,
+    position: observedPosition(origin.position),
+    velocity: observedVelocity(origin.velocity),
+    ageSeconds: FixedDurationSecs(0),
     state: 'flying',
   }
   let remaining = flightSecs
   while (state.state === 'flying' && remaining > 1e-9) {
     const dt = Math.min(stepSecs, remaining)
-    state = stepProjectile(state, dt, FIXTURE_WALL_WORLD, ARROW_PROFILE).projectile
+    // dt is in (0, stepSecs]: the loop guard keeps `remaining` positive.
+    state = stepProjectile(state, DeltaTimeSecs(dt), FIXTURE_WALL_WORLD, ARROW_PROFILE).projectile
     remaining -= dt
   }
   return state

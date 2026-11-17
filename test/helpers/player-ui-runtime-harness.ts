@@ -1,6 +1,6 @@
-import { Effect } from 'effect'
+import { Effect, Result } from 'effect'
 import { vi, type Mock } from 'vitest'
-import type { StackCount } from '@nerima-games/mc-kernel'
+import { position, PositionAxis } from '@nerima-games/mc-kernel'
 import {
   emptyPlayerStorage,
   itemStack,
@@ -11,7 +11,7 @@ import {
   type PlayerStorage,
 } from '@nerima-games/mc-sim'
 import type { ChestStorageSlotTarget } from '@nerima-games/mx-ui'
-import type { InventoryInteractionService } from '../../apps/web/inventory-interaction'
+import type { InventoryInteractionInventory } from '../../apps/web/inventory-interaction'
 import { initialPlayerSwimmingRuntimeState } from '../../apps/web/player-swimming-runtime'
 import { TOUCH_LOOK_CONTROLLER_IDLE } from '../../apps/web/touch-input'
 import {
@@ -21,9 +21,10 @@ import {
   type PlayerUiRuntimeContext,
 } from '../../apps/web/player-ui-runtime'
 
-type HarnessItem = ItemStack['item']
-type HarnessContext = PlayerUiRuntimeContext<HarnessItem, never>
-type HarnessRuntime = PlayerUiRuntime<HarnessItem, never>
+type HarnessContext = PlayerUiRuntimeContext
+type HarnessRuntime = PlayerUiRuntime
+type HarnessWorldWriteFailure = Effect.Error<ReturnType<HarnessContext['writeBlocks']>>
+type HarnessInventoryClickFailure = Effect.Error<ReturnType<InventoryInteractionInventory['click']>>
 
 type PlayerUiRuntimeHarnessState = {
   inventoryOpen: boolean
@@ -45,6 +46,10 @@ type PlayerUiRuntimeHarnessState = {
   dirtyGeneration: number
   savedGeneration: number
   debounceTimer: number | undefined
+  blocks: Map<string, number>
+  worldWriteFailure: HarnessWorldWriteFailure | undefined
+  equipmentActionStatus: string
+  inventoryClickFailure: HarnessInventoryClickFailure | undefined
 }
 
 type PlayerUiRuntimeHarness = {
@@ -65,17 +70,18 @@ type PlayerUiRuntimeHarness = {
     readonly requestedFrames: ReadonlyArray<FrameRequestCallback>
   }
   readonly views: {
-    readonly inventoryView: PlayerUiRuntimeContext<never, never>['inventoryView']
-    readonly furnaceView: PlayerUiRuntimeContext<never, never>['furnaceView']
-    readonly chestView: PlayerUiRuntimeContext<never, never>['chestView']
-    readonly anvilView: PlayerUiRuntimeContext<never, never>['anvilView']
-    readonly enchantingView: PlayerUiRuntimeContext<never, never>['enchantingView']
+    readonly inventoryView: PlayerUiRuntimeContext['inventoryView']
+    readonly furnaceView: PlayerUiRuntimeContext['furnaceView']
+    readonly chestView: PlayerUiRuntimeContext['chestView']
+    readonly anvilView: PlayerUiRuntimeContext['anvilView']
+    readonly enchantingView: PlayerUiRuntimeContext['enchantingView']
     readonly renderHud: Mock
   }
   readonly calls: {
     readonly sendFacilityCommand: Mock
     readonly sendInventoryCommand: Mock
     readonly requestCrafting: Mock
+    readonly writeBlocks: Mock<HarnessContext['writeBlocks']>
   }
   readonly addPlayerStack: (slot: number, item: Parameters<typeof itemStack>[0], count: number) => void
   readonly makeSlot: (region: 'hotbar' | 'main' | 'crafting-grid', index: number) => FakeElement
@@ -179,12 +185,19 @@ export class FakeElement {
   }
 }
 
-export const createPlayerUiRuntimeHarness = (): PlayerUiRuntimeHarness => {
+/**
+ * Builds the runtime over fakes. `overrides` replaces context members; by
+ * default deferred work runs at once, since most tests drive the listeners'
+ * logic rather than the frame-boundary routing.
+ */
+export const createPlayerUiRuntimeHarness = (
+  overrides: Partial<HarnessContext> = {},
+): PlayerUiRuntimeHarness => {
   const state = {
     inventoryOpen: false,
     inventoryMode: 'player' as InventoryMode,
     activeChestId: 'chest-42' as string | undefined,
-    activeChestContainer: null as { readonly slots: ReadonlyArray<ReturnType<typeof itemStack> | null> } | null,
+    activeChestContainer: null as { readonly slots: ReadonlyArray<ItemStack | null> } | null,
     selectedChest: undefined as ChestStorageSlotTarget | undefined,
     chestFocus: { region: 'chest', slot: 0 } as ChestStorageSlotTarget,
     chestStatus: '',
@@ -200,6 +213,10 @@ export const createPlayerUiRuntimeHarness = (): PlayerUiRuntimeHarness => {
     dirtyGeneration: 0,
     savedGeneration: 0,
     debounceTimer: undefined as number | undefined,
+    blocks: new Map<string, number>(),
+    worldWriteFailure: undefined as HarnessWorldWriteFailure | undefined,
+    equipmentActionStatus: '',
+    inventoryClickFailure: undefined as HarnessInventoryClickFailure | undefined,
   }
   const body = new FakeElement()
   let pointerLockElement: object | null = null
@@ -232,9 +249,12 @@ export const createPlayerUiRuntimeHarness = (): PlayerUiRuntimeHarness => {
   const sendFacilityCommand = vi.fn(() => true)
   const sendInventoryCommand = vi.fn(() => true)
   const requestCrafting = vi.fn()
-  const inventoryService: InventoryInteractionService<HarnessItem, never, StackCount> = {
-    add: () => Effect.succeed(0),
-    click: () => Effect.succeed({ _tag: 'NoChange', carried: undefined }),
+  const writeBlocks = vi.fn<HarnessContext['writeBlocks']>(() =>
+    state.worldWriteFailure === undefined ? Effect.void : Effect.fail(state.worldWriteFailure))
+  const inventoryService: InventoryInteractionInventory = {
+    click: () => state.inventoryClickFailure === undefined
+      ? Effect.succeed({ _tag: 'NoChange', carried: undefined })
+      : Effect.fail(state.inventoryClickFailure),
     snapshot: Effect.sync(() => ({
       slots: state.storage.inventory.slots.map((stack) => stack ?? undefined),
     })),
@@ -242,6 +262,7 @@ export const createPlayerUiRuntimeHarness = (): PlayerUiRuntimeHarness => {
     craft: () => Effect.succeed({ _tag: 'NoMatch' }),
   }
   const context: HarnessContext = {
+    deferToFrameBoundary: (work) => work(),
     document: document as unknown as Document,
     window,
     canvas,
@@ -270,14 +291,17 @@ export const createPlayerUiRuntimeHarness = (): PlayerUiRuntimeHarness => {
     restorePlayerForDimension: () => Effect.succeed(undefined),
     getOrCreateDimensionChunkContext: (() => ({})) as unknown as HarnessContext['getOrCreateDimensionChunkContext'],
     getPlayerPose: () => Effect.succeed({
-      feetPosition: { x: 0, y: 64, z: 0 },
+      feetPosition: position(PositionAxis(0), PositionAxis(64), PositionAxis(0)),
       yawRadians: 0,
       pitchRadians: 0,
     }),
-    readBlockAt: () => Effect.succeed({ _tag: 'Unavailable' }),
+    readBlockAt: (cell) => Effect.sync(() => {
+      const block = state.blocks.get(`${String(cell.x)},${String(cell.y)},${String(cell.z)}`)
+      return block === undefined ? { _tag: 'Unavailable' } : { _tag: 'Block', block }
+    }),
     getEntitiesForExplosion: () => [],
-    setBlockAt: vi.fn(),
     setBlockEffect: () => Effect.succeed(undefined),
+    writeBlocks,
     resolveExplosionEffects: vi.fn(),
     getActiveSeed: () => 0,
     endPortalFrames: new Map(),
@@ -326,8 +350,8 @@ export const createPlayerUiRuntimeHarness = (): PlayerUiRuntimeHarness => {
     setInventoryFocus: vi.fn(),
     setFurnaceFocus: (slot) => { state.furnaceFocus = slot },
     setFurnaceStatus: (status) => { state.furnaceStatus = status },
-    getEquipmentActionStatus: () => '',
-    setEquipmentActionStatus: vi.fn(),
+    getEquipmentActionStatus: () => state.equipmentActionStatus,
+    setEquipmentActionStatus: (status) => { state.equipmentActionStatus = status },
     getInventoryDragSource: () => undefined,
     setInventoryDragSource: vi.fn(),
     getMultiplayerInventorySelection: () => state.multiplayerInventorySelection,
@@ -342,7 +366,7 @@ export const createPlayerUiRuntimeHarness = (): PlayerUiRuntimeHarness => {
     setEnchantmentSeed: vi.fn(),
     getVitalsSnapshot: () => ({ totalExperience: 0 }),
     getInventorySnapshot: () => Effect.sync(() => state.storage.inventory),
-    restoreVitalsAtExperience: vi.fn(),
+    restoreVitalsAtExperience: vi.fn(() => Result.succeed(undefined)),
     setAnvilName: vi.fn(),
     setAnvilStatus: vi.fn(),
     setEnchantingStatus: vi.fn(),
@@ -393,13 +417,15 @@ export const createPlayerUiRuntimeHarness = (): PlayerUiRuntimeHarness => {
     saveSession: async () => {},
     saveDebounceMs: 1,
     renderCrosshair: vi.fn(),
+    ...overrides,
   }
 
   vi.stubGlobal('Element', FakeElement)
   const runtime = createPlayerUiRuntime(context)
   const addPlayerStack = (slot: number, item: Parameters<typeof itemStack>[0], count: number): void => {
     const inventory = [...state.storage.inventory.slots]
-    inventory[slot] = itemStack(item, count)
+    // Harness callers pass valid stacks; an invalid one is a broken test fixture.
+    inventory[slot] = Result.getOrThrow(itemStack(item, count))
     state.storage = { ...state.storage, inventory: { ...state.storage.inventory, slots: inventory } }
   }
   const makeSlot = (region: 'hotbar' | 'main' | 'crafting-grid', index: number): FakeElement => {
@@ -442,7 +468,7 @@ export const createPlayerUiRuntimeHarness = (): PlayerUiRuntimeHarness => {
     runtime,
     elements: { body, document, inventoryParent, touchControlsParent, swimmingHud, canvas, requestedFrames },
     views: { inventoryView, furnaceView, chestView, anvilView, enchantingView, renderHud },
-    calls: { sendFacilityCommand, sendInventoryCommand, requestCrafting },
+    calls: { sendFacilityCommand, sendInventoryCommand, requestCrafting, writeBlocks },
     addPlayerStack,
     makeSlot,
     makeChestSlot,

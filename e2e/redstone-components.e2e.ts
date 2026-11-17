@@ -1,5 +1,6 @@
 import { expect, test, type Page } from '@playwright/test'
 
+import { callQa, callQaWithFrames } from './helpers/qa'
 import { startGameSession } from './helpers/session'
 import { waitForSimulationProgress } from './helpers/simulation-wait'
 
@@ -25,36 +26,14 @@ type RedstoneSnapshot = {
   pressurePlateLamp: number | null
 }
 
-const callQa = async <Result>(page: Page, command: string): Promise<Result> =>
-  page.evaluate((commandName) => {
-    const qa = (globalThis as unknown as Record<string, unknown>)['__NERIMA_GAMES_QA__'] as
-      | Record<string, () => unknown>
-      | undefined
-    const operation = qa?.[commandName]
-    if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
-    return operation() as Result
-  }, command)
-
 const useTargetedBlock = async (page: Page): Promise<void> => {
   await page.mouse.down({ button: 'right' })
   await page.waitForTimeout(50)
   await page.mouse.up({ button: 'right' })
 }
 
-const readRedstoneSnapshot = (
-  page: Page,
-): Promise<{ frames: number; value: RedstoneSnapshot }> =>
-  page.evaluate((commandName) => {
-    const qa = (globalThis as unknown as Record<string, unknown>)['__NERIMA_GAMES_QA__'] as
-      | Record<string, () => unknown>
-      | undefined
-    const operation = qa?.[commandName]
-    if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
-    return {
-      frames: Number(document.body.getAttribute('data-frames')),
-      value: operation() as RedstoneSnapshot,
-    }
-  }, 'gameplay.redstoneFixturesSnapshot')
+const readRedstoneSnapshot = (page: Page): Promise<{ frames: number; value: RedstoneSnapshot }> =>
+  callQaWithFrames(page, 'gameplay.redstoneFixturesSnapshot')
 
 test('redstone components place, activate, tick, and emit host transitions', async ({ page }) => {
   await startGameSession(page, 'redstone-components-e2e')

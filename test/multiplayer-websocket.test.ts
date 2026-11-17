@@ -152,7 +152,7 @@ describe('browser websocket transport', () => {
       'normal-frame',
     ])
     expect(saved).toEqual(['new-token'])
-    expect(Array.from(await Effect.runPromise(Queue.takeAll(transport.inbound)))).toEqual([])
+    expect(Array.from(await Effect.runPromise(Queue.clear(transport.inbound)))).toEqual([])
   })
 
   it('omits an unavailable resume token while preserving unauthenticated compatibility', async () => {
@@ -305,7 +305,7 @@ describe('browser websocket transport', () => {
     })
 
     expect(saved).toEqual(['first'])
-    expect(Array.from(await Effect.runPromise(Queue.takeAll(transport.inbound)))).toEqual([])
+    expect(Array.from(await Effect.runPromise(Queue.clear(transport.inbound)))).toEqual([])
   })
 
   it('fails sends after close, error, or resume setup failure', async () => {
@@ -395,21 +395,21 @@ describe('browser websocket transport', () => {
     socket.emit('message', { data: JSON.stringify(craftingFrames[0]) })
     socket.emit('message', { data: JSON.stringify(craftingFrames[1]) })
 
-    expect(Array.from(await Effect.runPromise(Queue.takeAll(transport.inbound)))).toEqual([
+    expect(Array.from(await Effect.runPromise(Queue.clear(transport.inbound)))).toEqual([
       'first',
       'second',
       'third',
     ])
-    expect(Array.from(await Effect.runPromise(Queue.takeAll(transport.sleepInbound)))).toEqual(
+    expect(Array.from(await Effect.runPromise(Queue.clear(transport.sleepInbound)))).toEqual(
       sleepFrames,
     )
-    expect(Array.from(await Effect.runPromise(Queue.takeAll(transport.witherInbound)))).toEqual(
+    expect(Array.from(await Effect.runPromise(Queue.clear(transport.witherInbound)))).toEqual(
       witherFrames,
     )
-    expect(Array.from(await Effect.runPromise(Queue.takeAll(transport.playerDamageInbound)))).toEqual(
+    expect(Array.from(await Effect.runPromise(Queue.clear(transport.playerDamageInbound)))).toEqual(
       playerDamageFrames,
     )
-    expect(Array.from(await Effect.runPromise(Queue.takeAll(transport.craftingInbound)))).toEqual(
+    expect(Array.from(await Effect.runPromise(Queue.clear(transport.craftingInbound)))).toEqual(
       craftingFrames,
     )
   })
@@ -485,9 +485,9 @@ describe('browser websocket transport', () => {
     expect(socket.closes).toEqual([[1000, 'transport disposed']])
     expect(socket.listenerCount()).toBe(0)
     expect(transport.state()).toBe('closed')
-    expect(await Effect.runPromise(Queue.isShutdown(transport.inbound))).toBe(true)
-    expect(await Effect.runPromise(Queue.isShutdown(transport.playerDamageInbound))).toBe(true)
-    expect(await Effect.runPromise(Queue.isShutdown(transport.craftingInbound))).toBe(true)
+    expect(transport.inbound.state._tag).toBe('Done')
+    expect(transport.playerDamageInbound.state._tag).toBe('Done')
+    expect(transport.craftingInbound.state._tag).toBe('Done')
   })
 
   it('reports construction and invalid capacity failures as typed errors', async () => {

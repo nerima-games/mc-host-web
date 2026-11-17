@@ -1,7 +1,8 @@
 import { ESCAPE_KEY_CODE, type InputAction, type InputSnapshot } from '@nerima-games/mc-render'
 import type { DeltaTimeSecs, MonotonicTimeSecs } from '@nerima-games/mc-kernel'
-import { Effect } from 'effect'
+import { Effect, Result } from 'effect'
 
+import { gamepadLookDelta } from '../gamepad-input'
 import type { H5aFrameInputContext, H5aFrameInputResult } from './h5a-context'
 
 export type FrameTiming = {
@@ -21,14 +22,42 @@ export const readFrameTiming = (
   return { raw, deltaSecs: clampDelta(raw) }
 }
 
+export const applyFrameLook = (
+  context: H5aFrameInputContext,
+  frameInput: InputSnapshot,
+  frameDeltaSecs: DeltaTimeSecs,
+): boolean => {
+  const { state } = context
+  const consumedTouchLook = context.touchLook.consume(state.touchLookState.get())
+  state.touchLookState.set(consumedTouchLook.state)
+  if (
+    frameInput.justPressed.has(ESCAPE_KEY_CODE) || context.paused() || context.playerIsDead()
+    || state.inventoryOpen.get() || state.tradeOpen.get() || state.brewingOpen.get()
+  ) {
+    return false
+  }
+
+  const gamepadLook = gamepadLookDelta(frameInput.gamepadAxes, frameDeltaSecs)
+  // Pointer and touch are accumulated pixel deltas; only the gamepad is a rate.
+  const lookDelta = {
+    x: frameInput.pointerDelta.x + consumedTouchLook.delta.positionX + gamepadLook.x,
+    y: frameInput.pointerDelta.y + consumedTouchLook.delta.positionY + gamepadLook.y,
+  }
+  const looked = lookDelta.x !== 0 || lookDelta.y !== 0
+  const { sensitivity } = context.playerSettings()
+  Effect.runSync(context.playerApi.look(
+    -lookDelta.x * context.lookSensitivity * sensitivity,
+    -lookDelta.y * context.lookSensitivity * sensitivity,
+  ))
+  return looked
+}
+
 export const runTickFrameInput = (
   context: H5aFrameInputContext,
   nowSecs: MonotonicTimeSecs,
   frameInput: InputSnapshot,
 ): H5aFrameInputResult | undefined => {
   const { inputApi, state } = context
-  const consumedTouchLook = context.touchLook.consume(state.touchLookState.get())
-  state.touchLookState.set(consumedTouchLook.state)
 
   if (frameInput.justPressed.has(ESCAPE_KEY_CODE)) {
     context.handlePauseRequest()
@@ -62,21 +91,9 @@ export const runTickFrameInput = (
   }
 
   const walk = frameInput
-  const healthBeforeHungerTick = Effect.runSync(context.world.vitals.view).healthPoints
-  const hungerOutcome = context.isCreativeMode || context.multiplayer !== undefined
-    ? undefined
-    : context.survivalHunger.tick(timing.deltaSecs)
-  if (healthBeforeHungerTick > 0 && context.playerIsDead() && context.multiplayer === undefined) {
-    context.handleLocalPlayerDeath()
-  }
-  if (
-    hungerOutcome !== undefined && (
-      hungerOutcome.exhaustionAdded > 0 ||
-      hungerOutcome.foodTicks > 0 ||
-      hungerOutcome.regeneratedHealth > 0 ||
-      hungerOutcome.starvationDamage > 0
-    )
-  ) context.markSessionDirty()
+  // Hunger is ticked by mx-gameplay's survival-hunger stage inside the frame
+  // (I4); its starvation death and save marking are handled after `runFrame`
+  // in `runTickPlayerMovement`.
   state.simulationElapsedSecs.set(state.simulationElapsedSecs.get() + timing.deltaSecs)
 
   const dead = context.playerIsDead()
@@ -90,7 +107,7 @@ export const runTickFrameInput = (
   if (
     !dead &&
     !context.bowInteractionLocked() &&
-    Effect.runSync(inputApi.wasActionJustTriggered('openInventory'))
+    Effect.runSync(inputApi.wasActionJustTriggered('openInventory', frameInput))
   ) {
     context.setInventoryOpen(!state.inventoryOpen.get(), 'player')
   }
@@ -99,8 +116,9 @@ export const runTickFrameInput = (
     const nextHotbarIndex = context.selectedHotbarAfterInput(
       state.selectedHotbarIndex.get(),
       walk.wheelSteps,
-      (action) => Effect.runSync(inputApi.wasActionJustTriggered(action)),
-      context.wrapHotbarSelection,
+      (action) => Effect.runSync(inputApi.wasActionJustTriggered(action, frameInput)),
+      // Selection and wheel steps come from validated local input; nine slots is fixed.
+      (current, steps, size) => Result.getOrThrow(context.wrapHotbarSelection(current, steps, size)),
     )
     if (nextHotbarIndex !== state.selectedHotbarIndex.get()) {
       // Optimistic: the selection is purely local UI focus (which slot
@@ -118,7 +136,7 @@ export const runTickFrameInput = (
 
   const held = (action: InputAction): number =>
     !dead && !state.inventoryOpen.get() && !state.tradeOpen.get() && !state.brewingOpen.get()
-      && Effect.runSync(inputApi.isActionActive(action)) ? 1 : 0
+      && Effect.runSync(inputApi.isActionActive(action, frameInput)) ? 1 : 0
   state.vehicleControls.set({
     throttle: held('moveForward') - held('moveBackward'),
     steering: held('moveRight') - held('moveLeft'),
@@ -128,9 +146,9 @@ export const runTickFrameInput = (
   if (queuedNativeAttack) context.resetPrimaryAttackGesture()
   const attackTriggered =
     !dead && !state.inventoryOpen.get() && !state.tradeOpen.get() && !state.brewingOpen.get()
-    && (Effect.runSync(inputApi.wasActionJustTriggered('attack')) || queuedNativeAttack)
+    && (Effect.runSync(inputApi.wasActionJustTriggered('attack', frameInput)) || queuedNativeAttack)
   if (attackTriggered && !context.isCreativeMode) {
-    if (context.multiplayer === undefined) context.survivalHunger.submit({ _tag: 'attack', count: 1 })
+    if (context.multiplayer === undefined) Effect.runSync(context.survivalHunger.submit({ _tag: 'attack', count: 1 }))
     else context.sendVitalsCommand({ _tag: 'activity', activity: 'attack', amount: 1 })
   }
   const attackHeld = held('attack') > 0 || queuedNativeAttack
@@ -144,20 +162,8 @@ export const runTickFrameInput = (
     : { triggered: false, state: state.nativeInputQueue.get() }
   state.nativeInputQueue.set(nativeUse.state)
   const useTriggered = canUse
-    && (Effect.runSync(inputApi.wasActionJustTriggered('use')) || nativeUse.triggered)
+    && (Effect.runSync(inputApi.wasActionJustTriggered('use', frameInput)) || nativeUse.triggered)
   const useHeld = held('use') > 0
-  const lookDelta = {
-    x: walk.pointerDelta.x + consumedTouchLook.delta.positionX,
-    y: walk.pointerDelta.y + consumedTouchLook.delta.positionY,
-  }
-  const looked = !dead && !state.inventoryOpen.get() && !state.tradeOpen.get() && !state.brewingOpen.get()
-    && (lookDelta.x !== 0 || lookDelta.y !== 0)
-  if (!dead && !state.inventoryOpen.get() && !state.tradeOpen.get() && !state.brewingOpen.get()) {
-    Effect.runSync(context.playerApi.look(
-      -lookDelta.x * context.lookSensitivity * context.playerSettings.sensitivity,
-      -lookDelta.y * context.lookSensitivity * context.playerSettings.sensitivity,
-    ))
-  }
 
   return {
     nowSecs,
@@ -170,6 +176,6 @@ export const runTickFrameInput = (
     canUse,
     useTriggered,
     useHeld,
-    looked,
+    looked: false,
   }
 }

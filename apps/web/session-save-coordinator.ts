@@ -1,6 +1,52 @@
+import { Data, Effect, type Schema } from 'effect'
+import type { YieldableError } from 'effect/Cause'
+import { StorageError } from '@nerima-games/mc-save'
 import { chunkSnapshotOf } from '@nerima-games/mc-worldgen'
+import {
+  CropSnapshotSchema,
+  PlayerServiceSnapshotSchema,
+  PlayerStorageSnapshotSchema,
+  type ReplicatedOwnerUnknown,
+  type WorldCommitCoordinatorApi,
+} from '@nerima-games/mc-sim'
+import {
+  ExperienceOrbVitalsOwnerSnapshotSchema,
+  GAMEPLAY_CROPS_OWNER_ID,
+  GameplayEntityRosterSchema,
+  type GameplayEntityRoster,
+} from '@nerima-games/mx-gameplay'
 
-import type { DimensionChunk } from './session-persistence'
+import { poseOfPlayerOwner, type OwnerBackedOwnerIds } from './owner-backed-services'
+import { SessionIncompatibleError, type DimensionChunk, type SessionState } from './session-persistence'
+
+/** The saved fields whose source of truth is a coordinator owner. */
+export type OwnedSessionState = Pick<SessionState, 'dimension' | 'player' | 'storage' | 'vitals' | 'entities' | 'crops'>
+
+/**
+ * Read the owner-held part of a save straight from the owners, so a save
+ * records what the stages and the host views committed. Entities are split
+ * back into the saved per-dimension rosters by `entityRostersOf`.
+ */
+export const snapshotOwnedSessionState = (
+  coordinator: Pick<WorldCommitCoordinatorApi, 'snapshot'>,
+  ownerIds: OwnerBackedOwnerIds,
+  entityRostersOf: (owner: GameplayEntityRoster) => SessionState['entities'],
+): Effect.Effect<OwnedSessionState, Schema.SchemaError | ReplicatedOwnerUnknown> =>
+  Effect.gen(function* () {
+    const player = (yield* coordinator.snapshot(ownerIds.player, PlayerServiceSnapshotSchema)).state
+    const storage = yield* coordinator.snapshot(ownerIds.playerStorage, PlayerStorageSnapshotSchema)
+    const vitals = yield* coordinator.snapshot(ownerIds.vitals, ExperienceOrbVitalsOwnerSnapshotSchema)
+    const entities = yield* coordinator.snapshot(ownerIds.entities, GameplayEntityRosterSchema)
+    const crops = yield* coordinator.snapshot(GAMEPLAY_CROPS_OWNER_ID, CropSnapshotSchema)
+    return {
+      dimension: player.pose.feetPosition.dimension,
+      player: poseOfPlayerOwner(player),
+      storage: storage.state,
+      vitals: vitals.state.vitals,
+      entities: entityRostersOf(entities.state),
+      crops: crops.state,
+    }
+  })
 
 export type SessionSavePublication<State> = {
   readonly state: State
@@ -18,10 +64,49 @@ export type SessionSaveCoordinatorOptions<State> = {
   readonly initialKnownChunks: Iterable<DimensionChunk>
   readonly snapshotResidents: () => Promise<ReadonlyArray<DimensionChunk>>
   readonly currentGeneration: () => number
-  readonly snapshotState: () => State
+  /** Asynchronous so the host can take it under the frame lock instead of mid-frame. */
+  readonly snapshotState: () => Promise<State>
   readonly publish: (publication: SessionSavePublication<State>) => Promise<void>
   readonly onPublished?: (generation: number) => void
   readonly onFailure?: (error: unknown) => void
+}
+
+type SessionSnapshotUnstableErrorFields = {
+  readonly attempts: number
+}
+
+/** The world kept changing while a save captured it, so no consistent cut was published. */
+export type SessionSnapshotUnstableError = YieldableError &
+  SessionSnapshotUnstableErrorFields & { readonly _tag: 'SessionSnapshotUnstableError' }
+
+export const SessionSnapshotUnstableError: new (
+  fields: SessionSnapshotUnstableErrorFields,
+) => SessionSnapshotUnstableError = Data.TaggedError('SessionSnapshotUnstableError')
+
+export const SESSION_SAVE_INCOMPATIBLE_MESSAGE =
+  'This world was saved by a newer version. Saving is blocked so it is not overwritten.'
+export const SESSION_SAVE_UNSUPPORTED_VERSION_MESSAGE =
+  'This world was saved by an older version that can no longer be opened. Saving is blocked so it is not overwritten.'
+export const SESSION_SAVE_STORAGE_FAILURE_MESSAGE =
+  'The world could not be saved. Your progress since the last save is not stored yet.'
+export const SESSION_SAVE_SNAPSHOT_UNSTABLE_MESSAGE =
+  'The world kept changing while it was being saved. Your progress since the last save is not stored yet.'
+export const SESSION_SAVE_FAILURE_MESSAGE = 'The world could not be saved.'
+
+/**
+ * The player-facing message for a rejection passed to `onFailure`. The
+ * rejection is `unknown`, so any value outside the classified errors gets the
+ * generic message; this is display text, not a substitute for the error.
+ */
+export const sessionSaveFailureMessage = (error: unknown): string => {
+  if (error instanceof SessionIncompatibleError) {
+    return error.reason === 'future-version'
+      ? SESSION_SAVE_INCOMPATIBLE_MESSAGE
+      : SESSION_SAVE_UNSUPPORTED_VERSION_MESSAGE
+  }
+  if (error instanceof StorageError) return SESSION_SAVE_STORAGE_FAILURE_MESSAGE
+  if (error instanceof SessionSnapshotUnstableError) return SESSION_SAVE_SNAPSHOT_UNSTABLE_MESSAGE
+  return SESSION_SAVE_FAILURE_MESSAGE
 }
 
 const coordId = ({ dimension, chunk }: DimensionChunk): string =>
@@ -69,7 +154,7 @@ export const createSessionSaveCoordinator = <State>(
       const stateGeneration = options.currentGeneration()
       const retainedGeneration = retainedVersion
       const retainedCapture = [...retainedChunks.entries()]
-      const state = options.snapshotState()
+      const state = await options.snapshotState()
       const residents = await options.snapshotResidents()
       if (
         options.currentGeneration() === stateGeneration &&
@@ -80,7 +165,7 @@ export const createSessionSaveCoordinator = <State>(
       }
     }
     if (!validatedSnapshot) {
-      throw new Error(`Unable to capture a consistent save snapshot after ${maxSnapshotAttempts} attempts`)
+      throw new SessionSnapshotUnstableError({ attempts: maxSnapshotAttempts })
     }
     const { retainedCapture, state, stateGeneration, residents } = validatedSnapshot
 

@@ -1,170 +1,141 @@
-import { Effect } from 'effect'
+import { Effect, Result } from 'effect'
+import { RecipeGridDimension, splitItemStack, TransferQuantity } from '@nerima-games/mc-kernel'
+import {
+  itemStack,
+  type CraftGrid,
+  type CraftResult,
+  type InventoryCarriedSlot,
+  type InventoryClickResult,
+  type ItemStack,
+  type ItemStackFailure,
+  type PlayerStorageFailure,
+  type RecipeMatch,
+  type Slot,
+} from '@nerima-games/mc-sim'
 
-export type InteractionStack<Item, Count extends number = number> = {
-  readonly item: Item
-  readonly count: Count
-}
+import type {
+  OwnerBackedInventory,
+  OwnerBackedInventorySyncError,
+  OwnerBackedInventoryWriteError,
+} from './owner-backed-services'
 
-export type InteractionSlot<Item, Count extends number = number> =
-  | InteractionStack<Item, Count>
-  | undefined
+export type InventoryInteractionError = ItemStackFailure | PlayerStorageFailure | OwnerBackedInventoryWriteError
 
-export type InteractionInventory<Item, Count extends number = number> = {
-  readonly slots: ReadonlyArray<InteractionSlot<Item, Count>>
-}
+type InventoryInteractionReadError = ItemStackFailure | OwnerBackedInventorySyncError
 
-export type InteractionCraftGrid<Item, Count extends number = number> = {
-  readonly width: number
-  readonly height: number
-  readonly cells: ReadonlyArray<InteractionSlot<Item, Count>>
-}
+/**
+ * The part of the inventory the interaction controller calls, as the
+ * owner-backed view types it (mc-sim's `InventoryServiceApi` also fits).
+ */
+export type InventoryInteractionInventory = Pick<
+  OwnerBackedInventory,
+  'click' | 'snapshot' | 'previewCraft' | 'craft'
+>
 
-export type InteractionRecipeMatch<Item, Recipe, Count extends number = number> =
-  | {
-      readonly _tag: 'Match'
-      readonly recipe: Recipe
-      readonly output: InteractionStack<Item, Count>
-    }
-  | { readonly _tag: 'NoMatch' }
-
-export type InteractionCraftResult<Item, Count extends number = number> =
-  | {
-      readonly _tag: 'Crafted'
-      readonly recipeId: string
-      readonly output: InteractionStack<Item, Count>
-    }
-  | { readonly _tag: 'NoMatch' }
-  | {
-      readonly _tag: 'MissingIngredients'
-      readonly missing: ReadonlyArray<{
-        readonly item: Item
-        readonly short: number
-      }>
-    }
-  | { readonly _tag: 'NoRoom' }
-
-export type InventoryInteractionClick<Item, Count extends number = number> =
-  | {
-      readonly _tag: 'LeftClick'
-      readonly slotIndex: number
-      readonly carried: InteractionSlot<Item, Count>
-    }
-  | {
-      readonly _tag: 'RightClick'
-      readonly slotIndex: number
-      readonly carried: InteractionSlot<Item, Count>
-    }
-
-export type InventoryInteractionClickResult<Item, Count extends number = number> = {
-  readonly _tag:
-    | 'PickedUp'
-    | 'Placed'
-    | 'Merged'
-    | 'Swapped'
-    | 'NoChange'
-    | 'InvalidSlot'
-    | 'InvalidCount'
-  readonly carried: InteractionSlot<Item, Count>
-}
-
-export type InventoryInteractionService<Item, Recipe, Count extends number = number> = {
-  readonly add: (item: Item, count: number) => Effect.Effect<number>
-  readonly click: (
-    click: InventoryInteractionClick<Item, Count>,
-  ) => Effect.Effect<InventoryInteractionClickResult<Item, Count>>
-  readonly snapshot: Effect.Effect<InteractionInventory<Item, Count>>
-  readonly previewCraft: (
-    grid: InteractionCraftGrid<Item, Count>,
-  ) => Effect.Effect<InteractionRecipeMatch<Item, Recipe, Count>>
-  readonly craft: (
-    grid: InteractionCraftGrid<Item, Count>,
-  ) => Effect.Effect<InteractionCraftResult<Item, Count>>
-}
-
-export type InventoryInteractionState<Item, Recipe, Count extends number = number> = {
+export type InventoryInteractionState = {
   /** Canonical inventory stack held by the pointer. Kept separate from crafting drafts. */
-  readonly inventoryCarried: InteractionSlot<Item, Count>
-  readonly carried: InteractionSlot<Item, Count>
-  readonly grid: InteractionCraftGrid<Item, Count>
-  readonly preview: InteractionRecipeMatch<Item, Recipe, Count> | undefined
-  readonly status: InteractionCraftResult<Item, Count> | undefined
+  readonly inventoryCarried: InventoryCarriedSlot
+  readonly carried: Slot
+  readonly grid: CraftGrid
+  readonly preview: RecipeMatch | undefined
+  readonly status: CraftResult | undefined
 }
 
-export type InventoryInteractionController<Item, Recipe, Count extends number = number> = {
-  readonly state: () => InventoryInteractionState<Item, Recipe, Count>
+export type InventoryInteractionController = {
+  readonly state: () => InventoryInteractionState
   readonly configureGrid: (
-    width: number,
-    height: number,
-  ) => InventoryInteractionState<Item, Recipe, Count>
+    width: RecipeGridDimension,
+    height: RecipeGridDimension,
+  ) => InventoryInteractionState
   readonly pickupInventoryItem: (
     inventoryIndex: number,
-  ) => Effect.Effect<InventoryInteractionState<Item, Recipe, Count>>
+  ) => Effect.Effect<InventoryInteractionState, InventoryInteractionReadError>
   readonly clickInventoryItem: (
     inventoryIndex: number,
     button: 'left' | 'right',
-  ) => Effect.Effect<InventoryInteractionState<Item, Recipe, Count>>
+  ) => Effect.Effect<InventoryInteractionState, InventoryInteractionError>
   readonly interactCraftingCell: (
     cellIndex: number,
-  ) => InventoryInteractionState<Item, Recipe, Count>
+  ) => InventoryInteractionState
   readonly interactCraftingCellFromInventory: (
     cellIndex: number,
-  ) => Effect.Effect<InventoryInteractionState<Item, Recipe, Count>>
-  readonly preview: () => Effect.Effect<InventoryInteractionState<Item, Recipe, Count>>
-  readonly craftOnce: () => Effect.Effect<InventoryInteractionState<Item, Recipe, Count>>
-  readonly confirmCraftOnce: () => Effect.Effect<InventoryInteractionState<Item, Recipe, Count>>
-  readonly reset: () => InventoryInteractionState<Item, Recipe, Count>
-  readonly close: () => Effect.Effect<InventoryInteractionState<Item, Recipe, Count>>
+  ) => Effect.Effect<InventoryInteractionState, InventoryInteractionError>
+  readonly preview: () => Effect.Effect<InventoryInteractionState>
+  readonly craftOnce: () => Effect.Effect<InventoryInteractionState, InventoryInteractionError>
+  readonly confirmCraftOnce: () => Effect.Effect<InventoryInteractionState, ItemStackFailure>
+  readonly reset: () => InventoryInteractionState
+  readonly close: () => Effect.Effect<InventoryInteractionState, InventoryInteractionError>
 }
 
-export type InventoryInteractionTransition<Item, Count extends number = number> = {
+export type InventoryInteractionTransition = {
   readonly slotIndex: number
-  readonly slotBefore: InteractionSlot<Item, Count>
-  readonly carriedBefore: InteractionSlot<Item, Count>
-  readonly result: InventoryInteractionClickResult<Item, Count>
+  readonly slotBefore: Slot
+  readonly carriedBefore: InventoryCarriedSlot
+  readonly result: InventoryClickResult
 }
 
-export type InventoryInteractionOptions<Item, Count extends number = number> = {
+export type InventoryInteractionOptions = {
   readonly canInventoryClick?: (
-    transition: Omit<InventoryInteractionTransition<Item, Count>, 'result'>,
+    transition: Omit<InventoryInteractionTransition, 'result'>,
   ) => boolean
   readonly consumeCraftingGrid?: boolean
   readonly onCrafted?: () => void
   readonly onInventoryChanged?: () => void
   readonly onInventoryReset?: () => void
   readonly onInventoryTransition?: (
-    transition: InventoryInteractionTransition<Item, Count>,
+    transition: InventoryInteractionTransition,
   ) => void
 }
 
-const emptyGrid = <Item, Count extends number>(
-  width = 2,
-  height = 2,
-): InteractionCraftGrid<Item, Count> => ({
+const PLAYER_GRID_SIDE = RecipeGridDimension(2)
+const ONE_ITEM = TransferQuantity(1)
+
+const emptyGrid = (
+  width = PLAYER_GRID_SIDE,
+  height = PLAYER_GRID_SIDE,
+): CraftGrid => ({
   width,
   height,
   cells: Array.from({ length: width * height }, () => undefined),
 })
 
-const oneItem = <Item, Count extends number>(
-  stack: InteractionStack<Item, Count>,
-): InteractionStack<Item, Count> => ({
-  item: stack.item,
-  count: 1 as Count,
-})
+// mc-kernel's `splitItemStack` accepts only `{ item, count, components }`
+// (item-stack.js `itemStackSnapshot` passes the allowed fields to
+// `snapshotInputRecord`, which rejects any other field). mc-sim carried stacks may
+// add `durability`, so split a canonical projection rebuilt by mc-sim's
+// `itemStack` with the same components. `CraftGrid.cells` are mc-kernel `Slot`s,
+// which have no `durability` field, so draft cells do not keep it.
+const splitOne = (
+  stack: ItemStack,
+): Result.Result<{ readonly taken: ItemStack; readonly remainder: Slot }, ItemStackFailure> =>
+  Result.flatMap(
+    itemStack(stack.item, stack.count, { components: stack.components }),
+    (canonical) => splitItemStack(canonical, ONE_ITEM),
+  )
 
-const cloneState = <Item, Recipe, Count extends number>(
-  current: InventoryInteractionState<Item, Recipe, Count>,
-): InventoryInteractionState<Item, Recipe, Count> => ({
+const oneItem = (stack: ItemStack): Result.Result<ItemStack, ItemStackFailure> =>
+  Result.map(splitOne(stack), ({ taken }) => taken)
+
+const consumeOneFromEachCell = (grid: CraftGrid): Result.Result<CraftGrid, ItemStackFailure> =>
+  Result.map(
+    Result.all(grid.cells.map((cell): Result.Result<Slot, ItemStackFailure> =>
+      cell === undefined
+        ? Result.succeed(undefined)
+        : Result.map(splitOne(cell), ({ remainder }) => remainder))),
+    (cells) => ({ ...grid, cells }),
+  )
+
+const cloneState = (current: InventoryInteractionState): InventoryInteractionState => ({
   ...current,
   grid: { ...current.grid, cells: [...current.grid.cells] },
 })
 
-export const createInventoryInteraction = <Item, Recipe, Count extends number = number>(
-  service: InventoryInteractionService<Item, Recipe, Count>,
-  options: InventoryInteractionOptions<Item, Count> = {},
-): InventoryInteractionController<Item, Recipe, Count> => {
+export const createInventoryInteraction = (
+  service: InventoryInteractionInventory,
+  options: InventoryInteractionOptions = {},
+): InventoryInteractionController => {
   let crafting = false
-  let current: InventoryInteractionState<Item, Recipe, Count> = {
+  let current: InventoryInteractionState = {
     inventoryCarried: undefined,
     carried: undefined,
     grid: emptyGrid(),
@@ -172,16 +143,16 @@ export const createInventoryInteraction = <Item, Recipe, Count extends number = 
     status: undefined,
   }
 
-  const state = (): InventoryInteractionState<Item, Recipe, Count> => cloneState(current)
+  const state = (): InventoryInteractionState => cloneState(current)
+
+  const craftedGrid = (grid: CraftGrid): Result.Result<CraftGrid, ItemStackFailure> =>
+    options.consumeCraftingGrid === true ? consumeOneFromEachCell(grid) : Result.succeed(grid)
 
   const configureGrid = (
-    width: number,
-    height: number,
-  ): InventoryInteractionState<Item, Recipe, Count> => {
+    width: RecipeGridDimension,
+    height: RecipeGridDimension,
+  ): InventoryInteractionState => {
     if (crafting) return state()
-    if (!Number.isInteger(width) || width <= 0 || !Number.isInteger(height) || height <= 0) {
-      throw new RangeError('Crafting grid dimensions must be positive integers')
-    }
     current = {
       inventoryCarried: current.inventoryCarried,
       carried: undefined,
@@ -193,8 +164,8 @@ export const createInventoryInteraction = <Item, Recipe, Count extends number = 
   }
 
   const replaceDraft = (
-    patch: Pick<InventoryInteractionState<Item, Recipe, Count>, 'carried' | 'grid'>,
-  ): InventoryInteractionState<Item, Recipe, Count> => {
+    patch: Pick<InventoryInteractionState, 'carried' | 'grid'>,
+  ): InventoryInteractionState => {
     current = {
       inventoryCarried: current.inventoryCarried,
       ...patch,
@@ -204,7 +175,7 @@ export const createInventoryInteraction = <Item, Recipe, Count extends number = 
     return state()
   }
 
-  const reset = (): InventoryInteractionState<Item, Recipe, Count> => {
+  const reset = (): InventoryInteractionState => {
     if (crafting) return state()
     current = {
       inventoryCarried: undefined,
@@ -219,9 +190,9 @@ export const createInventoryInteraction = <Item, Recipe, Count extends number = 
 
   const applyInventoryClickResult = (
     slotIndex: number,
-    slotBefore: InteractionSlot<Item, Count>,
-    carriedBefore: InteractionSlot<Item, Count>,
-    result: InventoryInteractionClickResult<Item, Count>,
+    slotBefore: Slot,
+    carriedBefore: InventoryCarriedSlot,
+    result: InventoryClickResult,
   ): void => {
     if (
       result._tag !== 'PickedUp' &&
@@ -240,7 +211,7 @@ export const createInventoryInteraction = <Item, Recipe, Count extends number = 
     options.onInventoryChanged?.()
   }
 
-  const returnInventoryCarried = (): Effect.Effect<void> => {
+  const returnInventoryCarried = (): Effect.Effect<void, InventoryInteractionError> => {
     const carriedBefore = current.inventoryCarried
     if (carriedBefore === undefined) return Effect.void
 
@@ -254,7 +225,7 @@ export const createInventoryInteraction = <Item, Recipe, Count extends number = 
       }
 
       const candidates = [...matchingSlots, ...emptySlots]
-      const tryCandidate = (candidateIndex: number): Effect.Effect<void> => {
+      const tryCandidate = (candidateIndex: number): Effect.Effect<void, InventoryInteractionError> => {
         if (candidateIndex >= candidates.length) return Effect.void
 
         const slotIndex = candidates[candidateIndex]!
@@ -282,18 +253,21 @@ export const createInventoryInteraction = <Item, Recipe, Count extends number = 
 
   const pickupInventoryItem = (
     inventoryIndex: number,
-  ): Effect.Effect<InventoryInteractionState<Item, Recipe, Count>> =>
-    Effect.map(service.snapshot, (inventory) => {
-      if (crafting) return state()
+  ): Effect.Effect<InventoryInteractionState, InventoryInteractionReadError> =>
+    Effect.flatMap(service.snapshot, (inventory) => {
+      if (crafting) return Effect.succeed(state())
       const selected = inventory.slots[inventoryIndex]
-      if (selected === undefined || selected.count <= 0) return state()
-      return replaceDraft({ carried: oneItem(selected), grid: current.grid })
+      if (selected === undefined) return Effect.succeed(state())
+      return Effect.map(
+        Effect.fromResult(oneItem(selected)),
+        (carried) => replaceDraft({ carried, grid: current.grid }),
+      )
     })
 
   const clickInventoryItem = (
     inventoryIndex: number,
     button: 'left' | 'right',
-  ): Effect.Effect<InventoryInteractionState<Item, Recipe, Count>> =>
+  ): Effect.Effect<InventoryInteractionState, InventoryInteractionError> =>
     Effect.suspend(() => {
       if (crafting) return Effect.succeed(state())
       return Effect.flatMap(service.snapshot, (inventory) => {
@@ -322,7 +296,7 @@ export const createInventoryInteraction = <Item, Recipe, Count extends number = 
 
   const interactCraftingCell = (
     cellIndex: number,
-  ): InventoryInteractionState<Item, Recipe, Count> => {
+  ): InventoryInteractionState => {
     if (crafting) return state()
     if (!Number.isInteger(cellIndex) || cellIndex < 0 || cellIndex >= current.grid.cells.length) {
       return state()
@@ -339,7 +313,7 @@ export const createInventoryInteraction = <Item, Recipe, Count extends number = 
 
   const interactCraftingCellFromInventory = (
     cellIndex: number,
-  ): Effect.Effect<InventoryInteractionState<Item, Recipe, Count>> => Effect.suspend(() => {
+  ): Effect.Effect<InventoryInteractionState, InventoryInteractionError> => Effect.suspend(() => {
     if (crafting) return Effect.succeed(state())
     const inventoryCarried = current.inventoryCarried
     if (inventoryCarried === undefined) {
@@ -349,15 +323,17 @@ export const createInventoryInteraction = <Item, Recipe, Count extends number = 
       return Effect.succeed(state())
     }
 
-    return Effect.map(returnInventoryCarried(), () => {
-      if (crafting || current.inventoryCarried !== undefined) return state()
-      current = { ...current, carried: oneItem(inventoryCarried) }
-      options.onInventoryChanged?.()
-      return interactCraftingCell(cellIndex)
+    return Effect.flatMap(returnInventoryCarried(), () => {
+      if (crafting || current.inventoryCarried !== undefined) return Effect.succeed(state())
+      return Effect.map(Effect.fromResult(oneItem(inventoryCarried)), (carried) => {
+        current = { ...current, carried }
+        options.onInventoryChanged?.()
+        return interactCraftingCell(cellIndex)
+      })
     })
   })
 
-  const preview = (): Effect.Effect<InventoryInteractionState<Item, Recipe, Count>> => Effect.suspend(() => {
+  const preview = (): Effect.Effect<InventoryInteractionState> => Effect.suspend(() => {
     if (crafting) return Effect.succeed(state())
     const grid = current.grid
     return Effect.map(service.previewCraft(grid), (match) => {
@@ -367,7 +343,7 @@ export const createInventoryInteraction = <Item, Recipe, Count extends number = 
     })
   })
 
-  const craftOnce = (): Effect.Effect<InventoryInteractionState<Item, Recipe, Count>> =>
+  const craftOnce = (): Effect.Effect<InventoryInteractionState, InventoryInteractionError> =>
     Effect.suspend(() => {
       if (crafting) return Effect.succeed(state())
 
@@ -380,29 +356,23 @@ export const createInventoryInteraction = <Item, Recipe, Count extends number = 
             return Effect.succeed(state())
           }
 
-          current = {
-            inventoryCarried: current.inventoryCarried,
-            carried: undefined,
-            grid: options.consumeCraftingGrid === true
-              ? {
-                  ...grid,
-                  cells: grid.cells.map((cell) => {
-                    if (cell === undefined || cell.count <= 1) return undefined
-                    return { ...cell, count: (cell.count - 1) as Count }
-                  }),
-                }
-              : grid,
-            preview: undefined,
-            status: result,
-          }
-          options.onCrafted?.()
+          return Effect.flatMap(Effect.fromResult(craftedGrid(grid)), (nextGrid) => {
+            current = {
+              inventoryCarried: current.inventoryCarried,
+              carried: undefined,
+              grid: nextGrid,
+              preview: undefined,
+              status: result,
+            }
+            options.onCrafted?.()
 
-          return Effect.matchCauseEffect(service.previewCraft(current.grid), {
-            onFailure: () => Effect.succeed(state()),
-            onSuccess: (match) => {
-              current = { ...current, preview: match }
-              return Effect.succeed(state())
-            },
+            return Effect.matchCauseEffect(service.previewCraft(current.grid), {
+              onFailure: () => Effect.succeed(state()),
+              onSuccess: (match) => {
+                current = { ...current, preview: match }
+                return Effect.succeed(state())
+              },
+            })
           })
         }),
         Effect.sync(() => {
@@ -411,17 +381,16 @@ export const createInventoryInteraction = <Item, Recipe, Count extends number = 
       )
     })
 
-  const confirmCraftOnce = (): Effect.Effect<InventoryInteractionState<Item, Recipe, Count>> =>
+  const confirmCraftOnce = (): Effect.Effect<InventoryInteractionState, ItemStackFailure> =>
     Effect.suspend(() => {
       if (crafting) return Effect.succeed(state())
+      const nextGrid = craftedGrid(current.grid)
+      if (Result.isFailure(nextGrid)) return Effect.fail(nextGrid.failure)
       crafting = true
-      const grid = current.grid
       current = {
         inventoryCarried: current.inventoryCarried,
         carried: undefined,
-        grid: options.consumeCraftingGrid === true
-          ? { ...grid, cells: grid.cells.map((cell) => cell === undefined || cell.count <= 1 ? undefined : { ...cell, count: (cell.count - 1) as Count }) }
-          : grid,
+        grid: nextGrid.success,
         preview: undefined,
         status: undefined,
       }
@@ -438,7 +407,7 @@ export const createInventoryInteraction = <Item, Recipe, Count extends number = 
       )
     })
 
-  const close = (): Effect.Effect<InventoryInteractionState<Item, Recipe, Count>> => Effect.suspend(() => {
+  const close = (): Effect.Effect<InventoryInteractionState, InventoryInteractionError> => Effect.suspend(() => {
     if (crafting) return Effect.succeed(state())
     const inventoryCarried = current.inventoryCarried
     if (inventoryCarried === undefined) {

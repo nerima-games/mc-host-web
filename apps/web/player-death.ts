@@ -41,7 +41,8 @@ export const deathDropsFromPlayerStorage = (
     if (stack === undefined) return
     const durability = storage.inventoryDurability[index] ?? null
     drops.push({
-      ...stack,
+      item: stack.item,
+      count: stack.count,
       at,
       durability: durability === null ? null : { ...durability },
       ...metadataForSlot(String(index), stack.item, metadata),

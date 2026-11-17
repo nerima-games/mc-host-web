@@ -1,4 +1,6 @@
 import { describe, expect, it } from '@effect/vitest'
+import { Result } from 'effect'
+import { EnchantmentLevel, PositionAxis, position, type ItemType } from '@nerima-games/mc-kernel'
 
 import {
   emptyPlayerStorage,
@@ -9,12 +11,19 @@ import {
 
 import { deathDropsFromPlayerStorage } from '../apps/web/player-death'
 
+// Fixture literals are in-range stack counts, valid durabilities and finite coordinates.
+const stackOf = (item: ItemType, count: number) => Result.getOrThrow(itemStack(item, count))
+const equipmentItemOf = (...args: Parameters<typeof equipmentItem>) =>
+  Result.getOrThrow(equipmentItem(...args))
+const positionOf = (x: number, y: number, z: number) =>
+  position(PositionAxis(x), PositionAxis(y), PositionAxis(z))
+
 describe('deathDropsFromPlayerStorage', () => {
   it('converts all inventory and equipped items into drops with durability preserved', () => {
     const empty = emptyPlayerStorage()
     const inventorySlots = [...empty.inventory.slots]
-    inventorySlots[0] = itemStack('stone', 12)
-    inventorySlots[7] = itemStack('diamond_pickaxe', 1)
+    inventorySlots[0] = stackOf('stone', 12)
+    inventorySlots[7] = stackOf('diamond_pickaxe', 1)
 
     const storage: PlayerStorage = {
       inventory: { slots: inventorySlots },
@@ -23,15 +32,15 @@ describe('deathDropsFromPlayerStorage', () => {
       ),
       equipment: {
         slots: {
-          head: equipmentItem(itemStack('iron_helmet', 1), { current: 120, max: 165 }),
-          chest: equipmentItem(itemStack('iron_chestplate', 1), { current: 201, max: 240 }),
-          legs: equipmentItem(itemStack('iron_leggings', 1), { current: 180, max: 225 }),
-          feet: equipmentItem(itemStack('iron_boots', 1), { current: 99, max: 195 }),
-          offhand: equipmentItem(itemStack('iron_sword', 1), { current: 140, max: 250 }),
+          head: equipmentItemOf(stackOf('iron_helmet', 1), { current: 120, max: 165 }),
+          chest: equipmentItemOf(stackOf('iron_chestplate', 1), { current: 201, max: 240 }),
+          legs: equipmentItemOf(stackOf('iron_leggings', 1), { current: 180, max: 225 }),
+          feet: equipmentItemOf(stackOf('iron_boots', 1), { current: 99, max: 195 }),
+          offhand: equipmentItemOf(stackOf('iron_sword', 1), { current: 140, max: 250 }),
         },
       },
     }
-    const at = { x: 4.5, y: 65, z: -2.25 }
+    const at = positionOf(4.5, 65, -2.25)
 
     const drops = deathDropsFromPlayerStorage(storage, at)
 
@@ -48,14 +57,14 @@ describe('deathDropsFromPlayerStorage', () => {
   })
 
   it('ignores empty inventory and equipment slots', () => {
-    expect(deathDropsFromPlayerStorage(emptyPlayerStorage(), { x: 0, y: 64, z: 0 }))
+    expect(deathDropsFromPlayerStorage(emptyPlayerStorage(), positionOf(0, 64, 0)))
       .toStrictEqual([])
   })
 
   it('associates inventory and equipment metadata with their death drops', () => {
     const empty = emptyPlayerStorage()
     const inventorySlots = [...empty.inventory.slots]
-    inventorySlots[3] = itemStack('diamond_pickaxe', 1)
+    inventorySlots[3] = stackOf('diamond_pickaxe', 1)
     const storage: PlayerStorage = {
       ...empty,
       inventory: { slots: inventorySlots },
@@ -65,23 +74,23 @@ describe('deathDropsFromPlayerStorage', () => {
       equipment: {
         slots: {
           ...empty.equipment.slots,
-          head: equipmentItem(itemStack('iron_helmet', 1), { current: 150, max: 165 }),
+          head: equipmentItemOf(stackOf('iron_helmet', 1), { current: 150, max: 165 }),
         },
       },
     }
 
-    expect(deathDropsFromPlayerStorage(storage, { x: 0, y: 64, z: 0 }, {
+    expect(deathDropsFromPlayerStorage(storage, positionOf(0, 64, 0), {
       customNames: { '3': 'Fortune Miner', 'equipment:head': 'Deep Guard' },
       enchantedItems: {
         '3': {
           item: 'diamond_pickaxe',
           durability: { current: 1500, max: 1561 },
-          enchantments: [{ id: 'fortune', level: 3 }],
+          enchantments: [{ id: 'fortune', level: EnchantmentLevel(3) }],
         },
         'equipment:head': {
           item: 'iron_helmet',
           durability: { current: 150, max: 165 },
-          enchantments: [{ id: 'protection', level: 4 }],
+          enchantments: [{ id: 'protection', level: EnchantmentLevel(4) }],
         },
       },
     })).toStrictEqual([

@@ -11,14 +11,15 @@ import type {
   GameplayFrameState,
   MobBehaviour,
   FishingSession,
+  SurvivalHungerRuntimeApi,
 } from '@nerima-games/mx-gameplay'
 import type { InputAction, InputServiceApi, InputSnapshot } from '@nerima-games/mc-render'
 import type { Effect } from 'effect'
 
-import type { DimensionChunkContext } from '../chunk-streaming'
+import type { ChunkRenderFailure, DimensionChunkContext } from '../chunk-streaming'
 import type { MultiplayerRuntime } from '../multiplayer-client'
 import type { PlayerSettingsV1 } from '../settings'
-import type { SurvivalHungerCoordinator } from '../survival-hunger-runtime'
+import type { OwnerBackedWorld } from '../owner-backed-services'
 import type { NativeInputQueueState } from '../native-input-queue'
 import type { PlayerSwimmingRuntimeState } from '../player-swimming-runtime'
 import type { TouchLookControllerState, ConsumedTouchLook } from '../touch-input'
@@ -107,9 +108,11 @@ export type H5aTickContext = {
   readonly multiplayer: MultiplayerRuntime | undefined
   readonly syncRedstoneSnapshot: () => void
   readonly currentChunkContext: () => DimensionChunkContext
-  readonly world: GeneratedWorld<MobBehaviour>
+  readonly world: OwnerBackedWorld
+  /** The owner-backed roster for mx-gameplay helpers that take an exact `EntityManagerApi`. */
+  readonly entityManager: import('@nerima-games/mc-sim').EntityManagerApi<MobBehaviour>
   readonly isCreativeMode: boolean
-  readonly survivalHunger: SurvivalHungerCoordinator
+  readonly survivalHunger: SurvivalHungerRuntimeApi
   readonly playerIsDead: () => boolean
   readonly handleLocalPlayerDeath: () => void
   readonly markSessionDirty: () => void
@@ -134,9 +137,9 @@ export type H5aTickContext = {
     readonly triggered: boolean
     readonly state: NativeInputQueueState
   }
-  readonly playerSettings: PlayerSettingsV1
+  readonly playerSettings: () => PlayerSettingsV1
   readonly lookSensitivity: number
-  readonly playerApi: GeneratedWorld<MobBehaviour>['player']
+  readonly playerApi: OwnerBackedWorld['player']
   readonly simState: SimFrameState
   readonly currentChunkStore: GeneratedWorld<MobBehaviour>['chunkStore']
   readonly blockPosition: (x: number, y: number, z: number) => BlockPosition
@@ -150,7 +153,8 @@ export type H5aTickContext = {
   readonly sprintSpeedMPerSec: number
   readonly getPlayerMovementSpeedMultiplier: (state: GameplayFrameState) => Effect.Effect<number>
   readonly gameplayState: GameplayFrameState
-  readonly time: { readonly timeOfDay: Effect.Effect<number> }
+  readonly time: Pick<import('@nerima-games/mc-sim').TimeServiceApi, 'timeOfDay'>
+  readonly targeting: import('@nerima-games/mx-gameplay').GameplayTargetingSnapshotContext
   readonly weather: { readonly snapshot: Effect.Effect<WeatherState> }
   readonly syncPortalCandidateSnapshots: () => Effect.Effect<void>
   readonly setFishingResult: (result: string) => void
@@ -179,6 +183,7 @@ export type H5aTickContext = {
   readonly drainEnchantingInbound: () => void
   readonly drainPlayerDamageInbound: () => void
   readonly runFrame: (deltaSecs: DeltaTimeSecs) => Effect.Effect<void>
+  readonly drainChunkRenderFaults: () => Effect.Effect<void, ChunkRenderFailure>
   readonly applyPlayerDamage: (damage: { readonly amount: number; readonly cause: 'generic' }) => void
   readonly failBoot: (message: string, error: unknown) => void
   readonly droppedItemLifetime: {
@@ -192,11 +197,6 @@ export type H5aTickContext = {
   readonly droppedItemMetadataKey: (dimension: Dimension, entityId: string) => string
   readonly isDroppedItemBehaviour: typeof import('@nerima-games/mx-gameplay').isDroppedItemBehaviour
 }
-
-type H5aHungerOutcome = Pick<
-  ReturnType<SurvivalHungerCoordinator['tick']>,
-  'exhaustionAdded' | 'foodTicks' | 'regeneratedHealth' | 'starvationDamage'
->
 
 export type H5aFrameInputContext = {
   readonly firstFrameSecs: number
@@ -225,14 +225,9 @@ export type H5aFrameInputContext = {
   readonly observerPulses: H5aTickContext['observerPulses']
   readonly multiplayer: H5aTickContext['multiplayer']
   readonly syncRedstoneSnapshot: () => void
-  readonly world: { readonly vitals: { readonly view: Effect.Effect<{ readonly healthPoints: number }> } }
   readonly isCreativeMode: H5aTickContext['isCreativeMode']
-  readonly survivalHunger: Pick<SurvivalHungerCoordinator, 'submit'> & {
-    readonly tick: (deltaSecs: DeltaTimeSecs) => H5aHungerOutcome
-  }
+  readonly survivalHunger: Pick<SurvivalHungerRuntimeApi, 'submit'>
   readonly playerIsDead: H5aTickContext['playerIsDead']
-  readonly handleLocalPlayerDeath: H5aTickContext['handleLocalPlayerDeath']
-  readonly markSessionDirty: H5aTickContext['markSessionDirty']
   readonly syncTouchControls: H5aTickContext['syncTouchControls']
   readonly setInventoryOpen: H5aTickContext['setInventoryOpen']
   readonly setBrewingOpen: H5aTickContext['setBrewingOpen']
@@ -244,9 +239,9 @@ export type H5aFrameInputContext = {
   readonly resetPrimaryAttackGesture: H5aTickContext['resetPrimaryAttackGesture']
   readonly sendVitalsCommand: H5aTickContext['sendVitalsCommand']
   readonly consumeNativeInput: H5aTickContext['consumeNativeInput']
-  readonly playerSettings: Pick<PlayerSettingsV1, 'sensitivity'>
+  readonly playerSettings: () => Pick<PlayerSettingsV1, 'sensitivity'>
   readonly lookSensitivity: number
-  readonly playerApi: Pick<GeneratedWorld<MobBehaviour>['player'], 'look'>
+  readonly playerApi: Pick<OwnerBackedWorld['player'], 'look'>
 }
 
 export type H5aMovementContext = {
@@ -261,7 +256,7 @@ export type H5aMovementContext = {
     | 'lastPlayerMoveSentAt'
     | 'nextItemUseRequestId'
   >
-  readonly playerApi: Pick<GeneratedWorld<MobBehaviour>['player'], 'pose' | 'dimension' | 'moveTo'>
+  readonly playerApi: Pick<OwnerBackedWorld['player'], 'pose' | 'dimension' | 'moveTo'>
   readonly simState: Pick<SimFrameState, 'isGrounded' | 'movementIntent' | 'jumpIntent' | 'physicsConfig' | 'velocity'>
   readonly currentChunkStore: Pick<GeneratedWorld<MobBehaviour>['chunkStore'], 'getBlock'>
   readonly blockPosition: H5aTickContext['blockPosition']
@@ -300,9 +295,11 @@ export type H5aMovementContext = {
   readonly drainEnchantingInbound: H5aTickContext['drainEnchantingInbound']
   readonly drainPlayerDamageInbound: H5aTickContext['drainPlayerDamageInbound']
   readonly runFrame: H5aTickContext['runFrame']
+  readonly drainChunkRenderFaults: H5aTickContext['drainChunkRenderFaults']
   readonly applyPlayerDamage: H5aTickContext['applyPlayerDamage']
   readonly failBoot: H5aTickContext['failBoot']
   readonly markSessionDirty: H5aTickContext['markSessionDirty']
+  readonly handleLocalPlayerDeath: H5aTickContext['handleLocalPlayerDeath']
   readonly canvas: Pick<HTMLCanvasElement, 'setAttribute'>
   readonly world: {
     readonly inventory: {
@@ -310,9 +307,10 @@ export type H5aMovementContext = {
         readonly inventory: {
           readonly slots: ReadonlyArray<Readonly<{ readonly item: string; readonly count: number }> | undefined>
         }
-      }>
+      }, Effect.Error<OwnerBackedWorld['inventory']['storageSnapshot']>>
     }
-    readonly entities: Pick<GeneratedWorld<MobBehaviour>['entities'], 'entities' | 'despawn'>
+    readonly vitals: Pick<OwnerBackedWorld['vitals'], 'snapshot'>
+    readonly entities: Pick<OwnerBackedWorld['entities'], 'entities' | 'despawn'>
   }
   readonly currentChunkContext: () => Pick<DimensionChunkContext, 'dimension'>
   readonly droppedItemLifetime: H5aTickContext['droppedItemLifetime']
