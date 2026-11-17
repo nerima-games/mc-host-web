@@ -22,14 +22,42 @@ export const readFrameTiming = (
   return { raw, deltaSecs: clampDelta(raw) }
 }
 
+export const applyFrameLook = (
+  context: H5aFrameInputContext,
+  frameInput: InputSnapshot,
+  frameDeltaSecs: DeltaTimeSecs,
+): boolean => {
+  const { state } = context
+  const consumedTouchLook = context.touchLook.consume(state.touchLookState.get())
+  state.touchLookState.set(consumedTouchLook.state)
+  if (
+    frameInput.justPressed.has(ESCAPE_KEY_CODE) || context.paused() || context.playerIsDead()
+    || state.inventoryOpen.get() || state.tradeOpen.get() || state.brewingOpen.get()
+  ) {
+    return false
+  }
+
+  const gamepadLook = gamepadLookDelta(frameInput.gamepadAxes, frameDeltaSecs)
+  // Pointer and touch are accumulated pixel deltas; only the gamepad is a rate.
+  const lookDelta = {
+    x: frameInput.pointerDelta.x + consumedTouchLook.delta.positionX + gamepadLook.x,
+    y: frameInput.pointerDelta.y + consumedTouchLook.delta.positionY + gamepadLook.y,
+  }
+  const looked = lookDelta.x !== 0 || lookDelta.y !== 0
+  const { sensitivity } = context.playerSettings()
+  Effect.runSync(context.playerApi.look(
+    -lookDelta.x * context.lookSensitivity * sensitivity,
+    -lookDelta.y * context.lookSensitivity * sensitivity,
+  ))
+  return looked
+}
+
 export const runTickFrameInput = (
   context: H5aFrameInputContext,
   nowSecs: MonotonicTimeSecs,
   frameInput: InputSnapshot,
 ): H5aFrameInputResult | undefined => {
   const { inputApi, state } = context
-  const consumedTouchLook = context.touchLook.consume(state.touchLookState.get())
-  state.touchLookState.set(consumedTouchLook.state)
 
   if (frameInput.justPressed.has(ESCAPE_KEY_CODE)) {
     context.handlePauseRequest()
@@ -136,20 +164,6 @@ export const runTickFrameInput = (
   const useTriggered = canUse
     && (Effect.runSync(inputApi.wasActionJustTriggered('use')) || nativeUse.triggered)
   const useHeld = held('use') > 0
-  const gamepadLook = gamepadLookDelta(walk.gamepadAxes, timing.deltaSecs)
-  const lookDelta = {
-    x: walk.pointerDelta.x + consumedTouchLook.delta.positionX + gamepadLook.x,
-    y: walk.pointerDelta.y + consumedTouchLook.delta.positionY + gamepadLook.y,
-  }
-  const looked = !dead && !state.inventoryOpen.get() && !state.tradeOpen.get() && !state.brewingOpen.get()
-    && (lookDelta.x !== 0 || lookDelta.y !== 0)
-  if (!dead && !state.inventoryOpen.get() && !state.tradeOpen.get() && !state.brewingOpen.get()) {
-    const { sensitivity } = context.playerSettings()
-    Effect.runSync(context.playerApi.look(
-      -lookDelta.x * context.lookSensitivity * sensitivity,
-      -lookDelta.y * context.lookSensitivity * sensitivity,
-    ))
-  }
 
   return {
     nowSecs,
@@ -162,6 +176,6 @@ export const runTickFrameInput = (
     canUse,
     useTriggered,
     useHeld,
-    looked,
+    looked: false,
   }
 }
