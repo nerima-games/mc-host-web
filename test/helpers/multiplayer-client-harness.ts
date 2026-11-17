@@ -112,6 +112,8 @@ export type MultiplayerClientHarness = Readonly<{
   weather: MultiplayerClientContext['services']['weather']
   commandIds: MultiplayerCommandIds<CommandId>
   deliver: (message: NetworkMessage) => void
+  /** Hands one raw frame to the socket and drains it, for frames the codec must refuse. */
+  deliverFrame: (frame: string) => void
 }>
 
 /**
@@ -276,15 +278,19 @@ export const makeMultiplayerClientHarness = async (): Promise<MultiplayerClientH
   vi.spyOn(crypto, 'randomUUID').mockReturnValue(HARNESS_SESSION_ID)
   const client: MultiplayerClientApi = createMultiplayerClient(context)
 
-  const deliver = (message: NetworkMessage): void => {
-    const frame = encodeFrame(message)
-    if (Result.isFailure(frame)) throw new Error(`the test message does not encode: ${String(frame.failure)}`)
-    socket.emit('message', { data: frame.success })
+  const deliverFrame = (frame: string): void => {
+    socket.emit('message', { data: frame })
     Effect.runSync(inboundStage.run(DeltaTimeSecs(0)).pipe(Effect.provide(FixedClockLayer({
       monotonicSecs: MonotonicTimeSecs(0),
       wallClockEpochMillis: EpochMillis(0),
     }))))
     client.drainMultiplayerInbound()
+  }
+
+  const deliver = (message: NetworkMessage): void => {
+    const frame = encodeFrame(message)
+    if (Result.isFailure(frame)) throw new Error(`the test message does not encode: ${String(frame.failure)}`)
+    deliverFrame(frame.success)
   }
 
   return {
@@ -299,5 +305,6 @@ export const makeMultiplayerClientHarness = async (): Promise<MultiplayerClientH
     weather,
     commandIds: makeMultiplayerCommandIds(HARNESS_SESSION_ID, CommandId.make),
     deliver,
+    deliverFrame,
   }
 }

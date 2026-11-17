@@ -480,8 +480,9 @@ export const runTickPostFrameGameplay = (
     if (usedEndFeature || usedMultiplayerLever) {
       renderPlayerUi()
     } else if (opensBrewing) {
-      setBrewingOpen(true)
+      // A multiplayer open command names this stand, so record it first.
       if (brewingTarget !== undefined) state.activeBrewingStandAt.set({ ...brewingTarget.position })
+      setBrewingOpen(true)
     } else if (routeResult !== undefined && '_tag' in routeResult) {
       console.warn('Unable to route use to an unavailable block', routeResult)
     } else if (route?.kind === 'craftingTable') {

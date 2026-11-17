@@ -178,7 +178,6 @@ export type H5aTickContext = {
   ) => Effect.Effect<void>
   readonly drainMultiplayerInbound: () => void
   readonly drainCraftingInbound: () => void
-  readonly drainBrewingInbound: () => void
   readonly drainAnvilInbound: () => void
   readonly drainEnchantingInbound: () => void
   readonly drainPlayerDamageInbound: () => void
@@ -290,7 +289,6 @@ export type H5aMovementContext = {
   readonly requestFurnaceAdvance: H5aTickContext['requestFurnaceAdvance']
   readonly drainMultiplayerInbound: H5aTickContext['drainMultiplayerInbound']
   readonly drainCraftingInbound: H5aTickContext['drainCraftingInbound']
-  readonly drainBrewingInbound: H5aTickContext['drainBrewingInbound']
   readonly drainAnvilInbound: H5aTickContext['drainAnvilInbound']
   readonly drainEnchantingInbound: H5aTickContext['drainEnchantingInbound']
   readonly drainPlayerDamageInbound: H5aTickContext['drainPlayerDamageInbound']

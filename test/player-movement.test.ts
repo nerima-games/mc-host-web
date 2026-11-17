@@ -179,7 +179,6 @@ const makeHarness = async (multiplayer?: H5aMovementContext['multiplayer']) => {
     }),
     drainMultiplayerInbound: () => drainOrder.push('multiplayer'),
     drainCraftingInbound: () => drainOrder.push('crafting'),
-    drainBrewingInbound: () => drainOrder.push('brewing'),
     drainAnvilInbound: () => drainOrder.push('anvil'),
     drainEnchantingInbound: () => drainOrder.push('enchanting'),
     drainPlayerDamageInbound: () => drainOrder.push('player-damage'),
@@ -504,7 +503,7 @@ describe('tick player movement branches', () => {
     expect(harness.multiplayerClosed.get()).toBe(true)
     expect(harness.canvasAttributes.get('data-multiplayer-connection')).toBe('closed')
     expect(harness.multiplayerStatus).toEqual({ textContent: 'Multiplayer connection closed.', hidden: false })
-    expect(harness.drainOrder).toEqual(['multiplayer', 'crafting', 'brewing', 'anvil', 'enchanting', 'player-damage'])
+    expect(harness.drainOrder).toEqual(['multiplayer', 'crafting', 'anvil', 'enchanting', 'player-damage'])
   })
 
   it('requests furnace progress with deferred time and a stable request id', async () => {
