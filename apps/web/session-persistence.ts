@@ -86,6 +86,7 @@ import {
 
 import {
   makeSessionTerrainSources,
+  protectedTerrainChunks,
   reconcileTerrainMigrationState,
   restoreDimensionTerrain,
   type SessionTerrainRestorationFailure,
@@ -1992,7 +1993,7 @@ const completeV18TerrainMigration = (
   const saved = yield* makeSessionChunkSource(head, head.state.dimension, sources[head.state.dimension]).pipe(
     Effect.provideService(StoragePort, snapshotStorage),
   )
-  const terrain = yield* restoreDimensionTerrain(sources, saved.chunks)
+  const terrain = yield* restoreDimensionTerrain(sources, saved.chunks, protectedTerrainChunks(head.state, saved.chunks))
   const reconciled = yield* reconcileTerrainMigrationState(head.state, terrain, sources)
   // A checkpoint can be recovered repeatedly after a later live revision is damaged.
   const revision = `${head.revision}-terrain-v19-${crypto.randomUUID()}`

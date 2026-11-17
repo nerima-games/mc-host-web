@@ -66,6 +66,8 @@ import {
   itemStackEqualsIgnoringCount,
   type ChunkCoord,
   blockIdOf,
+  BrewingFuelCharges,
+  FixedDurationSecs,
 } from '@nerima-games/mc-kernel'
 import {
   CHUNK_FORMAT,
@@ -118,6 +120,8 @@ import {
   sessionOpenFailureMessage,
   sessionOpenNotice,
   reconcileTerrainMigrationState,
+  protectedTerrainChunks,
+  restoreDimensionTerrain,
 } from '../apps/web/session-restoration'
 import {
   vi,
@@ -498,7 +502,7 @@ const controlledStorage = (): ControlledStorage => {
         const next = new Map(entries)
         for (const mutation of mutations) {
           const key = mutation.key
-          if (mutation.expected !== undefined && JSON.stringify(Option.getOrUndefined(mutation.expected)) !== JSON.stringify(entries.get(key))) {
+          if (mutation.expected !== undefined && JSON.stringify(Option.getOrUndefined(mutation.expected)) !== JSON.stringify(next.get(key))) {
             return Effect.fail(new StorageError({ operation: 'commitBatch', key }))
           }
           if (mutation._tag === 'Put') {
@@ -580,8 +584,8 @@ const controlledStorage = (): ControlledStorage => {
 }
 
 describe('session persistence', () => {
-  const safeChunk = (cx = 0): ChunkWithBlockStates => {
-    const terrain = chunk(cx, 0, Option.getOrThrow(blockIdOf('air')))
+  const safeChunk = (cx = 0, cz = 0): ChunkWithBlockStates => {
+    const terrain = chunk(cx, cz, Option.getOrThrow(blockIdOf('air')))
     terrain.blocks[blockIndex(1, 63, 1)] = Option.getOrThrow(blockIdOf('stone'))
     return terrain
   }
@@ -627,37 +631,37 @@ describe('session persistence', () => {
     const sources = { overworld: () => Effect.succeed(safeChunk()), nether: () => Effect.succeed(safeChunk()), end: () => Effect.succeed(safeChunk()) }
     const result = yield* reconcileTerrainMigrationState(input, { chunks: [replacement], rebuiltChunks: [replacement] }, sources)
     expect(result.state.player).toEqual({ ...input.player, feetPosition: { x: 1.5, y: 64, z: 1.5 } })
-    expect(result.state.entities.nether.entities).toEqual(roster.entities.filter(({ id }) => id === 'edited-zombie'))
+    expect(result.state.entities.nether.entities).toEqual(roster.entities.filter(({ id }) => id !== 'affected-0'))
     expect(result.state.entities.nether.nextSerial).toBe(9)
-    expect(result.state.vehicles).toEqual([vehicles[1]])
-    expect(result.state.mountedVehicleId).toBeNull()
+    expect(result.state.vehicles).toEqual(vehicles)
+    expect(result.state.mountedVehicleId).toBe('v:0')
     expect(result.state.wither?.withers).toEqual([])
     expect(result.state.wither?.skulls).toEqual([input.wither!.skulls[1]])
-    expect(result.state.villagers).toEqual({ residents: [input.villagers.residents[1]],
-      trades: { ...input.villagers.trades, villagers: [input.villagers.trades.villagers[1]] } })
+    expect(result.state.villagers).toEqual(input.villagers)
     expect(result.state.end).toEqual(input.end)
     expect(result.state.storage).toEqual(input.storage)
   }))
 
-  it.effect('preserves an unaffected player and uses a saved center before generating a fallback', () => Effect.gen(function* () {
+  it.effect('preserves an unaffected player and searches saved nearby terrain before generating a landing chunk', () => Effect.gen(function* () {
     const state = sessionState(81)
     const replacement: DimensionChunk = { dimension: 'end', chunk: chunk(2, 0, 0) }
     let generated = 0
-    const source: ChunkSource = () => Effect.sync(() => { generated += 1; return safeChunk() })
+    const source: ChunkSource = (coord) => Effect.sync(() => { generated += 1; return safeChunk(coord.cx, coord.cz) })
     const sources = { overworld: source, nether: source, end: source }
     const unaffected = yield* reconcileTerrainMigrationState(state, { chunks: [replacement], rebuiltChunks: [replacement] }, sources)
     expect(unaffected.state.player).toEqual(state.player)
     const affected: SessionState = { ...state, dimension: 'end', player: { ...state.player, feetPosition: { x: 33, y: 70, z: 1 } } }
-    const savedCenter: DimensionChunk = { dimension: 'end', chunk: safeChunk() }
-    const saved = yield* reconcileTerrainMigrationState(affected, { chunks: [replacement, savedCenter], rebuiltChunks: [replacement] }, sources)
-    expect(saved.state.player.feetPosition).toEqual({ x: 1.5, y: 64, z: 1.5 })
+    const savedNearby: DimensionChunk = { dimension: 'end', chunk: safeChunk(1) }
+    const saved = yield* reconcileTerrainMigrationState(affected, { chunks: [replacement, savedNearby], rebuiltChunks: [replacement] }, sources)
+    expect(saved.state.player.feetPosition).toEqual({ x: 17.5, y: 64, z: 1.5 })
     expect(generated).toBe(0)
     const fresh = yield* reconcileTerrainMigrationState(affected, { chunks: [replacement], rebuiltChunks: [replacement] }, sources)
     expect(generated).toBe(1)
     expect(fresh.chunks).toHaveLength(2)
-    expect(fresh.chunks[1]?.chunk.coord).toEqual(coordOf(0, 0))
+    expect(fresh.chunks[1]?.chunk.coord).toEqual(coordOf(1, 0))
     const blocked = yield* Effect.result(reconcileTerrainMigrationState(affected, {
-      chunks: [replacement, { dimension: 'end', chunk: chunk(0, 0, 0) }], rebuiltChunks: [replacement],
+      chunks: [replacement, ...[-1, 0, 1].flatMap((dx) => [-1, 0, 1].filter((dz) => dx !== 0 || dz !== 0)
+        .map((dz): DimensionChunk => ({ dimension: 'end', chunk: chunk(2 + dx, dz, 0) })))], rebuiltChunks: [replacement],
     }, sources))
     expect(Result.isFailure(blocked)).toBe(true)
     if (Result.isFailure(blocked)) expect(blocked.failure._tag).toBe('SessionTerrainMigrationUnsafePosition')
@@ -685,6 +689,146 @@ describe('session persistence', () => {
     })
     yield* Effect.void
   })
+
+  it.effect('preserves the full death-drop pile in an otherwise unedited Nether chunk', () => {
+    const storage = controlledStorage()
+    return Effect.gen(function* () {
+      const inventory = [stoneStack, Result.getOrThrow(itemStack('diamond', 3))]
+      const entities = normalizePersistedEntityRoster({ nextSerial: 3, entities: inventory.map((stack, index) => ({
+        id: `death-drop-${index}`, kind: 'dropped_item', feetPosition: { x: 1.5, y: 70, z: 1.5 },
+        healthPoints: 1, behaviour: { item: stack.item, count: stack.count, elapsedSecs: 12, eligibleFromFrame: 9 },
+      })) })
+      const state: SessionState = { ...sessionState(81), dimension: 'nether',
+        player: { ...sessionState(81).player, feetPosition: { x: 1.5, y: 70, z: 1.5 } },
+        storage: storageFromInventory({ slots: Array.from({ length: INVENTORY_SLOT_COUNT }, () => undefined) }),
+        entities: { ...EMPTY_ENTITY_ROSTERS, nether: entities } }
+      yield* seedV18(storage, [{ dimension: 'nether', chunk: legacyTerrain }], state)
+      const migrated = Option.getOrThrow(yield* loadSession('terrain-v18'))
+      expect(migrated.state.entities.nether).toEqual(entities)
+      expect(migrated.state.player).toEqual(state.player)
+      expect(migrated.state.storage).toEqual(state.storage)
+      const loaded = yield* makeSessionChunkSource(migrated, 'nether', () => Effect.succeed(safeChunk()))
+      expect(loaded.chunks[0]?.chunk).toEqual(legacyTerrain)
+      expect(Option.getOrThrow(yield* loadSession('terrain-v18'))).toEqual(migrated)
+    }).pipe(Effect.provide(storage.layer))
+  })
+
+  for (const [caseIndex, kind] of ['dropped item', 'XP orb', 'boat', 'minecart', 'container', 'furnace', 'lever', 'portal', 'crop', 'villager'].entries()) {
+  it.effect(`protects a ${kind} at negative chunk coordinates without protecting another dimension`, () => Effect.gen(function* () {
+    const negative = { x: -0.5, y: 64, z: -16.5 }
+    const saved: Array<DimensionChunk> = ['nether', 'end'].map((dimension) => ({
+      dimension: dimension === 'nether' ? 'nether' : 'end', chunk: chunk(-1, -2, 0),
+    }))
+    const sources = { overworld: () => Effect.succeed(chunk(-1, -2, 0)),
+      nether: () => Effect.succeed(chunk(-1, -2, 1)), end: () => Effect.succeed(chunk(-1, -2, 1)) }
+    const baseline = sessionState(81)
+    const cases: Array<SessionState> = [
+      ...['dropped_item', 'experience_orb'].map((kind): SessionState => ({ ...baseline, entities: { ...baseline.entities,
+        nether: normalizePersistedEntityRoster({ nextSerial: 1, entities: [{ id: 'possession', kind,
+          feetPosition: negative, healthPoints: 1, behaviour: kind === 'dropped_item' ? { item: 'stone', count: 1 } : {} }] }) } })),
+      ...['boat', 'minecart'].map((type): SessionState => ({ ...baseline,
+        vehicles: validVehicles([{ id: 'v:0', type, dimension: 'nether', position: negative,
+          velocity: { x: 0, y: 0, z: 0 }, yawRadians: 0 }], 1) })),
+      { ...baseline, containerStorage: { version: 3, containers: [{ ...baseline.containerStorage.containers[0]!, id: 'nether:-1,64,-17' }] } },
+      { ...baseline, furnaces: [{ dimension: 'nether', position: { x: -1, y: 64, z: -17 }, state: {
+        station: 'furnace', input: undefined, fuel: undefined, output: undefined,
+        fuelTimeRemainingSecs: FixedDurationSecs(0), fuelTimeTotalSecs: FixedDurationSecs(0), cookProgressSecs: FixedDurationSecs(0),
+      } }] },
+      { ...baseline, redstone: { levers: [{ dimension: 'nether', position: { x: -1, y: 64, z: -17 }, active: true }] } },
+      { ...baseline, portals: [{ dimension: 'nether', position: { x: -1, y: 64, z: -17 } }] },
+      { ...baseline, crops: validCrops({ crops: [{ dimension: 'nether', position: { x: -1, y: 64, z: -17 }, crop: 'potato_crop', growthSecs: 1 }] }) },
+      { ...baseline, villagers: { residents: [{ id: 'resident', profession: 'farmer', dimension: 'nether', feetPosition: negative }],
+        trades: { villagers: [makeVillager('resident', 'farmer')], restockElapsedSecs: 30 } } },
+    ]
+    expect(cases).toHaveLength(10)
+    const state = Option.getOrThrow(Option.fromUndefinedOr(cases[caseIndex]))
+      const protectedChunks = protectedTerrainChunks(state, saved)
+      expect(protectedChunks.has('nether:-1,-2')).toBe(true)
+      expect(protectedChunks.has('end:-1,-2')).toBe(false)
+      const result = yield* restoreDimensionTerrain(sources, saved, protectedChunks)
+      expect(result.chunks[0]?.chunk).toBe(saved[0]?.chunk)
+      expect(result.rebuiltChunks.map(({ dimension }) => dimension)).toEqual(['end'])
+  }))
+  }
+
+  it('protects the mounted player chunk across a boundary and keeps End frame identities separate', () => {
+    const baseline = sessionState(81)
+    const saved = [dimensionChunk('nether', -1, -2, 0), dimensionChunk('end', -1, -2, 0)]
+    const rider: SessionState = { ...baseline, vehicles: validVehicles([{ id: 'v:0', type: 'boat', dimension: 'nether',
+      position: { x: -0.5, y: 64, z: -16.5 }, velocity: { x: 0, y: 0, z: 0 }, yawRadians: 0, occupant: 'local-player' }], 1),
+      dimension: 'nether', player: { ...baseline.player, feetPosition: { x: 0.5, y: 64, z: -16.5 } }, mountedVehicleId: 'v:0' }
+    expect(protectedTerrainChunks(rider, saved).has('nether:0,-2')).toBe(true)
+    const endFrames: SessionState = { ...baseline, end: { ...baseline.end, frames: [{ position: { x: -1, y: 64, z: -17 }, facing: 'north', eye: false }] } }
+    expect(protectedTerrainChunks(endFrames, saved).has('end:-1,-2')).toBe(true)
+    expect(protectedTerrainChunks(endFrames, saved).has('nether:-1,-2')).toBe(false)
+  })
+
+  for (const kind of ['container', 'furnace'] satisfies ReadonlyArray<'container' | 'furnace'>) {
+    it.effect(`keeps terrain and ${kind} contents through the v18 migration and reload`, () => {
+      const storage = controlledStorage()
+      return Effect.gen(function* () {
+        const baseline = sessionState(81)
+        const state: SessionState = kind === 'container' ? { ...baseline,
+          containerStorage: { version: 3, containers: [{ ...baseline.containerStorage.containers[0]!, id: 'nether:1,64,1' }] },
+        } : { ...baseline, furnaces: [{ dimension: 'nether', position: { x: 1, y: 64, z: 1 }, state: {
+          station: 'furnace', input: stoneStack, fuel: Result.getOrThrow(itemStack('coal', 2)),
+          output: Result.getOrThrow(itemStack('iron_ingot', 3)), fuelTimeRemainingSecs: FixedDurationSecs(0), fuelTimeTotalSecs: FixedDurationSecs(0), cookProgressSecs: FixedDurationSecs(0),
+        } }] }
+        yield* seedV18(storage, [{ dimension: 'nether', chunk: legacyTerrain }], state)
+        const migrated = Option.getOrThrow(yield* loadSession('terrain-v18'))
+        expect(migrated.state.containerStorage).toEqual(state.containerStorage)
+        expect(migrated.state.furnaces).toEqual(state.furnaces)
+        const loaded = yield* makeSessionChunkSource(migrated, 'nether', () => Effect.succeed(safeChunk()))
+        expect(loaded.chunks[0]?.chunk).toEqual(legacyTerrain)
+        expect(Option.getOrThrow(yield* loadSession('terrain-v18'))).toEqual(migrated)
+      }).pipe(Effect.provide(storage.layer))
+    })
+  }
+
+  it('conservatively protects all chunks for unlocated containers or nonempty global brewing state', () => {
+    const state = sessionState(81)
+    const saved = [dimensionChunk('nether', 20, -5, 0), dimensionChunk('end', -4, 8, 0)]
+    const variants: Array<SessionState> = [
+      { ...state, containerStorage: { ...state.containerStorage, containers: [{ ...state.containerStorage.containers[0]!, id: 'legacy-chest' }] } },
+      { ...state, brewing: { ...state.brewing, fuelCharges: BrewingFuelCharges(1) } },
+      { ...state, brewing: { ...state.brewing, fuel: Result.getOrThrow(itemStack('blaze_powder', 1)) } },
+    ]
+    for (const variant of variants) expect([...protectedTerrainChunks(variant, saved)]).toEqual(expect.arrayContaining(['nether:20,-5', 'end:-4,8']))
+  })
+
+  it.effect('checks repeated-key batch expectations against each preceding mutation', () => {
+    const storage = controlledStorage()
+    return Effect.gen(function* () {
+      const service = yield* StoragePort
+      const key = SaveKey('sequential-batch')
+      yield* service.commitBatch([
+        { _tag: 'Put', key, envelope: legacyTerrainEnvelope, expected: Option.none() },
+        { _tag: 'Remove', key, expected: Option.some(legacyTerrainEnvelope) },
+      ])
+      expect(Option.isNone(yield* service.get(key))).toBe(true)
+      const failed = yield* Effect.result(service.commitBatch([
+        { _tag: 'Put', key, envelope: legacyTerrainEnvelope, expected: Option.none() },
+        { _tag: 'Remove', key, expected: Option.none() },
+      ]))
+      expect(Result.isFailure(failed)).toBe(true)
+      expect(Option.isNone(yield* service.get(key))).toBe(true)
+    }).pipe(Effect.provide(storage.layer))
+  })
+
+  it.effect('chooses a landing near the original height before a higher closed pocket', () => Effect.gen(function* () {
+    const terrain = safeChunk(12, -7)
+    terrain.blocks[blockIndex(1, 120, 1)] = Option.getOrThrow(blockIdOf('stone'))
+    const replacement: DimensionChunk = { dimension: 'nether', chunk: terrain }
+    const state: SessionState = { ...sessionState(81), dimension: 'nether',
+      player: { ...sessionState(81).player, feetPosition: { x: 193.5, y: 65, z: -110.5 } } }
+    let generated = 0
+    const source: ChunkSource = () => Effect.sync(() => { generated += 1; return terrain })
+    const result = yield* reconcileTerrainMigrationState(state, { chunks: [replacement], rebuiltChunks: [replacement] }, {
+      overworld: source, nether: source, end: source,
+    })
+    expect(result.state.player.feetPosition).toEqual({ x: 193.5, y: 64, z: -110.5 })
+    expect(generated).toBe(0)
+  }))
 
   it.effect('leaves the old head valid when an affected player has no safe terrain', () => {
     const storage = controlledStorage()
@@ -722,6 +866,7 @@ describe('session persistence', () => {
       expect(storage.envelope(sessionHeadKey('terrain-v18'))).toEqual(oldHead)
       const migrated = Option.getOrThrow(yield* loadSession('terrain-v18'))
       expect(migrated.revision).toBe('original-terrain-v19-00000000-0000-4000-8000-000000000001')
+      expect(storage.keys.some((key) => key.includes('original-terrain-v19-'))).toBe(true)
       expect(migrated.chunks).toHaveLength(3)
       expect(storage.keys.filter((key) => key.includes('/chunk/'))).toHaveLength(6)
       expect(storage.keys.some((key) => key.includes('/revision/original/') && !key.includes('/checkpoint/'))).toBe(false)
@@ -808,7 +953,7 @@ describe('session persistence', () => {
         })))
         expect(Result.isFailure(failed)).toBe(true)
         expect(storage.envelope(conflictKey)).toEqual(concurrent)
-        expect(storage.keys.some((key) => key.includes('/original-terrain-v19/'))).toBe(false)
+        expect(storage.keys.some((key) => key.includes('original-terrain-v19-'))).toBe(false)
       }).pipe(Effect.provide(storage.layer))
     })
   }

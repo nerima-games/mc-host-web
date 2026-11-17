@@ -18,7 +18,7 @@ import {
   type ChunkSource,
   type Dimension,
 } from '@nerima-games/mc-worldgen'
-import { PlayerServiceSnapshotSchema, type PlayerPose, type PlayerStorage } from '@nerima-games/mc-sim'
+import { containerIdAt, PlayerServiceSnapshotSchema, type PlayerPose, type PlayerStorage } from '@nerima-games/mc-sim'
 import type { GameplayOwnerInitialState, MobRoster, PlayerVitals } from '@nerima-games/mx-gameplay'
 
 import { poseOfPlayerOwner } from './owner-backed-services'
@@ -162,6 +162,7 @@ const materializeTerrain = (generated: Chunk): Effect.Effect<ChunkWithBlockState
 export const restoreDimensionTerrain = (
   sources: SessionTerrainSources,
   savedChunks: ReadonlyArray<DimensionChunk>,
+  protectedChunks: ReadonlySet<string> = new Set(),
 ): Effect.Effect<{
   readonly chunks: ReadonlyArray<DimensionChunk>
   readonly rebuiltChunks: ReadonlyArray<DimensionChunk>
@@ -176,6 +177,10 @@ export const restoreDimensionTerrain = (
     }
     // Encode for comparison; persisted records have already passed loadFrom's validation.
     const encoded = yield* Effect.fromResult(Schema.encodeResult(CHUNK_FORMAT.schema)(saved.chunk))
+    if (protectedChunks.has(`${saved.dimension}:${String(saved.chunk.coord.cx)},${String(saved.chunk.coord.cz)}`)) {
+      chunks.push(saved)
+      continue
+    }
     const key = `${String(saved.chunk.coord.cx)},${String(saved.chunk.coord.cz)}`
     let encodedLegacy = legacyByCoord.get(key)
     if (encodedLegacy === undefined) {
@@ -215,7 +220,40 @@ export const SessionTerrainMigrationUnsafePosition: new (
 const terrainChunkKey = (dimension: string, at: { readonly x: number; readonly z: number }): string =>
   `${dimension}:${String(Math.floor(at.x / CHUNK_SIZE_XZ))},${String(Math.floor(at.z / CHUNK_SIZE_XZ))}`
 
-const safeTerrainPosition = (chunk: ChunkWithBlockStates): SessionState['player']['feetPosition'] | undefined => {
+export const protectedTerrainChunks = (state: SessionState, chunks: ReadonlyArray<DimensionChunk>): ReadonlySet<string> => {
+  const keys = new Set<string>()
+  const protect = (dimension: string, at: { readonly x: number; readonly z: number }): void => { keys.add(terrainChunkKey(dimension, at)) }
+  let unlocated = state.brewing.bottles.some((slot) => slot !== undefined)
+    || state.brewing.ingredient !== undefined || state.brewing.fuel !== undefined
+    || state.brewing.fuelCharges !== 0 || state.brewing.brewProgressSecs !== 0
+  for (const dimension of ['overworld', 'nether', 'end'] satisfies ReadonlyArray<Dimension>) {
+    for (const entity of state.entities[dimension].entities) {
+      if (entity.kind === 'dropped_item' || entity.kind === 'experience_orb') protect(dimension, entity.feetPosition)
+    }
+  }
+  for (const vehicle of state.vehicles ?? []) protect(vehicle.dimension, vehicle.position)
+  if (state.vehicles?.some(({ id }) => id === state.mountedVehicleId)) protect(state.dimension, state.player.feetPosition)
+  for (const container of state.containerStorage.containers) {
+    // The host writes containerIdAt(dimension, position); public ContainerId also permits non-spatial IDs.
+    const match = /^(overworld|nether|end):(-?\d+),(-?\d+),(-?\d+)$/u.exec(container.id)
+    if (match === null) { unlocated = true; continue }
+    const dimension = match[1]!
+    const at = { x: Number(match[2]), y: Number(match[3]), z: Number(match[4]) }
+    if (!Number.isSafeInteger(at.x) || !Number.isSafeInteger(at.y) || !Number.isSafeInteger(at.z)
+      || containerIdAt(dimension, at) !== container.id) { unlocated = true; continue }
+    protect(dimension, at)
+  }
+  for (const furnace of state.furnaces) protect(furnace.dimension, furnace.position)
+  for (const lever of state.redstone.levers) protect(lever.dimension, lever.position)
+  for (const portal of state.portals) protect(portal.dimension, portal.position)
+  for (const crop of state.crops.crops) protect(crop.dimension, crop.position)
+  for (const resident of state.villagers.residents) protect(resident.dimension, resident.feetPosition)
+  for (const frame of state.end.frames) protect('end', frame.position)
+  if (unlocated) for (const { dimension, chunk } of chunks) keys.add(`${dimension}:${String(chunk.coord.cx)},${String(chunk.coord.cz)}`)
+  return keys
+}
+
+const safeTerrainPosition = (chunk: ChunkWithBlockStates, original: SessionState['player']['feetPosition']): SessionState['player']['feetPosition'] | undefined => {
   // These fixed registry entries are full, non-hazardous terrain blocks; air is the only accepted body cell.
   const air = Option.getOrThrow(blockIdOf('air'))
   const floors = new Set<number>([
@@ -224,9 +262,18 @@ const safeTerrainPosition = (chunk: ChunkWithBlockStates): SessionState['player'
     Option.getOrThrow(blockIdOf('end_stone')),
     Option.getOrThrow(blockIdOf('obsidian')),
   ])
-  for (let y = CHUNK_HEIGHT - 3; y >= 0; y -= 1) {
-    for (let x = 1; x < CHUNK_SIZE_XZ - 1; x += 1) {
-      for (let z = 1; z < CHUNK_SIZE_XZ - 1; z += 1) {
+  const heights = Array.from({ length: CHUNK_HEIGHT - 2 }, (_, y) => y)
+    .sort((a, b) => Math.abs(a + 1 - original.y) - Math.abs(b + 1 - original.y) || a - b)
+  const columns = Array.from({ length: (CHUNK_SIZE_XZ - 2) ** 2 }, (_, index) => ({
+    x: 1 + Math.floor(index / (CHUNK_SIZE_XZ - 2)), z: 1 + index % (CHUNK_SIZE_XZ - 2),
+  })).sort((a, b) => {
+    const distance = (at: { readonly x: number; readonly z: number }): number =>
+      (chunk.coord.cx * CHUNK_SIZE_XZ + at.x + 0.5 - original.x) ** 2
+      + (chunk.coord.cz * CHUNK_SIZE_XZ + at.z + 0.5 - original.z) ** 2
+    return distance(a) - distance(b) || a.x - b.x || a.z - b.z
+  })
+  for (const y of heights) {
+    for (const { x, z } of columns) {
         const floor = chunk.blocks[blockIndex(x, y, z)]
         if (floor === undefined || !floors.has(floor)) continue
         let clear = true
@@ -241,7 +288,6 @@ const safeTerrainPosition = (chunk: ChunkWithBlockStates): SessionState['player'
           y: y + 1,
           z: chunk.coord.cz * CHUNK_SIZE_XZ + z + 0.5,
         }
-      }
     }
   }
   return undefined
@@ -267,16 +313,21 @@ export const reconcileTerrainMigrationState = (
         && terrainChunkKey(dimension, player.feetPosition) === `${dimension}:${String(chunk.coord.cx)},${String(chunk.coord.cz)}`)
     // affected() proves that this coordinate occurs in the replacement list.
     const replacedChunk = Option.getOrThrow(Option.fromUndefinedOr(replaced)).chunk
-    let landing = safeTerrainPosition(replacedChunk)
+    let landing = safeTerrainPosition(replacedChunk, player.feetPosition)
     if (landing === undefined) {
-      const centerCoord = chunkCoord(ChunkAxis(0), ChunkAxis(0))
-      let center = chunks.find(({ dimension, chunk }) =>
-        dimension === state.dimension && chunk.coord.cx === 0 && chunk.coord.cz === 0)?.chunk
-      if (center === undefined) {
-        center = yield* materializeTerrain(yield* sources[state.dimension](centerCoord))
-        chunks.push({ dimension: state.dimension, chunk: center })
+      const offsets = [{ x: -1, z: 0 }, { x: 0, z: -1 }, { x: 0, z: 1 }, { x: 1, z: 0 },
+        { x: -1, z: -1 }, { x: -1, z: 1 }, { x: 1, z: -1 }, { x: 1, z: 1 }]
+      for (const offset of offsets) {
+        const coord = chunkCoord(ChunkAxis(replacedChunk.coord.cx + offset.x), ChunkAxis(replacedChunk.coord.cz + offset.z))
+        const saved = chunks.find(({ dimension, chunk }) => dimension === state.dimension
+          && chunk.coord.cx === coord.cx && chunk.coord.cz === coord.cz)
+        const nearby = saved?.chunk ?? (yield* materializeTerrain(yield* sources[state.dimension](coord)))
+        landing = safeTerrainPosition(nearby, player.feetPosition)
+        if (landing !== undefined) {
+          if (saved === undefined) chunks.push({ dimension: state.dimension, chunk: nearby })
+          break
+        }
       }
-      landing = safeTerrainPosition(center)
     }
     if (landing === undefined) return yield* Effect.fail(new SessionTerrainMigrationUnsafePosition({
       dimension: state.dimension,
@@ -286,11 +337,9 @@ export const reconcileTerrainMigrationState = (
   }
   const entities = (dimension: Dimension): SessionState['entities'][Dimension] => ({
     ...state.entities[dimension],
-    entities: state.entities[dimension].entities.filter((entity) => !affected(dimension, entity.feetPosition)),
+    entities: state.entities[dimension].entities.filter((entity) => entity.kind === 'dropped_item'
+      || entity.kind === 'experience_orb' || !affected(dimension, entity.feetPosition)),
   })
-  const vehicles = state.vehicles?.filter((vehicle) => !affected(vehicle.dimension, vehicle.position))
-  const removedVehicleIds = new Set<string>(state.vehicles?.filter((vehicle) => affected(vehicle.dimension, vehicle.position)).map(({ id }) => id))
-  const removedResidentIds = new Set(state.villagers.residents.filter((resident) => affected(resident.dimension, resident.feetPosition)).map(({ id }) => id))
   const wither = state.wither === undefined ? undefined : {
     ...state.wither,
     withers: state.wither.withers.filter((wither) => !affected(wither.dimension, wither.snapshot.state.feetPosition)),
@@ -302,16 +351,6 @@ export const reconcileTerrainMigrationState = (
       ...state,
       player,
       entities: { overworld: entities('overworld'), nether: entities('nether'), end: entities('end') },
-      villagers: {
-        ...state.villagers,
-        residents: state.villagers.residents.filter((resident) => !affected(resident.dimension, resident.feetPosition)),
-        trades: {
-          ...state.villagers.trades,
-          villagers: state.villagers.trades.villagers.filter(({ id }) => !removedResidentIds.has(id)),
-        },
-      },
-      ...(vehicles === undefined ? {} : { vehicles }),
-      ...(state.mountedVehicleId != null && removedVehicleIds.has(state.mountedVehicleId) ? { mountedVehicleId: null } : {}),
       ...(wither === undefined ? {} : { wither }),
     },
   }
@@ -342,10 +381,20 @@ export const sessionLoadErrorOf = (error: SessionOpenError): SessionLoadError =>
     case 'SessionIncompatibleError':
       return error.reason === 'future-version' ? 'future-version-session' : 'unsupported-version-session'
     case 'SessionCorruptError':
+    case 'SaveDecodeError':
+    case 'SessionManifestError':
+    case 'ChunkIntegrityFailure':
       return 'corrupt-session'
     case 'StorageError':
       return 'session-storage-failure'
-    default:
+    case 'SessionTerrainMigrationUnsafePosition':
+    case 'SchemaError':
+    case 'InvalidNaturalStructureCoordinate':
+    case 'InvalidTerrainLevels':
+    case 'TerrainDensityFailure':
+    case 'UnsupportedBiomeCategory':
+    case 'BlockStateCodecFailure':
+    case 'DirtyChunkEvictionError':
       return 'terrain-migration-session'
   }
 }

@@ -98,6 +98,7 @@ import {
 import {
   SessionCorruptError,
   SessionIncompatibleError,
+  SessionManifestError,
   type PersistedEntityRoster,
   type PersistedEntityRosters,
   type SessionOpenError,
@@ -150,6 +151,16 @@ describe('session open failure messages', () => {
       new StorageError({ operation: 'get', key: 'mc-compose/session/w/head' }),
       'session-storage-failure',
       'Saved worlds could not be read from or updated in browser storage.',
+    ],
+    [
+      new SaveDecodeError({ format: 'f', version: 19, reason: 'invalid encoded chunk' }),
+      'corrupt-session',
+      'This world could not be read, and no earlier save of it could be opened.',
+    ],
+    [
+      new SessionManifestError({ reason: 'missing-chunk', dimension: 'nether', coord: chunkCoord(ChunkAxis(0), ChunkAxis(0)), key: 'missing-chunk' }),
+      'corrupt-session',
+      'This world could not be read, and no earlier save of it could be opened.',
     ],
   ]
 
