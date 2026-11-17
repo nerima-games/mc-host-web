@@ -168,6 +168,8 @@ overrides:
   smol-toml: 1.9.0
   launch-editor: 2.14.2
   '@vitest/mocker': 5.0.5
+  '@nerima-games/mc-worldgen': 0.9.2
+  '@nerima-games/mc-sim': 0.12.0
 
 patchedDependencies:
   '@types/three@0.186.0': f24dd792bcb58f32a179ae994bc14b1945dbbb990a5bf76a6ae1a0b4fcef9460
@@ -198,11 +200,11 @@ importers:
         specifier: 0.2.0
         version: 0.2.0
       '@nerima-games/mc-sim':
-        specifier: 0.11.1
-        version: 0.11.1
+        specifier: 0.12.0
+        version: 0.12.0
       '@nerima-games/mc-worldgen':
-        specifier: 0.9.1
-        version: 0.9.1
+        specifier: 0.9.2
+        version: 0.9.2
       '@nerima-games/mx-gameplay':
         specifier: 0.13.0
         version: 0.13.0
@@ -594,12 +596,12 @@ packages:
     engines: {node: '>=24.0.0', pnpm: '>=12.14.0'}
     hasBin: true
 
-  '@nerima-games/mc-sim@0.11.1':
-    resolution: {integrity: sha512-g9f18iwxynOn9xX3Jjqmv2D7tVl42FusXa3QziIy3dN4nI1za3EGbmS35bhimCazXRzI9iJznQtAsyBtimLuaA==, tarball: https://npm.pkg.github.com/download/@nerima-games/mc-sim/0.11.1/1763531a27eee3c8797d268c1739030507bb03a9}
+  '@nerima-games/mc-sim@0.12.0':
+    resolution: {integrity: sha512-Kwj5E6Wbe662MbQWXGb22jzNWnN9DafLNGjdsUq+6rHTh1f6QqSdDy8ewAyK9U7w4YcvniZrdB0FCxvIaZLHog==, tarball: https://npm.pkg.github.com/download/@nerima-games/mc-sim/0.12.0/a7511b9d377bfc3f7723c029b1ac7b7d0cc2731a}
     engines: {node: '>=24.0.0', pnpm: '>=11.24.0'}
 
-  '@nerima-games/mc-worldgen@0.9.1':
-    resolution: {integrity: sha512-8CiXrhqxegGOF9h2VrIfbR9s86U0jcy9q6vuw4FuDA5j7t3CP2xf6lgEbcLV+X9E9lFIPsSj/BuQ/SakJfebPw==, tarball: https://npm.pkg.github.com/download/@nerima-games/mc-worldgen/0.9.1/527c341c94b6123678bfc0bbac8734a4fed747b2}
+  '@nerima-games/mc-worldgen@0.9.2':
+    resolution: {integrity: sha512-vnTUUJJwPIr21+jdBuzZPT2JThWy7mdJ1VmEGLnHYFsYcyMrU/f4ZHx4Kymx/nlNZ0KzbiJxTqMzf4qLYyMjRw==, tarball: https://npm.pkg.github.com/download/@nerima-games/mc-worldgen/0.9.2/726a135fef9fdb059096aa3be7cce9344fec5ca2}
     engines: {node: '>=24.0.0', pnpm: '>=11.24.0'}
 
   '@nerima-games/mx-gameplay@0.11.0':
@@ -1548,8 +1550,8 @@ snapshots:
       '@nerima-games/mc-kernel': 0.17.0
       '@nerima-games/mc-render': 0.11.0
       '@nerima-games/mc-save': 0.8.0
-      '@nerima-games/mc-sim': 0.11.1
-      '@nerima-games/mc-worldgen': 0.9.1
+      '@nerima-games/mc-sim': 0.12.0
+      '@nerima-games/mc-worldgen': 0.9.2
       '@nerima-games/mx-gameplay': 0.11.0
       '@nerima-games/mx-multiplayer': 0.17.0
       '@nerima-games/mx-redstone': 0.7.1
@@ -1579,8 +1581,8 @@ snapshots:
     dependencies:
       '@nerima-games/mc-kernel': 0.17.0
       '@nerima-games/mc-meshing': 0.7.0
-      '@nerima-games/mc-sim': 0.11.1
-      '@nerima-games/mc-worldgen': 0.9.1
+      '@nerima-games/mc-sim': 0.12.0
+      '@nerima-games/mc-worldgen': 0.9.2
       '@types/three': 0.186.0(patch_hash=f24dd792bcb58f32a179ae994bc14b1945dbbb990a5bf76a6ae1a0b4fcef9460)
       effect: 4.0.5
       three: 0.186.1
@@ -1589,8 +1591,8 @@ snapshots:
     dependencies:
       '@nerima-games/mc-kernel': 0.17.0
       '@nerima-games/mc-meshing': 0.7.0
-      '@nerima-games/mc-sim': 0.11.1
-      '@nerima-games/mc-worldgen': 0.9.1
+      '@nerima-games/mc-sim': 0.12.0
+      '@nerima-games/mc-worldgen': 0.9.2
       '@types/three': 0.186.0(patch_hash=f24dd792bcb58f32a179ae994bc14b1945dbbb990a5bf76a6ae1a0b4fcef9460)
       effect: 4.0.5
       three: 0.186.1
@@ -1603,8 +1605,8 @@ snapshots:
   '@nerima-games/mc-server@0.2.0':
     dependencies:
       '@nerima-games/mc-kernel': 0.17.0
-      '@nerima-games/mc-sim': 0.11.1
-      '@nerima-games/mc-worldgen': 0.9.1
+      '@nerima-games/mc-sim': 0.12.0
+      '@nerima-games/mc-worldgen': 0.9.2
       '@nerima-games/mx-gameplay': 0.12.0
       '@nerima-games/mx-multiplayer': 0.17.0
       '@nerima-games/mx-redstone': 0.7.1
@@ -1614,15 +1616,15 @@ snapshots:
       - bufferutil
       - utf-8-validate
 
-  '@nerima-games/mc-sim@0.11.1':
+  '@nerima-games/mc-sim@0.12.0':
     dependencies:
       '@nerima-games/mc-kernel': 0.17.0
       '@nerima-games/mc-physics': 0.6.0
       '@nerima-games/mc-save': 0.8.0
-      '@nerima-games/mc-worldgen': 0.9.1
+      '@nerima-games/mc-worldgen': 0.9.2
       effect: 4.0.5
 
-  '@nerima-games/mc-worldgen@0.9.1':
+  '@nerima-games/mc-worldgen@0.9.2':
     dependencies:
       '@nerima-games/mc-kernel': 0.17.0
       '@nerima-games/mc-noise': 0.7.0
@@ -1634,8 +1636,8 @@ snapshots:
       '@nerima-games/mc-audio': 0.6.0
       '@nerima-games/mc-kernel': 0.17.0
       '@nerima-games/mc-physics': 0.6.0
-      '@nerima-games/mc-sim': 0.11.1
-      '@nerima-games/mc-worldgen': 0.9.1
+      '@nerima-games/mc-sim': 0.12.0
+      '@nerima-games/mc-worldgen': 0.9.2
       effect: 4.0.5
 
   '@nerima-games/mx-gameplay@0.12.0':
@@ -1643,8 +1645,8 @@ snapshots:
       '@nerima-games/mc-audio': 0.6.0
       '@nerima-games/mc-kernel': 0.17.0
       '@nerima-games/mc-physics': 0.6.0
-      '@nerima-games/mc-sim': 0.11.1
-      '@nerima-games/mc-worldgen': 0.9.1
+      '@nerima-games/mc-sim': 0.12.0
+      '@nerima-games/mc-worldgen': 0.9.2
       effect: 4.0.5
 
   '@nerima-games/mx-gameplay@0.13.0':
@@ -1652,21 +1654,21 @@ snapshots:
       '@nerima-games/mc-audio': 0.6.0
       '@nerima-games/mc-kernel': 0.17.0
       '@nerima-games/mc-physics': 0.6.0
-      '@nerima-games/mc-sim': 0.11.1
-      '@nerima-games/mc-worldgen': 0.9.1
+      '@nerima-games/mc-sim': 0.12.0
+      '@nerima-games/mc-worldgen': 0.9.2
       effect: 4.0.5
 
   '@nerima-games/mx-multiplayer@0.17.0':
     dependencies:
       '@nerima-games/mc-kernel': 0.17.0
-      '@nerima-games/mc-sim': 0.11.1
+      '@nerima-games/mc-sim': 0.12.0
       effect: 4.0.5
 
   '@nerima-games/mx-redstone@0.7.1':
     dependencies:
       '@nerima-games/mc-kernel': 0.17.0
-      '@nerima-games/mc-sim': 0.11.1
-      '@nerima-games/mc-worldgen': 0.9.1
+      '@nerima-games/mc-sim': 0.12.0
+      '@nerima-games/mc-worldgen': 0.9.2
       effect: 4.0.5
 
   '@nerima-games/mx-ui@0.10.0':
@@ -1674,7 +1676,7 @@ snapshots:
       '@nerima-games/mc-audio': 0.6.0
       '@nerima-games/mc-kernel': 0.17.0
       '@nerima-games/mc-render': 0.11.0
-      '@nerima-games/mc-sim': 0.11.1
+      '@nerima-games/mc-sim': 0.12.0
       effect: 4.0.5
 
   '@nerima-games/mx-ui@0.11.0':
@@ -1682,7 +1684,7 @@ snapshots:
       '@nerima-games/mc-audio': 0.6.0
       '@nerima-games/mc-kernel': 0.17.0
       '@nerima-games/mc-render': 0.11.0
-      '@nerima-games/mc-sim': 0.11.1
+      '@nerima-games/mc-sim': 0.12.0
       effect: 4.0.5
 
   '@oxc-project/types@0.155.0': {}
