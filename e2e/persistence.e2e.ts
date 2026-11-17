@@ -1,5 +1,5 @@
 import { expect, test, type ConsoleMessage, type Page } from '@playwright/test'
-import { DROPPED_ITEM_PICKUP_RADIUS, isDroppedItemBehaviour } from '@nerima-games/mx-gameplay'
+import { DROPPED_ITEM_PICKUP_RADIUS, isDroppedItemBehaviour, isHostileMobSnapshot } from '@nerima-games/mx-gameplay'
 
 import type { SessionHead } from '../apps/web/session-persistence'
 import { callQa, callQaWithFrames } from './helpers/qa'
@@ -238,11 +238,13 @@ test('retains death-drop custom name and enchantments through reload and pickup'
   expect(faults.consoleErrors).toEqual([])
 })
 
-// This fixture creates only death drops; natural hostile spawning remains enabled.
-const droppedEntities = (
+// Keep every non-ecosystem entity so unexpected entries still fail the roster checks.
+const nonEcosystemEntities = (
   current: GameplaySnapshot,
 ): ReadonlyArray<GameplaySnapshot['entities'][number]> =>
-  current.entities.filter((entity) => entity.kind === 'dropped_item')
+  current.entities.filter(({ behaviour }) => !(
+    isHostileMobSnapshot(behaviour) && behaviour.behaviour?._tag === 'EcosystemMob'
+  ))
 
 test('isolates and restores entity rosters across dimensions and reload', async ({ page }) => {
   const faults = watchForFaults(page)
@@ -261,7 +263,7 @@ test('isolates and restores entity rosters across dimensions and reload', async 
   ): Promise<GameplaySnapshot> => {
     const maximumAttempts = 10
     const dropState = async () => {
-      const entities = droppedEntities(await snapshot(page))
+      const entities = nonEcosystemEntities(await snapshot(page))
       const ids = new Set(entities.map(({ id }) => id))
       return {
         count: entities.length,
@@ -297,7 +299,7 @@ test('isolates and restores entity rosters across dimensions and reload', async 
       uniqueIds: true,
     })
     const current = await snapshot(page)
-    const newDrop = droppedEntities(current).find(({ id }) => !existingEntityIds.includes(id))
+    const newDrop = nonEcosystemEntities(current).find(({ id }) => !existingEntityIds.includes(id))
     expect(newDrop?.kind).toBe('dropped_item')
     if (newDrop === undefined || !isDroppedItemBehaviour(newDrop.behaviour)) {
       throw new Error('new death drop has no dropped-item behaviour')
@@ -314,7 +316,7 @@ test('isolates and restores entity rosters across dimensions and reload', async 
   await expect(page.locator('#game-canvas')).toHaveAttribute('data-player-grounded', 'true')
   const priorOverworldSerial = Math.max(-1, ...(await snapshot(page)).entities.map(({ id }) => serial(id)))
   const overworld = await damageUntilNewDrop([])
-  const seededOverworld = droppedEntities(overworld)
+  const seededOverworld = nonEcosystemEntities(overworld)
   const overworldDrop = seededOverworld[0]
   expect(overworld.dimension).toBe('overworld')
   expect(serial(overworldDrop?.id ?? '')).toBeGreaterThan(priorOverworldSerial)
@@ -323,9 +325,9 @@ test('isolates and restores entity rosters across dimensions and reload', async 
   await callQa(page, 'gameplay.enterNether')
   await expect.poll(async () => (await snapshot(page)).activeChunkDimension).toBe('nether')
   // Entering the nether must not carry the overworld's death drops with it.
-  expect(droppedEntities(await snapshot(page))).toEqual([])
+  expect(nonEcosystemEntities(await snapshot(page))).toEqual([])
   const nether = await damageUntilNewDrop([])
-  const seededNether = droppedEntities(nether)
+  const seededNether = nonEcosystemEntities(nether)
   expect(seededNether).toHaveLength(1)
   expect(seededNether[0]?.kind).toBe('dropped_item')
   // NOT an id-string comparison against `overworldDrop`: ids are minted
@@ -335,7 +337,7 @@ test('isolates and restores entity rosters across dimensions and reload', async 
   // and once natural spawns can consume serials ahead of a seeded entity,
   // that coincidence is no longer rare enough to treat as a leak signal.
   // The leak property — that the overworld's seeded entities did not carry
-  // into the nether roster — is what the empty-`droppedEntities` assertion
+  // into the nether roster — is what the empty-`nonEcosystemEntities` assertion
   // just above already proved, by roster membership rather than by id.
 
   await callQa(page, 'persistence.flush')
@@ -344,7 +346,7 @@ test('isolates and restores entity rosters across dimensions and reload', async 
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
   await expect.poll(async () => (await snapshot(page)).activeChunkDimension).toBe('nether')
   const restoredNether = await snapshot(page)
-  const seededRestoredNether = droppedEntities(restoredNether)
+  const seededRestoredNether = nonEcosystemEntities(restoredNether)
   // Compares the SEEDED subset only: the ecosystem's own population keeps
   // evolving in real time (including across a reload's round trip), so
   // asserting the full roster is byte-identical would just be asserting how
@@ -382,7 +384,7 @@ test('isolates and restores entity rosters across dimensions and reload', async 
     secondNether.pose.feetPosition.z - retainedNetherDrop.feetPosition.z,
   )).toBeGreaterThan(DROPPED_ITEM_PICKUP_RADIUS)
   const expandedNether = await damageUntilNewDrop(seededNether.map(({ id }) => id))
-  const seededExpandedNether = droppedEntities(expandedNether)
+  const seededExpandedNether = nonEcosystemEntities(expandedNether)
   expect(seededExpandedNether).toHaveLength(2)
   const nextNether = seededExpandedNether.find(({ id }) => id !== seededNether[0]?.id)
   expect(serial(nextNether?.id ?? '')).toBeGreaterThan(serial(seededNether[0]?.id ?? ''))
@@ -390,7 +392,7 @@ test('isolates and restores entity rosters across dimensions and reload', async 
   await callQa(page, 'gameplay.enterOverworld')
   await expect.poll(async () => (await snapshot(page)).activeChunkDimension).toBe('overworld')
   const restoredOverworld = await snapshot(page)
-  const seededRestoredOverworld = droppedEntities(restoredOverworld)
+  const seededRestoredOverworld = nonEcosystemEntities(restoredOverworld)
   expect(seededRestoredOverworld.map(({ id, kind }) => ({ id, kind }))).toEqual(
     seededOverworld.map(({ id, kind }) => ({ id, kind })),
   )

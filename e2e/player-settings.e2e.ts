@@ -173,8 +173,8 @@ test('rapid setting changes finish saving before title navigation', async ({ pag
     confirm.click()
   })
 
-  await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
   await expect(page).toHaveURL(/\?session=rapid-settings-[^&]+$/u)
+  await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
   await page.keyboard.press('Escape')
   await page.getByTestId('options-button').click()
   await expect(page.locator('[data-sensitivity]')).toHaveValue('245')

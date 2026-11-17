@@ -21,7 +21,6 @@
  * #16 and #17 are OBSOLETE in the triage for exactly that reason, and nothing
  * here is allowed to reintroduce the shape.
  */
-import { ATLAS_COLUMNS, ATLAS_ROWS, TILE_GUTTER_PIXELS, TILE_PIXELS } from '@nerima-games/mc-render'
 import { expect, test, type ConsoleMessage, type Page } from '@playwright/test'
 
 import { callQa } from './helpers/qa'
@@ -184,8 +183,7 @@ test.describe('smoke — the composed frame in a real browser', () => {
     expect(probe?.bufferHeight).toBe(probe?.layoutHeight)
     expect(probe?.layoutWidth).toBeGreaterThan(0)
     expect(probe?.audioSamples).toBeGreaterThan(0)
-    const atlasCellPixels = TILE_PIXELS + 2 * TILE_GUTTER_PIXELS
-    expect(probe?.atlasSize).toBe(`${String(ATLAS_COLUMNS * atlasCellPixels)}x${String(ATLAS_ROWS * atlasCellPixels)}`)
+    expect(probe?.atlasSize).toBe('512x512')
     // The naive pair, kept because they are what the row is named after — but
     // they are a postscript to the two above, not the claim.
     expect(probe?.hasWebgl2).toBe(true)
@@ -297,14 +295,8 @@ test.describe('smoke — the composed frame in a real browser', () => {
   })
 
   /**
-   * #4b The QA surface is installed.
-   *
-   * A boot milestone, not a feature test: `installQaApi` runs after composition
-   * and before the loop, so its presence dates the boot. The surface is EMPTY
-   * and the assertion says so — `domain/qa-api.ts` is explicit that compose
-   * authors no commands, and no composed module contributes a namespace yet.
-   * Asserting emptiness is what makes the first real namespace show up here as
-   * a deliberate change rather than as drift.
+   * #4b The transport and complete command catalog are public contracts.
+   * Exact equality detects newly published commands as well as removed ones.
    */
   test('#4b the QA surface publishes the host persistence contract', async ({ page }) => {
     await startGameSession(page)
@@ -319,6 +311,95 @@ test.describe('smoke — the composed frame in a real browser', () => {
     )
 
     expect(surface?.sort()).toEqual(['dispatch'])
+
+    const catalog = await callQa<ReadonlyArray<string>>(page, 'runtime.qaCatalog')
+    expect([...catalog].sort()).toEqual([
+      'render.snapshotLighting',
+      'gameplay.snapshot',
+      'gameplay.stickyPistonSnapshot',
+      'gameplay.redstoneFixturesSnapshot',
+      'gameplay.railTrackSnapshot',
+      'gameplay.boatWaterSnapshot',
+      'gameplay.seedChestTransferMetadata',
+      'gameplay.seedChestTransferMetadataConflict',
+      'gameplay.seedStaleCustomNames',
+      'gameplay.setWeather',
+      'gameplay.setPose',
+      'gameplay.seedSmokeGroundingEncounter',
+      'gameplay.setMultiplayerInvalidPose',
+      'gameplay.seedCreativeBreakEncounter',
+      'gameplay.seedCreativePlacementEncounter',
+      'gameplay.requestMultiplayerBlockPlacement',
+      'gameplay.requestMultiplayerBlockBreak',
+      'gameplay.returnToCraftingTable',
+      'gameplay.enterNether',
+      'gameplay.enterOverworld',
+      'gameplay.enterEnd',
+      'gameplay.seedBedExplosionEncounter',
+      'gameplay.seedBowProjectileEncounter',
+      'gameplay.breakTarget',
+      'gameplay.seedCraftingLog',
+      'gameplay.seedCraftingTableEncounter',
+      'gameplay.seedStickyPistonEncounter',
+      'gameplay.seedRedstoneFixtures',
+      'gameplay.pressRedstoneBranchButton',
+      'gameplay.mutateObserverInput',
+      'gameplay.seedRailTrackEncounter',
+      'gameplay.seedBoatWaterEncounter',
+      'gameplay.seedFarmingEncounter',
+      'gameplay.seedFishingEncounter',
+      'gameplay.seedSubmergedSwimmingEncounter',
+      'gameplay.leaveSubmergedSwimmingEncounter',
+      'gameplay.seedVillageTradingEncounter',
+      'gameplay.grantNearestVillagerTradeInput',
+      'gameplay.harvestFarmingCrop',
+      'gameplay.seedCactusApproach',
+      'gameplay.seedDuplicateLavaContact',
+      'gameplay.seedLethalMixedContact',
+      'gameplay.seedSafeFall',
+      'gameplay.seedDamagingFall',
+      'gameplay.seedLethalFall',
+      'gameplay.preparePotatoEating',
+      'gameplay.returnToFarmingPlot',
+      'gameplay.seedPortalEncounter',
+      'gameplay.seedPortalArrivalIntoSolidGround',
+      'gameplay.seedPortalIgnitionEncounter',
+      'gameplay.seedWoodenPickaxeProgression',
+      'gameplay.seedIronArmor',
+      'gameplay.damage',
+      'gameplay.heal',
+      'gameplay.eat',
+      'gameplay.respawn',
+      'gameplay.shoot',
+      'gameplay.seedZombiePursuitEncounter',
+      'gameplay.seedLethalZombieEncounter',
+      'gameplay.seedFoodUseEncounter',
+      'gameplay.seedFireChargeIgnition',
+      'gameplay.seedFlintAndSteelIgnition',
+      'gameplay.seedRefusedFireChargeIgnition',
+      'gameplay.seedMeleeDropEncounter',
+      'gameplay.seedBrewingEncounter',
+      'gameplay.seedItemUpgradeEncounter',
+      'gameplay.switchItemUpgradeStationToAnvil',
+      'gameplay.seedEndEyeCrafting',
+      'gameplay.forceNextEyeOfEnderDrop',
+      'gameplay.forceNextEyeOfEnderBreak',
+      'gameplay.spawnFullHealthEnderman',
+      'gameplay.spawnFullHealthBlaze',
+      'gameplay.targetNearestHostile',
+      'gameplay.targetNearestDroppedItem',
+      'gameplay.targetNearestStrongholdFrame',
+      'gameplay.seedEndPortalFinalFrame',
+      'gameplay.targetCompletedEndPortal',
+      'gameplay.seedEndDragonFinalHit',
+      'gameplay.targetEndDragon',
+      'gameplay.targetEndExitPortal',
+      'persistence.flush',
+      'audio.report',
+      'audio.snapshot',
+      'lifecycle.stop',
+      'runtime.qaCatalog',
+    ].sort())
   })
 
   test('#4c audio QA exposes the camera-derived listener orientation', async ({ page }) => {

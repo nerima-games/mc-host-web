@@ -37,6 +37,7 @@ type EquipmentSnapshotEntry = {
 }
 type GameplaySnapshot = {
   readonly environmentalContact: {
+    readonly simulationElapsedSecs: number
     readonly lastDamageElapsedSecs: number | null
     readonly cells: ReadonlyArray<{ readonly block: string; readonly contactDamage: number }>
   }
@@ -173,14 +174,21 @@ test('reduces player damage with equipped iron armor', async ({ page }) => {
       equipArmor ? dispatch('seedIronArmor') : Promise.resolve(undefined),
     ])
     const equipped = armor ?? seeded
-    for (;;) {
+    const firstContactDeadlineSecs = equipped.environmentalContact.simulationElapsedSecs + 1
+    let damaged = equipped
+    while (damaged.environmentalContact.simulationElapsedSecs < firstContactDeadlineSecs) {
       // Each dispatch reads the next frame boundary, before another tick can
       // hide the first hit behind passive regeneration or a second contact.
-      const damaged = await dispatch('snapshot')
+      damaged = await dispatch('snapshot')
       if (damaged.environmentalContact.lastDamageElapsedSecs !== null) {
         return { equipped, damaged }
       }
     }
+    throw new Error(`first lava contact did not damage the ${equipArmor ? 'armored' : 'unarmored'} player within one simulation second: ${JSON.stringify({
+      seededSimulationElapsedSecs: equipped.environmentalContact.simulationElapsedSecs,
+      environmentalContact: damaged.environmentalContact,
+      healthPoints: damaged.vitals.healthPoints,
+    })}`)
   }, armored)
 
   const control = await firstLavaContact(false)
