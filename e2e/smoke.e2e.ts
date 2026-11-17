@@ -183,7 +183,8 @@ test.describe('smoke — the composed frame in a real browser', () => {
     expect(probe?.bufferHeight).toBe(probe?.layoutHeight)
     expect(probe?.layoutWidth).toBeGreaterThan(0)
     expect(probe?.audioSamples).toBeGreaterThan(0)
-    expect(probe?.atlasSize).toBe('512x512')
+    // ATLAS_COLUMNS=32, ATLAS_ROWS=32, TILE_PIXELS=16, TILE_GUTTER_PIXELS=16: each axis is 32 * (16 + 2 * 16) = 1536.
+    expect(probe?.atlasSize).toBe('1536x1536')
     // The naive pair, kept because they are what the row is named after — but
     // they are a postscript to the two above, not the claim.
     expect(probe?.hasWebgl2).toBe(true)
