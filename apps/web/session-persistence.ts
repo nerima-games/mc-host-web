@@ -1415,6 +1415,47 @@ const validateChunkRecord = (stored: unknown): Effect.Effect<SaveEnvelope, SaveD
 const chunkRecordIntact = (stored: unknown): Effect.Effect<boolean> =>
   validateChunkRecord(stored).pipe(Effect.match({ onFailure: () => false, onSuccess: () => true }))
 
+// The integrity metadata covers the payload, so two intact records with equal
+// metadata hold the same payload.
+const sameRecord = (left: SaveEnvelope, right: SaveEnvelope): boolean =>
+  left.format === right.format &&
+  left.version === right.version &&
+  left.integrity.checksum === right.integrity.checksum &&
+  left.integrity.byteLength === right.integrity.byteLength
+
+type LiveChunkCopy = { readonly checkpoint: SaveKey; readonly live: Option.Option<SaveEnvelope> }
+
+/**
+ * Make the checkpoint, whose head already names the live revision, a verified
+ * copy of it. Each checkpoint record that is absent, fails its checksum, or
+ * differs from its live record is put over its own key, chunks before the
+ * head, so nothing is deleted first and no key is reused for another revision.
+ * A live revision that is itself incomplete or damaged is not copied: the
+ * checkpoint may then be the better copy, as mc-save's `isHealthy` rule keeps it.
+ */
+const ensureCheckpointCopiesLive = (
+  storage: StorageService,
+  checkpointHeadKey: SaveKey,
+  liveHead: SaveEnvelope,
+  checkpointHead: SaveEnvelope,
+  chunks: ReadonlyArray<LiveChunkCopy>,
+): Effect.Effect<void, StorageError> =>
+  Effect.gen(function* () {
+    const liveChunks: Array<{ readonly checkpoint: SaveKey; readonly live: SaveEnvelope }> = []
+    for (const { checkpoint, live } of chunks) {
+      if (Option.isNone(live) || !(yield* chunkRecordIntact(live.value))) return
+      liveChunks.push({ checkpoint, live: live.value })
+    }
+    for (const { checkpoint, live } of liveChunks) {
+      const copy = yield* storage.get(checkpoint)
+      const verified = Option.isSome(copy) &&
+        sameRecord(copy.value, live) &&
+        (yield* chunkRecordIntact(copy.value))
+      if (!verified) yield* storage.put(checkpoint, live)
+    }
+    if (!sameRecord(checkpointHead, liveHead)) yield* storage.put(checkpointHeadKey, liveHead)
+  })
+
 export type OpenedSession =
   | { readonly _tag: 'Live'; readonly head: SessionHead }
   | { readonly _tag: 'Checkpoint'; readonly head: SessionHead; readonly liveFailure: SaveDecodeError }
@@ -1777,16 +1818,28 @@ export const saveSession = (
 
     // Invariant: a good copy of the overwritten revision exists before the live
     // head moves. After a publish failed past its checkpoint copy, the
-    // checkpoint (written chunks first, head last) already holds the live
-    // revision; copying it again would reuse that revision's checkpoint keys,
-    // which mc-save rejects. A save reusing the live revision id overwrites
-    // those live records in place, so the checkpoint, though named alike,
-    // would not hold them: it still takes the copying path.
-    const checkpointHoldsLive = Option.isSome(previous) &&
+    // checkpoint head already names the live revision; copying it through
+    // mc-save again would reuse that revision's checkpoint keys, which it
+    // rejects. Its records may have been lost or damaged since, so they are
+    // verified, and repaired in place, before the live revision is replaced.
+    // A save reusing the live revision id overwrites those live records in
+    // place, so the checkpoint, though named alike, would not hold them: it
+    // still takes the copying path.
+    if (
+      Option.isSome(previous) &&
+      Option.isSome(storedHead) &&
+      Option.isSome(storedCheckpoint) &&
       Option.isSome(checkpoint) &&
       checkpoint.value.head.revision === previous.value.head.revision &&
       input.revision !== previous.value.head.revision
-    if (checkpointHoldsLive) {
+    ) {
+      yield* ensureCheckpointCopiesLive(
+        storage,
+        checkpointHeadKey,
+        storedHead.value,
+        storedCheckpoint.value,
+        Arr.zipWith(previous.value.keys, previousChunks, ({ checkpoint }, { value }) => ({ checkpoint, live: value })),
+      )
       yield* writeRevisionedSave<SaveKey, SaveEnvelope, StorageError | SessionManifestError, never>(live)
       return nextHead
     }

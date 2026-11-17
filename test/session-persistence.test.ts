@@ -2593,6 +2593,67 @@ describe('session checkpoint and compatibility', () => {
     }).pipe(Effect.provide(storage.layer))
   })
 
+  const checkpointDamage = [
+    { name: 'removed', damage: (storage: ControlledStorage, key: string) => storage.removeEnvelope(key) },
+    { name: 'tampered', damage: tamper },
+  ] as const
+  for (const { name, damage } of checkpointDamage) {
+    it.effect(`a save after a failed publish restores a ${name} checkpoint chunk before moving the live head`, () => {
+      const storage = controlledStorage()
+      const sessionId = `retry-${name}-checkpoint`
+      return Effect.gen(function* () {
+        yield* saveRevision(sessionId, 'r1', 1, [3])
+        storage.failChunkKey = `mc-compose/session/${sessionId}/revision/r2/dimension/overworld/chunk/0/0`
+        yield* Effect.flip(saveRevision(sessionId, 'r2', 2, [5]))
+        storage.failChunkKey = undefined
+        damage(storage, `mc-compose/session/${sessionId}/checkpoint/revision/r1/dimension/overworld/chunk/0/0`)
+
+        yield* saveRevision(sessionId, 'r3', 3, [7])
+
+        tamper(storage, `mc-compose/session/${sessionId}/head`)
+        const opened = Option.getOrThrow(yield* openSession(sessionId))
+        assert(opened._tag === 'Checkpoint')
+        expect(opened.head.revision).toBe('r1')
+        expect(yield* savedMarkers(opened.head)).toEqual([3])
+      }).pipe(Effect.provide(storage.layer))
+    })
+  }
+
+  it.effect('a save after a failed publish keeps the checkpoint when the live revision is damaged', () => {
+    const storage = controlledStorage()
+    return Effect.gen(function* () {
+      yield* saveRevision('retry-damaged-live', 'r1', 1, [3])
+      storage.failChunkKey = 'mc-compose/session/retry-damaged-live/revision/r2/dimension/overworld/chunk/0/0'
+      yield* Effect.flip(saveRevision('retry-damaged-live', 'r2', 2, [5]))
+      storage.failChunkKey = undefined
+      tamper(storage, 'mc-compose/session/retry-damaged-live/revision/r1/dimension/overworld/chunk/0/0')
+
+      yield* saveRevision('retry-damaged-live', 'r3', 3, [7])
+
+      tamper(storage, 'mc-compose/session/retry-damaged-live/head')
+      const opened = Option.getOrThrow(yield* openSession('retry-damaged-live'))
+      assert(opened._tag === 'Checkpoint')
+      expect(opened.head.revision).toBe('r1')
+      expect(yield* savedMarkers(opened.head)).toEqual([3])
+    }).pipe(Effect.provide(storage.layer))
+  })
+
+  it.effect('a save replacing a rewritten revision checkpoints its latest records', () => {
+    const storage = controlledStorage()
+    return Effect.gen(function* () {
+      yield* saveRevision('rewritten-revision', 'r1', 1, [3])
+      const rewritten = yield* saveRevision('rewritten-revision', 'r1', 2, [4])
+
+      yield* saveRevision('rewritten-revision', 'r2', 3, [5])
+
+      tamper(storage, 'mc-compose/session/rewritten-revision/head')
+      const opened = Option.getOrThrow(yield* openSession('rewritten-revision'))
+      assert(opened._tag === 'Checkpoint')
+      expect(opened.head.state).toEqual(rewritten.state)
+      expect(yield* savedMarkers(opened.head)).toEqual([4])
+    }).pipe(Effect.provide(storage.layer))
+  })
+
   it.effect('does not copy a previous revision whose chunk is damaged over the checkpoint', () => {
     const storage = controlledStorage()
     return Effect.gen(function* () {
