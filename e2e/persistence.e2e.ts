@@ -881,6 +881,35 @@ test('reopens a world from its checkpoint when the latest save is unreadable', a
   expect(faults.consoleErrors).toEqual([])
 })
 
+// The message the Save and Quit handler wrote before #45's typed messages.
+const GENERIC_SAVE_FAILURE_MESSAGE = 'Save failed. Your world is still open; please try again.'
+
+// Clicks Save and Quit with every text written to the pause error line
+// recorded from before the click. The autosave keeps running while paused and
+// can overwrite the line, so the final text alone cannot show what the Save and
+// Quit handler wrote. With `armFault`, the storage write fault is armed in the
+// same evaluation, so no autosave runs between arming and the click.
+const clickSaveQuitRecordingErrors = (page: Page, armFault: boolean): Promise<void> =>
+  page.evaluate((arm) => {
+    const errorLine = document.querySelector('[data-pause-error]')
+    if (errorLine === null) throw new Error('missing pause error line')
+    const button = document.querySelector<HTMLButtonElement>('[data-testid="save-quit-button"]')
+    if (button === null) throw new Error('missing save-quit button')
+    const texts: Array<string> = []
+    ;(globalThis as unknown as { pauseErrorTexts: Array<string> }).pauseErrorTexts = texts
+    new MutationObserver(() => { texts.push(errorLine.textContent ?? '') })
+      .observe(errorLine, { childList: true, characterData: true, subtree: true })
+    if (arm) {
+      ;(globalThis as unknown as { setStorageWriteFault: (armed: boolean) => void }).setStorageWriteFault(true)
+    }
+    button.click()
+  }, armFault)
+
+// The non-empty texts written to the pause error line since the click.
+const recordedPauseErrors = async (page: Page): Promise<ReadonlyArray<string>> =>
+  (await page.evaluate(() => [...(globalThis as unknown as { pauseErrorTexts: Array<string> }).pauseErrorTexts]))
+    .filter((text) => text !== '')
+
 test('keeps the world open with the storage message when Save and Quit cannot write', async ({ page }) => {
   const faults = watchForFaults(page)
   const sessionId = 'save-quit-storage-failure-e2e'
@@ -893,16 +922,14 @@ test('keeps the world open with the storage message when Save and Quit cannot wr
   await openPauseMenu(page)
 
   const saveQuitButton = page.getByTestId('save-quit-button')
-  // Armed and clicked in one evaluation, so the click is the next write the
-  // player asked for; the fault stays armed for any autosave in between.
-  await page.evaluate(() => {
-    ;(globalThis as unknown as { setStorageWriteFault: (armed: boolean) => void }).setStorageWriteFault(true)
-    const button = document.querySelector<HTMLButtonElement>('[data-testid="save-quit-button"]')
-    if (button === null) throw new Error('missing save-quit button')
-    button.click()
-  })
+  // The fault stays armed until this Save and Quit is seen failing, so an
+  // autosave already waiting to write cannot use it up first.
+  await clickSaveQuitRecordingErrors(page, true)
   await expect(saveQuitButton).not.toHaveAttribute('aria-busy', 'true')
   await expect(page.locator('[data-pause-error]')).toHaveText(SESSION_SAVE_STORAGE_FAILURE_MESSAGE)
+  const written = await recordedPauseErrors(page)
+  expect(written).not.toContain(GENERIC_SAVE_FAILURE_MESSAGE)
+  expect(written.at(-1)).toBe(SESSION_SAVE_STORAGE_FAILURE_MESSAGE)
   await expect(page).toHaveURL(new RegExp(`\\?session=${sessionId}$`, 'u'))
   await setStorageWriteFault(page, false)
 
@@ -921,12 +948,24 @@ test('keeps the world open with the incompatible-save message when Save and Quit
   await waitForStoredRecord(page, sessionHeadKey(sessionId))
   await openPauseMenu(page)
 
-  await replaceStoredEnvelope(page, sessionHeadKey(sessionId), sealedAtNewerVersion)
+  // An autosave that read the old head before the replacement can save over the
+  // newer one; every later save then succeeds. So the head is replaced again
+  // until a save fails against it. Saves are serial and a failed save writes
+  // nothing, so after that failure the newer head stays.
+  await expect(async () => {
+    await replaceStoredEnvelope(page, sessionHeadKey(sessionId), sealedAtNewerVersion)
+    // One autosave interval (5 s) plus margin.
+    await expect(page.locator('body')).toHaveAttribute('data-session-persistence', 'failed', { timeout: 7_000 })
+  }).toPass({ timeout: 30_000 })
+  expect((await requireStoredRecord(page, sessionHeadKey(sessionId))).envelope.version).toBe(NEWER_SESSION_FORMAT_VERSION)
   const saveQuitButton = page.getByTestId('save-quit-button')
-  await saveQuitButton.click()
+  await clickSaveQuitRecordingErrors(page, false)
 
   await expect(saveQuitButton).not.toHaveAttribute('aria-busy', 'true')
   await expect(page.locator('[data-pause-error]')).toHaveText(SESSION_SAVE_INCOMPATIBLE_MESSAGE)
+  const written = await recordedPauseErrors(page)
+  expect(written).not.toContain(GENERIC_SAVE_FAILURE_MESSAGE)
+  expect(written.at(-1)).toBe(SESSION_SAVE_INCOMPATIBLE_MESSAGE)
   await expect(page).toHaveURL(new RegExp(`\\?session=${sessionId}$`, 'u'))
   // No save replaced the newer head while the test wrote it.
   expect((await requireStoredRecord(page, sessionHeadKey(sessionId))).envelope.version).toBe(NEWER_SESSION_FORMAT_VERSION)

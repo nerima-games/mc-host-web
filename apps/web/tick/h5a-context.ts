@@ -201,7 +201,12 @@ export type H5aTickContext = {
 export type H5aFrameInputContext = {
   readonly firstFrameSecs: number
   readonly clampDelta: (raw: number) => DeltaTimeSecs
-  readonly inputApi: Pick<InputServiceApi, 'wasActionJustTriggered' | 'isActionActive'>
+  // A tick reads its own copy of the frame reading. The reading is required
+  // here, so a live `isActionActive(action)` does not compile.
+  readonly inputApi: {
+    readonly wasActionJustTriggered: InputServiceApi['wasActionJustTriggered']
+    readonly isActionActive: (action: InputAction, reading: InputSnapshot) => Effect.Effect<boolean>
+  }
   readonly state: Pick<H5aTickContext['state'],
     | 'touchLookState'
     | 'previousSecs'
