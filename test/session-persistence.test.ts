@@ -88,6 +88,7 @@ import {
   type SessionMetadata,
   type SessionState,
 } from '../apps/web/session-persistence'
+import { isDroppedItemPickupEligible } from '../apps/web/dropped-item-pickup'
 import {
   sessionLoadErrorOf,
   sessionOpenFailureMessage,
@@ -267,8 +268,27 @@ describe('dynamic entity persistence', () => {
       customName: 'Fortune Miner',
       enchantments: [{ id: 'fortune', level: 3 }],
       elapsedSecs: 123.5,
-      eligibleFromFrame: 42,
     })
+  })
+
+  it('restores a saved dropped item as pickable on the first tick of the new session', () => {
+    const roster = normalizePersistedEntityRoster({
+      entities: [{
+        id: 'drop-5',
+        kind: 'dropped_item',
+        feetPosition: { x: 0.5, y: 64, z: 0.5 },
+        healthPoints: 1,
+        // Saved late in an earlier session; the new session's tick count starts at 0.
+        behaviour: { item: 'stone', count: 2, elapsedSecs: 3, eligibleFromFrame: 72_000 },
+      }],
+      nextSerial: 6,
+    })
+
+    const behaviour = roster.entities[0]?.behaviour
+    assert.isTrue(isDroppedItemBehaviour(behaviour))
+    if (!isDroppedItemBehaviour(behaviour)) return
+    expect(behaviour.eligibleFromFrame).toBeUndefined()
+    expect(isDroppedItemPickupEligible(1, behaviour.eligibleFromFrame)).toBe(true)
   })
 
   it('validates item-drop metadata and omits malformed persisted values', () => {

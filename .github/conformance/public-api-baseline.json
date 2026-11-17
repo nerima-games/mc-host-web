@@ -141,7 +141,7 @@
     "count": 1,
     "file": "apps/web/browser-preview.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runFork(loop.submitFrame(MonotonicTimeSecs(timestamp / 1_000)))"
+    "text": "Effect.runFork(runFrame(MonotonicTimeSecs(timestamp / 1_000)))"
   },
   {
     "count": 2,
@@ -2499,7 +2499,7 @@
     "count": 1,
     "file": "apps/web/tick/post-frame.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(spawnDroppedItems( entityManager, drained.items.map((stack, index) => ({ ...stack, at, ...(slotMetadata[index]?.customName === undefined && slotMetadata[index]?.enchantedItem === undefined ? {} : { eligibleFromFrame: framesTotal + 1 }), })), ))"
+    "text": "Effect.runSync(spawnDroppedItems( entityManager, drained.items.map((stack, index) => ({ ...stack, at, ...(slotMetadata[index]?.customName === undefined && slotMetadata[index]?.enchantedItem === undefined ? {} : { eligibleFromFrame: ticksTotal + 1 }), })), ))"
   },
   {
     "count": 1,

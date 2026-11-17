@@ -17,7 +17,8 @@ type WorldExplosionFailure =
 export type H5bPostFrameInput = Readonly<{
   readonly frame: H5aFrameInputResult
   readonly movement: H5aMovementResult
-  readonly framesTotal: number
+  /** Fixed ticks run this session; dropped-item pickup eligibility counts these. */
+  readonly ticksTotal: number
 }>
 
 export type H5bPostFrameResult = Readonly<{

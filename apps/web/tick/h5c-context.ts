@@ -170,7 +170,8 @@ export type H5cTickContext = {
 export type H5cFramePresentationInput = Readonly<{
   partialTick: InterpolationFraction
   simulationTick: SimulationTick
-  frameDeltaSecs: DeltaTimeSecs
+  /** The unclamped wall-clock frame delta (`FrameTiming.raw`); not for integration. */
+  raw: DeltaTimeSecs
   nowSecs: MonotonicTimeSecs
 }>
 

@@ -1,6 +1,19 @@
-import { Context, Effect } from 'effect'
-import { WorldWritePort, type QaNamespace, type SaveSliceRegistration } from '@nerima-games/mc-kernel'
-import { renderModule, InputService, type ChunkSyncPort, type DrawPort, type GraphicsQuality } from '@nerima-games/mc-render'
+import { Context, Effect, Result } from 'effect'
+import {
+  WorldWritePort,
+  type QaNamespace,
+  type SaveSliceRegistration,
+  type StageId,
+  type StageRegistration,
+} from '@nerima-games/mc-kernel'
+import {
+  renderModule,
+  InputService,
+  RENDER_STAGE_IDS,
+  type ChunkSyncPort,
+  type DrawPort,
+  type GraphicsQuality,
+} from '@nerima-games/mc-render'
 import {
   entityManagerTag,
   makeCropService,
@@ -29,8 +42,12 @@ import { type MultiplayerHost } from '@nerima-games/mx-multiplayer'
 import { ChunkStore, type ChunkStoreApi, type Dimension } from '@nerima-games/mc-worldgen'
 import {
   EMPTY_MODULE_LAYER,
+  phaseOf,
   registerModule,
+  STAGE_PHASE_INPUT,
+  STAGE_PHASE_NETWORK_OUTBOUND,
   type GameModule,
+  type StagePhase,
 } from '@nerima-games/mc-compose'
 import { type PersistedLeverState } from './session-persistence'
 
@@ -153,10 +170,17 @@ export const registerHostModules = (deps: HostModulesDeps): Effect.Effect<Readon
   // keeps its default `PlayerControlPort`; the camera mirror reads the shared
   // `PlayerService`. `chunkSync` is what mc-render's own `render:chunk-sync`
   // stage updates each frame.
+  //
+  // `render:input` is left out: the host frame reads the input service once and
+  // ends that reading once (main.ts F2 and F7), and the canvas click handler
+  // requests pointer lock. The stage would read and end the frame a second time.
   const render = registerModule({
     name: '@nerima-games/mc-render',
     layers: EMPTY_MODULE_LAYER,
-    frameStages: renderModule(renderQuality, undefined, draw, undefined, chunkSync).frameStages,
+    frameStages: Effect.map(
+      renderModule(renderQuality, undefined, draw, undefined, chunkSync).frameStages,
+      (stages) => stages.filter((stage) => stage.id !== RENDER_STAGE_IDS.input),
+    ),
   })
 
   // `uiModule` allocates a UiFrameState the host cannot reach, so the UI stages
@@ -254,4 +278,67 @@ export const registerHostModules = (deps: HostModulesDeps): Effect.Effect<Readon
     Effect.all([render, ui, redstone, sim, gameplay, ...multiplayerModules]),
     services,
   )
+}
+
+/**
+ * The composed order split into the stages a fixed 20 Hz tick runs and the
+ * stages a render frame runs. Each keeps its `plan.order` order.
+ */
+export type HostStageSplit = {
+  readonly tickStages: ReadonlyArray<StageRegistration>
+  readonly frameStages: ReadonlyArray<StageRegistration>
+}
+
+export type HostStageSplitError =
+  | { readonly _tag: 'StageInInputPhase'; readonly stage: StageId }
+  | { readonly _tag: 'TickStageAfterFrameStage'; readonly stage: StageId; readonly after: StageId }
+  | { readonly _tag: 'StageNotRegisteredOnce'; readonly stage: StageId; readonly registrations: number }
+  | { readonly _tag: 'SkeletonWithoutNetworkOutbound' }
+
+/**
+ * Frame stages are those whose phase comes after `network:outbound` in
+ * `skeleton` (in the standard skeleton, camera mirror through HUD sync). A stage outside every
+ * phase, such as `gameplay:block-state-rules` or a mod's stage, runs per tick:
+ * presentation run per tick only draws late, but simulation run per frame
+ * would advance the world once per frame.
+ *
+ * Startup fails closed on any of:
+ * 1. a stage left in the input phase (the host reads input itself);
+ * 2. a tick stage ordered `after` a frame stage, which the split would reverse;
+ * 3. an id in `order` that is not registered exactly once, so it cannot land
+ *    in exactly one of the two groups.
+ * It also fails when `skeleton` has no `network:outbound` phase, because the
+ * boundary would then be unknown.
+ */
+export const splitStages = (
+  stages: ReadonlyArray<StageRegistration>,
+  order: ReadonlyArray<StageId>,
+  skeleton: ReadonlyArray<StagePhase>,
+): Result.Result<HostStageSplit, HostStageSplitError> => {
+  const boundary = skeleton.indexOf(STAGE_PHASE_NETWORK_OUTBOUND)
+  if (boundary < 0) return Result.fail({ _tag: 'SkeletonWithoutNetworkOutbound' })
+  const isFrameStage = (id: StageId): boolean => {
+    const phase = phaseOf(skeleton, id)
+    return phase !== undefined && skeleton.indexOf(phase) > boundary
+  }
+  const tickStages: Array<StageRegistration> = []
+  const frameStages: Array<StageRegistration> = []
+  for (const id of order) {
+    const registered = stages.filter((stage) => stage.id === id)
+    const [stage] = registered
+    if (stage === undefined || registered.length !== 1) {
+      return Result.fail({ _tag: 'StageNotRegisteredOnce', stage: id, registrations: registered.length })
+    }
+    if (phaseOf(skeleton, id) === STAGE_PHASE_INPUT) {
+      return Result.fail({ _tag: 'StageInInputPhase', stage: id })
+    }
+    if (isFrameStage(id)) {
+      frameStages.push(stage)
+    } else {
+      const after = stage.after?.find(isFrameStage)
+      if (after !== undefined) return Result.fail({ _tag: 'TickStageAfterFrameStage', stage: id, after })
+      tickStages.push(stage)
+    }
+  }
+  return Result.succeed({ tickStages, frameStages })
 }

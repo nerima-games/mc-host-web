@@ -95,9 +95,7 @@ import {
   blockTypeOfId,
   DeltaTimeSecs,
   DimensionIdSchema,
-  InterpolationFraction,
   EntityIdSchema,
-  SimulationTick,
   SimulationTickSchema,
   blockPositionOfPosition,
   chunkCoordOfBlock,
@@ -323,8 +321,10 @@ import {
   witherRenderDescriptors,
 } from '@nerima-games/mc-server/shared'
 import {
+  collectStages,
   composeGame,
   EMPTY_MODULE_LAYER,
+  STANDARD_STAGE_SKELETON,
 } from '@nerima-games/mc-compose'
 import { BrowserClockLayer, browserClock } from './clock'
 import { createDebugOverlayRuntime } from './debug-overlay-runtime'
@@ -417,6 +417,7 @@ import {
 import {
   makeHostServiceContext,
   registerHostModules,
+  splitStages,
   type GameplayCommitServices,
 } from './host-modules'
 import { makeHostWorldWrite } from './world-write-port'
@@ -442,7 +443,9 @@ import {
   installPlayerLifecycle,
   installPlayerQaSurface,
 } from './player-session-runtime'
-import { runTickFrameInput } from './tick/frame-input'
+import { FIXED_TICK_SECS, makeFixedStepFrameLoop } from './tick/fixed-step-frame'
+import { runHostFrame, tickInputQueries } from './tick/host-frame'
+import { applyFrameLook, runTickFrameInput } from './tick/frame-input'
 import { mutableState, type H5aTickContext } from './tick/h5a-context'
 import { runTickPlayerMovement } from './tick/player-movement'
 import type { H5bPostFrameContext } from './tick/h5b-context'
@@ -1688,7 +1691,7 @@ const bootGame = async (
     copyItemMetadata,
     deleteItemMetadata,
     droppedItemMetadataKey,
-    getFramesTotal: () => framesTotal,
+    getFramesTotal: () => ticksTotal,
     asBlockPosition,
     leverKeyOf,
   })
@@ -2579,6 +2582,17 @@ const bootGame = async (
 
   const game = composedExit.value
 
+  // One composed order, run as two groups: the simulation stages once per
+  // fixed 20 Hz tick and the presentation stages once per render frame.
+  const stageSplit = splitStages(collectStages(game.modules), game.plan.order, STANDARD_STAGE_SKELETON)
+  if (Result.isFailure(stageSplit)) {
+    failBoot('the composed stages could not be split into tick and frame stages', stageSplit.failure)
+    return
+  }
+  const { tickStages, frameStages } = stageSplit.success
+  const runStages = (stages: typeof tickStages) => (deltaSecs: DeltaTimeSecs): Effect.Effect<void> =>
+    Effect.provide(Effect.forEach(stages, (stage) => stage.run(deltaSecs), { discard: true }), BrowserClockLayer)
+
   // Reported, never enforced — `domain/composition.ts` on why a dangling `after`
   // is legal and still worth printing.
   for (const warning of game.warnings) {
@@ -3186,7 +3200,7 @@ const bootGame = async (
     getStorageSnapshot: () => Effect.runSync(world.inventory.storageSnapshot),
     customNames,
     enchantedItems,
-    getFramesTotal: () => framesTotal,
+    getFramesTotal: () => ticksTotal,
     spawnDroppedItems: (drops) => Effect.runSync(spawnDroppedItems(ownerBacked.entityManager, drops)),
     getPlayerDimension: () => Effect.runSync(world.player.dimension),
     droppedItemMetadataKey,
@@ -3599,13 +3613,21 @@ const bootGame = async (
   // 6. The frame
   // -------------------------------------------------------------------------
 
+  // The tick body's `runFrame` runs the tick stages only; `runFrameStages`
+  // runs the presentation stages once per render frame.
   const { runFrame, readNow } = createPlayerFramePreparation({
-    makeRunFrame: () => game.runFrameWith(BrowserClockLayer),
+    makeRunFrame: () => runStages(tickStages),
     readNow: () => Effect.runSync(browserClock.monotonicSecs),
   })
 
+  const runFrameStages = runStages(frameStages)
+  const fixedStep = Effect.runSync(makeFixedStepFrameLoop())
   let previousSecs: MonotonicTimeSecs | undefined
+  let previousFrameSecs: MonotonicTimeSecs | undefined
   let framesTotal = 0
+  // Fixed ticks run this session. Dropped items record the tick from which
+  // they can be picked up (`eligibleFromFrame`, named before the split).
+  let ticksTotal = 0
   let renderedCaptionSignature: string | undefined
 
   document.body.setAttribute('data-mc-compose-boot', 'running')
@@ -3613,7 +3635,8 @@ const bootGame = async (
   const tick = (() => {
     const h5aTickContext: H5aTickContext = {
       firstFrameSecs: FIRST_FRAME_SECS,
-      clampDelta,
+      // Every tick advances the simulation by exactly one 20 Hz tick.
+      clampDelta: () => FIXED_TICK_SECS,
       inputApi,
       state: {
         touchLookState: mutableState(() => touchLookState, (value) => { touchLookState = value }),
@@ -3915,13 +3938,15 @@ const bootGame = async (
       },
     }
 
-    // The browser preview runs this Effect inside the mc-sim GameLoop's frame
-    // handler and awaits it before taking the next frame, so the coordinator
-    // commits of one frame complete before the next frame starts. A typed
-    // failure reaches the preview's frame-failure path, which stops the loop.
+    // The browser preview runs this Effect once per animation frame and awaits
+    // it before starting another, so the coordinator commits of one frame
+    // complete before the next frame starts. A typed failure reaches the
+    // preview's frame-failure path, which stops the loop.
     //
     // The frame holds the frame lock throughout and first runs the writes queued
-    // since the previous frame (see `frameBoundary`).
+    // since the previous frame (see `frameBoundary`). It reads the input service
+    // once (F2), turns the view once (F3), runs zero to ten fixed 20 Hz ticks
+    // (F4), presents once (F5), updates music (F6) and ends that one reading (F7).
     return frameBoundary.frame(Effect.gen(function* () {
       const nowSecs = readNow()
       if (sessionLoading !== undefined) {
@@ -3937,40 +3962,64 @@ const bootGame = async (
       if (Result.isFailure(gamepadPolled)) {
         console.error('[gamepad] axes rejected; gamepad input released', gamepadPolled.failure)
       }
-      const frameInput = yield* inputApi.snapshot
-      yield* Effect.gen(function* () {
-        const frame = runTickFrameInput(h5aTickContext, nowSecs, frameInput)
-        if (frame === undefined) return
-        const movement = yield* runTickPlayerMovement(h5aTickContext, frame)
-        if (movement === undefined) return
-        const postFrame = yield* runTickPostFrame(h5bTickContext, { frame, movement, framesTotal })
-        yield* runTickPostFrameGameplay(h5cTickContext, { frame, movement, postFrame, nowSecs })
-        yield* runFramePresentation(
-          { ...h5cTickContext, updateDebugOverlay: debugOverlay.update },
-          {
-            partialTick: InterpolationFraction(0),
-            simulationTick: SimulationTick(0),
-            frameDeltaSecs: yield* Effect.fromResult(DeltaTimeSecs.result(frame.raw)),
+      yield* runHostFrame({
+        input: inputApi,
+        fixedStep,
+        previousFrameSecs: mutableState(() => previousFrameSecs, (value) => { previousFrameSecs = value }),
+        firstFrameSecs: FIRST_FRAME_SECS,
+        clampDelta,
+        // The tick's own look result is always false; orientation saves rely on this.
+        look: (frameInput, frameDeltaSecs) => {
+          if (applyFrameLook(h5aTickContext, frameInput, frameDeltaSecs)) markSessionDirty()
+        },
+        tick: ({ input }) => Effect.gen(function* () {
+          // Counted per tick: dropped-item pickup eligibility is in ticks.
+          ticksTotal += 1
+          const frame = runTickFrameInput({ ...h5aTickContext, inputApi: tickInputQueries(inputApi, input) }, nowSecs, input)
+          if (frame === undefined) return 'continue' as const
+          const movement = yield* runTickPlayerMovement(h5aTickContext, frame)
+          // A defected tick stage has already failed the boot; the frame stops there.
+          if (movement === undefined) return 'halt' as const
+          const postFrame = yield* runTickPostFrame(h5bTickContext, { frame, movement, ticksTotal })
+          yield* runTickPostFrameGameplay(h5cTickContext, { frame, movement, postFrame, nowSecs })
+          return 'continue' as const
+        }),
+        presents: () => !paused,
+        present: ({ partialTick, simulationTick, timing }) => Effect.gen(function* () {
+          const presentationStages = yield* Effect.exit(runFrameStages(timing.deltaSecs))
+          if (Exit.isFailure(presentationStages)) {
+            failBoot('a frame stage defected', presentationStages.cause)
+            return
+          }
+          yield* drainChunkRenderFaults([...dimensionContexts.values()])
+          yield* runFramePresentation(
+            { ...h5cTickContext, updateDebugOverlay: debugOverlay.update },
+            // The overlay's frame rate reads the unclamped delta.
+            {
+              partialTick,
+              simulationTick,
+              raw: yield* Effect.fromResult(DeltaTimeSecs.result(timing.raw)),
+              nowSecs,
+            },
+          )
+          yield* music.update({
             nowSecs,
-          },
-        )
-        yield* music.update({
-          nowSecs,
-          scene: {
-            title: false,
-            dimension: postFrame.dimensionAfterFrame,
-            time: yield* time.snapshot,
-            playerPosition: postFrame.postFramePose.feetPosition,
-            underwater: swimmingState.fullySubmerged,
-            // The host has no combat signal yet, so combat music never starts.
-            combat: false,
-            creative: isCreativeMode,
-          },
-          musicEnabled: playerSettingsWrites.applied.audioEnabled,
-          musicVolume: MUSIC_VOLUME,
-          ambient: null,
-        })
-      }).pipe(Effect.ensuring(inputApi.endFrame(frameInput)))
+            scene: {
+              title: false,
+              dimension: yield* playerApi.dimension,
+              time: yield* time.snapshot,
+              playerPosition: (yield* playerApi.pose).feetPosition,
+              underwater: swimmingState.fullySubmerged,
+              // The host has no combat signal yet, so combat music never starts.
+              combat: false,
+              creative: isCreativeMode,
+            },
+            musicEnabled: playerSettingsWrites.applied.audioEnabled,
+            musicVolume: MUSIC_VOLUME,
+            ambient: null,
+          })
+        }),
+      }, nowSecs)
     }))
   })()
 

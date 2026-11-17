@@ -22,7 +22,7 @@ export const runTickPostFrame = (
   | ReturnType<H5bPostFrameContext['advanceWitherRuntime']>
   | ReturnType<H5bPostFrameContext['damageRuntimeWither']>
 >> => Effect.gen(function* () {
-  const { frame, movement, framesTotal } = input
+  const { frame, movement, ticksTotal } = input
   const h5a = context.h5a
   const targeting = h5a.targeting
   const h5aState = h5a.state
@@ -206,7 +206,7 @@ export const runTickPostFrame = (
     } else for (const entity of Effect.runSync(world.entities.entities)) {
       if (deadAfterFrame) break
       if (!isDroppedItemBehaviour(entity.behaviour)) continue
-      if (!isDroppedItemPickupEligible(framesTotal, entity.behaviour.eligibleFromFrame)) continue
+      if (!isDroppedItemPickupEligible(ticksTotal, entity.behaviour.eligibleFromFrame)) continue
       const metadataKey = droppedItemMetadataKey(playerDimension, String(entity.id))
       const metadata = droppedItemMetadata.get(metadataKey)
         ?? droppedItemMetadataFromBehaviour(entity.behaviour)
@@ -371,7 +371,7 @@ export const runTickPostFrame = (
                 ...(slotMetadata[index]?.customName === undefined
                     && slotMetadata[index]?.enchantedItem === undefined
                   ? {}
-                  : { eligibleFromFrame: framesTotal + 1 }),
+                  : { eligibleFromFrame: ticksTotal + 1 }),
               })),
             ))
             dropped.forEach((entity, index) => {

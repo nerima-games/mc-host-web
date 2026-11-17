@@ -1,5 +1,5 @@
 import { assert, describe, expect, it } from '@effect/vitest'
-import { Context, Effect, Layer, Option, Ref, Schema } from 'effect'
+import { Context, Effect, Layer, Option, Ref, Result, Schema } from 'effect'
 import {
   BlockAxis,
   blockIdOf,
@@ -13,11 +13,12 @@ import {
   MonotonicTimeSecs,
   position,
   PositionAxis,
+  StageId,
   WorldIdSchema,
   WorldWriteBatchSchema,
   WorldWritePort,
 } from '@nerima-games/mc-kernel'
-import { composeGame } from '@nerima-games/mc-compose'
+import { collectStages, composeGame, STANDARD_STAGE_SKELETON } from '@nerima-games/mc-compose'
 import {
   CropService,
   CropSnapshotSchema,
@@ -70,6 +71,7 @@ import {
   makeHostServiceContext,
   MobEntityManager,
   registerHostModules,
+  splitStages,
   type HostGameModule,
   type HostModulesDeps,
   type HostServiceInstances,
@@ -78,10 +80,12 @@ import {
 import { makeOwnerBackedHost } from '../apps/web/owner-backed-services'
 import { makeHostWorldWrite } from '../apps/web/world-write-port'
 import { makeHostGameplayBlockStateWorld } from '../apps/web/gameplay-block-state-world'
+import { FIXED_TICK_SECS, makeFixedStepFrameLoop } from '../apps/web/tick/fixed-step-frame'
+import { runHostFrame } from '../apps/web/tick/host-frame'
+import { mutableState } from '../apps/web/tick/h5a-context'
 
 // The browser twin of this list is e2e/smoke.e2e.ts #3b; both must change together.
 const SMOKE_STAGE_ORDER = [
-  'render:input',
   'sim:physics',
   'gameplay:vehicles',
   'gameplay:interactions',
@@ -352,6 +356,115 @@ describe('host modules', () => {
       const game = yield* composeGame(modules)
 
       expect(game.plan.order).toStrictEqual(SMOKE_STAGE_ORDER)
+      expect(game.plan.order).not.toContain('render:input')
+    }))
+
+  it.effect('splits the composed order into tick stages and frame stages', () =>
+    Effect.gen(function* () {
+      const game = yield* composeGame(yield* registerHostModules(yield* makeDeps(yield* makeHost)))
+      const split = yield* Effect.fromResult(
+        splitStages(collectStages(game.modules), game.plan.order, STANDARD_STAGE_SKELETON),
+      )
+
+      expect(split.tickStages.map((stage) => stage.id)).toStrictEqual([
+        'sim:physics',
+        'gameplay:vehicles',
+        'gameplay:interactions',
+        'gameplay:fire',
+        'gameplay:survival-hunger',
+        'gameplay:entities',
+        'gameplay:ender-dragon',
+        'gameplay:fluids',
+        'redstone:power',
+        'redstone:effects',
+        'gameplay:time-weather',
+        // In no skeleton phase, so it runs per tick.
+        'gameplay:block-state-rules',
+      ])
+      expect(split.frameStages.map((stage) => stage.id)).toStrictEqual([
+        'render:camera-mirror',
+        'render:chunk-sync',
+        'render:post-fx',
+        'render:draw',
+        'ui:hud-sync',
+        'ui:overlay-sync',
+      ])
+      // Each id of the order lands in exactly one group.
+      const ids = [...split.tickStages, ...split.frameStages].map((stage) => stage.id)
+      expect([...ids].sort()).toStrictEqual([...game.plan.order].sort())
+    }))
+
+  it.effect('places multiplayer inbound and outbound with the tick stages', () =>
+    Effect.gen(function* () {
+      const host = yield* makeHost
+      const multiplayer = {
+        host: yield* makeMultiplayerHost.pipe(Effect.provideService(TransportPort, yield* disconnectedTransport)),
+      }
+      const game = yield* composeGame(yield* registerHostModules({ ...(yield* makeDeps(host)), multiplayer }))
+      const split = yield* Effect.fromResult(
+        splitStages(collectStages(game.modules), game.plan.order, STANDARD_STAGE_SKELETON),
+      )
+      const tickIds = split.tickStages.map((stage) => String(stage.id))
+
+      expect(tickIds).toContain('multiplayer:inbound')
+      expect(tickIds).toContain('multiplayer:outbound')
+      expect(split.frameStages.map((stage) => String(stage.id)).filter((id) => id.startsWith('multiplayer:'))).toStrictEqual([])
+    }))
+
+  it.effect('a 60 Hz second of frames presents every frame and runs the tick stages 20 times', () =>
+    Effect.gen(function* () {
+      const host = yield* makeHost
+      const game = yield* composeGame(yield* registerHostModules(yield* makeDeps(host)))
+      const split = yield* Effect.fromResult(
+        splitStages(collectStages(game.modules), game.plan.order, STANDARD_STAGE_SKELETON),
+      )
+      const runs = new Map<string, Array<number>>()
+      const clock = FixedClockLayer({ monotonicSecs: MonotonicTimeSecs(0), wallClockEpochMillis: EpochMillis(0) })
+      const runStages = (stages: typeof split.tickStages, deltaSecs: DeltaTimeSecs) => Effect.provide(
+        Effect.forEach(stages, (stage) => Effect.andThen(
+          Effect.sync(() => { runs.set(String(stage.id), [...(runs.get(String(stage.id)) ?? []), deltaSecs]) }),
+          stage.run(deltaSecs),
+        ), { discard: true }),
+        clock,
+      )
+      const input = Context.get(host.instances.inputContext, InputService)
+      const reads: Array<unknown> = []
+      const ended: Array<unknown> = []
+      let looks = 0
+      let previous: MonotonicTimeSecs | undefined
+      const fixedStep = yield* makeFixedStepFrameLoop()
+      const timeBefore = yield* host.instances.time.snapshot
+      const frameAt = (nowSecs: number) => runHostFrame({
+        input: {
+          snapshot: Effect.tap(input.snapshot, (reading) => Effect.sync(() => { reads.push(reading) })),
+          endFrame: (frame) => Effect.andThen(Effect.sync(() => { ended.push(frame) }), input.endFrame(frame)),
+        },
+        fixedStep,
+        previousFrameSecs: mutableState(() => previous, (value) => { previous = value }),
+        firstFrameSecs: 0.016,
+        clampDelta: (raw) => DeltaTimeSecs(Math.min(Math.max(0.001, raw), 0.05)),
+        look: () => { looks += 1 },
+        tick: () => Effect.as(runStages(split.tickStages, FIXED_TICK_SECS), 'continue' as const),
+        presents: () => true,
+        present: ({ timing }) => runStages(split.frameStages, timing.deltaSecs),
+      }, MonotonicTimeSecs(nowSecs))
+
+      // The first frame starts the clock; 60 more cover one second at 60 Hz.
+      // Each is 0.3 ms past the 60 Hz instant, so no frame lands exactly on a
+      // tick boundary, where mc-sim's delta truncation decides the tick.
+      yield* frameAt(100)
+      for (let frame = 1; frame <= 60; frame += 1) yield* frameAt(100 + (frame * 1000 / 60 + 0.3) / 1000)
+
+      expect(runs.get('render:draw')).toHaveLength(61)
+      expect(runs.get('ui:overlay-sync')).toHaveLength(61)
+      expect(runs.get('sim:physics')).toHaveLength(20)
+      expect(runs.get('gameplay:block-state-rules')).toHaveLength(20)
+      expect(new Set(runs.get('sim:physics'))).toStrictEqual(new Set([FIXED_TICK_SECS]))
+      expect(runs.get('render:draw')?.slice(2).every((delta) => Math.abs(delta - 1 / 60) < 1e-9)).toBe(true)
+      expect((yield* host.instances.time.snapshot).ticks).toBe(timeBefore.ticks + 20)
+      expect(looks).toBe(61)
+      expect(ended).toHaveLength(61)
+      ended.forEach((frame, index) => { expect(frame).toBe(reads[index]) })
     }))
 
   it.effect('resolves every host service tag to the instance the host passed in', () =>
@@ -473,6 +586,50 @@ describe('host modules', () => {
       expect(committed.state.pose.feetPosition).toEqual({ dimension: 'overworld', x: -2.5, y: 90, z: 3.5 })
       expect((yield* owned.views.player.pose).feetPosition).toEqual(destination)
     }))
+})
+
+describe('splitStages', () => {
+  const stage = (id: string, after?: ReadonlyArray<string>) => ({
+    id: StageId(id),
+    ...(after === undefined ? {} : { after: after.map(StageId) }),
+    run: () => Effect.void,
+  })
+
+  const failureOf = <A, E>(result: Result.Result<A, E>): E | undefined =>
+    Result.isFailure(result) ? result.failure : undefined
+
+  it('keeps the order within each group', () => {
+    const stages = [stage('render:draw'), stage('sim:physics'), stage('mod:custom', ['sim:physics'])]
+    const split = Result.getOrThrow(
+      splitStages(stages, ['sim:physics', 'mod:custom', 'render:draw'].map(StageId), STANDARD_STAGE_SKELETON),
+    )
+    expect(split.tickStages.map(({ id }) => id)).toStrictEqual(['sim:physics', 'mod:custom'])
+    expect(split.frameStages.map(({ id }) => id)).toStrictEqual(['render:draw'])
+  })
+
+  it('fails for a stage left in the input phase', () => {
+    expect(failureOf(splitStages([stage('render:input')], [StageId('render:input')], STANDARD_STAGE_SKELETON)))
+      .toStrictEqual({ _tag: 'StageInInputPhase', stage: 'render:input' })
+  })
+
+  it('fails for a tick stage ordered after a frame stage', () => {
+    const stages = [stage('render:draw'), stage('mod:after-draw', ['render:draw'])]
+    expect(failureOf(splitStages(stages, ['render:draw', 'mod:after-draw'].map(StageId), STANDARD_STAGE_SKELETON)))
+      .toStrictEqual({ _tag: 'TickStageAfterFrameStage', stage: 'mod:after-draw', after: 'render:draw' })
+  })
+
+  it('fails for an ordered id registered zero times or twice', () => {
+    expect(failureOf(splitStages([], [StageId('sim:physics')], STANDARD_STAGE_SKELETON)))
+      .toStrictEqual({ _tag: 'StageNotRegisteredOnce', stage: 'sim:physics', registrations: 0 })
+    expect(failureOf(
+      splitStages([stage('sim:physics'), stage('sim:physics')], [StageId('sim:physics')], STANDARD_STAGE_SKELETON),
+    )).toStrictEqual({ _tag: 'StageNotRegisteredOnce', stage: 'sim:physics', registrations: 2 })
+  })
+
+  it('fails for a skeleton without the network outbound boundary', () => {
+    expect(failureOf(splitStages([], [], STANDARD_STAGE_SKELETON.filter((phase) => phase.name !== 'network:outbound'))))
+      .toStrictEqual({ _tag: 'SkeletonWithoutNetworkOutbound' })
+  })
 })
 
 describe('the registered survival-hunger stage', () => {
