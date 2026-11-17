@@ -1,4 +1,6 @@
-import { Effect, type Schema } from 'effect'
+import { Data, Effect, type Schema } from 'effect'
+import type { YieldableError } from 'effect/Cause'
+import { StorageError } from '@nerima-games/mc-save'
 import { chunkSnapshotOf } from '@nerima-games/mc-worldgen'
 import {
   CropSnapshotSchema,
@@ -15,7 +17,7 @@ import {
 } from '@nerima-games/mx-gameplay'
 
 import { poseOfPlayerOwner, type OwnerBackedOwnerIds } from './owner-backed-services'
-import type { DimensionChunk, SessionState } from './session-persistence'
+import { SessionIncompatibleError, type DimensionChunk, type SessionState } from './session-persistence'
 
 /** The saved fields whose source of truth is a coordinator owner. */
 export type OwnedSessionState = Pick<SessionState, 'dimension' | 'player' | 'storage' | 'vitals' | 'entities' | 'crops'>
@@ -67,6 +69,44 @@ export type SessionSaveCoordinatorOptions<State> = {
   readonly publish: (publication: SessionSavePublication<State>) => Promise<void>
   readonly onPublished?: (generation: number) => void
   readonly onFailure?: (error: unknown) => void
+}
+
+type SessionSnapshotUnstableErrorFields = {
+  readonly attempts: number
+}
+
+/** The world kept changing while a save captured it, so no consistent cut was published. */
+export type SessionSnapshotUnstableError = YieldableError &
+  SessionSnapshotUnstableErrorFields & { readonly _tag: 'SessionSnapshotUnstableError' }
+
+export const SessionSnapshotUnstableError: new (
+  fields: SessionSnapshotUnstableErrorFields,
+) => SessionSnapshotUnstableError = Data.TaggedError('SessionSnapshotUnstableError')
+
+export const SESSION_SAVE_INCOMPATIBLE_MESSAGE =
+  'This world was saved by a newer version. Saving is blocked so it is not overwritten.'
+export const SESSION_SAVE_UNSUPPORTED_VERSION_MESSAGE =
+  'This world was saved by an older version that can no longer be opened. Saving is blocked so it is not overwritten.'
+export const SESSION_SAVE_STORAGE_FAILURE_MESSAGE =
+  'The world could not be saved. Your progress since the last save is not stored yet.'
+export const SESSION_SAVE_SNAPSHOT_UNSTABLE_MESSAGE =
+  'The world kept changing while it was being saved. Your progress since the last save is not stored yet.'
+export const SESSION_SAVE_FAILURE_MESSAGE = 'The world could not be saved.'
+
+/**
+ * The player-facing message for a rejection passed to `onFailure`. The
+ * rejection is `unknown`, so any value outside the classified errors gets the
+ * generic message; this is display text, not a substitute for the error.
+ */
+export const sessionSaveFailureMessage = (error: unknown): string => {
+  if (error instanceof SessionIncompatibleError) {
+    return error.reason === 'future-version'
+      ? SESSION_SAVE_INCOMPATIBLE_MESSAGE
+      : SESSION_SAVE_UNSUPPORTED_VERSION_MESSAGE
+  }
+  if (error instanceof StorageError) return SESSION_SAVE_STORAGE_FAILURE_MESSAGE
+  if (error instanceof SessionSnapshotUnstableError) return SESSION_SAVE_SNAPSHOT_UNSTABLE_MESSAGE
+  return SESSION_SAVE_FAILURE_MESSAGE
 }
 
 const coordId = ({ dimension, chunk }: DimensionChunk): string =>
@@ -125,7 +165,7 @@ export const createSessionSaveCoordinator = <State>(
       }
     }
     if (!validatedSnapshot) {
-      throw new Error(`Unable to capture a consistent save snapshot after ${maxSnapshotAttempts} attempts`)
+      throw new SessionSnapshotUnstableError({ attempts: maxSnapshotAttempts })
     }
     const { retainedCapture, state, stateGeneration, residents } = validatedSnapshot
 

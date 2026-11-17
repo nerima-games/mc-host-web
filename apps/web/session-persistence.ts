@@ -1,19 +1,30 @@
-import { Data, Effect, Option, Result, Schema, SchemaIssue, SchemaTransformation } from 'effect'
+import { Array as Arr, Data, Effect, Option, Result, Schema, SchemaIssue, SchemaTransformation } from 'effect'
 import type { YieldableError } from 'effect/Cause'
 import { isValidWitherRuntimeSnapshot, type WitherRuntimeSnapshot } from '@nerima-games/mc-server/shared'
 
 import { ChunkAxis, isItemStack, isItemType, type ChunkCoord } from '@nerima-games/mc-kernel'
 import {
+  decodeSave,
+  encodeSave,
+  isFromFuture,
   loadFrom,
+  loadRetainedRevision,
+  SaveDecodeError,
+  SaveEnvelopeSchema,
   SaveKey,
-  saveTo,
+  sealSaveEnvelope,
   StoragePort,
   defineFormat,
   SaveFormatVersion,
-  type SaveDecodeError,
+  validateSaveEnvelope,
+  writeRevisionedSave,
+  writeRevisionedSaveWithCheckpoint,
+  type RevisionStorage,
+  type SaveEnvelope,
   type SaveFormat,
   type SaveFormatMigration,
   type StorageError,
+  type StorageService,
 } from '@nerima-games/mc-save'
 import {
   isValidTimeState,
@@ -1107,26 +1118,77 @@ export const SESSION_FORMAT: SaveFormat<SessionHead, unknown> = Result.getOrThro
   migrations: [SESSION_V17_MIGRATION],
 }))
 
-type SessionManifestErrorFields = {
-  readonly reason: 'duplicate-coordinate' | 'missing-chunk'
-  readonly dimension: Dimension
-  readonly coord: ChunkCoord
-  readonly key: string
-}
+type SessionManifestErrorFields =
+  | {
+    readonly reason: 'duplicate-coordinate' | 'missing-chunk'
+    readonly dimension: Dimension
+    readonly coord: ChunkCoord
+    readonly key: string
+  }
+  // mc-save reports a collision between live and checkpoint keys by key alone.
+  | { readonly reason: 'duplicate-key'; readonly key: string }
 
 export type SessionManifestError = YieldableError &
   SessionManifestErrorFields & { readonly _tag: 'SessionManifestError' }
 
+const SessionManifestErrorBase = Data.TaggedError('SessionManifestError')
+
+// Instantiated explicitly: inferring from the annotation would take the
+// error type itself, not the field union, as the constructor's argument.
 export const SessionManifestError: new (fields: SessionManifestErrorFields) => SessionManifestError =
-  Data.TaggedError('SessionManifestError')
+  SessionManifestErrorBase<SessionManifestErrorFields>
+
+type SessionIncompatibleErrorFields = {
+  readonly reason: 'future-version' | 'unsupported-version'
+  readonly key: SaveKey
+  readonly storedVersion: number
+  readonly currentVersion: number
+}
+
+/** A stored session this build must neither read nor overwrite. It is not corrupt. */
+export type SessionIncompatibleError = YieldableError &
+  SessionIncompatibleErrorFields & { readonly _tag: 'SessionIncompatibleError' }
+
+export const SessionIncompatibleError: new (fields: SessionIncompatibleErrorFields) => SessionIncompatibleError =
+  Data.TaggedError('SessionIncompatibleError')
+
+/** Why the checkpoint could not stand in for an unreadable live revision. */
+export type SessionCheckpointFailure = 'absent' | SaveDecodeError | SessionIncompatibleError
+
+type SessionCorruptErrorFields = {
+  readonly sessionId: string
+  readonly liveFailure: SaveDecodeError
+  readonly checkpoint: SessionCheckpointFailure
+}
+
+export type SessionCorruptError = YieldableError &
+  SessionCorruptErrorFields & { readonly _tag: 'SessionCorruptError' }
+
+export const SessionCorruptError: new (fields: SessionCorruptErrorFields) => SessionCorruptError =
+  Data.TaggedError('SessionCorruptError')
 
 export type SessionPersistenceError =
   | StorageError
   | SaveDecodeError
   | InstanceType<typeof SessionManifestError>
+  | SessionIncompatibleError
+  | SessionCorruptError
+
+export type SessionOpenError = StorageError | SessionIncompatibleError | SessionCorruptError
+
+const SESSION_KEY_PREFIX = 'mc-compose/session/'
+const SESSION_HEAD_KEY_PATTERN = /^mc-compose\/session\/([^/]+)\/head$/u
+
+const sessionKeyPrefix = (sessionId: string): string =>
+  `${SESSION_KEY_PREFIX}${encodeURIComponent(sessionId)}/`
 
 export const sessionHeadKey = (sessionId: string): SaveKey =>
-  SaveKey(`mc-compose/session/${encodeURIComponent(sessionId)}/head`)
+  SaveKey(`${sessionKeyPrefix(sessionId)}head`)
+
+// Neither checkpoint key matches SESSION_HEAD_KEY_PATTERN, so listing ignores
+// them, and both share the session prefix that deleteSession removes.
+const sessionCheckpointHeadKey = (sessionId: string): SaveKey =>
+  SaveKey(`${sessionKeyPrefix(sessionId)}checkpoint/head`)
 
 export const sessionChunkKey = (
   sessionId: string,
@@ -1138,13 +1200,17 @@ export const sessionChunkKey = (
     `mc-compose/session/${encodeURIComponent(sessionId)}/revision/${encodeURIComponent(revision)}/dimension/${encodeURIComponent(dimension)}/chunk/${String(coord.cx)}/${String(coord.cz)}`,
   )
 
-export const loadSession = (
+// `sessionChunkKey` with `checkpoint/` inserted. It names the revision, so it is
+// revision-specific, as mc-save's checkpoint contract requires.
+const sessionCheckpointChunkKey = (
   sessionId: string,
-): Effect.Effect<Option.Option<SessionHead>, SessionPersistenceError, StoragePort> =>
-  loadFrom(SESSION_FORMAT, sessionHeadKey(sessionId))
-
-const SESSION_KEY_PREFIX = 'mc-compose/session/'
-const SESSION_HEAD_KEY_PATTERN = /^mc-compose\/session\/([^/]+)\/head$/u
+  revision: string,
+  dimension: Dimension,
+  coord: ChunkCoord,
+): SaveKey =>
+  SaveKey(
+    `${sessionKeyPrefix(sessionId)}checkpoint/revision/${encodeURIComponent(revision)}/dimension/${encodeURIComponent(dimension)}/chunk/${String(coord.cx)}/${String(coord.cz)}`,
+  )
 
 const sessionIdFromHeadKey = (key: SaveKey): string | undefined => {
   const match = SESSION_HEAD_KEY_PATTERN.exec(key)
@@ -1158,12 +1224,442 @@ const sessionIdFromHeadKey = (key: SaveKey): string | undefined => {
   }
 }
 
-/** Enumerate valid session heads, ignoring malformed keys and independently corrupted sessions. */
-export const listSessions = (): Effect.Effect<
-  ReadonlyArray<SessionHead>,
-  StorageError,
-  StoragePort
+const decodeStoredRecord = <A, I>(
+  format: SaveFormat<A, I>,
+  stored: unknown,
+): Effect.Effect<A, SaveDecodeError> =>
+  Schema.decodeUnknownEffect(SaveEnvelopeSchema)(stored).pipe(
+    Effect.mapError((cause) => new SaveDecodeError({
+      format: format.name,
+      version: 0,
+      reason: 'the stored value is not a well-formed save envelope',
+      cause,
+    })),
+    Effect.flatMap((envelope) => validateSaveEnvelope(envelope)),
+    Effect.flatMap((envelope) => decodeSave(format, envelope)),
+  )
+
+const sealedRecord = <A, I>(format: SaveFormat<A, I>, value: A): Effect.Effect<SaveEnvelope, SaveDecodeError> =>
+  encodeSave(format, value).pipe(
+    Effect.flatMap((draft) => Effect.fromResult(sealSaveEnvelope(draft))),
+    Effect.flatMap((envelope) => validateSaveEnvelope(envelope)),
+  )
+
+const sessionHeadDecodeError = (reason: string): SaveDecodeError =>
+  new SaveDecodeError({ format: SESSION_FORMAT_NAME, version: SESSION_FORMAT_VERSION, reason })
+
+type SessionChunkKeys = {
+  readonly live: SaveKey
+  readonly checkpoint: SaveKey
+}
+
+// Each manifest key must be the canonical live key of its own coordinate, so no
+// manifest reaches outside its session and every live key has a checkpoint key.
+const sessionManifestKeys = (
+  sessionId: string,
+  head: SessionHead,
+): Result.Result<ReadonlyArray<SessionChunkKeys>, SaveDecodeError> => {
+  if (head.sessionId !== sessionId) {
+    return Result.fail(sessionHeadDecodeError(`the head belongs to session "${head.sessionId}"`))
+  }
+  const duplicate = duplicateManifestEntry(head.chunks)
+  if (duplicate !== undefined) {
+    return Result.fail(sessionHeadDecodeError(
+      `the manifest lists ${coordId(duplicate.dimension, duplicate.coord)} more than once`,
+    ))
+  }
+  const keys: Array<SessionChunkKeys> = []
+  for (const entry of head.chunks) {
+    const live = sessionChunkKey(sessionId, head.revision, entry.dimension, entry.coord)
+    if (entry.key !== live) {
+      return Result.fail(sessionHeadDecodeError(`the manifest key "${entry.key}" is not the chunk key "${live}"`))
+    }
+    keys.push({ live, checkpoint: sessionCheckpointChunkKey(sessionId, head.revision, entry.dimension, entry.coord) })
+  }
+  return Result.succeed(keys)
+}
+
+type DecodedSessionHead = { readonly head: SessionHead; readonly keys: ReadonlyArray<SessionChunkKeys> }
+
+const decodeSessionHead = (
+  sessionId: string,
+  stored: unknown,
+): Effect.Effect<DecodedSessionHead, SaveDecodeError> =>
+  decodeStoredRecord(SESSION_FORMAT, stored).pipe(
+    Effect.flatMap((head) =>
+      Effect.fromResult(sessionManifestKeys(sessionId, head)).pipe(Effect.map((keys) => ({ head, keys })))),
+  )
+
+/**
+ * mc-save hands its `chunkKey` callbacks a raw head and a live key. Every key
+ * it maps was first returned by one of the `chunkKeysFromHead` callbacks, which
+ * record each live key's checkpoint key here.
+ */
+const makeCheckpointKeyLookup = () => {
+  const checkpointKeys = new Map<SaveKey, SaveKey>()
+  return {
+    remember: (keys: ReadonlyArray<SessionChunkKeys>): ReadonlyArray<SaveKey> => {
+      for (const { live, checkpoint } of keys) checkpointKeys.set(live, checkpoint)
+      return keys.map(({ live }) => live)
+    },
+    // A miss means mc-save mapped a key no callback returned: a broken contract, not stored data.
+    checkpointKeyOf: (liveKey: SaveKey): SaveKey =>
+      Option.getOrThrowWith(
+        Option.fromNullishOr(checkpointKeys.get(liveKey)),
+        () => new Error(`no checkpoint key was derived for "${liveKey}"`),
+      ),
+  }
+}
+
+const checkpointHeadOf = (head: SessionHead, keys: ReadonlyArray<SessionChunkKeys>): SessionHead => ({
+  ...head,
+  chunks: Arr.zipWith(head.chunks, keys, (entry, { checkpoint }) => ({ ...entry, key: checkpoint })),
+})
+
+const hasMigrationPath = <A, I>(format: SaveFormat<A, I>, version: number): boolean => {
+  const migrations = format.migrations
+  for (let from = version; from < format.version; from += 1) {
+    if (migrations === undefined || !migrations.some((migration) => migration.fromVersion === from)) return false
+  }
+  return true
+}
+
+/**
+ * Classify a stored record this build cannot read for version reasons.
+ * Anything that is not a well-formed envelope of `format` is not classified
+ * here: the regular decode reports it as a `SaveDecodeError`.
+ */
+const recordIncompatibility = <A, I>(
+  format: SaveFormat<A, I>,
+  key: SaveKey,
+  stored: unknown,
+): Option.Option<SessionIncompatibleError> => {
+  const envelope = Schema.decodeUnknownResult(SaveEnvelopeSchema)(stored)
+  if (Result.isFailure(envelope) || envelope.success.format !== format.name) return Option.none()
+  const storedVersion = envelope.success.version
+  const reason: Option.Option<SessionIncompatibleError['reason']> = isFromFuture(envelope.success, format.version)
+    ? Option.some('future-version')
+    : hasMigrationPath(format, storedVersion) ? Option.none() : Option.some('unsupported-version')
+  return Option.map(reason, (incompatibility) => new SessionIncompatibleError({
+    reason: incompatibility,
+    key,
+    storedVersion,
+    currentVersion: format.version,
+  }))
+}
+
+const chunkIncompatibility = (
+  storage: StorageService,
+  keys: ReadonlyArray<SaveKey>,
+): Effect.Effect<Option.Option<SessionIncompatibleError>, StorageError> =>
+  Effect.gen(function* () {
+    for (const key of keys) {
+      const stored = yield* storage.get(key)
+      if (Option.isNone(stored)) continue
+      const incompatible = recordIncompatibility(CHUNK_FORMAT, key, stored.value)
+      if (Option.isSome(incompatible)) return incompatible
+    }
+    return Option.none()
+  })
+
+// Hands each record saveSession already read to mc-save once instead of
+// reading it again; a write to the key drops the copy.
+const prefetchedStorage = <Error>(
+  storage: StorageService,
+  records: ReadonlyArray<readonly [SaveKey, Option.Option<SaveEnvelope>]>,
+): RevisionStorage<SaveKey, SaveEnvelope, StorageError | Error, never> => {
+  const prefetched = new Map(records)
+  return {
+    get: (key) =>
+      Effect.suspend(() => {
+        const value = prefetched.get(key)
+        if (value === undefined) return storage.get(key)
+        prefetched.delete(key)
+        return Effect.succeed(value)
+      }),
+    put: (key, value) =>
+      Effect.suspend(() => {
+        prefetched.delete(key)
+        return storage.put(key, value)
+      }),
+    remove: (key) =>
+      Effect.suspend(() => {
+        prefetched.delete(key)
+        return storage.remove(key)
+      }),
+  }
+}
+
+const chunkRecordError = (reason: string, version: number): SaveDecodeError =>
+  new SaveDecodeError({ format: CHUNK_FORMAT.name, version, reason })
+
+/**
+ * A chunk record's envelope, format, version and checksum, without the chunk
+ * schema decode. The checksum is sealed over what this format's encoder wrote,
+ * so it catches damaged or altered bytes; the schema decode, which dominates a
+ * chunk's load cost, then runs once, where `makeSessionChunkSource` loads it.
+ */
+const validateChunkRecord = (stored: unknown): Effect.Effect<SaveEnvelope, SaveDecodeError> => {
+  const envelope = Schema.decodeUnknownResult(SaveEnvelopeSchema)(stored)
+  if (Result.isFailure(envelope)) {
+    return Effect.fail(chunkRecordError('the stored value is not a well-formed save envelope', 0))
+  }
+  const { format, version } = envelope.success
+  if (format !== CHUNK_FORMAT.name) return Effect.fail(chunkRecordError(`the record belongs to format "${format}"`, version))
+  if (isFromFuture(envelope.success, CHUNK_FORMAT.version) || !hasMigrationPath(CHUNK_FORMAT, version)) {
+    return Effect.fail(chunkRecordError(`chunk format v${String(version)} cannot be read by this build`, version))
+  }
+  return validateSaveEnvelope(envelope.success)
+}
+
+const chunkRecordIntact = (stored: unknown): Effect.Effect<boolean> =>
+  validateChunkRecord(stored).pipe(Effect.match({ onFailure: () => false, onSuccess: () => true }))
+
+// The integrity metadata covers the payload, so two intact records with equal
+// metadata hold the same payload.
+const sameRecord = (left: SaveEnvelope, right: SaveEnvelope): boolean =>
+  left.format === right.format &&
+  left.version === right.version &&
+  left.integrity.checksum === right.integrity.checksum &&
+  left.integrity.byteLength === right.integrity.byteLength
+
+type LiveChunkCopy = { readonly checkpoint: SaveKey; readonly live: Option.Option<SaveEnvelope> }
+
+/**
+ * Make the checkpoint, whose head already names the live revision, a verified
+ * copy of it. Each checkpoint record that is absent, fails its checksum, or
+ * differs from its live record is put over its own key, chunks before the
+ * head, so nothing is deleted first and no key is reused for another revision.
+ * A live revision that is itself incomplete or damaged is not copied: the
+ * checkpoint may then be the better copy, as mc-save's `isHealthy` rule keeps it.
+ */
+const ensureCheckpointCopiesLive = (
+  storage: StorageService,
+  checkpointHeadKey: SaveKey,
+  liveHead: SaveEnvelope,
+  checkpointHead: SaveEnvelope,
+  chunks: ReadonlyArray<LiveChunkCopy>,
+): Effect.Effect<void, StorageError> =>
+  Effect.gen(function* () {
+    const liveChunks: Array<{ readonly checkpoint: SaveKey; readonly live: SaveEnvelope }> = []
+    for (const { checkpoint, live } of chunks) {
+      if (Option.isNone(live) || !(yield* chunkRecordIntact(live.value))) return
+      liveChunks.push({ checkpoint, live: live.value })
+    }
+    for (const { checkpoint, live } of liveChunks) {
+      const copy = yield* storage.get(checkpoint)
+      const verified = Option.isSome(copy) &&
+        sameRecord(copy.value, live) &&
+        (yield* chunkRecordIntact(copy.value))
+      if (!verified) yield* storage.put(checkpoint, live)
+    }
+    if (!sameRecord(checkpointHead, liveHead)) yield* storage.put(checkpointHeadKey, liveHead)
+  })
+
+export type OpenedSession =
+  | { readonly _tag: 'Live'; readonly head: SessionHead }
+  | { readonly _tag: 'Checkpoint'; readonly head: SessionHead; readonly liveFailure: SaveDecodeError }
+
+type SessionRevision = 'live' | 'checkpoint'
+
+// Located like mc-save's annotated head failures. No older revision is claimed:
+// openSession sets that once the checkpoint opened.
+const headFailureAt = (key: SaveKey, error: SaveDecodeError): SaveDecodeError =>
+  new SaveDecodeError({
+    format: error.format,
+    version: error.version,
+    reason: error.reason,
+    record: { _tag: 'Head', key },
+    repair: { lastHealthyRevisionAvailable: false, discardableChunkKeys: [] },
+    ...(error.cause === undefined ? {} : { cause: error.cause }),
+  })
+
+/**
+ * `None` when the revision's head is absent. For the checkpoint, the returned
+ * head's manifest keys name the checkpoint chunk records.
+ */
+const readSessionRevision = (
+  storage: StorageService,
+  sessionId: string,
+  revision: SessionRevision,
+): Effect.Effect<
+  Option.Option<Result.Result<SessionHead, SaveDecodeError | SessionIncompatibleError>>,
+  StorageError
+> => {
+  const headKey = revision === 'live' ? sessionHeadKey(sessionId) : sessionCheckpointHeadKey(sessionId)
+  const lookup = makeCheckpointKeyLookup()
+  const chunkKeyOf = (liveKey: SaveKey): SaveKey => revision === 'live' ? liveKey : lookup.checkpointKeyOf(liveKey)
+  return Effect.gen(function* () {
+    const stored = yield* storage.get(headKey)
+    if (Option.isNone(stored)) return Option.none()
+    const incompatible = recordIncompatibility(SESSION_FORMAT, headKey, stored.value)
+    if (Option.isSome(incompatible)) return Option.some(Result.fail(incompatible.value))
+    // Decoded here because mc-save rebuilds a head failure without its cause,
+    // which for a failed migration is the only account of what went wrong.
+    const decodedHead = yield* Effect.result(decodeStoredRecord(SESSION_FORMAT, stored.value))
+    if (Result.isFailure(decodedHead)) return Option.some(Result.fail(headFailureAt(headKey, decodedHead.failure)))
+
+    const read = yield* loadRetainedRevision({
+      storage: prefetchedStorage<never>(storage, [[headKey, stored]]),
+      headKey,
+      chunkKey: (_rawHead, key) => chunkKeyOf(key),
+      // openSession re-annotates the live failure once the checkpoint opened.
+      lastHealthyRevisionAvailable: false,
+      // mc-save reads the prefetched record, which is the one decoded above.
+      decodeHead: () => Effect.succeed(decodedHead.success),
+      chunkKeysFromHead: (head) =>
+        Effect.fromResult(sessionManifestKeys(sessionId, head)).pipe(Effect.map(lookup.remember)),
+      decodeChunk: validateChunkRecord,
+      missingChunkError: (_head, key) => new SaveDecodeError({
+        format: CHUNK_FORMAT.name,
+        version: CHUNK_FORMAT.version,
+        reason: `the manifest chunk "${key}" is missing`,
+      }),
+      keyToString: (key) => key,
+    }).pipe(Effect.result)
+    if (Result.isFailure(read)) {
+      if (read.failure._tag === 'StorageError') return yield* Effect.fail(read.failure)
+      return Option.some(Result.fail(read.failure))
+    }
+    // The head vanished between the two reads.
+    if (Option.isNone(read.success)) return Option.none()
+    const { head, failures } = read.success.value
+    if (Arr.isReadonlyArrayNonEmpty(failures)) {
+      // A newer build's chunk fails decoding like a corrupt one; re-reading the
+      // failed chunks tells them apart.
+      const incompatibleChunk = yield* chunkIncompatibility(
+        storage,
+        failures.flatMap(({ record }) => record?._tag === 'Chunk' ? [record.key] : []),
+      )
+      return Option.some(Result.fail(Option.isSome(incompatibleChunk)
+        ? incompatibleChunk.value
+        : Arr.headNonEmpty(failures)))
+    }
+    return Option.some(Result.succeed(revision === 'live' ? head : {
+      ...head,
+      chunks: head.chunks.map((entry) => ({ ...entry, key: lookup.checkpointKeyOf(SaveKey(entry.key)) })),
+    }))
+  })
+}
+
+// The live read cannot know whether the checkpoint will open, so the repair
+// guidance is set once it has. Discardable keys follow mc-save's own rule.
+const withHealthyCheckpoint = (error: SaveDecodeError): SaveDecodeError =>
+  new SaveDecodeError({
+    format: error.format,
+    version: error.version,
+    reason: error.reason,
+    ...(error.record === undefined ? {} : { record: error.record }),
+    ...(error.cause === undefined ? {} : { cause: error.cause }),
+    repair: {
+      lastHealthyRevisionAvailable: true,
+      discardableChunkKeys: error.record?._tag === 'Chunk' ? [error.record.key] : [],
+    },
+  })
+
+/**
+ * Open the live revision, or its checkpoint when the live head or any live
+ * chunk cannot be read. A session without a live head is absent even if a
+ * checkpoint remains: saveSession only writes a checkpoint while replacing a
+ * live head, so a lone checkpoint is the remainder of an interrupted delete.
+ * An incompatible live head or chunk fails without consulting the checkpoint,
+ * because opening an older copy would hide that a newer build owns this session.
+ */
+export const openSession = (
+  sessionId: string,
+): Effect.Effect<Option.Option<OpenedSession>, SessionOpenError, StoragePort> =>
+  Effect.gen(function* () {
+    const storage = yield* StoragePort
+    const live = yield* readSessionRevision(storage, sessionId, 'live')
+    if (Option.isNone(live)) return Option.none()
+    if (Result.isSuccess(live.value)) return Option.some<OpenedSession>({ _tag: 'Live', head: live.value.success })
+    const liveFailure = live.value.failure
+    if (liveFailure._tag === 'SessionIncompatibleError') return yield* Effect.fail(liveFailure)
+
+    const checkpoint = yield* readSessionRevision(storage, sessionId, 'checkpoint')
+    if (Option.isNone(checkpoint)) {
+      return yield* new SessionCorruptError({ sessionId, liveFailure, checkpoint: 'absent' })
+    }
+    if (Result.isFailure(checkpoint.value)) {
+      return yield* new SessionCorruptError({ sessionId, liveFailure, checkpoint: checkpoint.value.failure })
+    }
+    return Option.some<OpenedSession>({
+      _tag: 'Checkpoint',
+      head: checkpoint.value.success,
+      liveFailure: withHealthyCheckpoint(liveFailure),
+    })
+  })
+
+/**
+ * The head `openSession` opened, so a caller that only needs the head still
+ * recovers from the checkpoint. `openSession` also says which revision opened.
+ */
+export const loadSession = (
+  sessionId: string,
+): Effect.Effect<Option.Option<SessionHead>, SessionPersistenceError, StoragePort> =>
+  openSession(sessionId).pipe(Effect.map(Option.map(({ head }) => head)))
+
+export type UnavailableSession = {
+  readonly sessionId: string
+  readonly failure: SessionIncompatibleError | SessionCorruptError
+}
+
+export type SessionEntries = {
+  readonly sessions: ReadonlyArray<SessionHead>
+  readonly unavailable: ReadonlyArray<UnavailableSession>
+}
+
+/** `None` when no head is stored at `key`; the head's manifest keys are returned alongside it. */
+const readSessionHead = (
+  storage: StorageService,
+  sessionId: string,
+  key: SaveKey,
+): Effect.Effect<
+  Option.Option<Result.Result<
+    { readonly head: SessionHead; readonly keys: ReadonlyArray<SessionChunkKeys> },
+    SaveDecodeError | SessionIncompatibleError
+  >>,
+  StorageError
 > =>
+  Effect.gen(function* () {
+    const stored = yield* storage.get(key)
+    if (Option.isNone(stored)) return Option.none()
+    const incompatible = recordIncompatibility(SESSION_FORMAT, key, stored.value)
+    if (Option.isSome(incompatible)) return Option.some(Result.fail(incompatible.value))
+    const decoded = yield* Effect.result(decodeSessionHead(sessionId, stored.value))
+    return Option.some(Result.mapError(decoded, (error) => headFailureAt(key, error)))
+  })
+
+type ListedSession = Result.Result<SessionHead, UnavailableSession>
+
+const listSessionEntry = (
+  storage: StorageService,
+  sessionId: string,
+): Effect.Effect<Option.Option<ListedSession>, StorageError> =>
+  Effect.gen(function* () {
+    const live = yield* readSessionHead(storage, sessionId, sessionHeadKey(sessionId))
+    if (Option.isNone(live)) return Option.none()
+    if (Result.isSuccess(live.value)) {
+      return Option.some<ListedSession>(Result.succeed(live.value.success.head))
+    }
+    const liveFailure = live.value.failure
+    if (liveFailure._tag === 'SessionIncompatibleError') {
+      return Option.some<ListedSession>(Result.fail({ sessionId, failure: liveFailure }))
+    }
+
+    const checkpoint = yield* readSessionHead(storage, sessionId, sessionCheckpointHeadKey(sessionId))
+    const corrupt = (failure: SessionCheckpointFailure): Option.Option<ListedSession> =>
+      Option.some(Result.fail({
+        sessionId,
+        failure: new SessionCorruptError({ sessionId, liveFailure, checkpoint: failure }),
+      }))
+    if (Option.isNone(checkpoint)) return corrupt('absent')
+    if (Result.isFailure(checkpoint.value)) return corrupt(checkpoint.value.failure)
+    const { head, keys } = checkpoint.value.success
+    return Option.some<ListedSession>(Result.succeed(checkpointHeadOf(head, keys)))
+  })
+
+const listSessionHeads = (): Effect.Effect<ReadonlyArray<ListedSession>, StorageError, StoragePort> =>
   Effect.gen(function* () {
     const storage = yield* StoragePort
     const keys = yield* storage.keys
@@ -1172,25 +1668,36 @@ export const listSessions = (): Effect.Effect<
       .filter((sessionId): sessionId is string => sessionId !== undefined)
       .sort()
 
-    const sessions = yield* Effect.forEach(sessionIds, (sessionId) =>
-      loadSession(sessionId).pipe(
-        Effect.map(Option.filter((head) => head.sessionId === sessionId)),
-        Effect.matchEffect({
-          onFailure: () => Effect.succeed(Option.none<SessionHead>()),
-          onSuccess: Effect.succeed,
-        }),
-      ),
-    )
-    return sessions.flatMap(Option.toArray)
+    const entries = yield* Effect.forEach(sessionIds, (sessionId) => listSessionEntry(storage, sessionId))
+    return entries.flatMap(Option.toArray)
   })
 
-/** Remove every record belonging to one encoded session key prefix. */
+/**
+ * Enumerate sessions by their heads in lexical session id order, ignoring
+ * malformed keys. A session whose live head is unreadable is listed by its
+ * checkpoint head when that one decodes. Chunks are not read here, so a chunk
+ * that turns out unreadable is reported by `openSession`.
+ */
+export const listSessionEntries = (): Effect.Effect<SessionEntries, StorageError, StoragePort> =>
+  listSessionHeads().pipe(Effect.map((entries) => {
+    const [sessions, unavailable] = Arr.partition(entries, (entry) => entry)
+    return { sessions, unavailable }
+  }))
+
+/** The sessions `listSessionEntries` lists: those `loadSession` can open by their live or checkpoint head. */
+export const listSessions = (): Effect.Effect<
+  ReadonlyArray<SessionHead>,
+  StorageError,
+  StoragePort
+> => listSessionEntries().pipe(Effect.map(({ sessions }) => sessions))
+
+/** Remove every record belonging to one encoded session key prefix, checkpoint included. */
 export const deleteSession = (
   sessionId: string,
 ): Effect.Effect<void, StorageError, StoragePort> =>
   Effect.gen(function* () {
     const storage = yield* StoragePort
-    const prefix = `${SESSION_KEY_PREFIX}${encodeURIComponent(sessionId)}/`
+    const prefix = sessionKeyPrefix(sessionId)
     const keys = yield* storage.keys
     yield* Effect.forEach(
       keys.filter((key) => key.startsWith(prefix)),
@@ -1207,18 +1714,25 @@ export type SaveSessionInput = {
   readonly chunks: ReadonlyArray<DimensionChunk>
 }
 
-/** Write revision chunks first, atomically publish their manifest, then collect the old revision. */
+/**
+ * Write revision chunks first and publish their head last, after copying the
+ * previous healthy live revision to the session's checkpoint. A live head or
+ * chunk written by an incompatible build fails the save before anything is
+ * written. mc-save restores the previous live records when publishing fails.
+ */
 export const saveSession = (
   input: SaveSessionInput,
 ): Effect.Effect<SessionHead, SessionPersistenceError, StoragePort> =>
   Effect.gen(function* () {
-    const manifest = input.chunks.map(
-      ({ dimension, chunk }): SessionChunkManifestEntry => ({
+    const entries = input.chunks.map(({ dimension, chunk }) => ({
+      entry: {
         dimension,
         coord: chunk.coord,
         key: sessionChunkKey(input.sessionId, input.revision, dimension, chunk.coord),
-      }),
-    )
+      } satisfies SessionChunkManifestEntry,
+      chunk,
+    }))
+    const manifest = entries.map(({ entry }) => entry)
     const duplicate = duplicateManifestEntry(manifest)
     if (duplicate !== undefined) {
       return yield* new SessionManifestError({
@@ -1230,63 +1744,127 @@ export const saveSession = (
     }
 
     const storage = yield* StoragePort
-    const headKey = sessionHeadKey(input.sessionId)
-    const previousSession = yield* loadSession(input.sessionId)
-    const previousHeadEnvelope = yield* storage.get(headKey)
-    const previousChunkEnvelopes = yield* Effect.forEach(manifest, (entry) =>
-      storage.get(SaveKey(entry.key)).pipe(
-        Effect.map((envelope) => ({ key: SaveKey(entry.key), envelope })),
-      ),
-    )
+    const sessionId = input.sessionId
+    const headKey = sessionHeadKey(sessionId)
+    const checkpointHeadKey = sessionCheckpointHeadKey(sessionId)
+    const storedHead = yield* storage.get(headKey)
+    if (Option.isSome(storedHead)) {
+      const incompatible = recordIncompatibility(SESSION_FORMAT, headKey, storedHead.value)
+      if (Option.isSome(incompatible)) return yield* Effect.fail(incompatible.value)
+    }
+
+    // Heads are decoded once per save; mc-save hands the prefetched envelopes
+    // back to the callbacks, so a lookup by envelope finds them.
+    const decodedHeads = new Map<SaveEnvelope, Option.Option<DecodedSessionHead>>()
+    const decodedHead = (stored: SaveEnvelope): Effect.Effect<Option.Option<DecodedSessionHead>> =>
+      Effect.suspend(() => {
+        const known = decodedHeads.get(stored)
+        if (known !== undefined) return Effect.succeed(known)
+        // An undecodable head is one mc-save cannot inspect; the callbacks turn
+        // that into "no chunks" or "not healthy" as its contract defines.
+        return Effect.result(decodeSessionHead(sessionId, stored)).pipe(Effect.map((decoded) => {
+          const head = Result.getSuccess(decoded)
+          decodedHeads.set(stored, head)
+          return head
+        }))
+      })
+    const decodedStored = (stored: Option.Option<SaveEnvelope>): Effect.Effect<Option.Option<DecodedSessionHead>> =>
+      Option.isNone(stored) ? Effect.succeed(Option.none()) : decodedHead(stored.value)
+
+    const previous = yield* decodedStored(storedHead)
+    const previousChunks = Option.isNone(previous)
+      ? []
+      : yield* Effect.forEach(previous.value.keys, ({ live }) =>
+        storage.get(live).pipe(Effect.map((value) => ({ key: live, value }))))
+    for (const { key, value } of previousChunks) {
+      if (Option.isNone(value)) continue
+      const incompatible = recordIncompatibility(CHUNK_FORMAT, key, value.value)
+      if (Option.isSome(incompatible)) return yield* Effect.fail(incompatible.value)
+    }
+    const storedCheckpoint = yield* storage.get(checkpointHeadKey)
+    const checkpoint = yield* decodedStored(storedCheckpoint)
 
     const nextHead: SessionHead = {
-      sessionId: input.sessionId,
+      sessionId,
       revision: input.revision,
       metadata: input.metadata,
       state: input.state,
       chunks: manifest,
     }
+    const headEnvelope = yield* sealedRecord(SESSION_FORMAT, nextHead)
+    const chunkEnvelopes = yield* Effect.forEach(entries, ({ entry, chunk }) =>
+      sealedRecord(CHUNK_FORMAT, chunk).pipe(Effect.map((value) => ({ key: SaveKey(entry.key), value }))))
+    const lookup = makeCheckpointKeyLookup()
 
-    yield* Effect.gen(function* () {
-      yield* Effect.forEach(input.chunks, ({ chunk }, index) =>
-        saveTo(CHUNK_FORMAT, SaveKey(manifest[index]!.key), chunk),
-      )
-      yield* saveTo(SESSION_FORMAT, headKey, nextHead)
-    }).pipe(
-      Effect.matchEffect({
-        onFailure: (saveError) => Effect.gen(function* () {
-          yield* (Option.isSome(previousHeadEnvelope)
-            ? storage.put(headKey, previousHeadEnvelope.value)
-            : storage.remove(headKey)
-          ).pipe(Effect.matchEffect({ onFailure: () => Effect.void, onSuccess: () => Effect.void }))
-          yield* Effect.forEach(
-            previousChunkEnvelopes,
-            ({ key, envelope }) =>
-              (Option.isSome(envelope)
-                ? storage.put(key, envelope.value)
-                : storage.remove(key)
-              ).pipe(Effect.matchEffect({ onFailure: () => Effect.void, onSuccess: () => Effect.void })),
-            { discard: true },
-          )
-          return yield* Effect.fail(saveError)
-        }),
-        onSuccess: Effect.succeed,
-      }),
-    )
-
-    if (Option.isSome(previousSession)) {
-      const retainedKeys = new Set(manifest.map(({ key }) => key))
-      yield* Effect.forEach(
-        previousSession.value.chunks,
-        ({ key }) =>
-          retainedKeys.has(key)
-            ? Effect.void
-            : storage.remove(SaveKey(key)).pipe(
-                Effect.matchEffect({ onFailure: () => Effect.void, onSuccess: () => Effect.void }),
-              ),
-        { discard: true },
-      )
+    const live = {
+      storage: prefetchedStorage<SessionManifestError>(storage, [
+        [headKey, storedHead],
+        [checkpointHeadKey, storedCheckpoint],
+        ...previousChunks.map(({ key, value }): readonly [SaveKey, Option.Option<SaveEnvelope>] => [key, value]),
+      ]),
+      head: { key: headKey, value: headEnvelope },
+      chunks: chunkEnvelopes,
+      // A previous head that does not decode lists no chunks and is never
+      // healthy, so it is replaced without displacing the existing checkpoint;
+      // its chunk records are then left behind until deleteSession removes the prefix.
+      chunkKeysFromHead: (previousHead: Option.Option<SaveEnvelope>) =>
+        decodedStored(previousHead).pipe(Effect.map(Option.match({
+          onNone: (): ReadonlyArray<SaveKey> => [],
+          onSome: ({ keys }) => lookup.remember(keys),
+        }))),
+      sameKey: (left: SaveKey, right: SaveKey) => left === right,
+      duplicateKeyError: (key: SaveKey) => new SessionManifestError({ reason: 'duplicate-key', key }),
     }
+
+    // Invariant: a good copy of the overwritten revision exists before the live
+    // head moves. After a publish failed past its checkpoint copy, the
+    // checkpoint head already names the live revision; copying it through
+    // mc-save again would reuse that revision's checkpoint keys, which it
+    // rejects. Its records may have been lost or damaged since, so they are
+    // verified, and repaired in place, before the live revision is replaced.
+    // A save reusing the live revision id overwrites those live records in
+    // place, so the checkpoint, though named alike, would not hold them: it
+    // still takes the copying path.
+    if (
+      Option.isSome(previous) &&
+      Option.isSome(storedHead) &&
+      Option.isSome(storedCheckpoint) &&
+      Option.isSome(checkpoint) &&
+      checkpoint.value.head.revision === previous.value.head.revision &&
+      input.revision !== previous.value.head.revision
+    ) {
+      yield* ensureCheckpointCopiesLive(
+        storage,
+        checkpointHeadKey,
+        storedHead.value,
+        storedCheckpoint.value,
+        Arr.zipWith(previous.value.keys, previousChunks, ({ checkpoint }, { value }) => ({ checkpoint, live: value })),
+      )
+      yield* writeRevisionedSave<SaveKey, SaveEnvelope, StorageError | SessionManifestError, never>(live)
+      return nextHead
+    }
+
+    yield* writeRevisionedSaveWithCheckpoint<SaveKey, SaveEnvelope, StorageError | SessionManifestError, never>({
+      ...live,
+      checkpoint: {
+        headKey: checkpointHeadKey,
+        chunkKey: (_head, liveChunkKey) => lookup.checkpointKeyOf(liveChunkKey),
+        // An old checkpoint head that does not decode cannot name its chunks
+        // for cleanup; mc-save then leaves them in place.
+        chunkKeysFromHead: (checkpointHead) =>
+          decodedHead(checkpointHead).pipe(Effect.map(Option.map(({ keys }) => lookup.remember(keys)))),
+        // mc-save asks for a verdict, not a reason: an unreadable previous
+        // revision is simply not copied over the checkpoint.
+        isHealthy: (previousHead, chunks) =>
+          decodedHead(previousHead).pipe(Effect.flatMap(Option.match({
+            onNone: () => Effect.succeed(false),
+            onSome: () =>
+              Effect.forEach(chunks, ({ value }) => chunkRecordIntact(value)).pipe(
+                Effect.map((intact) => intact.every((chunkIntact) => chunkIntact)),
+              ),
+          }))),
+      },
+    })
     return nextHead
   })
 

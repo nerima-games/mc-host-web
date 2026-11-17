@@ -1,5 +1,6 @@
 import { assert, describe, expect, it } from '@effect/vitest'
 import { Effect, Option, Result, Schema } from 'effect'
+import { SaveDecodeError, SaveKey, StorageError } from '@nerima-games/mc-save'
 
 import {
   ChunkAxis,
@@ -62,11 +63,21 @@ import {
   makeSessionChunkSourceFor,
   restoreInitialWorld,
   restoreLoadedSessionServices,
+  sessionLoadErrorMessage,
+  sessionLoadErrorOf,
+  sessionOpenFailureMessage,
   type GeneratedOwnerState,
 } from '../apps/web/session-restoration'
 import { createDroppedItemLifetimeTracker } from '../apps/web/dropped-item-lifetime'
 import { initializeSessionWorld } from '../apps/web/session-world'
-import type { PersistedEntityRoster, PersistedEntityRosters, SessionState } from '../apps/web/session-persistence'
+import {
+  SessionCorruptError,
+  SessionIncompatibleError,
+  type PersistedEntityRoster,
+  type PersistedEntityRosters,
+  type SessionOpenError,
+  type SessionState,
+} from '../apps/web/session-persistence'
 import { makeHostWorldWrite } from '../apps/web/world-write-port'
 
 const chunk = (cx: number, cz: number, marker: number): ChunkWithBlockStates => ({
@@ -74,6 +85,59 @@ const chunk = (cx: number, cz: number, marker: number): ChunkWithBlockStates => 
   blocks: new Uint16Array(CHUNK_VOLUME).fill(marker),
   blockStates: new Uint32Array(CHUNK_VOLUME),
   biomes: Array.from({ length: CHUNK_SIZE_XZ * CHUNK_SIZE_XZ }, () => 'PLAINS'),
+})
+
+describe('session open failure messages', () => {
+  const failures: ReadonlyArray<readonly [SessionOpenError, string, string]> = [
+    [
+      new SessionIncompatibleError({
+        reason: 'future-version',
+        key: SaveKey('mc-compose/session/w/head'),
+        storedVersion: 19,
+        currentVersion: 18,
+      }),
+      'future-version-session',
+      'This world was saved by a newer version and cannot be opened.',
+    ],
+    [
+      new SessionIncompatibleError({
+        reason: 'unsupported-version',
+        key: SaveKey('mc-compose/session/w/head'),
+        storedVersion: 16,
+        currentVersion: 18,
+      }),
+      'unsupported-version-session',
+      'This world was saved by an older version that can no longer be opened.',
+    ],
+    [
+      new SessionCorruptError({
+        sessionId: 'w',
+        liveFailure: new SaveDecodeError({ format: 'f', version: 18, reason: 'checksum mismatch' }),
+        checkpoint: 'absent',
+      }),
+      'corrupt-session',
+      'This world could not be read, and no earlier save of it could be opened.',
+    ],
+    [
+      new StorageError({ operation: 'get', key: 'mc-compose/session/w/head' }),
+      'session-storage-failure',
+      'Saved worlds could not be read from browser storage.',
+    ],
+  ]
+
+  it('gives each open failure its own message and title query value', () => {
+    for (const [error, loadError, message] of failures) {
+      expect(sessionOpenFailureMessage(error)).toBe(message)
+      expect(sessionLoadErrorOf(error)).toBe(loadError)
+      expect(sessionLoadErrorMessage(loadError)).toEqual(Option.some(message))
+    }
+  })
+
+  it('shows nothing for a query value it did not produce', () => {
+    expect(sessionLoadErrorMessage(null)).toEqual(Option.none())
+    expect(sessionLoadErrorMessage('missing-session')).toEqual(Option.none())
+    expect(sessionLoadErrorMessage('toString')).toEqual(Option.none())
+  })
 })
 
 describe('session restoration', () => {

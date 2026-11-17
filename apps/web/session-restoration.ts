@@ -1,4 +1,4 @@
-import { Effect, Result, Schema } from 'effect'
+import { Effect, Option, Result, Schema } from 'effect'
 import {
   chunkSnapshotOf,
   type ChunkWithBlockStates,
@@ -9,7 +9,7 @@ import { PlayerServiceSnapshotSchema, type PlayerPose, type PlayerStorage } from
 import type { GameplayOwnerInitialState, MobRoster, PlayerVitals } from '@nerima-games/mx-gameplay'
 
 import { poseOfPlayerOwner } from './owner-backed-services'
-import type { SessionState } from './session-persistence'
+import type { OpenedSession, SessionOpenError, SessionState } from './session-persistence'
 
 /** What the owners hold before anything is loaded: the generated world's own state. */
 export type GeneratedOwnerState = Readonly<{
@@ -122,3 +122,50 @@ export const makeSessionChunkSourceFor = (
     ? generatedSource(coord)
     : Effect.sync(() => chunkSnapshotOf(persisted))
 }
+
+export const SESSION_CHECKPOINT_OPENED_MESSAGE =
+  'The latest save could not be read. The previous save was opened instead.'
+export const SESSION_FUTURE_VERSION_MESSAGE = 'This world was saved by a newer version and cannot be opened.'
+export const SESSION_UNSUPPORTED_VERSION_MESSAGE =
+  'This world was saved by an older version that can no longer be opened.'
+export const SESSION_CORRUPT_MESSAGE = 'This world could not be read, and no earlier save of it could be opened.'
+export const SESSION_STORAGE_FAILURE_MESSAGE = 'Saved worlds could not be read from browser storage.'
+
+/** What the player is told after a session opened; `None` when the latest save opened. */
+export const sessionOpenNotice = (opened: OpenedSession): Option.Option<string> =>
+  opened._tag === 'Checkpoint' ? Option.some(SESSION_CHECKPOINT_OPENED_MESSAGE) : Option.none()
+
+/** The `loadError` query value the game sends the title screen when a session cannot be opened. */
+export type SessionLoadError =
+  | 'future-version-session'
+  | 'unsupported-version-session'
+  | 'corrupt-session'
+  | 'session-storage-failure'
+
+export const sessionLoadErrorOf = (error: SessionOpenError): SessionLoadError => {
+  switch (error._tag) {
+    case 'SessionIncompatibleError':
+      return error.reason === 'future-version' ? 'future-version-session' : 'unsupported-version-session'
+    case 'SessionCorruptError':
+      return 'corrupt-session'
+    case 'StorageError':
+      return 'session-storage-failure'
+  }
+}
+
+const SESSION_LOAD_ERROR_MESSAGES: Readonly<Record<SessionLoadError, string>> = {
+  'future-version-session': SESSION_FUTURE_VERSION_MESSAGE,
+  'unsupported-version-session': SESSION_UNSUPPORTED_VERSION_MESSAGE,
+  'corrupt-session': SESSION_CORRUPT_MESSAGE,
+  'session-storage-failure': SESSION_STORAGE_FAILURE_MESSAGE,
+}
+
+export const sessionOpenFailureMessage = (error: SessionOpenError): string =>
+  SESSION_LOAD_ERROR_MESSAGES[sessionLoadErrorOf(error)]
+
+const isSessionLoadError = (value: string): value is SessionLoadError =>
+  Object.hasOwn(SESSION_LOAD_ERROR_MESSAGES, value)
+
+/** The message for a `loadError` query value; `None` for a value this module did not produce. */
+export const sessionLoadErrorMessage = (value: string | null): Option.Option<string> =>
+  value !== null && isSessionLoadError(value) ? Option.some(SESSION_LOAD_ERROR_MESSAGES[value]) : Option.none()
