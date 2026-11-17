@@ -95,6 +95,19 @@ describe('H4b main.ts wiring', () => {
     expect(frameInputSource).toContain('context.handlePauseRequest()')
   })
 
+  it('runs the frame presentation once, right after the gameplay step, in place of the overlay call', () => {
+    const tickStart = positionOf(mainSource, 'const tick = (() => {')
+    const gameplay = positionOf(mainSource, 'yield* runTickPostFrameGameplay(h5cTickContext,', tickStart)
+    const presentation = positionOf(mainSource, 'yield* runFramePresentation(', tickStart)
+    const music = positionOf(mainSource, 'yield* music.update({', tickStart)
+    expect(gameplay).toBeLessThan(presentation)
+    expect(presentation).toBeLessThan(music)
+    expect(mainSource.indexOf('yield* runFramePresentation(', presentation + 1)).toBe(-1)
+    // The presentation step updates the debug overlay; a second direct call
+    // would update it twice per frame.
+    expect(mainSource).not.toContain('runTickDebugOverlayFrame')
+  })
+
   it('keeps inventory input gated before calling the extracted runtime', () => {
     const tickStart = positionOf(frameInputSource, 'export const runTickFrameInput = (')
     const tickInput = frameInputSource.slice(
