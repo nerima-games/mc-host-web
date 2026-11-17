@@ -1279,7 +1279,7 @@ export const runFramePresentation = <DebugOverlayFailure>(
   context: H5cFramePresentationContext<DebugOverlayFailure>,
   frame: H5cFramePresentationInput,
 ): Effect.Effect<void, FramePresentationFailure | DebugOverlayFailure> => Effect.gen(function* () {
-  const { frameDeltaSecs, nowSecs } = frame
+  const { raw, nowSecs } = frame
   const { h5a, h5b, services, state } = context
   const { playerApi, renderCrosshair } = h5a
   const { renderPlayerUi, projectileHud } = h5b
@@ -1332,6 +1332,6 @@ export const runFramePresentation = <DebugOverlayFailure>(
 
   yield* runTickDebugOverlayFrame(context.updateDebugOverlay, {
     framesTotal: state.framesTotal.get(),
-    raw: frameDeltaSecs,
+    raw,
   })
 })

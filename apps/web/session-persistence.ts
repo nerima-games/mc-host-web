@@ -244,18 +244,15 @@ const normalizePersistedEntityBehaviour = (kind: string, behaviour: unknown): un
   })
   if (!enchantedItem.ok || (enchantedItem.value.durability !== null && count !== 1)) return behaviour
 
-  const eligibleFromFrame = drop['eligibleFromFrame']
   const customName = drop['customName']
   return {
     _tag: 'DroppedItem',
     item: enchantedItem.value.item,
     count,
     durability: enchantedItem.value.durability,
-    ...(typeof eligibleFromFrame === 'number'
-      && Number.isInteger(eligibleFromFrame)
-      && eligibleFromFrame >= 0
-      ? { eligibleFromFrame }
-      : {}),
+    // A saved `eligibleFromFrame` is not restored: it counts ticks of the session
+    // that dropped the item, and the new session counts from 0 again. It only
+    // ever held a one-tick grace, so a restored drop is pickable at once.
     ...(typeof customName === 'string' && customName.trim().length > 0 ? { customName } : {}),
     enchantments: enchantedItem.value.enchantments.map((enchantment) => ({ ...enchantment })),
     elapsedSecs: persistedItemDropLifetime(drop).elapsedSecs,

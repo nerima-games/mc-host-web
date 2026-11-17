@@ -484,7 +484,7 @@ const withHarness = async (
 const presentationFrame = {
   partialTick: InterpolationFraction(0),
   simulationTick: SimulationTick(0),
-  frameDeltaSecs: DeltaTimeSecs(0.016),
+  raw: DeltaTimeSecs(0.016),
   nowSecs: MonotonicTimeSecs(2),
 }
 

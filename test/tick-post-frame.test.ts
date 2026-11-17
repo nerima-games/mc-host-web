@@ -433,7 +433,7 @@ describe('tick post-frame processing', () => {
     const result = runTickPostFrame(harness.context, {
       frame: harness.input,
       movement: harness.movement,
-      framesTotal: 5,
+      ticksTotal: 5,
     })
 
     expect(result.dimensionChanged).toBe(true)
@@ -460,7 +460,7 @@ describe('tick post-frame processing', () => {
     const result = runTickPostFrame(context, {
       frame: { ...harness.input, dead: false },
       movement: { ...harness.movement, dimensionBeforeFrame: 'overworld' },
-      framesTotal: 5,
+      ticksTotal: 5,
     })
 
     expect(result.dimensionChanged).toBe(false)
@@ -491,7 +491,7 @@ describe('tick post-frame processing', () => {
     const result = runTickPostFrame(inOverworld(harness.context), {
       frame: harness.input,
       movement: inOverworldMovement(harness.movement),
-      framesTotal: 5,
+      ticksTotal: 5,
     })
 
     const inventoryAfter = Effect.runSync(world.inventory.storageSnapshot).inventory.slots
@@ -533,7 +533,7 @@ describe('tick post-frame processing', () => {
     runTickPostFrame(context, {
       frame: harness.input,
       movement: inOverworldMovement(harness.movement),
-      framesTotal: 5,
+      ticksTotal: 5,
     })
 
     expect(context.state.tradeStatus.get()).toBe('Trade complete')
@@ -555,7 +555,7 @@ describe('tick post-frame processing', () => {
     }
 
     const exit = await Effect.runPromiseExit(runTickPostFrameEffect(context, {
-      frame: harness.input, movement: harness.movement, framesTotal: 5,
+      frame: harness.input, movement: harness.movement, ticksTotal: 5,
     }))
 
     expect(batchFailure).toMatchObject({ _tag: 'WorldWriteChunkUnavailable', dimension: 'nether', chunk: '2,0' })
@@ -584,7 +584,7 @@ describe('tick post-frame processing', () => {
         applyPortalTravels: () => Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
       }
       const fiber = yield* Effect.forkChild(runTickPostFrameEffect(context, {
-        frame: harness.input, movement: harness.movement, framesTotal: 5,
+        frame: harness.input, movement: harness.movement, ticksTotal: 5,
       }))
       yield* Deferred.await(entered)
       yield* Fiber.interrupt(fiber)
@@ -617,7 +617,7 @@ describe('tick post-frame processing', () => {
     }
 
     const exit = await Effect.runPromiseExit(runTickPostFrameEffect(context, {
-      frame: harness.input, movement: harness.movement, framesTotal: 5,
+      frame: harness.input, movement: harness.movement, ticksTotal: 5,
     }))
 
     expect(batchFailure).toMatchObject({ _tag: 'WorldWriteChunkUnavailable' })
@@ -646,7 +646,7 @@ describe('tick post-frame processing', () => {
     }
 
     const exit = await Effect.runPromiseExit(runTickPostFrameEffect(context, {
-      frame: harness.input, movement: harness.movement, framesTotal: 5,
+      frame: harness.input, movement: harness.movement, ticksTotal: 5,
     }))
 
     expect(Exit.isFailure(exit)).toBe(true)
@@ -694,7 +694,7 @@ describe('tick post-frame processing', () => {
     const result = runTickPostFrame(context, {
       frame: harness.input,
       movement: inOverworldMovement(harness.movement),
-      framesTotal: 5,
+      ticksTotal: 5,
     })
 
     expect(portalTravelCount).toBe(1)
@@ -737,7 +737,7 @@ describe('tick post-frame processing', () => {
       result = runTickPostFrame(context, {
         frame: harness.input,
         movement: inOverworldMovement(harness.movement),
-        framesTotal: 5,
+        ticksTotal: 5,
       })
     } finally {
       if (priorDocument === undefined) Reflect.deleteProperty(globalThis, 'document')
@@ -767,7 +767,7 @@ describe('tick post-frame processing', () => {
       const result = Effect.runSync(Effect.result(runTickPostFrameEffect(context, {
         frame: harness.input,
         movement: inOverworldMovement(harness.movement),
-        framesTotal: 5,
+        ticksTotal: 5,
       })))
 
       expect(Result.isFailure(result)).toBe(true)
@@ -794,7 +794,7 @@ describe('tick post-frame processing', () => {
     const result = Effect.runSync(Effect.result(runTickPostFrameEffect(context, {
       frame: { ...harness.input, attackTriggered: true, attackHeld: true },
       movement: inOverworldMovement(harness.movement),
-      framesTotal: 5,
+      ticksTotal: 5,
     })))
 
     expect(Result.isFailure(result)).toBe(true)
@@ -829,7 +829,7 @@ describe('tick post-frame processing', () => {
     const result = Effect.runSync(Effect.result(runTickPostFrameEffect(context, {
       frame: harness.input,
       movement: inOverworldMovement(harness.movement),
-      framesTotal: 5,
+      ticksTotal: 5,
     })))
 
     expect(Result.isFailure(result)).toBe(true)
@@ -856,7 +856,7 @@ describe('tick post-frame processing', () => {
     const result = Effect.runSync(Effect.result(runTickPostFrameEffect(context, {
       frame: harness.input,
       movement: inOverworldMovement(harness.movement),
-      framesTotal: 5,
+      ticksTotal: 5,
     })))
 
     expect(Result.isFailure(result)).toBe(true)
@@ -878,7 +878,7 @@ describe('tick post-frame processing', () => {
     expect(() => runTickPostFrame(context, {
       frame: harness.input,
       movement: harness.movement,
-      framesTotal: 5,
+      ticksTotal: 5,
     })).toThrow('bow reset failed')
     expect(harness.bowUseState.get()).toEqual(IDLE_BOW_USE)
   })
@@ -896,7 +896,7 @@ describe('tick post-frame processing', () => {
     expect(() => runTickPostFrame(context, {
       frame: harness.input,
       movement: harness.movement,
-      framesTotal: 5,
+      ticksTotal: 5,
     })).toThrow('simulation reset failed')
     expect(harness.environmentalContactDamageState.get()).toEqual({ lastDamageElapsedSecs: undefined })
   })
@@ -912,12 +912,12 @@ describe('tick post-frame processing', () => {
     runTickPostFrame(context, {
       frame: { ...harness.input, raw: 0.25, useTriggered: true, useHeld: true },
       movement: inOverworldMovement(harness.movement),
-      framesTotal: 5,
+      ticksTotal: 5,
     })
     const result = runTickPostFrame(context, {
       frame: { ...harness.input, raw: 0.05, useTriggered: false, useHeld: false },
       movement: inOverworldMovement(harness.movement),
-      framesTotal: 5,
+      ticksTotal: 5,
     })
 
     const projectile = context.state.projectileRuntimeState.get().projectiles[0]
@@ -961,7 +961,7 @@ describe('tick post-frame processing', () => {
     runTickPostFrame(context, {
       frame: { ...harness.input, attackTriggered: true, attackHeld: true },
       movement: inOverworldMovement(harness.movement),
-      framesTotal: 5,
+      ticksTotal: 5,
     })
 
     expect(Effect.runSync(Ref.get(harness.context.h5a.gameplayState.pendingMeleeAttacks))).toEqual([
@@ -992,7 +992,7 @@ describe('tick post-frame processing', () => {
     runTickPostFrame(context, {
       frame: { ...harness.input, attackTriggered: true, attackHeld: true },
       movement: inOverworldMovement(harness.movement),
-      framesTotal: 5,
+      ticksTotal: 5,
     })
 
     expect(Effect.runSync(harness.generated.chunkStore.getBlock(at))).toMatchObject({ _tag: 'Block', block: Option.getOrThrow(blockIdOf('potato_crop')) })
@@ -1017,7 +1017,7 @@ describe('tick post-frame processing', () => {
     }
     context.pendingBlockBreakConfirmations.push({ dimension: 'overworld', position: at, blockId: crop })
     Effect.runSync(gameplay.requestPotatoHarvest(context.h5a.gameplayState, 'retry-harvest', at, 0.25))
-    const frame = { frame: harness.input, movement: inOverworldMovement(harness.movement), framesTotal: 5 }
+    const frame = { frame: harness.input, movement: inOverworldMovement(harness.movement), ticksTotal: 5 }
 
     runTickPostFrame(context, frame)
     runTickPostFrame(context, frame)
@@ -1061,7 +1061,7 @@ describe('tick post-frame processing', () => {
     runTickPostFrame(context, {
       frame: { ...harness.input, attackTriggered: true, attackHeld: true },
       movement: inOverworldMovement(harness.movement),
-      framesTotal: 5,
+      ticksTotal: 5,
     })
     expect(Effect.runSync(Ref.get(harness.context.h5a.gameplayState.pendingBreaks))).toEqual([
       blockPositionKeyOf(position),
@@ -1075,7 +1075,7 @@ describe('tick post-frame processing', () => {
     runTickPostFrame(context, {
       frame: { ...harness.input, attackTriggered: false, attackHeld: false },
       movement: inOverworldMovement(harness.movement),
-      framesTotal: 6,
+      ticksTotal: 6,
     })
     expect(harness.canvasAttributes.get('data-breaks-completed')).toBe('1')
   })
@@ -1113,7 +1113,7 @@ describe('tick post-frame processing', () => {
     runTickPostFrame(context, {
       frame: harness.input,
       movement: inOverworldMovement(harness.movement),
-      framesTotal: 5,
+      ticksTotal: 5,
     })
 
     const targetAfter = Effect.runSync(world.entities.find(target.id))

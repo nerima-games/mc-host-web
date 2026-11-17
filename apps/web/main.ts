@@ -3980,7 +3980,7 @@ const bootGame = async (
           const movement = yield* runTickPlayerMovement(h5aTickContext, frame)
           // A defected tick stage has already failed the boot; the frame stops there.
           if (movement === undefined) return 'halt' as const
-          const postFrame = yield* runTickPostFrame(h5bTickContext, { frame, movement, framesTotal: ticksTotal })
+          const postFrame = yield* runTickPostFrame(h5bTickContext, { frame, movement, ticksTotal })
           yield* runTickPostFrameGameplay(h5cTickContext, { frame, movement, postFrame, nowSecs })
           return 'continue' as const
         }),
@@ -3998,7 +3998,7 @@ const bootGame = async (
             {
               partialTick,
               simulationTick,
-              frameDeltaSecs: yield* Effect.fromResult(DeltaTimeSecs.result(timing.raw)),
+              raw: yield* Effect.fromResult(DeltaTimeSecs.result(timing.raw)),
               nowSecs,
             },
           )
