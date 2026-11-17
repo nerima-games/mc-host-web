@@ -331,7 +331,6 @@ import { createDebugOverlayRuntime } from './debug-overlay-runtime'
 import {
   connectMultiplayer,
   createMultiplayerClient,
-  MULTIPLAYER_BREWING_UNSUPPORTED_MESSAGE,
   multiplayerRegistrationTokenKey,
   type DecodedVehicle,
   type MultiplayerClientContext,
@@ -2510,7 +2509,6 @@ const bootGame = async (
     requestCrafting,
     drainCraftingInbound,
     requestBrewing,
-    drainBrewingInbound,
     requestAnvil,
     drainAnvilInbound,
     requestEnchanting,
@@ -2765,7 +2763,6 @@ const bootGame = async (
     let progress = brewingParent.querySelector<HTMLElement>('[data-testid="brewing-progress"]')
     let status = brewingParent.querySelector<HTMLElement>('.brewing-status')
     let collect = brewingParent.querySelector<HTMLButtonElement>('[data-brewing-action="collect"]')
-    const protocolFailure = multiplayerClientApi.brewingProtocolFailure
     if (summary === null || progress === null || status === null || collect === null) {
       const title = document.createElement('h2')
       title.textContent = 'Brewing Stand'
@@ -2777,17 +2774,14 @@ const bootGame = async (
       insert.type = 'button'
       insert.dataset['brewingAction'] = 'insert'
       insert.textContent = 'Insert selected item'
-      insert.disabled = protocolFailure !== undefined
       collect = document.createElement('button')
       collect.type = 'button'
       collect.dataset['brewingAction'] = 'collect'
       collect.textContent = 'Collect bottle'
-      collect.disabled = protocolFailure !== undefined
       const drink = document.createElement('button')
       drink.type = 'button'
       drink.dataset['brewingAction'] = 'drink'
       drink.textContent = 'Drink potion'
-      drink.disabled = protocolFailure !== undefined
       const close = document.createElement('button')
       close.type = 'button'
       close.dataset['brewingAction'] = 'close'
@@ -2796,15 +2790,6 @@ const bootGame = async (
       status.className = 'brewing-status'
       status.setAttribute('role', 'status')
       brewingParent.replaceChildren(title, summary, progress, insert, collect, drink, close, status)
-    }
-    if (protocolFailure !== undefined) {
-      switch (protocolFailure.reason) {
-        case 'LegacySingleBottleState':
-          summary.textContent = MULTIPLAYER_BREWING_UNSUPPORTED_MESSAGE
-          progress.textContent = ''
-          status.textContent = brewingStatus
-      }
-      return
     }
     const state = Effect.runSync(snapshotGameplayBrewing)
     collect.disabled = state.brewProgressSecs > 0
@@ -2827,7 +2812,7 @@ const bootGame = async (
     brewingParent.hidden = !open
     brewingParent.setAttribute('aria-hidden', String(!open))
     document.body.setAttribute('data-brewing-open', String(open))
-    if (open && multiplayer !== undefined) requestBrewing()
+    if (open && multiplayer !== undefined) Effect.runSync(requestBrewing({ _tag: 'open' }))
     renderBrewingUi()
     renderCrosshair()
     syncTouchControls()
@@ -2846,11 +2831,6 @@ const bootGame = async (
       if (!brewingOpen) return
       if (action === 'close') {
         setBrewingOpen(false)
-        return
-      }
-      if (multiplayer !== undefined) {
-        requestBrewing()
-        renderBrewingUi()
         return
       }
       if (action === 'insert') {
@@ -2874,6 +2854,14 @@ const bootGame = async (
         if (bottleIndex === -1) {
           brewingStatus = 'Cannot insert item: Occupied'
           renderBrewingUi()
+          return
+        }
+        if (multiplayer !== undefined) {
+          Effect.runSync(requestBrewing(selected.item === 'blaze_powder'
+            ? { _tag: 'insert-fuel', slot: selectedHotbarIndex }
+            : bottleIndex !== undefined
+              ? { _tag: 'insert-bottle', slot: selectedHotbarIndex, bottleIndex }
+              : { _tag: 'insert-ingredient', slot: selectedHotbarIndex }))
           return
         }
         nextItemUseRequestId += 1
@@ -2909,6 +2897,10 @@ const bootGame = async (
           renderBrewingUi()
           return
         }
+        if (multiplayer !== undefined) {
+          Effect.runSync(requestBrewing({ _tag: 'collect', bottleIndex }))
+          return
+        }
         nextItemUseRequestId += 1
         const requestId = `brewing-${String(nextItemUseRequestId)}`
         Effect.runSync(collectBrewingPotion(gameplayState, {
@@ -2927,6 +2919,10 @@ const bootGame = async (
         return
       }
       if (action === 'drink') {
+        if (multiplayer !== undefined) {
+          Effect.runSync(requestBrewing({ _tag: 'drink', slot: selectedHotbarIndex }))
+          return
+        }
         nextItemUseRequestId += 1
         const requestId = `brewing-${String(nextItemUseRequestId)}`
         Effect.runSync(useBrewingPotion(gameplayState, {
@@ -3724,7 +3720,6 @@ const bootGame = async (
       requestFurnaceAdvance,
       drainMultiplayerInbound,
       drainCraftingInbound,
-      drainBrewingInbound,
       drainAnvilInbound,
       drainEnchantingInbound,
       drainPlayerDamageInbound,
@@ -4034,9 +4029,8 @@ const bootGame = async (
         if (multiplayerInboundStage !== undefined && multiplayerOutboundStage !== undefined) {
           frameBoundary.enqueue(Effect.gen(function* () {
             yield* multiplayerInboundStage.run(DeltaTimeSecs(0)).pipe(Effect.provide(BrowserClockLayer))
-            drainMultiplayerInbound()
+            yield* drainMultiplayerInbound()
             drainCraftingInbound()
-            drainBrewingInbound()
             drainAnvilInbound()
             drainEnchantingInbound()
             drainPlayerDamageInbound()

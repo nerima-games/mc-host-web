@@ -1,4 +1,4 @@
-import { Data, Effect, Option, Queue, Result, type Brand } from 'effect'
+import { Data, Effect, Option, Queue, Result, Schema, type Brand } from 'effect'
 import type { YieldableError } from 'effect/Cause'
 import {
   BlockAxis,
@@ -12,6 +12,7 @@ import {
   itemStackFromUnknown,
   position,
   PositionAxis,
+  type BrewingState,
   type ItemStackFailure,
   type ItemType,
   type Position as Vec3,
@@ -21,7 +22,8 @@ import {
   durabilityForItem,
   equipmentItem,
   EQUIPMENT_SLOTS,
-  furnaceState,
+  BrewingServiceStateSchema,
+  emptyBrewingState,
   HungerPoints,
   makeTimeService,
   makeVehicleService,
@@ -35,31 +37,39 @@ import {
   type ContainerSlot,
   type ContainerStorageValidationError,
   type EquipmentItemFailure,
-  type FurnaceStateValidationFailure,
   type ItemStack,
   type PlayerStorage,
   type PlayerStorageValidationError,
   type Vehicle,
   type WeatherValidationFailure,
+  type BrewingFailure,
   type WorldCommitCoordinatorError,
 } from '@nerima-games/mc-sim'
 import {
+  BrewingCommand,
+  brewingStateFromWire,
   CommandId,
   EntityId,
+  furnaceStateFromWire,
   makeMultiplayerHost,
   PlayerId,
   PlayerName,
   TransportPort,
   WorldId,
   type AuthoritativeEntityState,
+  type BrewingAction,
+  type BrewingWireConversionFailure,
+  type FurnaceWireConversionFailure,
   type MultiplayerHost,
   type NetworkMessage,
 } from '@nerima-games/mx-multiplayer'
 import {
+  GAMEPLAY_BREWING_OWNER_ID,
   GAMEPLAY_VILLAGER_TRADES_OWNER_ID,
   GameplayVillagerTradeSnapshotSchema,
   type GeneratedWorld,
   restoreStatusEffects,
+  StatusEffectStateSchema,
   type EnchantedItem,
   type GameplayFrameState,
   type MobBehaviour,
@@ -381,7 +391,9 @@ type InvalidServerStateFailure =
   | InvalidFurnaceId
   | ItemStackFailure
   | EquipmentItemFailure
-  | FurnaceStateValidationFailure
+  | FurnaceWireConversionFailure
+  | BrewingWireConversionFailure
+  | Schema.SchemaError
   | PlayerStorageValidationError
   | ContainerStorageValidationError
   | WeatherValidationFailure
@@ -410,6 +422,9 @@ type ServerStateApplyFailure =
   | Effect.Error<ReturnType<ClientServices['world']['inventory']['restoreContainerStorage']>>
   | Effect.Error<ReturnType<ClientServices['weather']['applyTransition']>>
   | Effect.Error<ReturnType<ClientServices['playerApi']['restore']>>
+  | Effect.Error<ClientServices['playerApi']['dimension']>
+  | Effect.Error<ReturnType<typeof restoreStatusEffects>>
+  | BrewingFailure
   | Effect.Error<ReturnType<ClientChunkContext['chunkStore']['setBlock']>>
   | Effect.Error<ReturnType<ClientInventoryInteraction['confirmCraftOnce']>>
   | WorldCommitCoordinatorError
@@ -428,6 +443,27 @@ const ServerStateNotApplied: new (fields: ServerStateNotAppliedFields) => Server
 
 type ServerStateFailure = InvalidServerState | ServerStateNotApplied
 
+type ServerProtocolVersionMismatchFields = {
+  /** Frames dropped for their protocol version since the connection opened. */
+  readonly droppedFrames: number
+}
+
+/**
+ * The server sends frames at a protocol version other than this build's, so
+ * mx-multiplayer drops each of them before the client sees it.
+ */
+type ServerProtocolVersionMismatch = YieldableError &
+  ServerProtocolVersionMismatchFields & { readonly _tag: 'ServerProtocolVersionMismatch' }
+
+const ServerProtocolVersionMismatch: new (fields: ServerProtocolVersionMismatchFields) => ServerProtocolVersionMismatch =
+  Data.TaggedError('ServerProtocolVersionMismatch')
+
+/** Re-sends of a brewing command the server refused because its revision had moved on. */
+export const BREWING_STALE_RETRY_LIMIT = 4
+
+const BREWING_WAITING_STATUS = 'Waiting for the multiplayer server...'
+const BREWING_LOADING_STATUS = 'Loading brewing stand...'
+
 const invalidServerState = (what: string) => (failure: InvalidServerStateFailure): InvalidServerState =>
   new InvalidServerState({ what, failure })
 
@@ -436,15 +472,6 @@ const appliedAs = <A>(
   effect: Effect.Effect<A, ServerStateApplyFailure>,
 ): Effect.Effect<A, ServerStateNotApplied> =>
   Effect.mapError(effect, (failure) => new ServerStateNotApplied({ what, failure }))
-
-type BrewingProtocolFailure = Readonly<{
-  readonly _tag: 'ServerProtocolUnsupported'
-  readonly feature: 'BrewingStand'
-  readonly reason: 'LegacySingleBottleState'
-}>
-
-export const MULTIPLAYER_BREWING_UNSUPPORTED_MESSAGE =
-  'Multiplayer brewing is unsupported until the server protocol is updated.'
 
 const networkPosition = (at: MultiplayerPosition): Result.Result<Vec3, Brand.BrandError> =>
   Result.gen(function* () {
@@ -632,34 +659,24 @@ const decodeNetworkVehicles = (
 ): Result.Result<ReadonlyArray<DecodedVehicle>, InvalidServerState> =>
   Result.all(entities.flatMap((entity) => entity._tag === 'vehicle' ? [decodeNetworkVehicle(entity)] : []))
 
-const decodeNetworkFurnace = (state: NetworkFurnaceState, known: FurnaceLocation | undefined) => {
-  const networkStack = (stack: NetworkFurnaceState['input']): Result.Result<ItemStack | undefined, ItemStackFailure> =>
-    stack === null ? Result.succeed(undefined) : itemStackFromUnknown(stack.item, stack.count)
-  return Result.mapError(Result.gen(function* () {
+const decodeNetworkFurnace = (state: NetworkFurnaceState, known: FurnaceLocation | undefined) =>
+  Result.mapError(Result.gen(function* () {
     const location = known ?? (yield* furnaceLocationFromId(state.furnaceId))
-    // The wire carries the pre-station furnace record, so the fields it lacks
-    // are filled as the v17 session migration fills them: the furnace station,
-    // and the remaining burn time standing in for the burning fuel's total.
     const furnace: PersistedFurnaceState = {
       dimension: location.dimension,
       position: location.position,
-      state: yield* furnaceState({
-        station: 'furnace',
-        input: yield* networkStack(state.input),
-        fuel: yield* networkStack(state.fuel),
-        output: yield* networkStack(state.output),
-        fuelTimeRemainingSecs: state.burnTicksRemaining / 20,
-        fuelTimeTotalSecs: state.burnTicksRemaining / 20,
-        cookProgressSecs: state.cookTicks / 20,
-      }),
+      state: yield* furnaceStateFromWire(state),
     }
     return { furnaceId: state.furnaceId, furnace }
   }), invalidServerState('furnace'))
-}
+
+/** Brewing stands are keyed by world and block position, as the server addresses them. */
+const brewingStandKey = (world: WorldId, at: MultiplayerPosition): string =>
+  JSON.stringify([world, at.x, at.y, at.z])
 
 export type MultiplayerClientApi = Readonly<{
   enqueueMultiplayerPlayerMove: (nowSecs: number) => void
-  drainMultiplayerInbound: () => void
+  drainMultiplayerInbound: () => Effect.Effect<void>
   sendVitalsCommand: (action: Extract<NetworkMessage, { readonly _tag: 'PlayerVitalsCommand' }>['action']) => void
   sendPortalUseCommand: (portal: MultiplayerPosition, tag: 'EndPortalUseCommand' | 'NetherPortalUseCommand') => boolean
   sendEndProgressCommand: (
@@ -682,9 +699,7 @@ export type MultiplayerClientApi = Readonly<{
   drainPlayerDamageInbound: () => void
   requestCrafting: () => void
   drainCraftingInbound: () => void
-  requestBrewing: () => boolean
-  brewingProtocolFailure: BrewingProtocolFailure | undefined
-  drainBrewingInbound: () => void
+  requestBrewing: (action: BrewingAction) => Effect.Effect<boolean>
   requestAnvil: () => boolean
   drainAnvilInbound: () => void
   requestEnchanting: (offer: 0 | 1 | 2) => boolean
@@ -804,7 +819,15 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
   let nextInventoryCommand = 0
   let nextPlayerDamageCommand = 0
   let nextCraftingCommand = 0
-  let brewingProtocolFailure: BrewingProtocolFailure | undefined
+  let nextBrewingCommand = 0
+  let pendingBrewingCommand: { readonly commandId: CommandId; readonly action: BrewingAction } | null = null
+  let brewingStaleRetries = 0
+  // Set when a stand opened before the server described it; its first delta clears the loading status.
+  let awaitingBrewingStand = false
+  let reportedVersionMismatches = 0
+  // Every stand the server has described, so opening one shows its state
+  // before the reply to the open command arrives.
+  const brewingStands = new Map<string, BrewingState>()
   let nextAnvilCommand = 0
   let nextEnchantingCommand = 0
   let nextVillagerTradeCommand = 0
@@ -882,8 +905,10 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
     clientContext.state.lastPlayerMoveSentAt = nowSecs
   }
 
-  const drainMultiplayerInbound = (): void => {
-    if (clientContext.multiplayer === undefined) return
+  // Runs after the inbound stage: it applies what that stage decoded and
+  // reports the frames it dropped for their protocol version.
+  const drainMultiplayerInbound = (): Effect.Effect<void> => Effect.suspend(() => {
+    if (clientContext.multiplayer === undefined) return Effect.void
     for (const message of Effect.runSync(Queue.clear(clientContext.multiplayer.transport.sleepInbound))) {
       if (message._tag === 'SleepSnapshot') clientContext.state.networkSleepState = sleepClientFromSnapshot(message.snapshot)
       else if (message._tag === 'SleepCommandResult') clientContext.state.networkSleepState = applySleepCommandResult(clientContext.state.networkSleepState, message.result)
@@ -910,8 +935,16 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
       }
     }
     const multiplayer = clientContext.multiplayer
-    Effect.runSync(Effect.flatMap(multiplayer.host.drainInbound, (messages) => Effect.forEach(messages, (message) => applyNetworkMessage(multiplayer, message), { discard: true })))
-  }
+    return Effect.flatMap(multiplayer.host.drainInbound, (messages) => Effect.forEach(messages, (message) => applyNetworkMessage(multiplayer, message), { discard: true })).pipe(
+      Effect.andThen(multiplayer.host.countersSnapshot),
+      Effect.map(({ versionMismatched }) => {
+        if (versionMismatched > reportedVersionMismatches) {
+          reportedVersionMismatches = versionMismatched
+          reportProtocolVersionMismatch(new ServerProtocolVersionMismatch({ droppedFrames: versionMismatched }))
+        }
+      }),
+    )
+  })
   clientContext.ui.multiplayerStatus.hidden = clientContext.multiplayer === undefined
   clientContext.ui.multiplayerStatus.textContent = clientContext.multiplayer === undefined ? '' : 'Connecting to multiplayer server...'
   setMultiplayerChatVisibility(clientContext.ui.multiplayerChat, clientContext.multiplayer)
@@ -933,6 +966,17 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
       clientContext.ui.multiplayerStatus.textContent = `The ${failure.what} from the multiplayer server could not be applied.`
     }
     clientContext.ui.multiplayerStatus.hidden = false
+  }
+
+  // The resume handshake is unversioned, so a server on another protocol
+  // version still connects; only its dropped frames show the mismatch.
+  const reportProtocolVersionMismatch = (failure: ServerProtocolVersionMismatch): void => {
+    console.error('[mc-compose] multiplayer server frames were dropped for their protocol version', failure)
+    clientContext.state.multiplayerRejection = 'protocol version mismatch'
+    clientContext.ui.multiplayerStatus.textContent =
+      'The multiplayer server and this client use different protocol versions; server updates are not applied.'
+    clientContext.ui.multiplayerStatus.hidden = false
+    clientContext.ui.canvas.setAttribute('data-multiplayer-rejection', clientContext.state.multiplayerRejection)
   }
 
   const sendVitalsCommand = (action: Extract<NetworkMessage, { readonly _tag: 'PlayerVitalsCommand' }>['action']): void => {
@@ -1309,44 +1353,80 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
     }
   }
 
-  const reportUnsupportedBrewingProtocol = (): void => {
-    if (brewingProtocolFailure === undefined) {
-      brewingProtocolFailure = {
-        _tag: 'ServerProtocolUnsupported', feature: 'BrewingStand', reason: 'LegacySingleBottleState',
-      }
-      console.error('[mc-compose] multiplayer brewing state cannot be represented locally', brewingProtocolFailure)
-    }
-    clientContext.state.brewingStatus = MULTIPLAYER_BREWING_UNSUPPORTED_MESSAGE
+  const activeBrewingStandKey = (world: WorldId): string | undefined =>
+    clientContext.state.brewingOpen && clientContext.state.activeBrewingStandAt !== undefined
+      ? brewingStandKey(world, clientContext.state.activeBrewingStandAt)
+      : undefined
+
+  // The brewing owner holds the open stand, so the brewing UI reads the
+  // server's stand exactly as it reads the single-player one.
+  const applyBrewingStand = (state: BrewingState): Effect.Effect<void, ServerStateNotApplied> =>
+    appliedAs('brewing stand', Effect.asVoid(clientContext.services.gameplayCommit.coordinator.commitFromSnapshot(
+      GAMEPLAY_BREWING_OWNER_ID,
+      BrewingServiceStateSchema,
+      (snapshot) => Effect.succeed({
+        expectedRevision: snapshot.revision,
+        expectedDimensions: [],
+        changes: [{ ownerId: GAMEPLAY_BREWING_OWNER_ID, state }],
+      }),
+    )))
+
+  const showBrewingStatus = (status: string): void => {
+    clientContext.state.brewingStatus = status
     clientContext.callbacks.renderBrewingUi()
   }
 
-  const requestBrewing = (): boolean => {
-    if (clientContext.multiplayer !== undefined) reportUnsupportedBrewingProtocol()
-    return false
-  }
+  const sendBrewingCommand = (action: BrewingAction): Effect.Effect<boolean, ServerStateNotApplied> =>
+    Effect.gen(function* () {
+      const multiplayer = clientContext.multiplayer
+      const at = clientContext.state.activeBrewingStandAt
+      if (multiplayer === undefined || !clientContext.state.brewingOpen || at === undefined) return false
+      if (!clientContext.state.multiplayerHandshakeComplete || pendingBrewingCommand !== null) {
+        showBrewingStatus(BREWING_WAITING_STATUS)
+        return false
+      }
+      const world = WorldId.make(yield* appliedAs('brewing stand', clientContext.services.playerApi.dimension))
+      // The codec bounds slot and bottle indices; an out-of-range command is
+      // refused here rather than dropped unencoded by the outbound stage.
+      const command = Schema.decodeUnknownResult(BrewingCommand)({
+        _tag: 'BrewingCommand',
+        action,
+        at: { x: at.x, y: at.y, z: at.z },
+        commandId: commandIdFor('brewing', nextBrewingCommand + 1),
+        expectedRevision: multiplayerRevision,
+        player: multiplayer.query.player,
+        world,
+      })
+      if (Result.isFailure(command)) {
+        console.error('[mc-compose] multiplayer brewing command is invalid', command.failure)
+        showBrewingStatus('Cannot send brewing command: invalid-command')
+        return false
+      }
+      nextBrewingCommand += 1
+      pendingBrewingCommand = { commandId: command.success.commandId, action }
+      yield* multiplayer.host.enqueueOutbound(command.success)
+      return true
+    })
 
-  const drainBrewingInbound = (): void => {
-    if (clientContext.multiplayer === undefined) return
-    const currentWorld = String(WorldId.make(Effect.runSync(clientContext.services.playerApi.dimension)))
-    for (const message of Effect.runSync(Queue.clear(clientContext.multiplayer.transport.brewingInbound))) {
-      if (message._tag === 'BrewingCommandResult') {
-        reportUnsupportedBrewingProtocol()
-        continue
+  const requestBrewing = (action: BrewingAction): Effect.Effect<boolean> =>
+    Effect.gen(function* () {
+      const at = clientContext.state.activeBrewingStandAt
+      if (clientContext.multiplayer === undefined || !clientContext.state.brewingOpen || at === undefined) return false
+      if (action._tag === 'open') {
+        const world = WorldId.make(yield* appliedAs('brewing stand', clientContext.services.playerApi.dimension))
+        const known = brewingStands.get(brewingStandKey(world, at))
+        // An undescribed stand shows as empty, never as the previously open one.
+        yield* applyBrewingStand(known ?? (yield* appliedAs('brewing stand', Effect.fromResult(emptyBrewingState()))))
+        awaitingBrewingStand = known === undefined
+        if (awaitingBrewingStand) showBrewingStatus(BREWING_LOADING_STATUS)
+        else clientContext.callbacks.renderBrewingUi()
       }
-      if (message._tag !== 'BrewingStandDelta' && message._tag !== 'PlayerStatusEffectsDelta') continue
-      if (message.world !== currentWorld || message.revision < multiplayerRevision) continue
-      multiplayerRevision = Math.max(multiplayerRevision, message.revision)
-      if (message._tag === 'BrewingStandDelta') {
-        // The single-bottle wire state lacks the three slots, fuel stack and
-        // progress needed by the live owner. Save migration would finish brews.
-        reportUnsupportedBrewingProtocol()
-        continue
-      }
-      if (message.player === String(clientContext.multiplayer.query.player)) {
-        Effect.runSync(restoreStatusEffects(clientContext.services.gameplayState, message.state, clientContext.services.gameplayCommit))
-      }
-    }
-  }
+      brewingStaleRetries = 0
+      return yield* sendBrewingCommand(action)
+    }).pipe(Effect.catch((failure) => Effect.sync(() => {
+      reportServerStateFailure(failure)
+      return false
+    })))
 
   const requestAnvil = (): boolean => {
     if (clientContext.multiplayer === undefined || !clientContext.state.multiplayerHandshakeComplete || pendingAnvilCommand !== null) return false
@@ -1697,6 +1777,8 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
             yawRadians: message.facing.yawRadians,
             pitchRadians: message.facing.pitchRadians,
           }, dimension))
+          // A realm transfer carries no brewing stands; the destination's are learnt on open.
+          brewingStands.clear()
           clientContext.services.alignActiveDimension(dimension)
           clientContext.services.resetSimState(true)
           clientContext.state.lastPlayerMoveSent = { world: message.destinationWorld, at: message.at, facing: message.facing }
@@ -1843,6 +1925,65 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
             && pendingFacilityCommand.facilityId === message.state.furnaceId
           ) pendingFacilityCommand.facilityDeltaRevision = message.revision
           if (clientContext.state.inventoryOpen && clientContext.state.inventoryMode === 'furnace' && clientContext.state.activeFurnaceKey === message.state.furnaceId) clientContext.callbacks.renderPlayerUi()
+          return
+        }
+        case 'BrewingStandDelta': {
+          if (message.revision < multiplayerRevision) return
+          const stand = yield* Effect.fromResult(
+            Result.mapError(brewingStateFromWire(message.state), invalidServerState('brewing stand')),
+          )
+          const key = brewingStandKey(message.world, message.at)
+          const world = WorldId.make(yield* appliedAs('brewing stand', clientContext.services.playerApi.dimension))
+          const active = activeBrewingStandKey(world) === key
+          if (active) yield* applyBrewingStand(stand)
+          brewingStands.set(key, stand)
+          multiplayerRevision = message.revision
+          if (active && awaitingBrewingStand) {
+            awaitingBrewingStand = false
+            clientContext.state.brewingStatus = ''
+          }
+          if (active) clientContext.callbacks.renderBrewingUi()
+          return
+        }
+        case 'PlayerStatusEffectsDelta': {
+          if (message.revision < multiplayerRevision) return
+          if (message.player === localPlayer) {
+            // The wire may omit an amplifier the owner requires; such a state is refused.
+            const effects = yield* Effect.fromResult(Result.mapError(
+              Schema.decodeUnknownResult(StatusEffectStateSchema)(message.state),
+              invalidServerState('status effects'),
+            ))
+            yield* appliedAs('status effects', restoreStatusEffects(
+              clientContext.services.gameplayState,
+              effects,
+              clientContext.services.gameplayCommit,
+            ))
+          }
+          multiplayerRevision = message.revision
+          return
+        }
+        case 'BrewingCommandAccepted':
+        case 'BrewingCommandRejected': {
+          multiplayerRevision = Math.max(multiplayerRevision, message.revision)
+          const pending = pendingBrewingCommand
+          if (message.commandId !== pending?.commandId) return
+          pendingBrewingCommand = null
+          // The server advances its revision every tick while a stand brews or
+          // an effect runs, so a valid command often arrives one tick late. The
+          // rejection carries the current revision, adopted above, so a bounded
+          // re-send names a fresh one.
+          if (
+            message._tag === 'BrewingCommandRejected'
+            && message.reason === 'stale-revision'
+            && brewingStaleRetries < BREWING_STALE_RETRY_LIMIT
+          ) {
+            brewingStaleRetries += 1
+            if (yield* sendBrewingCommand(pending.action)) return
+          }
+          brewingStaleRetries = 0
+          showBrewingStatus(message._tag === 'BrewingCommandAccepted'
+            ? (awaitingBrewingStand ? BREWING_LOADING_STATUS : '')
+            : `Cannot use brewing stand: ${message.reason}`)
           return
         }
         case 'VillagerTradeDelta': {
@@ -2017,8 +2158,6 @@ export const createMultiplayerClient = (clientContext: MultiplayerClientContext)
     requestCrafting,
     drainCraftingInbound,
     requestBrewing,
-    get brewingProtocolFailure() { return brewingProtocolFailure },
-    drainBrewingInbound,
     requestAnvil,
     drainAnvilInbound,
     requestEnchanting,

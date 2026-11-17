@@ -191,6 +191,8 @@ const makeHarness = async (options: HarnessOptions = {}) => {
   const attributes = new Map<string, string>()
   const canvasAttributes = new Map<string, string>()
   const tradeOpenCalls: Array<{ readonly open: boolean; readonly villagerId?: string }> = []
+  // The stand recorded when the brewing stand opens, which a multiplayer open command names.
+  const brewingOpenCalls: Array<{ readonly open: boolean; readonly standAt: SessionPosition | undefined }> = []
   const fishingResults: string[] = []
   const streamCalls: Array<{ readonly dimension: string; readonly x: number; readonly z: number }> = []
   const damageCalls: Array<unknown> = []
@@ -282,7 +284,7 @@ const makeHarness = async (options: HarnessOptions = {}) => {
     isCreativeMode: false,
     survivalHunger: gameplayState.survivalHunger,
     setInventoryOpen: () => undefined,
-    setBrewingOpen: () => undefined,
+    setBrewingOpen: (open: boolean) => brewingOpenCalls.push({ open, standAt: state.activeBrewingStandAt.get() }),
     setFishingResult: (result: string) => fishingResults.push(result),
     markSessionDirty: () => undefined,
     sendVitalsCommand: () => undefined,
@@ -455,6 +457,7 @@ const makeHarness = async (options: HarnessOptions = {}) => {
     attributes,
     canvasAttributes,
     tradeOpenCalls,
+    brewingOpenCalls,
     fishingResults,
     streamCalls,
     endAudioCalls,
@@ -927,6 +930,24 @@ describe('tick post-frame gameplay processing', () => {
       })
 
       expect(harness.tradeOpenCalls).toEqual([{ open: true, villagerId: 'villager-7' }])
+    })
+  })
+
+  it('records the targeted brewing stand before opening it', async () => {
+    const target = {
+      position: position(PositionAxis(4), PositionAxis(64), PositionAxis(-6)),
+      adjacentPosition: position(PositionAxis(4), PositionAxis(65), PositionAxis(-6)),
+      block: Option.getOrThrow(blockIdOf('brewing_stand')),
+    }
+    await withHarness({ useTriggered: true, targetedBlock: target }, (harness) => {
+      runTickPostFrameGameplay(harness.context, {
+        frame: harness.frame,
+        movement: harness.movement,
+        postFrame: harness.postFrame,
+        nowSecs: MonotonicTimeSecs(2),
+      })
+
+      expect(harness.brewingOpenCalls).toEqual([{ open: true, standAt: { x: 4, y: 64, z: -6 } }])
     })
   })
 

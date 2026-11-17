@@ -165,12 +165,6 @@
     "count": 1,
     "file": "apps/web/multiplayer-client.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(Queue.clear(clientContext.multiplayer.transport.brewingInbound))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/multiplayer-client.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(Queue.clear(clientContext.multiplayer.transport.craftingInbound))"
   },
   {
@@ -208,12 +202,6 @@
     "file": "apps/web/multiplayer-client.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(clientContext.callbacks.getInventoryInteraction().confirmCraftOnce())"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/multiplayer-client.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(Effect.flatMap(multiplayer.host.drainInbound, (messages) => Effect.forEach(messages, (message) => applyNetworkMessage(multiplayer, message), { discard: true })))"
   },
   {
     "count": 1,
@@ -300,7 +288,7 @@
     "text": "Effect.runSync(clientContext.multiplayer.transport.sendPlayerDamage(command))"
   },
   {
-    "count": 21,
+    "count": 20,
     "file": "apps/web/multiplayer-client.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(clientContext.services.playerApi.dimension)"
@@ -324,22 +312,10 @@
     "text": "Effect.runSync(currentMultiplayer.host.enqueueOutbound(command))"
   },
   {
-    "count": 1,
-    "file": "apps/web/multiplayer-client.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(restoreStatusEffects(clientContext.services.gameplayState, message.state, clientContext.services.gameplayCommit))"
-  },
-  {
     "count": 2,
     "file": "apps/web/multiplayer-websocket.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(Queue.shutdown(anvilInbound))"
-  },
-  {
-    "count": 2,
-    "file": "apps/web/multiplayer-websocket.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(Queue.shutdown(brewingInbound))"
   },
   {
     "count": 2,

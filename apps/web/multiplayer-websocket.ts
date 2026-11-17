@@ -6,7 +6,6 @@ import {
 import { Effect, Queue } from 'effect'
 import {
   decodeAnvilWireMessage,
-  decodeBrewingWireMessage,
   decodeCraftingWireMessage,
   decodeEnderDragonWireMessage,
   decodeEnchantingWireMessage,
@@ -14,15 +13,12 @@ import {
   decodeSleepWireMessage,
   decodeWitherWireMessage,
   encodeAnvilCommand,
-  encodeBrewingCommand,
   encodeCraftingCommand,
   encodeEnderDragonCommand,
   encodeEnchantingCommand,
   encodePlayerDamageCommand,
   type AnvilCommand,
   type AnvilWireMessage,
-  type BrewingCommand,
-  type BrewingWireMessage,
   type CraftingCommand,
   type CraftingWireMessage,
   type EnderDragonCommand,
@@ -75,7 +71,6 @@ export interface BrowserWebSocketTransport extends TransportService {
   readonly enderDragonInbound: Queue.Dequeue<EnderDragonWireMessage>
   readonly playerDamageInbound: Queue.Dequeue<PlayerDamageWireMessage>
   readonly craftingInbound: Queue.Dequeue<CraftingWireMessage>
-  readonly brewingInbound: Queue.Dequeue<BrewingWireMessage>
   readonly anvilInbound: Queue.Dequeue<AnvilWireMessage>
   readonly enchantingInbound: Queue.Dequeue<EnchantingWireMessage>
   readonly sendSleep: (message: SleepWireMessage) => Effect.Effect<void, TransportError>
@@ -83,7 +78,6 @@ export interface BrowserWebSocketTransport extends TransportService {
   readonly sendEnderDragon: (command: EnderDragonCommand) => Effect.Effect<void, TransportError>
   readonly sendPlayerDamage: (command: PlayerDamageCommand) => Effect.Effect<void, TransportError>
   readonly sendCrafting: (command: CraftingCommand) => Effect.Effect<void, TransportError>
-  readonly sendBrewing: (command: BrewingCommand) => Effect.Effect<void, TransportError>
   readonly sendAnvil: (command: AnvilCommand) => Effect.Effect<void, TransportError>
   readonly sendEnchanting: (command: EnchantingCommand) => Effect.Effect<void, TransportError>
   readonly state: () => WebSocketTransportState
@@ -170,7 +164,6 @@ export const makeBrowserWebSocketTransport = (
     const enderDragonInbound = yield* Queue.unbounded<EnderDragonWireMessage>()
     const playerDamageInbound = yield* Queue.unbounded<PlayerDamageWireMessage>()
     const craftingInbound = yield* Queue.unbounded<CraftingWireMessage>()
-    const brewingInbound = yield* Queue.unbounded<BrewingWireMessage>()
     const anvilInbound = yield* Queue.unbounded<AnvilWireMessage>()
     const enchantingInbound = yield* Queue.unbounded<EnchantingWireMessage>()
     const socket = yield* Effect.try({
@@ -214,7 +207,6 @@ export const makeBrowserWebSocketTransport = (
       if (shutdownInbound) Effect.runSync(Queue.shutdown(enderDragonInbound))
       if (shutdownInbound) Effect.runSync(Queue.shutdown(playerDamageInbound))
       if (shutdownInbound) Effect.runSync(Queue.shutdown(craftingInbound))
-      if (shutdownInbound) Effect.runSync(Queue.shutdown(brewingInbound))
       if (shutdownInbound) Effect.runSync(Queue.shutdown(anvilInbound))
       if (shutdownInbound) Effect.runSync(Queue.shutdown(enchantingInbound))
     }
@@ -318,11 +310,6 @@ export const makeBrowserWebSocketTransport = (
         Queue.offerUnsafe(craftingInbound, craftingMessage)
         return
       }
-      const brewingMessage = decodeBrewingWireMessage(event.data)
-      if (brewingMessage !== undefined) {
-        Queue.offerUnsafe(brewingInbound, brewingMessage)
-        return
-      }
       const anvilMessage = decodeAnvilWireMessage(event.data)
       if (anvilMessage !== undefined) {
         Queue.offerUnsafe(anvilInbound, anvilMessage)
@@ -398,7 +385,6 @@ export const makeBrowserWebSocketTransport = (
       Effect.runSync(Queue.shutdown(enderDragonInbound))
       Effect.runSync(Queue.shutdown(playerDamageInbound))
       Effect.runSync(Queue.shutdown(craftingInbound))
-      Effect.runSync(Queue.shutdown(brewingInbound))
       Effect.runSync(Queue.shutdown(anvilInbound))
       Effect.runSync(Queue.shutdown(enchantingInbound))
       if (shouldCloseSocket) socket.close(1000, 'transport disposed')
@@ -414,8 +400,6 @@ export const makeBrowserWebSocketTransport = (
       send(encodePlayerDamageCommand(command))
     const sendCrafting = (command: CraftingCommand): Effect.Effect<void, TransportError> =>
       send(encodeCraftingCommand(command))
-    const sendBrewing = (command: BrewingCommand): Effect.Effect<void, TransportError> =>
-      send(encodeBrewingCommand(command))
     const sendAnvil = (command: AnvilCommand): Effect.Effect<void, TransportError> =>
       send(encodeAnvilCommand(command))
     const sendEnchanting = (command: EnchantingCommand): Effect.Effect<void, TransportError> =>
@@ -428,7 +412,6 @@ export const makeBrowserWebSocketTransport = (
       enderDragonInbound,
       playerDamageInbound,
       craftingInbound,
-      brewingInbound,
       anvilInbound,
       enchantingInbound,
       sendSleep,
@@ -436,7 +419,6 @@ export const makeBrowserWebSocketTransport = (
       sendEnderDragon,
       sendPlayerDamage,
       sendCrafting,
-      sendBrewing,
       sendAnvil,
       sendEnchanting,
       close,

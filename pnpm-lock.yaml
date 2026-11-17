@@ -197,8 +197,8 @@ importers:
         specifier: 0.8.0
         version: 0.8.0
       '@nerima-games/mc-server':
-        specifier: 0.2.0
-        version: 0.2.0
+        specifier: 0.3.0
+        version: 0.3.0
       '@nerima-games/mc-sim':
         specifier: 0.12.0
         version: 0.12.0
@@ -209,8 +209,8 @@ importers:
         specifier: 0.13.0
         version: 0.13.0
       '@nerima-games/mx-multiplayer':
-        specifier: 0.17.0
-        version: 0.17.0
+        specifier: 0.18.0
+        version: 0.18.0
       '@nerima-games/mx-redstone':
         specifier: 0.7.1
         version: 0.7.1
@@ -591,8 +591,8 @@ packages:
     resolution: {integrity: sha512-z15WOznf2T/kJnOiws7ANThVoJEv8Ps9L1M9dDahlk+PBRgAgY5JC7jKMwyApKPX9KOWuP8Jgflu5P7L+8owzg==, tarball: https://npm.pkg.github.com/download/@nerima-games/mc-save/0.8.0/e281e006eac7c117a4e06a33136629da958f2625}
     engines: {node: '>=24.0.0', pnpm: '>=11.24.0'}
 
-  '@nerima-games/mc-server@0.2.0':
-    resolution: {integrity: sha512-FBhYEueXektMtn+3Mar4qs9F0/EzqYQCd1LhyW9Bn4q56NGc7JlcX1uUp2rc6d1sjZQBooL+MPfPeYaWbWiVEQ==, tarball: https://npm.pkg.github.com/download/@nerima-games/mc-server/0.2.0/e6718ff25b3d65902c58bbd34e145587808a4f22}
+  '@nerima-games/mc-server@0.3.0':
+    resolution: {integrity: sha512-Wb7VPd7DR5kABw7JjOxdeUiqWZWhWGQq1aKZHIq7IcfSrcGN6VkRbO9co9/l60WyCk8iPL1nua3KnjDWC2fu+w==, tarball: https://npm.pkg.github.com/download/@nerima-games/mc-server/0.3.0/8ca187f3fa1434e1fe36b40e27511f0517f825a6}
     engines: {node: '>=24.0.0', pnpm: '>=12.14.0'}
     hasBin: true
 
@@ -618,6 +618,10 @@ packages:
 
   '@nerima-games/mx-multiplayer@0.17.0':
     resolution: {integrity: sha512-txpPhx2yik6NhKzaNIoCc6n+RuFJ5g85Gq5oQkh3b2b1q3gTYigM5cJf1polJtnA6ozcnsVxUWS8mrVrv9l9Pw==, tarball: https://npm.pkg.github.com/download/@nerima-games/mx-multiplayer/0.17.0/fa1acc792dfab77c7f35636482730ac6c4e884f4}
+    engines: {node: '>=24.0.0', pnpm: '>=11.24.0'}
+
+  '@nerima-games/mx-multiplayer@0.18.0':
+    resolution: {integrity: sha512-c568x4+bjkkqOCDEexV2gZNAfxY7lRqRLnlmpHQg9KjVVH8l8L4T+CucuTdUGV3E17UZmZyeiQnuu3T0o2Ym9w==, tarball: https://npm.pkg.github.com/download/@nerima-games/mx-multiplayer/0.18.0/0dfacb24a87cbafacef9ffca259041ec034cc05e}
     engines: {node: '>=24.0.0', pnpm: '>=11.24.0'}
 
   '@nerima-games/mx-redstone@0.7.1':
@@ -1602,13 +1606,13 @@ snapshots:
       '@nerima-games/mc-kernel': 0.17.0
       effect: 4.0.5
 
-  '@nerima-games/mc-server@0.2.0':
+  '@nerima-games/mc-server@0.3.0':
     dependencies:
       '@nerima-games/mc-kernel': 0.17.0
       '@nerima-games/mc-sim': 0.12.0
       '@nerima-games/mc-worldgen': 0.9.2
       '@nerima-games/mx-gameplay': 0.12.0
-      '@nerima-games/mx-multiplayer': 0.17.0
+      '@nerima-games/mx-multiplayer': 0.18.0
       '@nerima-games/mx-redstone': 0.7.1
       effect: 4.0.5
       ws: 8.22.0
@@ -1659,6 +1663,12 @@ snapshots:
       effect: 4.0.5
 
   '@nerima-games/mx-multiplayer@0.17.0':
+    dependencies:
+      '@nerima-games/mc-kernel': 0.17.0
+      '@nerima-games/mc-sim': 0.12.0
+      effect: 4.0.5
+
+  '@nerima-games/mx-multiplayer@0.18.0':
     dependencies:
       '@nerima-games/mc-kernel': 0.17.0
       '@nerima-games/mc-sim': 0.12.0
