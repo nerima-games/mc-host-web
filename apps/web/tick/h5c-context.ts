@@ -1,4 +1,4 @@
-import type { BlockId, BlockPosition, MonotonicTimeSecs, Position } from '@nerima-games/mc-kernel'
+import type { BlockId, BlockPosition, DeltaTimeSecs, InterpolationFraction, MonotonicTimeSecs, Position, SimulationTick } from '@nerima-games/mc-kernel'
 import type { ItemStack, Vehicle } from '@nerima-games/mc-sim'
 import type { Brand, Effect, Result, Schema } from 'effect'
 import type { GameplayFrameState, ItemUseResult, MobDropEvent } from '@nerima-games/mx-gameplay'
@@ -165,4 +165,15 @@ export type H5cTickContext = {
     readonly isGameplayIgnitionItem: (item: ItemStack['item']) => item is GameplayIgnitionItemType
     readonly isPlaceableGameplayItem: (item: ItemStack['item']) => item is import('@nerima-games/mx-gameplay').PlaceableItemType
   }
+}
+
+export type H5cFramePresentationInput = Readonly<{
+  partialTick: InterpolationFraction
+  simulationTick: SimulationTick
+  frameDeltaSecs: DeltaTimeSecs
+  nowSecs: MonotonicTimeSecs
+}>
+
+export type H5cFramePresentationContext<DebugOverlayFailure> = H5cTickContext & {
+  readonly updateDebugOverlay: (rawDeltaSecs: number | undefined) => Effect.Effect<void, DebugOverlayFailure>
 }

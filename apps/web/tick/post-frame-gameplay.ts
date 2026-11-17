@@ -54,7 +54,13 @@ import {
 } from '@nerima-games/mc-server/shared'
 import { REDSTONE_PLACEMENT_ITEMS } from '../qa-fixtures'
 import { captionRenderSignature } from '../audio-runtime'
-import type { H5cPostFrameInput, H5cTickContext } from './h5c-context'
+import type {
+  H5cFramePresentationContext,
+  H5cFramePresentationInput,
+  H5cPostFrameInput,
+  H5cTickContext,
+} from './h5c-context'
+import { runTickDebugOverlayFrame } from './debug-overlay-frame'
 import type { PersistedVillager } from '../session-persistence'
 
 type Dimension = import('../session-persistence').SessionState['dimension']
@@ -75,8 +81,6 @@ type TickGameplayFailure = Effect.Error<
   | ReturnType<H5cTickContext['services']['useEndFeature']>
   | ReturnType<H5cTickContext['services']['targetedBlock']>
   | ReturnType<H5cTickContext['services']['fishingEnvironmentAt']>
-  | ReturnType<H5cTickContext['services']['presentWeatherRuntime']>
-  | ReturnType<H5cTickContext['services']['syncRenderedEntities']>
   | ReturnType<H5cTickContext['services']['brewingService']['advance']>
 > | Result.Result.Failure<
   | ReturnType<H5cTickContext['h5b']['applyWorldExplosion']>
@@ -126,7 +130,6 @@ export const runTickPostFrameGameplay = (
     setBrewingOpen,
     markSessionDirty,
     setFishingResult,
-    renderCrosshair,
     canvas,
     currentChunkContext,
     vehicleById,
@@ -161,7 +164,6 @@ export const runTickPostFrameGameplay = (
     targetedBlock,
     fishingEnvironmentAt,
     networkFishingPhase,
-    playerSettings,
     vehicleService,
     vehicleList,
     localVehicleOccupant,
@@ -179,16 +181,11 @@ export const runTickPostFrameGameplay = (
     asBlockPosition,
     streamAround,
     presentWeather,
-    presentWeatherRuntime,
-    syncRenderedEntities,
     registerPortal,
     requiredSleepRatio,
     sleepHud,
     endDragonSnapshot,
     adapters,
-    uiFrameState,
-    fpsValue,
-    captionsParent,
     observedMobDrops,
     pendingItemUses,
     pendingBlockUses,
@@ -216,7 +213,7 @@ export const runTickPostFrameGameplay = (
     applyDropperTrigger,
     applyPoweredPistonTransition,
   } = redstoneContainerRuntime
-  const { audio, endAudio, queueEndAudio, placementAudio } = adapters
+  const { endAudio, queueEndAudio, placementAudio } = adapters
   const { state: h5aState } = h5a
   const { state: h5bState } = h5b
   const increment = (reference: { readonly get: () => number; readonly set: (value: number) => void }): void => {
@@ -1051,12 +1048,6 @@ export const runTickPostFrameGameplay = (
     sleepHud.hidden = true
     document.body.setAttribute('data-sleep-result', 'morning-skipped')
   }
-  yield* presentWeatherRuntime(
-    weatherAdvanced ?? Effect.runSync(weather.snapshot),
-    postFramePose,
-    nowSecs,
-  )
-
   // The public drain clears every kind. Remove only correlated brewing
   // refusals so the other host consumers retain their own unsupported records.
   const unsupportedBrewing = yield* Ref.modify(gameplayState.unsupportedOperations, (operations) => {
@@ -1270,9 +1261,52 @@ export const runTickPostFrameGameplay = (
     listenerForward: adapters.getReadAudioListenerForward(),
     events: adapters.drainEndAudioEvents(),
   })
+})
+
+type FramePresentationFailure = Effect.Error<
+  | H5cTickContext['h5a']['playerApi']['pose']
+  | H5cTickContext['h5a']['playerApi']['dimension']
+  | ReturnType<H5cTickContext['services']['presentWeatherRuntime']>
+  | ReturnType<H5cTickContext['services']['syncRenderedEntities']>
+>
+
+/**
+ * The once-per-render-frame output, run after the frame's ticks. It reads the
+ * state the ticks left and writes only display and frame counters.
+ * `partialTick` and `simulationTick` are reserved for entity interpolation.
+ */
+export const runFramePresentation = <DebugOverlayFailure>(
+  context: H5cFramePresentationContext<DebugOverlayFailure>,
+  frame: H5cFramePresentationInput,
+): Effect.Effect<void, FramePresentationFailure | DebugOverlayFailure> => Effect.gen(function* () {
+  const { frameDeltaSecs, nowSecs } = frame
+  const { h5a, h5b, services, state } = context
+  const { playerApi, renderCrosshair } = h5a
+  const { renderPlayerUi, projectileHud } = h5b
+  const {
+    weather,
+    presentWeatherRuntime,
+    syncRenderedEntities,
+    renderBrewingUi,
+    playerSettings,
+    adapters: { audio },
+    uiFrameState,
+    fpsValue,
+    captionsParent,
+  } = services
+  const pose = yield* playerApi.pose
+  const dimension = yield* playerApi.dimension
+
+  yield* presentWeatherRuntime(yield* weather.snapshot, pose, nowSecs)
+
+  const activeProjectileCount = h5b.state.projectileRuntimeState.get().projectiles
+    .filter((projectile) => projectile.dimension === dimension)
+    .length
+  projectileHud.textContent = `Arrows ${String(activeProjectileCount)}`
+  projectileHud.hidden = activeProjectileCount === 0
 
   yield* syncRenderedEntities()
-  if (h5aState.brewingOpen.get()) renderBrewingUi()
+  if (h5a.state.brewingOpen.get()) renderBrewingUi()
   renderPlayerUi()
   renderCrosshair(nowSecs)
   const captions = playerSettings().captionsEnabled ? audio.visible(KernelMonotonicTimeSecs(nowSecs)) : []
@@ -1295,4 +1329,9 @@ export const runTickPostFrameGameplay = (
   // Readable by a test without a QA command: the frame count IS the claim
   // that the loop is running, and docs/e2e-triage.md #4 is exactly that claim.
   document.body.setAttribute('data-frames', String(state.framesTotal.get()))
+
+  yield* runTickDebugOverlayFrame(context.updateDebugOverlay, {
+    framesTotal: state.framesTotal.get(),
+    raw: frameDeltaSecs,
+  })
 })

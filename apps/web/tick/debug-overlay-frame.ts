@@ -1,7 +1,7 @@
 import type { Effect } from 'effect'
 
 export type DebugOverlayFrameInput = Readonly<{
-  /** The count after `runTickPostFrameGameplay` has counted this frame. */
+  /** The count after `runFramePresentation` has counted this frame. */
   framesTotal: number
   /** The frame's unclamped interval (`FrameTiming.raw`). */
   raw: number

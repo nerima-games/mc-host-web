@@ -95,7 +95,9 @@ import {
   blockTypeOfId,
   DeltaTimeSecs,
   DimensionIdSchema,
+  InterpolationFraction,
   EntityIdSchema,
+  SimulationTick,
   SimulationTickSchema,
   blockPositionOfPosition,
   chunkCoordOfBlock,
@@ -446,8 +448,7 @@ import { runTickPlayerMovement } from './tick/player-movement'
 import type { H5bPostFrameContext } from './tick/h5b-context'
 import { runTickPostFrame } from './tick/post-frame'
 import type { H5cTickContext } from './tick/h5c-context'
-import { runTickPostFrameGameplay } from './tick/post-frame-gameplay'
-import { runTickDebugOverlayFrame } from './tick/debug-overlay-frame'
+import { runFramePresentation, runTickPostFrameGameplay } from './tick/post-frame-gameplay'
 
 /**
  * plan.md §3.4's measured clamp, applied by the DELTA'S PRODUCER.
@@ -3944,7 +3945,15 @@ const bootGame = async (
         if (movement === undefined) return
         const postFrame = yield* runTickPostFrame(h5bTickContext, { frame, movement, framesTotal })
         yield* runTickPostFrameGameplay(h5cTickContext, { frame, movement, postFrame, nowSecs })
-        yield* runTickDebugOverlayFrame(debugOverlay.update, { framesTotal, raw: frame.raw })
+        yield* runFramePresentation(
+          { ...h5cTickContext, updateDebugOverlay: debugOverlay.update },
+          {
+            partialTick: InterpolationFraction(0),
+            simulationTick: SimulationTick(0),
+            frameDeltaSecs: yield* Effect.fromResult(DeltaTimeSecs.result(frame.raw)),
+            nowSecs,
+          },
+        )
         yield* music.update({
           nowSecs,
           scene: {
