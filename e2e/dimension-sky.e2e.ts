@@ -1,9 +1,9 @@
 import { expect, test, type ConsoleMessage, type Page } from '@playwright/test'
 
+import { callQa } from './helpers/qa'
 import { startGameSession } from './helpers/session'
 import { waitForSimulationProgress } from './helpers/simulation-wait'
 
-const QA_GLOBAL_KEY = '__NERIMA_GAMES_QA__'
 
 /**
  * mc-render 0.7.0 wires a dimension into `planRenderEnvironment`, and
@@ -49,19 +49,6 @@ const watchForFaults = (page: Page): PageFaults => {
   return { consoleErrors, pageErrors }
 }
 
-const callQa = <A>(page: Page, command: string): Promise<A> =>
-  page.evaluate(
-    async ({ key, commandName }) => {
-      const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-        | Record<string, () => unknown>
-        | undefined
-      const operation = surface?.[commandName]
-      if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
-      return await operation()
-    },
-    { key: QA_GLOBAL_KEY, commandName: command },
-  ) as Promise<A>
-
 const framesNow = (page: Page): Promise<number> =>
   page.evaluate(() => Number(document.body.getAttribute('data-frames')))
 
@@ -83,13 +70,9 @@ const readClearColor = (page: Page): Promise<ClearColor | undefined> =>
     return Array.from(value)
   })
 
-// The QA dimension switch (enterQaDimension in apps/web/main.ts) mutates
-// currentChunkContext synchronously, but the environment only reaches the
-// GPU on the running game loop's NEXT requestAnimationFrame tick, inside
-// presentWeatherRuntime's call to worldRenderer.weather.frame. Waiting for
-// the frame counter to advance past its value at call time is what makes
-// "the sky updated" distinguishable from "we read stale GL state" — the
-// same shape waitForSimulationProgress is used for elsewhere in this suite.
+// QA dispatch acknowledges the dimension change before its frame finishes drawing.
+// Capture the counter after that acknowledgement, then wait for a later frame
+// before reading GPU state so a frame drawn before the change cannot satisfy it.
 const waitForFrameAdvance = (page: Page, before: number): Promise<number> =>
   waitForSimulationProgress(
     page,
@@ -120,12 +103,12 @@ test('the rendered sky changes when the player crosses dimensions, and restores 
   await startGameSession(page)
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
 
+  await waitForFrameAdvance(page, await framesNow(page))
   const overworldClear = await readClearColor(page)
   assertClearColor(overworldClear, 'the overworld should already be drawing through a live WebGL2 context')
 
-  let frames = await framesNow(page)
   await callQa(page, 'gameplay.enterNether')
-  frames = await waitForFrameAdvance(page, frames)
+  await waitForFrameAdvance(page, await framesNow(page))
   const netherClear = await readClearColor(page)
   assertClearColor(netherClear, 'the Nether should still be drawing through a live WebGL2 context')
   expect(
@@ -134,7 +117,7 @@ test('the rendered sky changes when the player crosses dimensions, and restores 
   ).toBeGreaterThan(NOTICEABLE_COLOR_DISTANCE)
 
   await callQa(page, 'gameplay.enterEnd')
-  frames = await waitForFrameAdvance(page, frames)
+  await waitForFrameAdvance(page, await framesNow(page))
   const endClear = await readClearColor(page)
   assertClearColor(endClear, 'the End should still be drawing through a live WebGL2 context')
   expect(
@@ -143,7 +126,7 @@ test('the rendered sky changes when the player crosses dimensions, and restores 
   ).toBeGreaterThan(NOTICEABLE_COLOR_DISTANCE)
 
   await callQa(page, 'gameplay.enterOverworld')
-  frames = await waitForFrameAdvance(page, frames)
+  await waitForFrameAdvance(page, await framesNow(page))
   const overworldClearAgain = await readClearColor(page)
   assertClearColor(overworldClearAgain, 'the overworld should still be drawing through a live WebGL2 context')
   // NOT an exact round-trip: planRenderEnvironment interpolates the overworld

@@ -1,5 +1,6 @@
 import { expect, test, type Page } from '@playwright/test'
 
+import { callQa, callQaWithFrames } from './helpers/qa'
 import { startGameSession } from './helpers/session'
 import { waitForSimulationProgress } from './helpers/simulation-wait'
 
@@ -19,23 +20,6 @@ type SleepSnapshot = {
 
 type Position = { readonly x: number; readonly y: number; readonly z: number }
 type PersistedTime = { readonly ticks: number; readonly dayLengthTicks: number }
-
-const callQa = <Result>(
-  page: Page,
-  command: string,
-  ...arguments_: ReadonlyArray<unknown>
-): Promise<Result> =>
-  page.evaluate(
-    async ({ commandName, commandArguments }) => {
-      const qa = (globalThis as unknown as Record<string, unknown>)['__NERIMA_GAMES_QA__'] as
-        | Record<string, (...arguments_: ReadonlyArray<unknown>) => unknown>
-        | undefined
-      const operation = qa?.[commandName]
-      if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
-      return await operation(...commandArguments)
-    },
-    { commandName: command, commandArguments: arguments_ },
-  ) as Promise<Result>
 
 const useTargetedBlock = async (page: Page): Promise<void> => {
   const canvas = page.locator('#game-canvas')
@@ -143,17 +127,7 @@ test('using a bed in the Nether explodes it and damages the player', async ({ pa
   // Playwright's 5s real-time budget for what is a simulation-gated wait.
   await waitForSimulationProgress(
     page,
-    () => page.evaluate(async () => {
-      const qa = (globalThis as unknown as Record<string, unknown>)['__NERIMA_GAMES_QA__'] as
-        | Record<string, () => unknown>
-        | undefined
-      const operation = qa?.['gameplay.snapshot']
-      if (operation === undefined) throw new Error('missing QA command: gameplay.snapshot')
-      return {
-        frames: Number(document.body.getAttribute('data-frames')),
-        value: await operation() as SleepSnapshot,
-      }
-    }),
+    () => callQaWithFrames<SleepSnapshot>(page, 'gameplay.snapshot'),
     (current) => (
       current.bedExplosionProbe.block === AIR_BLOCK_ID
       && current.vitals.healthPoints < before.vitals.healthPoints

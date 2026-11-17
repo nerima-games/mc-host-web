@@ -1,13 +1,18 @@
+import { itemComponents, type ItemComponents } from '@nerima-games/mc-kernel'
 import { expect, test, type Page } from '@playwright/test'
+import { Result } from 'effect'
 
+import { callQa } from './helpers/qa'
 import { startGameSession } from './helpers/session'
-
-const QA_GLOBAL_KEY = '__NERIMA_GAMES_QA__'
 
 type GameplaySnapshot = {
   readonly vitals: { readonly totalExperience: number }
   readonly inventory: {
-    readonly slots: ReadonlyArray<{ readonly item: string; readonly count: number } | null>
+    readonly slots: ReadonlyArray<{
+      readonly item: string
+      readonly count: number
+      readonly components: ItemComponents
+    } | null>
     readonly durability: ReadonlyArray<{ readonly current: number; readonly max: number } | null>
   }
   readonly itemMetadata: {
@@ -19,18 +24,6 @@ type GameplaySnapshot = {
     }>>
   }
 }
-
-const callQa = <A>(page: Page, command: string): Promise<A> => page.evaluate(
-  async ({ key, commandName }) => {
-    const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-      | Record<string, () => unknown>
-      | undefined
-    const operation = surface?.[commandName]
-    if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
-    return await operation()
-  },
-  { key: QA_GLOBAL_KEY, commandName: command },
-) as Promise<A>
 
 const snapshot = (page: Page): Promise<GameplaySnapshot> =>
   callQa(page, 'gameplay.snapshot')
@@ -82,7 +75,11 @@ test('enchants, repairs, renames, and persists an upgraded item', async ({ page 
   await startGameSession(page, sessionId)
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
   const seeded = await callQa<GameplaySnapshot>(page, 'gameplay.seedItemUpgradeEncounter')
-  expect(seeded.inventory.slots[0]).toEqual({ item: 'diamond_pickaxe', count: 1 })
+  expect(seeded.inventory.slots[0]).toEqual({
+    item: 'diamond_pickaxe',
+    count: 1,
+    components: Result.getOrThrow(itemComponents('diamond_pickaxe')),
+  })
   expect(inventoryCount(seeded, 'lapis_lazuli')).toBe(3)
   expect(inventoryCount(seeded, 'iron_ingot')).toBe(1)
   expect(seeded.itemMetadata.customNames).toEqual({})

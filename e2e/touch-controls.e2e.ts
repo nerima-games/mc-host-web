@@ -1,9 +1,8 @@
 import { expect, test, type CDPSession, type Page } from '@playwright/test'
 
+import { callQa, callQaWithFrames } from './helpers/qa'
 import { startGameSession } from './helpers/session'
 import { waitForSimulationProgress } from './helpers/simulation-wait'
-
-const QA_GLOBAL_KEY = '__NERIMA_GAMES_QA__'
 
 type Position = { readonly x: number; readonly y: number; readonly z: number }
 type GameplaySnapshot = {
@@ -21,27 +20,10 @@ type GameplaySnapshot = {
 }
 
 const snapshot = (page: Page): Promise<GameplaySnapshot> =>
-  page.evaluate(async (key) => {
-    const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-      | Record<string, () => unknown>
-      | undefined
-    const operation = surface?.['gameplay.snapshot']
-    if (operation === undefined) throw new Error('missing QA command: gameplay.snapshot')
-    return await operation()
-  }, QA_GLOBAL_KEY) as Promise<GameplaySnapshot>
+  callQa(page, 'gameplay.snapshot')
 
 const snapshotWithFrames = (page: Page): Promise<{ frames: number; value: GameplaySnapshot }> =>
-  page.evaluate(async (key) => {
-    const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-      | Record<string, () => unknown>
-      | undefined
-    const operation = surface?.['gameplay.snapshot']
-    if (operation === undefined) throw new Error('missing QA command: gameplay.snapshot')
-    return {
-      frames: Number(document.body.getAttribute('data-frames')),
-      value: await operation() as GameplaySnapshot,
-    }
-  }, QA_GLOBAL_KEY)
+  callQaWithFrames(page, 'gameplay.snapshot')
 
 const horizontalDistance = (left: Position, right: Position): number =>
   Math.hypot(right.x - left.x, right.z - left.z)
@@ -154,7 +136,7 @@ test.describe('touch input surface', () => {
     await page.locator('[data-touch-action="escape"]').tap()
     await expect(controls).toBeHidden()
     await expect(page.locator('body')).toHaveAttribute('data-session-paused', 'true')
-    await page.locator('#resume-button').click()
+    await page.getByTestId('resume-button').click()
     await expect(controls).toBeVisible()
 
     await dispatchTouch(client, 'touchStart', forward)

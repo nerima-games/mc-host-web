@@ -1,9 +1,10 @@
 import { expect, test, type ConsoleMessage, type Page } from '@playwright/test'
 
+import { callQa, callQaWithFrames } from './helpers/qa'
+import { regenerationHeals, type NutritionSnapshot } from './helpers/regeneration'
 import { startGameSession } from './helpers/session'
 import { waitForSimulationProgress } from './helpers/simulation-wait'
 
-const QA_GLOBAL_KEY = '__NERIMA_GAMES_QA__'
 const PLAYER_HALF_WIDTH = 0.3
 const PLAYER_HEIGHT = 1.8
 const PHYSICS_CONTACT_EPSILON = 1e-9
@@ -16,7 +17,7 @@ type EnvironmentalContactCell = {
 }
 type GameplaySnapshot = {
   readonly pose: { readonly feetPosition: Position }
-  readonly vitals: {
+  readonly vitals: NutritionSnapshot & {
     readonly healthPoints: number
     readonly lastDamageCause?: string
   }
@@ -42,35 +43,11 @@ const watchForFaults = (page: Page): PageFaults => {
   return { consoleErrors, pageErrors }
 }
 
-const callQa = <A>(page: Page, command: string): Promise<A> =>
-  page.evaluate(
-    async ({ key, commandName }) => {
-      const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-        | Record<string, () => unknown>
-        | undefined
-      const operation = surface?.[commandName]
-      if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
-      return await operation()
-    },
-    { key: QA_GLOBAL_KEY, commandName: command },
-  ) as Promise<A>
-
 const snapshot = (page: Page): Promise<GameplaySnapshot> =>
   callQa(page, 'gameplay.snapshot')
 
 const snapshotWithFrames = (page: Page): Promise<{ frames: number; value: GameplaySnapshot }> =>
-  page.evaluate(
-    async ({ key, commandName }) => {
-      const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-        | Record<string, () => unknown>
-        | undefined
-      const operation = surface?.[commandName]
-      if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
-      const value = await operation()
-      return { frames: Number(document.body.getAttribute('data-frames')), value }
-    },
-    { key: QA_GLOBAL_KEY, commandName: 'gameplay.snapshot' },
-  ) as Promise<{ frames: number; value: GameplaySnapshot }>
+  callQaWithFrames(page, 'gameplay.snapshot')
 
 const overlapsPlayerAabb = (
   feetPosition: Position,
@@ -210,25 +187,56 @@ test('resets lava cadence and preserves its half-second repeat interval', async 
   )
   expectRealContacts(seeded)
 
+  const trackContact = (initial: GameplaySnapshot) => {
+    let previous = initial
+    let previousFrames: number | undefined
+    let hits = 0
+    return async () => {
+      const current = await snapshotWithFrames(page)
+      const value = current.value
+      expect(value.pose.feetPosition.x).toBe(initial.pose.feetPosition.x)
+      expect(value.pose.feetPosition.z).toBe(initial.pose.feetPosition.z)
+      expect(value.environmentalContact.simulationElapsedSecs
+        - previous.environmentalContact.simulationElapsedSecs).toBeLessThan(0.5)
+      expect(value.environmentalContact.simulationElapsedSecs)
+        .toBeGreaterThanOrEqual(previous.environmentalContact.simulationElapsedSecs)
+      if (previousFrames !== undefined) expect(current.frames).toBeGreaterThan(previousFrames)
+      if (value.environmentalContact.lastDamageElapsedSecs !== previous.environmentalContact.lastDamageElapsedSecs) {
+        expect(value.environmentalContact.lastDamageElapsedSecs).not.toBeNull()
+        hits += 1
+      }
+      const heals = regenerationHeals(initial.vitals, value.vitals)
+      const previousHeals = regenerationHeals(initial.vitals, previous.vitals)
+      expect(heals).toBeGreaterThanOrEqual(previousHeals)
+      expect(heals).toBeCloseTo(Math.round(heals), 5)
+      if (heals > previousHeals) expect(value.vitals.foodTimerSecs).toBeLessThan(previous.vitals.foodTimerSecs)
+      expect(value.vitals.healthPoints - heals).toBe(20 - 4 * hits)
+      previous = value
+      previousFrames = current.frames
+      return { frames: current.frames, value: { snapshot: value, adjustedHealth: value.vitals.healthPoints - heals } }
+    }
+  }
+
   // Lava damage repeats on a simulated cadence — see
   // waitForSimulationProgress.
   await waitForSimulationProgress(
     page,
-    () => snapshotWithFrames(page),
-    (current) => current.vitals.healthPoints === 16,
+    trackContact(seeded),
+    (current) => current.adjustedHealth === 16,
     { description: 'lava contact damage' },
   )
   const reseeded = await callQa<GameplaySnapshot>(page, 'gameplay.seedDuplicateLavaContact')
   expect(reseeded.vitals.healthPoints).toBe(20)
   expect(reseeded.environmentalContact.lastDamageElapsedSecs).toBeNull()
+  const readResetContact = trackContact(reseeded)
 
-  await waitForSimulationProgress(
+  const resetContact = await waitForSimulationProgress(
     page,
-    () => snapshotWithFrames(page),
-    (current) => current.vitals.healthPoints === 16,
+    readResetContact,
+    (current) => current.adjustedHealth === 16,
     { description: 'lava contact damage after reset' },
   )
-  const afterResetDamage = await snapshot(page)
+  const afterResetDamage = resetContact.snapshot
   const resetDamageElapsedSecs = afterResetDamage.environmentalContact.lastDamageElapsedSecs
   expect(resetDamageElapsedSecs).not.toBeNull()
   expect(resetDamageElapsedSecs! - reseeded.environmentalContact.simulationElapsedSecs)
@@ -236,13 +244,13 @@ test('resets lava cadence and preserves its half-second repeat interval', async 
   expect(resetDamageElapsedSecs! - reseeded.environmentalContact.simulationElapsedSecs)
     .toBeLessThan(0.15)
 
-  await waitForSimulationProgress(
+  const secondContact = await waitForSimulationProgress(
     page,
-    () => snapshotWithFrames(page),
-    (current) => current.vitals.healthPoints === 12,
+    readResetContact,
+    (current) => current.adjustedHealth === 12,
     { description: 'second lava contact damage tick' },
   )
-  const afterSecondDamage = await snapshot(page)
+  const afterSecondDamage = secondContact.snapshot
   const secondDamageElapsedSecs = afterSecondDamage.environmentalContact.lastDamageElapsedSecs
   expect(secondDamageElapsedSecs).not.toBeNull()
   expect(secondDamageElapsedSecs! - resetDamageElapsedSecs!).toBeGreaterThanOrEqual(0.5)

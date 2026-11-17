@@ -4,8 +4,11 @@ import { createHash } from 'node:crypto'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { itemComponents, type ItemComponents } from '@nerima-games/mc-kernel'
+import { Result } from 'effect'
 
-const QA_GLOBAL_KEY = '__NERIMA_GAMES_QA__'
+import { callQa } from './helpers/qa'
+
 const PLAYER_AT = { x: 8.5, y: 65, z: 10.5 } as const
 const ENVIRONMENT_PLAYER_AT = { x: 24.95, y: 65, z: 8.5 } as const
 const ENVIRONMENT_BLOCKS = [
@@ -36,7 +39,11 @@ type GameplaySnapshot = {
     readonly healthPoints: number
   }
   readonly inventory: {
-    readonly slots: ReadonlyArray<{ readonly item: string; readonly count: number } | null>
+    readonly slots: ReadonlyArray<{
+      readonly item: string
+      readonly count: number
+      readonly components: ItemComponents
+    } | null>
   }
   readonly renderedEntities: ReadonlyArray<{
     readonly id: string
@@ -104,16 +111,6 @@ const initialState = {
   ],
 }
 
-const callQa = <A>(page: Page, command: string): Promise<A> =>
-  page.evaluate(async ({ key, commandName }) => {
-    const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-      | Record<string, () => unknown>
-      | undefined
-    const operation = surface?.[commandName]
-    if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
-    return await operation()
-  }, { key: QA_GLOBAL_KEY, commandName: command }) as Promise<A>
-
 const snapshot = (page: Page): Promise<GameplaySnapshot> => callQa(page, 'gameplay.snapshot')
 
 const revision = async (page: Page): Promise<number> =>
@@ -121,7 +118,8 @@ const revision = async (page: Page): Promise<number> =>
 
 const createSurvivalWorld = async (page: Page, name: string): Promise<string> => {
   await page.goto('/')
-  await page.locator('[data-menu-entry="new-world"]').click()
+  await page.locator('[data-menu-entry="single-player"]').click()
+  await page.locator('[data-menu-action="new-world"]').click()
   await page.locator('[data-mx-ui="menu-world-name"]').fill(name)
   await expect(page.locator('[data-mx-ui="menu-game-mode"]')).toHaveAttribute(
     'aria-label',
@@ -310,7 +308,9 @@ test('automatically picks up nearby item drops through the authoritative multipl
 
   try {
     await expect.poll(async () => (await snapshot(alice.page)).inventory.slots).toEqual(
-      expect.arrayContaining([{ item: 'rotten_flesh', count: 2 }]),
+      expect.arrayContaining([{
+        item: 'rotten_flesh', count: 2, components: Result.getOrThrow(itemComponents('rotten_flesh')),
+      }]),
     )
     await expect.poll(() => authoritativeEntity(alice.page, 'survival-rotten-flesh')).toBeUndefined()
 
@@ -318,7 +318,9 @@ test('automatically picks up nearby item drops through the authoritative multipl
     bob = bobSession
     await expect.poll(() => authoritativeEntity(bobSession.page, 'survival-rotten-flesh')).toBeUndefined()
     await expect.poll(async () => (await snapshot(bobSession.page)).inventory.slots).not.toEqual(
-      expect.arrayContaining([{ item: 'rotten_flesh', count: 2 }]),
+      expect.arrayContaining([{
+        item: 'rotten_flesh', count: 2, components: Result.getOrThrow(itemComponents('rotten_flesh')),
+      }]),
     )
   } finally {
     await Promise.all([alice.context.close(), bob?.context.close()])
@@ -334,7 +336,7 @@ test('keeps Survival inventory, vitals, entities, vehicles, and reconnect state 
     await expect(bob.page.locator('#game-canvas')).toHaveAttribute('data-multiplayer-player-count', '2')
     await expect.poll(async () => (await snapshot(alice.page)).vitals.healthPoints).toBe(13)
     await expect.poll(async () => (await snapshot(alice.page)).inventory.slots[0]).toEqual({
-      item: 'potato', count: 2,
+      item: 'potato', count: 2, components: Result.getOrThrow(itemComponents('potato')),
     })
     const aliceInventory = alice.page.locator('#inventory-root')
     const alicePotatoes = aliceInventory.locator('[data-region="hotbar"] [data-slot-index="0"]')
@@ -349,7 +351,7 @@ test('keeps Survival inventory, vitals, entities, vehicles, and reconnect state 
       const slots = (await snapshot(alice.page)).inventory.slots
       return [slots[0], ...slots.slice(2, 10)]
     }).toEqual([
-      { item: 'potato', count: 1 },
+      { item: 'potato', count: 1, components: Result.getOrThrow(itemComponents('potato')) },
       null,
       null,
       null,
@@ -357,7 +359,7 @@ test('keeps Survival inventory, vitals, entities, vehicles, and reconnect state 
       null,
       null,
       null,
-      { item: 'potato', count: 1 },
+      { item: 'potato', count: 1, components: Result.getOrThrow(itemComponents('potato')) },
     ])
     await alice.page.keyboard.press('KeyE')
     await expect(aliceInventory).toBeHidden()
@@ -374,7 +376,9 @@ test('keeps Survival inventory, vitals, entities, vehicles, and reconnect state 
     await expect.poll(() => authoritativeEntity(bob.page, 'survival-target')).toBeUndefined()
 
     await expect.poll(async () => (await snapshot(alice.page)).inventory.slots).toEqual(
-      expect.arrayContaining([{ item: 'rotten_flesh', count: 2 }]),
+      expect.arrayContaining([{
+        item: 'rotten_flesh', count: 2, components: Result.getOrThrow(itemComponents('rotten_flesh')),
+      }]),
     )
     await expect.poll(async () => (await snapshot(bob.page)).renderedEntities.some(
       (entity) => entity.kind === 'dropped_item',

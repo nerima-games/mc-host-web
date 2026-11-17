@@ -1,32 +1,24 @@
+import { getDisplayName, itemComponents, type ItemComponents, type ItemType } from '@nerima-games/mc-kernel'
 import { expect, test, type Locator, type Page } from '@playwright/test'
+import { Result } from 'effect'
 
+import { callQa } from './helpers/qa'
 import { startGameSession } from './helpers/session'
 import { waitForSimulationProgress } from './helpers/simulation-wait'
 
-const QA_GLOBAL_KEY = '__NERIMA_GAMES_QA__'
-
 type GameplaySnapshot = {
   readonly inventory: {
-    readonly slots: ReadonlyArray<{ readonly item: string; readonly count: number } | null>
+    readonly slots: ReadonlyArray<{
+      readonly item: string
+      readonly count: number
+      readonly components: ItemComponents
+    } | null>
     readonly durability: ReadonlyArray<{ readonly current: number; readonly max: number } | null>
   }
   readonly ignitionTarget: {
     readonly block: number | null
   }
 }
-
-const callQa = <A>(page: Page, command: string, ...arguments_: ReadonlyArray<unknown>): Promise<A> =>
-  page.evaluate(
-    async ({ key, commandName, commandArguments }) => {
-      const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-        | Record<string, (...arguments_: ReadonlyArray<unknown>) => unknown>
-        | undefined
-      const operation = surface?.[commandName]
-      if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
-      return await operation(...commandArguments)
-    },
-    { key: QA_GLOBAL_KEY, commandName: command, commandArguments: arguments_ },
-  ) as Promise<A>
 
 const selectedSlotIndex = async (hotbar: Locator): Promise<number> =>
   hotbar.locator('[data-mx-ui="slot"]').evaluateAll((slots) =>
@@ -94,38 +86,38 @@ test.describe('player inventory experience', () => {
 
     await page.keyboard.press('KeyE')
     await expect(inventory).toBeVisible()
-    await expect(hotbarSlot).toHaveAttribute('aria-label', /oak_log/)
+    await expect(hotbarSlot).toHaveAttribute('aria-label', /, Oak Log,/)
 
     await hotbarSlot.click()
     await craftingCell.focus()
     await page.keyboard.press('Enter')
-    await expect(output).toHaveAttribute('aria-label', /oak_planks, 4/)
+    await expect(output).toHaveAttribute('aria-label', /, Oak Planks, 4$/)
 
     await output.click()
     await expect(inventory.locator('[data-mx-ui="inventory-status"]')).toContainText(
       'Crafted 4 oak_planks',
     )
-    await expect(hotbarSlot).toHaveAttribute('aria-label', /oak_planks, 4/)
+    await expect(hotbarSlot).toHaveAttribute('aria-label', /, Oak Planks, 4$/)
     await expect(page.locator('body')).toHaveAttribute('data-session-persistence', /dirty|saved/)
 
     const mainSlot = inventory.locator('[data-region="main"] [data-slot-index="0"]')
     await hotbarSlot.click({ button: 'right' })
-    await expect(hotbarSlot).toHaveAttribute('aria-label', /oak_planks, 2/)
+    await expect(hotbarSlot).toHaveAttribute('aria-label', /, Oak Planks, 2$/)
     await mainSlot.click({ button: 'right' })
-    await expect(mainSlot).toHaveAttribute('aria-label', /oak_planks, 1/)
+    await expect(mainSlot).toHaveAttribute('aria-label', /, Oak Planks, 1$/)
     await mainSlot.click({ button: 'right' })
-    await expect(mainSlot).toHaveAttribute('aria-label', /oak_planks, 2/)
+    await expect(mainSlot).toHaveAttribute('aria-label', /, Oak Planks, 2$/)
 
     await mainSlot.click()
     await expect(mainSlot).toHaveAttribute('aria-label', /empty/)
     await hotbarSlot.click()
-    await expect(hotbarSlot).toHaveAttribute('aria-label', /oak_planks, 4/)
+    await expect(hotbarSlot).toHaveAttribute('aria-label', /, Oak Planks, 4$/)
 
     await callQa(page, 'gameplay.seedCraftingLog')
     await hotbarSlot.click()
     await craftingCell.focus()
     await page.keyboard.press('Enter')
-    await expect(craftingCell).toHaveAttribute('aria-label', /oak_log/)
+    await expect(craftingCell).toHaveAttribute('aria-label', /, Oak Log,/)
 
     await page.keyboard.press('KeyE')
     await expect(inventory).toBeHidden()
@@ -149,16 +141,20 @@ test.describe('player inventory experience', () => {
 
     await page.keyboard.press('KeyE')
     await expect(inventory).toBeVisible()
-    await expect(source).toHaveAttribute('aria-label', /stone, 2/)
+    await expect(source).toHaveAttribute('aria-label', /, Stone, 2$/)
     await expect(destination).toHaveAttribute('aria-label', /empty/)
 
     await source.dragTo(destination)
 
     await expect(source).toHaveAttribute('aria-label', /empty/)
-    await expect(destination).toHaveAttribute('aria-label', /stone, 2/)
+    await expect(destination).toHaveAttribute('aria-label', /, Stone, 2$/)
     const snapshot = await callQa<GameplaySnapshot>(page, 'gameplay.snapshot')
     expect(snapshot.inventory.slots[0]).toBeNull()
-      expect(snapshot.inventory.slots[9]).toEqual({ item: 'stone', count: 2 })
+    expect(snapshot.inventory.slots[9]).toEqual({
+      item: 'stone',
+      count: 2,
+      components: Result.getOrThrow(itemComponents('stone')),
+    })
     })
 
     test('places an inventory stack into the crafting grid by dragging', async ({ page }) => {
@@ -173,16 +169,16 @@ test.describe('player inventory experience', () => {
 
       await page.keyboard.press('KeyE')
       await expect(inventory).toBeVisible()
-      await expect(source).toHaveAttribute('aria-label', /oak_log, 1/)
+      await expect(source).toHaveAttribute('aria-label', /, Oak Log, 1$/)
       await expect(craftingCell).toHaveAttribute('aria-label', /empty/)
 
       await page.locator('body').evaluate((body) => body.removeAttribute('data-equipment-action'))
       await source.dragTo(craftingCell)
 
       await expect(page.locator('body')).toHaveAttribute('data-equipment-action', 'accepted')
-      await expect(source).toHaveAttribute('aria-label', /oak_log, 1/)
-      await expect(craftingCell).toHaveAttribute('aria-label', /oak_log, 1/)
-      await expect(output).toHaveAttribute('aria-label', /oak_planks, 4/)
+      await expect(source).toHaveAttribute('aria-label', /, Oak Log, 1$/)
+      await expect(craftingCell).toHaveAttribute('aria-label', /, Oak Log, 1$/)
+      await expect(output).toHaveAttribute('aria-label', /, Oak Planks, 4$/)
     })
 
     test('progresses from wood through diamond and mines obsidian', async ({ page }) => {
@@ -203,35 +199,37 @@ test.describe('player inventory experience', () => {
       '[data-region="crafting-grid"] [data-mx-ui="slot"]',
     )
     const output = inventory.locator('[data-mx-ui="crafting-output"]')
-    const inventoryItemSlot = (item: string): Locator =>
-      inventory.locator(
-        `[data-region="hotbar"] [data-mx-ui="slot"][aria-label*="${item}"], ` +
-        `[data-region="main"] [data-mx-ui="slot"][aria-label*="${item}"]`,
+    const inventoryItemSlot = (item: ItemType): Locator => {
+      const displayName = Result.getOrThrow(getDisplayName({ kind: 'item', id: item, language: 'en' }))
+      return inventory.locator(
+        `[data-region="hotbar"] [data-mx-ui="slot"][aria-label*=", ${displayName},"], ` +
+        `[data-region="main"] [data-mx-ui="slot"][aria-label*=", ${displayName},"]`,
       ).first()
+    }
 
     await page.keyboard.press('KeyE')
     await expect(inventory).toBeVisible()
-    await expect(inventoryItemSlot('oak_log')).toHaveAttribute('aria-label', /oak_log, 3/)
+    await expect(inventoryItemSlot('oak_log')).toHaveAttribute('aria-label', /, Oak Log, 3$/)
 
     for (let craftIndex = 0; craftIndex < 3; craftIndex += 1) {
       await inventoryItemSlot('oak_log').click()
       await craftingCells.nth(0).click()
-      await expect(output).toHaveAttribute('aria-label', /oak_planks, 4/)
+      await expect(output).toHaveAttribute('aria-label', /, Oak Planks, 4$/)
       await output.click()
     }
-    await expect(inventoryItemSlot('oak_planks')).toHaveAttribute('aria-label', /oak_planks, 12/)
+    await expect(inventoryItemSlot('oak_planks')).toHaveAttribute('aria-label', /, Oak Planks, 12$/)
 
     for (const cellIndex of [0, 1, 2, 3]) {
       await inventoryItemSlot('oak_planks').click()
       await craftingCells.nth(cellIndex).click()
     }
-    await expect(output).toHaveAttribute('aria-label', /crafting_table, 1/)
+    await expect(output).toHaveAttribute('aria-label', /, Crafting Table, 1$/)
     await output.click()
 
     const craftingTableSlot = inventory.locator(
-      '[data-region="hotbar"] [data-mx-ui="slot"][aria-label*="crafting_table"]',
+      '[data-region="hotbar"] [data-mx-ui="slot"][aria-label*=", Crafting Table,"]',
     )
-    await expect(craftingTableSlot).toHaveAttribute('aria-label', /crafting_table, 1/)
+    await expect(craftingTableSlot).toHaveAttribute('aria-label', /, Crafting Table, 1$/)
     const craftingTableSlotIndex = Number(
       await craftingTableSlot.getAttribute('data-slot-index'),
     )
@@ -242,7 +240,7 @@ test.describe('player inventory experience', () => {
     const heldTableSlot = page.locator(
       `#hud-root [data-mx-ui="hotbar"] [data-slot-index="${craftingTableSlotIndex}"]`,
     )
-    await expect(heldTableSlot).toContainText('crafting_table')
+    await expect(heldTableSlot).toContainText('Crafting Table')
 
     await grantPointerLock(page)
     await canvas.click({ button: 'right' })
@@ -257,7 +255,7 @@ test.describe('player inventory experience', () => {
       await inventoryItemSlot('oak_planks').click()
       await craftingCells.nth(cellIndex).click()
     }
-    await expect(output).toHaveAttribute('aria-label', /stick, 4/)
+    await expect(output).toHaveAttribute('aria-label', /, Stick, 4$/)
     await output.click()
 
     for (const cellIndex of [0, 1, 2]) {
@@ -268,16 +266,17 @@ test.describe('player inventory experience', () => {
       await inventoryItemSlot('stick').click()
       await craftingCells.nth(cellIndex).click()
     }
-    await expect(output).toHaveAttribute('aria-label', /wooden_pickaxe, 1/)
+    await expect(output).toHaveAttribute('aria-label', /, Wooden Pickaxe, 1$/)
     await output.click()
     await expect(inventoryItemSlot('wooden_pickaxe')).toHaveAttribute(
       'aria-label',
-      /wooden_pickaxe, 1/,
+      /, Wooden Pickaxe, 1$/,
     )
 
-    const selectHotbarItem = async (item: string): Promise<number> => {
+    const selectHotbarItem = async (item: ItemType): Promise<number> => {
+      const displayName = Result.getOrThrow(getDisplayName({ kind: 'item', id: item, language: 'en' }))
       const slot = inventory.locator(
-        `[data-region="hotbar"] [data-mx-ui="slot"][aria-label*="${item}"]`,
+        `[data-region="hotbar"] [data-mx-ui="slot"][aria-label*=", ${displayName},"]`,
       )
       await expect(slot).toHaveCount(1)
       const slotIndex = Number(await slot.getAttribute('data-slot-index'))
@@ -340,11 +339,11 @@ test.describe('player inventory experience', () => {
       await inventoryItemSlot('stick').click()
       await craftingCells.nth(cellIndex).click()
     }
-    await expect(output).toHaveAttribute('aria-label', /stone_pickaxe, 1/)
+    await expect(output).toHaveAttribute('aria-label', /, Stone Pickaxe, 1$/)
     await output.click()
     await expect(inventoryItemSlot('stone_pickaxe')).toHaveAttribute(
       'aria-label',
-      /stone_pickaxe, 1/,
+      /, Stone Pickaxe, 1$/,
     )
 
     await page.keyboard.press('KeyE')
@@ -380,9 +379,9 @@ test.describe('player inventory experience', () => {
       await inventoryItemSlot('cobblestone').click()
       await craftingCells.nth(cellIndex).click()
     }
-    await expect(output).toHaveAttribute('aria-label', /furnace, 1/)
+    await expect(output).toHaveAttribute('aria-label', /, Furnace, 1$/)
     await output.click()
-    await expect(inventoryItemSlot('furnace')).toHaveAttribute('aria-label', /furnace, 1/)
+    await expect(inventoryItemSlot('furnace')).toHaveAttribute('aria-label', /, Furnace, 1$/)
 
     await page.keyboard.press('KeyE')
     await expect(inventory).toBeHidden()
@@ -420,7 +419,7 @@ test.describe('player inventory experience', () => {
       await furnaceInput.click()
       await expect(furnaceInput).toHaveAttribute(
         'aria-label',
-        new RegExp(`raw_iron, ${inputCount}`),
+        new RegExp(`, Raw Iron, ${inputCount}$`),
       )
     }
 
@@ -447,7 +446,7 @@ test.describe('player inventory experience', () => {
     await waitForSimulationProgress(
       page,
       () => readFurnaceSlot(furnaceFuel),
-      (label) => label !== null && /coal, 1/.test(label),
+      (label) => label !== null && /, Coal, 1$/.test(label),
       { description: 'furnace fuel insertion' },
     )
     // Cook progress only leaves 0 once the simulation has ticked the
@@ -468,7 +467,7 @@ test.describe('player inventory experience', () => {
     await waitForSimulationProgress(
       page,
       () => readFurnaceSlot(furnaceOutput),
-      (label) => label !== null && /iron_ingot, 3/.test(label),
+      (label) => label !== null && /, Iron Ingot, 3$/.test(label),
       { description: 'furnace smelting progress (3 iron ingots)', backstopMs: 150_000 },
     )
 
@@ -494,7 +493,7 @@ test.describe('player inventory experience', () => {
       await inventoryItemSlot('oak_planks').click()
       await craftingCells.nth(cellIndex).click()
     }
-    await expect(output).toHaveAttribute('aria-label', /stick, 4/)
+    await expect(output).toHaveAttribute('aria-label', /, Stick, 4$/)
     await output.click()
 
     for (const cellIndex of [0, 1, 2]) {
@@ -505,11 +504,11 @@ test.describe('player inventory experience', () => {
       await inventoryItemSlot('stick').click()
       await craftingCells.nth(cellIndex).click()
     }
-    await expect(output).toHaveAttribute('aria-label', /iron_pickaxe, 1/)
+    await expect(output).toHaveAttribute('aria-label', /, Iron Pickaxe, 1$/)
     await output.click()
     await expect(inventoryItemSlot('iron_pickaxe')).toHaveAttribute(
       'aria-label',
-      /iron_pickaxe, 1/,
+      /, Iron Pickaxe, 1$/,
     )
 
     await page.keyboard.press('KeyE')
@@ -545,11 +544,11 @@ test.describe('player inventory experience', () => {
       await inventoryItemSlot('stick').click()
       await craftingCells.nth(cellIndex).click()
     }
-    await expect(output).toHaveAttribute('aria-label', /diamond_pickaxe, 1/)
+    await expect(output).toHaveAttribute('aria-label', /, Diamond Pickaxe, 1$/)
     await output.click()
     await expect(inventoryItemSlot('diamond_pickaxe')).toHaveAttribute(
       'aria-label',
-      /diamond_pickaxe, 1/,
+      /, Diamond Pickaxe, 1$/,
     )
 
     await page.keyboard.press('KeyE')

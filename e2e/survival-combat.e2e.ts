@@ -1,9 +1,10 @@
+import { itemComponents, type ItemComponents } from '@nerima-games/mc-kernel'
 import { expect, test, type ConsoleMessage, type Locator, type Page } from '@playwright/test'
+import { Result } from 'effect'
 
+import { callQa, callQaWithFrames } from './helpers/qa'
 import { startGameSession } from './helpers/session'
 import { waitForSimulationProgress } from './helpers/simulation-wait'
-
-const QA_GLOBAL_KEY = '__NERIMA_GAMES_QA__'
 
 type Position = { readonly x: number; readonly y: number; readonly z: number }
 type Pose = {
@@ -17,6 +18,8 @@ type EntitySnapshot = {
   readonly feetPosition: Position
   readonly healthPoints: number
   readonly behaviour?: unknown
+  readonly item?: string
+  readonly count?: number
 }
 type RenderedEntitySnapshot = {
   readonly id: string
@@ -33,6 +36,11 @@ type EquipmentSnapshotEntry = {
   } | null
 }
 type GameplaySnapshot = {
+  readonly environmentalContact: {
+    readonly simulationElapsedSecs: number
+    readonly lastDamageElapsedSecs: number | null
+    readonly cells: ReadonlyArray<{ readonly block: string; readonly contactDamage: number }>
+  }
   readonly dimension: 'overworld' | 'nether' | 'end'
   readonly pose: Pose
   readonly vitals: {
@@ -44,7 +52,11 @@ type GameplaySnapshot = {
   }
   readonly dead: boolean
   readonly inventory: {
-    readonly slots: ReadonlyArray<{ readonly item: string; readonly count: number } | null>
+    readonly slots: ReadonlyArray<{
+      readonly item: string
+      readonly count: number
+      readonly components: ItemComponents
+    } | null>
     readonly durability: ReadonlyArray<{
       readonly current: number
       readonly max: number
@@ -109,35 +121,11 @@ const watchForFaults = (page: Page): PageFaults => {
   return { consoleErrors, pageErrors }
 }
 
-const callQa = <A>(page: Page, command: string, ...arguments_: ReadonlyArray<unknown>): Promise<A> =>
-  page.evaluate(
-    async ({ key, commandName, commandArguments }) => {
-      const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-        | Record<string, (...arguments_: ReadonlyArray<unknown>) => unknown>
-        | undefined
-      const operation = surface?.[commandName]
-      if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
-      return await operation(...commandArguments)
-    },
-    { key: QA_GLOBAL_KEY, commandName: command, commandArguments: arguments_ },
-  ) as Promise<A>
-
 const snapshot = (page: Page): Promise<GameplaySnapshot> =>
   callQa(page, 'gameplay.snapshot')
 
 const snapshotWithFrames = (page: Page): Promise<{ frames: number; value: GameplaySnapshot }> =>
-  page.evaluate(
-    async ({ key, commandName }) => {
-      const surface = (globalThis as unknown as Record<string, unknown>)[key] as
-        | Record<string, () => unknown>
-        | undefined
-      const operation = surface?.[commandName]
-      if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
-      const value = await operation()
-      return { frames: Number(document.body.getAttribute('data-frames')), value }
-    },
-    { key: QA_GLOBAL_KEY, commandName: 'gameplay.snapshot' },
-  ) as Promise<{ frames: number; value: GameplaySnapshot }>
+  callQaWithFrames(page, 'gameplay.snapshot')
 
 const selectedSlotIndex = async (hotbar: Locator): Promise<number> =>
   hotbar.locator('[data-mx-ui="slot"]').evaluateAll((slots) =>
@@ -171,7 +159,49 @@ test('reduces player damage with equipped iron armor', async ({ page }) => {
   await startGameSession(page)
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
 
-  const equipped = await callQa<GameplaySnapshot>(page, 'gameplay.seedIronArmor')
+  const firstLavaContact = (armored: boolean) => page.evaluate(async (equipArmor) => {
+    const transport = window.__NERIMA_GAMES_QA__
+    if (transport === undefined) throw new Error('missing QA transport')
+    const dispatch = async (operation: string): Promise<GameplaySnapshot> => {
+      const result = await transport.dispatch('gameplay', operation, null)
+      if (result._tag === 'Failure') throw new Error(JSON.stringify(result.error))
+      return result.value as GameplaySnapshot
+    }
+    // Queue both writes before the frame starts, so contact cannot hit between
+    // restoring the encounter and equipping the armor.
+    const [seeded, armor] = await Promise.all([
+      dispatch('seedDuplicateLavaContact'),
+      equipArmor ? dispatch('seedIronArmor') : Promise.resolve(undefined),
+    ])
+    const equipped = armor ?? seeded
+    const firstContactDeadlineSecs = equipped.environmentalContact.simulationElapsedSecs + 1
+    let damaged = equipped
+    while (damaged.environmentalContact.simulationElapsedSecs < firstContactDeadlineSecs) {
+      // Each dispatch reads the next frame boundary, before another tick can
+      // hide the first hit behind passive regeneration or a second contact.
+      damaged = await dispatch('snapshot')
+      if (damaged.environmentalContact.lastDamageElapsedSecs !== null) {
+        return { equipped, damaged }
+      }
+    }
+    throw new Error(`first lava contact did not damage the ${equipArmor ? 'armored' : 'unarmored'} player within one simulation second: ${JSON.stringify({
+      seededSimulationElapsedSecs: equipped.environmentalContact.simulationElapsedSecs,
+      environmentalContact: damaged.environmentalContact,
+      healthPoints: damaged.vitals.healthPoints,
+    })}`)
+  }, armored)
+
+  const control = await firstLavaContact(false)
+  expect(control.equipped.vitals.healthPoints).toBe(20)
+  expect(control.damaged.vitals.healthPoints).toBe(16)
+  expect(control.damaged.vitals.lastDamageCause).toBeUndefined()
+
+  const { equipped, damaged } = await firstLavaContact(true)
+  expect(equipped.environmentalContact.cells.map(({ block, contactDamage }) => ({ block, contactDamage }))).toEqual([
+    { block: 'lava', contactDamage: 4 },
+    { block: 'lava', contactDamage: 4 },
+  ])
+  expect(damaged.environmentalContact.cells).toEqual(equipped.environmentalContact.cells)
   expect(equipped.inventory.equipment).toMatchObject({
     head: {
       item: 'iron_helmet',
@@ -196,8 +226,10 @@ test('reduces player damage with equipped iron armor', async ({ page }) => {
   })
   expect(equipped.vitals.healthPoints).toBe(20)
 
-  const damaged = await callQa<GameplaySnapshot>(page, 'gameplay.damage')
-  expect(damaged.vitals.healthPoints).toBeCloseTo(18.4, 5)
+  // Java armor/toughness: iron's 15 points and zero toughness leave 13
+  // effective points against a 4-point hit: 4 * (1 - 13 / 25) = 1.92.
+  expect(damaged.vitals.healthPoints).toBeCloseTo(18.08, 5)
+  expect(damaged.vitals.healthPoints).toBeGreaterThan(control.damaged.vitals.healthPoints)
   expect(damaged.vitals.lastDamageCause).toBeUndefined()
   expect(damaged.inventory.equipment).toMatchObject({
     head: { durability: { current: 164, max: 165 } },
@@ -229,19 +261,55 @@ const grantPointerLock = async (page: Page): Promise<void> => {
   })
 }
 
+const seedZombieEncounter = async (page: Page, command: string) => {
+  // Capture the baseline before queuing the fixture's spawn request. The
+  // entities stage processes that request after this frame-boundary callback.
+  const { before, seeded } = await page.evaluate(async (operation) => {
+    const transport = window.__NERIMA_GAMES_QA__
+    if (transport === undefined) throw new Error('missing QA transport')
+    const results = await Promise.all([
+      transport.dispatch('gameplay', 'snapshot', null),
+      transport.dispatch('gameplay', operation, null),
+    ])
+    const snapshots = results.map((result) => {
+      if (result._tag === 'Failure') throw new Error(JSON.stringify(result.error))
+      return result.value as GameplaySnapshot
+    })
+    return { before: snapshots[0]!, seeded: snapshots[1]! }
+  }, command)
+  const baselineIds = new Set(before.entities.map(({ id }) => id))
+  const identity = ({ id, kind }: EntitySnapshot) => ({ id, kind })
+  expect(seeded.entities.filter(({ id }) => baselineIds.has(id)).map(identity)).toEqual(before.entities.map(identity))
+  let spawnedZombie: EntitySnapshot | undefined
+  await expect.poll(async () => {
+    const current = await snapshot(page)
+    const added = current.entities.filter(({ id, kind }) => kind === 'zombie' && !baselineIds.has(id))
+    if (added.length !== 1) return false
+    const zombie = added[0]!
+    const rendered = current.renderedEntities.filter(({ id }) => id === zombie.id)
+    if (rendered.length !== 1 || rendered[0]?.kind !== 'zombie' || rendered[0]?.category !== 'hostile') return false
+    spawnedZombie = zombie
+    return true
+  }).toBe(true)
+  expect(spawnedZombie).toBeDefined()
+  return { baselineIds, zombieId: spawnedZombie!.id }
+}
+
 test('renders a zombie pursuing the player and persists contact damage', async ({ page }) => {
   const faults = watchForFaults(page)
 
   await startGameSession(page)
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
-  await callQa<unknown>(page, 'gameplay.seedZombiePursuitEncounter')
+  const { zombieId } = await seedZombieEncounter(page, 'seedZombiePursuitEncounter')
 
   await expect.poll(async () => {
     const current = await snapshot(page)
-    const zombie = current.entities[0]
-    const renderedZombie = current.renderedEntities[0]
-    return current.entities.length === 1
-      && current.renderedEntities.length === 1
+    const zombies = current.entities.filter((entity) => entity.id === zombieId)
+    const renderedZombies = current.renderedEntities.filter((entity) => entity.id === zombieId)
+    const zombie = zombies[0]
+    const renderedZombie = renderedZombies[0]
+    return zombies.length === 1
+      && renderedZombies.length === 1
       && zombie?.kind === 'zombie'
       && renderedZombie?.kind === 'zombie'
       && renderedZombie.category === 'hostile'
@@ -249,7 +317,6 @@ test('renders a zombie pursuing the player and persists contact damage', async (
   }).toBe(true)
 
   const pursuitStart = await snapshot(page)
-  const zombieId = pursuitStart.entities[0]?.id
   expect(zombieId).toBeDefined()
   const initialZombie = pursuitStart.entities.find((entity) => entity.id === zombieId)
   expect(initialZombie).toBeDefined()
@@ -308,32 +375,32 @@ test('renders a lethal zombie encounter and recovers through the Respawn control
   await expect(hotbar.locator('[data-mx-ui="slot"]')).toHaveCount(9)
   const spawn = await callQa<GameplaySnapshot>(page, 'gameplay.respawn')
 
-  await callQa<unknown>(page, 'gameplay.seedLethalZombieEncounter')
+  const { baselineIds, zombieId } = await seedZombieEncounter(page, 'seedLethalZombieEncounter')
+  const isDeathDrop = (entity: EntitySnapshot) => entity.kind === 'dropped_item' && !baselineIds.has(entity.id)
   await expect.poll(async () => {
     const current = await snapshot(page)
-    const simulated = current.entities.find((entity) => entity.kind === 'zombie')
-    const rendered = current.renderedEntities.find((entity) => entity.kind === 'zombie')
+    const simulated = current.entities.find((entity) => entity.id === zombieId && entity.kind === 'zombie')
+    const rendered = current.renderedEntities.find((entity) => entity.id === zombieId && entity.kind === 'zombie')
     return simulated !== undefined
       && rendered?.category === 'hostile'
       && simulated.id === rendered.id
   }).toBe(true)
-  const zombieId = (await snapshot(page)).entities
-    .find((entity) => entity.kind === 'zombie')?.id
   expect(zombieId).toBeDefined()
 
   await expect.poll(async () => {
     const current = await snapshot(page)
-    const simulatedZombie = current.entities.find((entity) => entity.kind === 'zombie')
-    const simulatedDrops = current.entities.filter((entity) => entity.kind === 'dropped_item')
-    const renderedZombie = current.renderedEntities.find((entity) => entity.kind === 'zombie')
+    const simulatedZombie = current.entities.find((entity) => entity.id === zombieId && entity.kind === 'zombie')
+    const simulatedDrops = current.entities.filter(isDeathDrop)
+    const cohortIds = new Set([zombieId, ...simulatedDrops.map(({ id }) => id)])
+    const renderedZombie = current.renderedEntities.find((entity) => entity.id === zombieId && entity.kind === 'zombie')
     const renderedDrops = current.renderedEntities.filter(
-      (entity) => entity.kind === 'dropped_item',
+      (entity) => entity.kind === 'dropped_item' && cohortIds.has(entity.id),
     )
     return {
-      simulationEntityCount: current.entities.length,
+      simulationEntityCount: current.entities.filter(({ id }) => cohortIds.has(id)).length,
       simulationZombieId: simulatedZombie?.id,
       simulationDropIds: simulatedDrops.map((entity) => entity.id).sort(),
-      renderedEntityCount: current.renderedEntities.length,
+      renderedEntityCount: current.renderedEntities.filter(({ id }) => cohortIds.has(id)).length,
       renderedZombieId: renderedZombie?.id,
       renderedZombieCategory: renderedZombie?.category,
       renderedDropIds: renderedDrops.map((entity) => entity.id).sort(),
@@ -367,14 +434,22 @@ test('renders a lethal zombie encounter and recovers through the Respawn control
   })
 
   const deathSnapshot = await snapshot(page)
+  expect(deathSnapshot.entities.filter(isDeathDrop).map(({ item, count }) => ({ item, count }))
+    .sort((left, right) => String(left.item).localeCompare(String(right.item)))).toEqual([
+    { item: 'oak_planks', count: 4 },
+    { item: 'potato', count: 2 },
+    { item: 'stone_pickaxe', count: 1 },
+    { item: 'torch', count: 8 },
+  ])
   const dropIds = deathSnapshot.entities
-    .filter((entity) => entity.kind === 'dropped_item')
+    .filter(isDeathDrop)
     .map((entity) => entity.id)
     .sort()
   expect(dropIds).toHaveLength(4)
+  const cohortIds = new Set([zombieId, ...dropIds])
   expect(
     deathSnapshot.renderedEntities
-      .filter((entity) => entity.kind === 'dropped_item')
+      .filter((entity) => entity.kind === 'dropped_item' && cohortIds.has(entity.id))
       .map((entity) => entity.id)
       .sort(),
   ).toEqual(dropIds)
@@ -408,23 +483,23 @@ test('renders a lethal zombie encounter and recovers through the Respawn control
       maxHealthPoints: current.vitals.maxHealthPoints,
       lastDamageCause: current.vitals.lastDamageCause ?? null,
       dead: current.dead,
-      entityCount: current.entityCount,
+      entityCount: current.entityCount - current.entities.filter(({ id }) => !cohortIds.has(id)).length,
       simulationZombieIds: current.entities
-        .filter((entity) => entity.kind === 'zombie')
+        .filter((entity) => entity.id === zombieId && entity.kind === 'zombie')
         .map((entity) => entity.id),
       simulationDropIds: current.entities
-        .filter((entity) => entity.kind === 'dropped_item')
+        .filter((entity) => entity.kind === 'dropped_item' && cohortIds.has(entity.id))
         .map((entity) => entity.id)
         .sort(),
       renderedZombieIds: current.renderedEntities
-        .filter((entity) => entity.kind === 'zombie')
+        .filter((entity) => entity.id === zombieId && entity.kind === 'zombie')
         .map((entity) => entity.id),
       renderedDropIds: current.renderedEntities
-        .filter((entity) => entity.kind === 'dropped_item')
+        .filter((entity) => entity.kind === 'dropped_item' && cohortIds.has(entity.id))
         .map((entity) => entity.id)
         .sort(),
       renderedDropCategories: current.renderedEntities
-        .filter((entity) => entity.kind === 'dropped_item')
+        .filter((entity) => entity.kind === 'dropped_item' && cohortIds.has(entity.id))
         .map((entity) => entity.category),
     }
   }).toEqual({
@@ -459,15 +534,16 @@ test('preserves Nether death drops and unrelated drops across respawn', async ({
   const faults = watchForFaults(page)
 
   await startGameSession(page)
-  const canvas = page.locator('#game-canvas')
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
 
-  await canvas.hover()
-  await callQa<unknown>(page, 'gameplay.seedMeleeDropEncounter')
-  await grantPointerLock(page)
-  await page.mouse.down({ button: 'left' })
-  await page.waitForTimeout(250)
-  await page.mouse.up({ button: 'left' })
+  // Death loot supplies the unrelated drop without relying on random mob loot.
+  await callQa(page, 'gameplay.seedFoodUseEncounter')
+  await callQa(page, 'gameplay.seedSmokeGroundingEncounter')
+  await expect(page.locator('#game-canvas')).toHaveAttribute('data-player-grounded', 'true')
+  for (let hit = 0; hit < 5 && !(await snapshot(page)).dead; hit += 1) {
+    await callQa(page, 'gameplay.damage')
+  }
+  await expect.poll(async () => (await snapshot(page)).dead).toBe(true)
 
   await expect.poll(async () => {
     const current = await snapshot(page)
@@ -748,7 +824,15 @@ test('mines only after continuous hold and exposes progress at the crosshair', a
 
   await page.mouse.down({ button: 'left' })
   await expect(progress).toBeVisible()
-  const firstProgress = Number(await progress.getAttribute('aria-valuenow'))
+  const firstProgress = await waitForSimulationProgress(
+    page,
+    () => progress.evaluate((element) => ({
+      frames: Number(document.body.getAttribute('data-frames')),
+      value: Number(element.getAttribute('aria-valuenow')),
+    })),
+    (value) => value > 0 && value < 100,
+    { description: 'mining progress starts' },
+  )
   expect(firstProgress).toBeGreaterThan(0)
   expect(firstProgress).toBeLessThan(100)
   // Mining progress accumulates over simulated frames — see
@@ -802,15 +886,28 @@ test('kills a hostile with a left click and collects its dropped item', async ({
   await expect(body).toHaveAttribute('data-mc-compose-boot', 'running')
 
   await canvas.hover()
-  await callQa<unknown>(page, 'gameplay.seedMeleeDropEncounter')
-  await expect.poll(async () => {
-    const current = await snapshot(page)
-    return current.entities.map(({ kind, healthPoints }) => ({ kind, healthPoints }))
-  }).toEqual([{ kind: 'creeper', healthPoints: 1 }])
-  const seededSnapshot = await snapshot(page)
+  const { before, seeded: seededSnapshot } = await page.evaluate(async () => {
+    const transport = window.__NERIMA_GAMES_QA__
+    if (transport === undefined) throw new Error('missing QA transport')
+    const results = await Promise.all([
+      transport.dispatch('gameplay', 'snapshot', null),
+      transport.dispatch('gameplay', 'seedMeleeDropEncounter', null),
+    ])
+    const snapshots = results.map((result) => {
+      if (result._tag === 'Failure') throw new Error(JSON.stringify(result.error))
+      return result.value as GameplaySnapshot
+    })
+    return { before: snapshots[0]!, seeded: snapshots[1]! }
+  })
+  const baselineIds = new Set(before.entities.map(({ id }) => id))
+  const added = seededSnapshot.entities.filter(({ id }) => !baselineIds.has(id))
+  expect(added.map(({ kind, healthPoints }) => ({ kind, healthPoints })))
+    .toEqual([{ kind: 'creeper', healthPoints: 1 }])
+  const creeperId = added[0]!.id
   expect(seededSnapshot.inventory.slots[0]).toEqual({
     item: 'wooden_sword',
     count: 1,
+    components: Result.getOrThrow(itemComponents('wooden_sword')),
   })
   expect(seededSnapshot.inventory.durability[0]).toEqual({
     current: 59,
@@ -837,7 +934,7 @@ test('kills a hostile with a left click and collects its dropped item', async ({
     const current = await snapshot(page)
     return {
       hostileKinds: current.entities
-        .filter((entity) => entity.kind !== 'dropped_item')
+        .filter((entity) => entity.id === creeperId)
         .map((entity) => entity.kind),
       droppedKinds: current.entities
         .filter((entity) => entity.kind === 'dropped_item')
@@ -953,11 +1050,8 @@ test('grounds the player within a couple of frames after spawnFullHealthHostile 
   // measurement, which is the only way a bound this tight can mean anything.
   for (const command of ['gameplay.spawnFullHealthBlaze', 'gameplay.spawnFullHealthEnderman'] as const) {
     const framesToGround = await page.evaluate(async (commandName) => {
-      const registry = (globalThis as unknown as Record<string, unknown>)['__NERIMA_GAMES_QA__'] as
-        | Record<string, () => unknown>
-        | undefined
-      const operation = registry?.[commandName]
-      if (operation === undefined) throw new Error(`missing QA command: ${commandName}`)
+      const transport = window.__NERIMA_GAMES_QA__
+      if (transport === undefined) throw new Error('missing QA transport')
       const framesNow = (): number => Number(document.body.getAttribute('data-frames'))
       const isGrounded = (): boolean =>
         document.querySelector('#game-canvas')?.getAttribute('data-player-grounded') === 'true'
@@ -965,7 +1059,8 @@ test('grounds the player within a couple of frames after spawnFullHealthHostile 
         await new Promise((resolve) => { requestAnimationFrame(() => resolve(undefined)) })
       }
       const start = framesNow()
-      operation()
+      const result = await transport.dispatch('gameplay', commandName.slice('gameplay.'.length), null)
+      if (result._tag === 'Failure') throw new Error(`QA command failed: ${JSON.stringify(result.error)}`)
       for (let frame = 0; frame < 200; frame += 1) {
         if (isGrounded()) return framesNow() - start
         await nextFrame()
