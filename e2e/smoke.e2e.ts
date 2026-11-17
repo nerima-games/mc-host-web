@@ -226,7 +226,7 @@ test.describe('smoke — the composed frame in a real browser', () => {
    * the transcript has already been wrong once, listing six stage ids that no
    * module registered, and staying green for it.
    *
-   * Nineteen stages across the composed modules. The exact ids are asserted
+   * Eighteen stages across the composed modules. The exact ids are asserted
    * rather than the count, because a count is satisfied by any set of stages.
    */
   test('#3b the resolved stage order is the one the loaded modules declare', async ({ page }) => {
@@ -240,12 +240,12 @@ test.describe('smoke — the composed frame in a real browser', () => {
     // requires; its stages are placed HERE BY THE RESOLVER, from the `after`
     // edges each one declares, not by the order this file registers them in.
     //
-    // That is the property worth reading off this list: `gameplay:interactions`
-    // lands after `render:input` because it consumes the frame's input, and
-    // `gameplay:time-weather` after the redstone pair — neither placement is
-    // written anywhere in `apps/web/main.ts`.
+    // That is the property worth reading off this list: `gameplay:time-weather`
+    // lands after the redstone pair, and `gameplay:block-state-rules`, which
+    // declares only `after` interactions, lands last — neither placement is
+    // written anywhere in `apps/web/main.ts`. `render:input` is not registered:
+    // the host frame reads and ends the input itself.
     expect(order?.split(' ')).toEqual([
-      'render:input',
       'sim:physics',
       'gameplay:vehicles',
       'gameplay:interactions',

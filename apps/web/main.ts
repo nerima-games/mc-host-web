@@ -1691,7 +1691,7 @@ const bootGame = async (
     copyItemMetadata,
     deleteItemMetadata,
     droppedItemMetadataKey,
-    getFramesTotal: () => framesTotal,
+    getFramesTotal: () => ticksTotal,
     asBlockPosition,
     leverKeyOf,
   })
@@ -3200,7 +3200,7 @@ const bootGame = async (
     getStorageSnapshot: () => Effect.runSync(world.inventory.storageSnapshot),
     customNames,
     enchantedItems,
-    getFramesTotal: () => framesTotal,
+    getFramesTotal: () => ticksTotal,
     spawnDroppedItems: (drops) => Effect.runSync(spawnDroppedItems(ownerBacked.entityManager, drops)),
     getPlayerDimension: () => Effect.runSync(world.player.dimension),
     droppedItemMetadataKey,
@@ -3625,6 +3625,9 @@ const bootGame = async (
   let previousSecs: MonotonicTimeSecs | undefined
   let previousFrameSecs: MonotonicTimeSecs | undefined
   let framesTotal = 0
+  // Fixed ticks run this session. Dropped items record the tick from which
+  // they can be picked up (`eligibleFromFrame`, named before the split).
+  let ticksTotal = 0
   let renderedCaptionSignature: string | undefined
 
   document.body.setAttribute('data-mc-compose-boot', 'running')
@@ -3962,28 +3965,28 @@ const bootGame = async (
       yield* runHostFrame({
         input: inputApi,
         fixedStep,
-        frameDelta: (frameNowSecs) => {
-          const delta = clampDelta(previousFrameSecs === undefined ? FIRST_FRAME_SECS : frameNowSecs - previousFrameSecs)
-          previousFrameSecs = frameNowSecs
-          return delta
-        },
+        previousFrameSecs: mutableState(() => previousFrameSecs, (value) => { previousFrameSecs = value }),
+        firstFrameSecs: FIRST_FRAME_SECS,
+        clampDelta,
         // The tick's own look result is always false; orientation saves rely on this.
         look: (frameInput, frameDeltaSecs) => {
           if (applyFrameLook(h5aTickContext, frameInput, frameDeltaSecs)) markSessionDirty()
         },
         tick: ({ input }) => Effect.gen(function* () {
+          // Counted per tick: dropped-item pickup eligibility is in ticks.
+          ticksTotal += 1
           const frame = runTickFrameInput({ ...h5aTickContext, inputApi: tickInputQueries(inputApi, input) }, nowSecs, input)
           if (frame === undefined) return 'continue' as const
           const movement = yield* runTickPlayerMovement(h5aTickContext, frame)
           // A defected tick stage has already failed the boot; the frame stops there.
           if (movement === undefined) return 'halt' as const
-          const postFrame = yield* runTickPostFrame(h5bTickContext, { frame, movement, framesTotal })
+          const postFrame = yield* runTickPostFrame(h5bTickContext, { frame, movement, framesTotal: ticksTotal })
           yield* runTickPostFrameGameplay(h5cTickContext, { frame, movement, postFrame, nowSecs })
           return 'continue' as const
         }),
         presents: () => !paused,
-        present: ({ partialTick, simulationTick, frameDeltaSecs }) => Effect.gen(function* () {
-          const presentationStages = yield* Effect.exit(runFrameStages(frameDeltaSecs))
+        present: ({ partialTick, simulationTick, timing }) => Effect.gen(function* () {
+          const presentationStages = yield* Effect.exit(runFrameStages(timing.deltaSecs))
           if (Exit.isFailure(presentationStages)) {
             failBoot('a frame stage defected', presentationStages.cause)
             return
@@ -3991,7 +3994,13 @@ const bootGame = async (
           yield* drainChunkRenderFaults([...dimensionContexts.values()])
           yield* runFramePresentation(
             { ...h5cTickContext, updateDebugOverlay: debugOverlay.update },
-            { partialTick, simulationTick, frameDeltaSecs, nowSecs },
+            // The overlay's frame rate reads the unclamped delta.
+            {
+              partialTick,
+              simulationTick,
+              frameDeltaSecs: yield* Effect.fromResult(DeltaTimeSecs.result(timing.raw)),
+              nowSecs,
+            },
           )
           yield* music.update({
             nowSecs,

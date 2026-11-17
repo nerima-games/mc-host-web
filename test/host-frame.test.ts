@@ -4,7 +4,8 @@ import { Effect } from 'effect'
 import { DeltaTimeSecs, MonotonicTimeSecs } from '@nerima-games/mc-kernel'
 import { makeInputService, type InputServiceApi, type InputSnapshot } from '@nerima-games/mc-render'
 
-import { FIXED_TICK_SECS, makeFixedStepFrameLoop } from '../apps/web/tick/fixed-step-frame'
+import { HOST_MAX_CATCH_UP_TICKS, makeFixedStepFrameLoop } from '../apps/web/tick/fixed-step-frame'
+import { mutableState } from '../apps/web/tick/h5a-context'
 import {
   runHostFrame,
   tickInputQueries,
@@ -20,6 +21,18 @@ type FrameLog = {
   readonly looks: Array<{ readonly input: InputSnapshot; readonly frameDeltaSecs: DeltaTimeSecs }>
   readonly presented: Array<HostPresentedFrame>
   readonly tickEdges: Array<boolean>
+}
+
+// The host's clamp (main.ts): frame stages integrate at most 0.05 s per frame.
+const clampDelta = (raw: number): DeltaTimeSecs => DeltaTimeSecs(Math.min(Math.max(0.001, raw), 0.05))
+
+const frameTiming = () => {
+  let previous: MonotonicTimeSecs | undefined
+  return {
+    previousFrameSecs: mutableState(() => previous, (value) => { previous = value }),
+    firstFrameSecs: 0.016,
+    clampDelta,
+  }
 }
 
 // The real input service with its reads and frame ends recorded.
@@ -41,17 +54,12 @@ const makeFrame = Effect.gen(function* () {
   const service = yield* makeInputService()
   const fixedStep = yield* makeFixedStepFrameLoop()
   const log: FrameLog = { events: [], reads: [], ended: [], looks: [], presented: [], tickEdges: [] }
-  let previous: MonotonicTimeSecs | undefined
   let paused = false
   let tickOutcome: HostFrameTickOutcome = 'continue'
   const context: HostFrameContext<never, never> = {
     input: recordedInput(service, log),
     fixedStep,
-    frameDelta: (nowSecs) => {
-      const delta = DeltaTimeSecs(previous === undefined ? 0 : nowSecs - previous)
-      previous = nowSecs
-      return delta
-    },
+    ...frameTiming(),
     look: (input, frameDeltaSecs) => {
       log.events.push('look')
       log.looks.push({ input, frameDeltaSecs })
@@ -92,7 +100,7 @@ describe('runHostFrame', () => {
       expect(log.looks.map(({ input }) => input)).toStrictEqual(log.reads)
       expect(log.ended).toStrictEqual(log.reads)
       expect(log.ended[1]).toBe(log.reads[1])
-      expect(log.looks[1]?.frameDeltaSecs).toBeCloseTo(0.06, 10)
+      expect(log.looks[1]?.frameDeltaSecs).toBeCloseTo(0.05, 10)
       expect(log.presented[1]).toMatchObject({ ticks: 1, simulationTick: 1, nowSecs: 10.06 })
     }))
 
@@ -106,7 +114,8 @@ describe('runHostFrame', () => {
       expect(log.looks).toHaveLength(2)
       expect(log.presented[1]?.ticks).toBe(0)
       expect(log.presented[1]?.partialTick).toBeCloseTo(0.4, 6)
-      expect(log.presented[1]?.frameDeltaSecs).toBeCloseTo(0.02, 10)
+      expect(log.presented[1]?.timing.raw).toBeCloseTo(0.02, 10)
+      expect(log.presented[1]?.timing.deltaSecs).toBeCloseTo(0.02, 10)
     }))
 
   it.effect('a paused frame ticks and ends its reading but does not present', () =>
@@ -130,6 +139,45 @@ describe('runHostFrame', () => {
       expect(log.events.slice(4)).toStrictEqual(['read', 'look', 'tick', 'end'])
     }))
 
+  it.effect('a frame over 50 ms presents the unclamped delta and looks with the clamped one', () =>
+    Effect.gen(function* () {
+      const { log, frameAt } = yield* makeFrame
+      yield* frameAt(10)
+      yield* frameAt(10.2)
+
+      expect(log.presented[1]?.timing.raw).toBeCloseTo(0.2, 10)
+      expect(log.presented[1]?.timing.deltaSecs).toBeCloseTo(0.05, 10)
+      expect(log.looks[1]?.frameDeltaSecs).toBeCloseTo(0.05, 10)
+    }))
+
+  it.effect('a ten-tick frame reads, looks, presents and ends once', () =>
+    Effect.gen(function* () {
+      const { log, frameAt } = yield* makeFrame
+      yield* frameAt(10)
+      // 0.51 s is ten 50 ms ticks plus a remainder.
+      yield* frameAt(10.51)
+
+      expect(log.events.slice(4)).toStrictEqual([
+        'read', 'look', ...Array.from({ length: 10 }, () => 'tick'), 'present', 'end',
+      ])
+      expect(log.presented[1]?.ticks).toBe(10)
+      expect(log.ended[1]).toBe(log.reads[1])
+    }))
+
+  it.effect('a frame after a long stall runs the catch-up bound and still reads, looks, presents and ends once', () =>
+    Effect.gen(function* () {
+      const { log, frameAt } = yield* makeFrame
+      yield* frameAt(10)
+      yield* frameAt(15)
+
+      expect(log.events.slice(4)).toStrictEqual([
+        'read', 'look', ...Array.from({ length: HOST_MAX_CATCH_UP_TICKS }, () => 'tick'), 'present', 'end',
+      ])
+      expect(log.presented[1]).toMatchObject({ ticks: HOST_MAX_CATCH_UP_TICKS, overloaded: true })
+      expect(log.presented[1]?.timing.raw).toBeCloseTo(5, 10)
+      expect(log.ended[1]).toBe(log.reads[1])
+    }))
+
   it.effect('a failing tick still ends the frame\'s reading', () =>
     Effect.gen(function* () {
       const service = yield* makeInputService()
@@ -137,7 +185,7 @@ describe('runHostFrame', () => {
       const failing: HostFrameContext<'tick-failed', never> = {
         input: recordedInput(service, log),
         fixedStep: yield* makeFixedStepFrameLoop(),
-        frameDelta: () => DeltaTimeSecs(0.05),
+        ...frameTiming(),
         look: () => undefined,
         tick: () => Effect.fail('tick-failed' as const),
         presents: () => true,
@@ -192,10 +240,4 @@ describe('tickInputQueries', () => {
       expect(yield* queries.wasActionJustTriggered('moveForward')).toBe(true)
       expect(yield* queries.wasActionJustTriggered('escape')).toBe(false)
     }))
-})
-
-describe('fixed tick delta', () => {
-  it('is the 20 Hz step the tick body runs at', () => {
-    expect(FIXED_TICK_SECS).toBeCloseTo(0.05, 10)
-  })
 })

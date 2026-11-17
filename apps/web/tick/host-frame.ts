@@ -1,24 +1,29 @@
 import { bindingFor, type InputServiceApi, type InputSnapshot } from '@nerima-games/mc-render'
 import type { DeltaTimeSecs, MonotonicTimeSecs } from '@nerima-games/mc-kernel'
 import type { FixedStepFailure } from '@nerima-games/mc-sim'
+
 import { Effect } from 'effect'
 
 import type { FixedStepFrame, FixedStepFrameLoop, FixedStepTick } from './fixed-step-frame'
-import type { H5aFrameInputContext } from './h5a-context'
+import { readFrameTiming, type FrameTiming } from './frame-input'
+import type { H5aFrameInputContext, MutableState } from './h5a-context'
 
 /** `halt` ends the frame's ticks and skips its presentation. */
 export type HostFrameTickOutcome = 'continue' | 'halt'
 
 export type HostPresentedFrame = FixedStepFrame & {
-  readonly frameDeltaSecs: DeltaTimeSecs
+  /** `raw` is the unclamped wall-clock delta; `deltaSecs` is what stages integrate. */
+  readonly timing: FrameTiming
   readonly nowSecs: MonotonicTimeSecs
 }
 
 export type HostFrameContext<TickError, PresentError> = {
   readonly input: Pick<InputServiceApi, 'snapshot' | 'endFrame'>
   readonly fixedStep: Pick<FixedStepFrameLoop, 'runFrame'>
-  /** The wall-clock delta since the previous frame, as the frame stages take it. */
-  readonly frameDelta: (nowSecs: MonotonicTimeSecs) => DeltaTimeSecs
+  /** The previous frame's instant; the frame reads and advances it once. */
+  readonly previousFrameSecs: MutableState<MonotonicTimeSecs | undefined>
+  readonly firstFrameSecs: number
+  readonly clampDelta: (raw: number) => DeltaTimeSecs
   readonly look: (input: InputSnapshot, frameDeltaSecs: DeltaTimeSecs) => void
   readonly tick: (tick: FixedStepTick) => Effect.Effect<HostFrameTickOutcome, TickError>
   /** False while the game is paused: a paused frame draws nothing. */
@@ -38,15 +43,21 @@ export const runHostFrame = <TickError, PresentError>(
 ): Effect.Effect<void, TickError | PresentError | FixedStepFailure> => Effect.gen(function* () {
   const frameInput = yield* context.input.snapshot
   yield* Effect.gen(function* () {
-    const frameDeltaSecs = context.frameDelta(nowSecs)
-    context.look(frameInput, frameDeltaSecs)
+    const timing = readFrameTiming(
+      nowSecs,
+      context.previousFrameSecs.get(),
+      context.firstFrameSecs,
+      context.previousFrameSecs.set,
+      context.clampDelta,
+    )
+    context.look(frameInput, timing.deltaSecs)
     let halted = false
     const stepped = yield* context.fixedStep.runFrame({ nowSecs, input: frameInput }, (tick) => Effect.gen(function* () {
       if (halted) return
       halted = (yield* context.tick(tick)) === 'halt'
     }))
     if (halted || !context.presents()) return
-    yield* context.present({ ...stepped, frameDeltaSecs, nowSecs })
+    yield* context.present({ ...stepped, timing, nowSecs })
   }).pipe(Effect.ensuring(context.input.endFrame(frameInput)))
 })
 

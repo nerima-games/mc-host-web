@@ -82,6 +82,7 @@ import { makeHostWorldWrite } from '../apps/web/world-write-port'
 import { makeHostGameplayBlockStateWorld } from '../apps/web/gameplay-block-state-world'
 import { FIXED_TICK_SECS, makeFixedStepFrameLoop } from '../apps/web/tick/fixed-step-frame'
 import { runHostFrame } from '../apps/web/tick/host-frame'
+import { mutableState } from '../apps/web/tick/h5a-context'
 
 // The browser twin of this list is e2e/smoke.e2e.ts #3b; both must change together.
 const SMOKE_STAGE_ORDER = [
@@ -430,7 +431,7 @@ describe('host modules', () => {
       const reads: Array<unknown> = []
       const ended: Array<unknown> = []
       let looks = 0
-      let previous: number | undefined
+      let previous: MonotonicTimeSecs | undefined
       const fixedStep = yield* makeFixedStepFrameLoop()
       const timeBefore = yield* host.instances.time.snapshot
       const frameAt = (nowSecs: number) => runHostFrame({
@@ -439,15 +440,13 @@ describe('host modules', () => {
           endFrame: (frame) => Effect.andThen(Effect.sync(() => { ended.push(frame) }), input.endFrame(frame)),
         },
         fixedStep,
-        frameDelta: (now) => {
-          const delta = DeltaTimeSecs(previous === undefined ? 0 : now - previous)
-          previous = now
-          return delta
-        },
+        previousFrameSecs: mutableState(() => previous, (value) => { previous = value }),
+        firstFrameSecs: 0.016,
+        clampDelta: (raw) => DeltaTimeSecs(Math.min(Math.max(0.001, raw), 0.05)),
         look: () => { looks += 1 },
         tick: () => Effect.as(runStages(split.tickStages, FIXED_TICK_SECS), 'continue' as const),
         presents: () => true,
-        present: ({ frameDeltaSecs }) => runStages(split.frameStages, frameDeltaSecs),
+        present: ({ timing }) => runStages(split.frameStages, timing.deltaSecs),
       }, MonotonicTimeSecs(nowSecs))
 
       // The first frame starts the clock; 60 more cover one second at 60 Hz.
