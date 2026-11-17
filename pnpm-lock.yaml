@@ -191,8 +191,8 @@ importers:
         specifier: 0.6.0
         version: 0.6.0
       '@nerima-games/mc-render':
-        specifier: 0.14.1
-        version: 0.14.1
+        specifier: 0.15.0
+        version: 0.15.0
       '@nerima-games/mc-save':
         specifier: 0.8.0
         version: 0.8.0
@@ -583,8 +583,8 @@ packages:
     resolution: {integrity: sha512-Yps21De6Wwc9I7rhGeZX6BJ01ZYrOeqcQh55KW86+Ki5XZmHkhLTiXVILGsJJM62Qmhnyv+IpyfCw+mVj5gzMA==, tarball: https://npm.pkg.github.com/download/@nerima-games/mc-render/0.11.0/e4c3498cc166e9fe1812897e14f8fdcc278b1bea}
     engines: {node: '>=24.0.0', pnpm: '>=11.24.0'}
 
-  '@nerima-games/mc-render@0.14.1':
-    resolution: {integrity: sha512-54sd7/ELExrAgtmx3jkYNskhrnyLMcYKJcIMZ5xacGMtw17uKZFQWHiBcVPDFcGHyuj09m91jXLIfiYWdnJqqw==, tarball: https://npm.pkg.github.com/download/@nerima-games/mc-render/0.14.1/5c821cd5db8dc575f440dce3d6f511c2dffbbb32}
+  '@nerima-games/mc-render@0.15.0':
+    resolution: {integrity: sha512-ITD8zNpIabaaqxC6vKmpi0P7IHZrIiQ5STsy2uZJ+B7g9NCcmXc39re24jmoD2CXzHw0A5Dq+Y//irDOYm13ew==, tarball: https://npm.pkg.github.com/download/@nerima-games/mc-render/0.15.0/7b79b602664ff7e4e37a2716c2e07cbf114dfa11}
     engines: {node: '>=24.0.0', pnpm: '>=11.24.0'}
 
   '@nerima-games/mc-save@0.8.0':
@@ -1587,7 +1587,7 @@ snapshots:
       effect: 4.0.5
       three: 0.186.1
 
-  '@nerima-games/mc-render@0.14.1':
+  '@nerima-games/mc-render@0.15.0':
     dependencies:
       '@nerima-games/mc-kernel': 0.17.0
       '@nerima-games/mc-meshing': 0.7.0

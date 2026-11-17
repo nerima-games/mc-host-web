@@ -65,7 +65,7 @@
     "@nerima-games/mc-compose": "0.3.0",
     "@nerima-games/mc-kernel": "0.17.0",
     "@nerima-games/mc-physics": "0.6.0",
-    "@nerima-games/mc-render": "0.14.1",
+    "@nerima-games/mc-render": "0.15.0",
     "@nerima-games/mc-save": "0.8.0",
     "@nerima-games/mc-server": "0.2.0",
     "@nerima-games/mc-sim": "0.12.0",

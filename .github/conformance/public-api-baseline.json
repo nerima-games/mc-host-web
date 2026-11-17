@@ -45,7 +45,7 @@
     "count": 1,
     "file": "apps/render-preview/preview.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(input.isActionActive(action))"
+    "text": "Effect.runSync(input.isActionActive(action, snapshot))"
   },
   {
     "count": 1,
@@ -1803,31 +1803,31 @@
     "count": 1,
     "file": "apps/web/tick/frame-input.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(inputApi.isActionActive(action))"
+    "text": "Effect.runSync(inputApi.isActionActive(action, frameInput))"
   },
   {
     "count": 1,
     "file": "apps/web/tick/frame-input.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(inputApi.wasActionJustTriggered('attack'))"
+    "text": "Effect.runSync(inputApi.wasActionJustTriggered('attack', frameInput))"
   },
   {
     "count": 1,
     "file": "apps/web/tick/frame-input.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(inputApi.wasActionJustTriggered('openInventory'))"
+    "text": "Effect.runSync(inputApi.wasActionJustTriggered('openInventory', frameInput))"
   },
   {
     "count": 1,
     "file": "apps/web/tick/frame-input.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(inputApi.wasActionJustTriggered('use'))"
+    "text": "Effect.runSync(inputApi.wasActionJustTriggered('use', frameInput))"
   },
   {
     "count": 1,
     "file": "apps/web/tick/frame-input.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(inputApi.wasActionJustTriggered(action))"
+    "text": "Effect.runSync(inputApi.wasActionJustTriggered(action, frameInput))"
   },
   {
     "count": 1,

@@ -107,7 +107,7 @@ export const runTickFrameInput = (
   if (
     !dead &&
     !context.bowInteractionLocked() &&
-    Effect.runSync(inputApi.wasActionJustTriggered('openInventory'))
+    Effect.runSync(inputApi.wasActionJustTriggered('openInventory', frameInput))
   ) {
     context.setInventoryOpen(!state.inventoryOpen.get(), 'player')
   }
@@ -116,7 +116,7 @@ export const runTickFrameInput = (
     const nextHotbarIndex = context.selectedHotbarAfterInput(
       state.selectedHotbarIndex.get(),
       walk.wheelSteps,
-      (action) => Effect.runSync(inputApi.wasActionJustTriggered(action)),
+      (action) => Effect.runSync(inputApi.wasActionJustTriggered(action, frameInput)),
       // Selection and wheel steps come from validated local input; nine slots is fixed.
       (current, steps, size) => Result.getOrThrow(context.wrapHotbarSelection(current, steps, size)),
     )
@@ -136,7 +136,7 @@ export const runTickFrameInput = (
 
   const held = (action: InputAction): number =>
     !dead && !state.inventoryOpen.get() && !state.tradeOpen.get() && !state.brewingOpen.get()
-      && Effect.runSync(inputApi.isActionActive(action)) ? 1 : 0
+      && Effect.runSync(inputApi.isActionActive(action, frameInput)) ? 1 : 0
   state.vehicleControls.set({
     throttle: held('moveForward') - held('moveBackward'),
     steering: held('moveRight') - held('moveLeft'),
@@ -146,7 +146,7 @@ export const runTickFrameInput = (
   if (queuedNativeAttack) context.resetPrimaryAttackGesture()
   const attackTriggered =
     !dead && !state.inventoryOpen.get() && !state.tradeOpen.get() && !state.brewingOpen.get()
-    && (Effect.runSync(inputApi.wasActionJustTriggered('attack')) || queuedNativeAttack)
+    && (Effect.runSync(inputApi.wasActionJustTriggered('attack', frameInput)) || queuedNativeAttack)
   if (attackTriggered && !context.isCreativeMode) {
     if (context.multiplayer === undefined) Effect.runSync(context.survivalHunger.submit({ _tag: 'attack', count: 1 }))
     else context.sendVitalsCommand({ _tag: 'activity', activity: 'attack', amount: 1 })
@@ -162,7 +162,7 @@ export const runTickFrameInput = (
     : { triggered: false, state: state.nativeInputQueue.get() }
   state.nativeInputQueue.set(nativeUse.state)
   const useTriggered = canUse
-    && (Effect.runSync(inputApi.wasActionJustTriggered('use')) || nativeUse.triggered)
+    && (Effect.runSync(inputApi.wasActionJustTriggered('use', frameInput)) || nativeUse.triggered)
   const useHeld = held('use') > 0
 
   return {

@@ -444,7 +444,7 @@ import {
   installPlayerQaSurface,
 } from './player-session-runtime'
 import { FIXED_TICK_SECS, makeFixedStepFrameLoop } from './tick/fixed-step-frame'
-import { runHostFrame, tickInputQueries } from './tick/host-frame'
+import { runHostFrame } from './tick/host-frame'
 import { applyFrameLook, runTickFrameInput } from './tick/frame-input'
 import { mutableState, type H5aTickContext } from './tick/h5a-context'
 import { runTickPlayerMovement } from './tick/player-movement'
@@ -3975,7 +3975,7 @@ const bootGame = async (
         tick: ({ input }) => Effect.gen(function* () {
           // Counted per tick: dropped-item pickup eligibility is in ticks.
           ticksTotal += 1
-          const frame = runTickFrameInput({ ...h5aTickContext, inputApi: tickInputQueries(inputApi, input) }, nowSecs, input)
+          const frame = runTickFrameInput(h5aTickContext, nowSecs, input)
           if (frame === undefined) return 'continue' as const
           const movement = yield* runTickPlayerMovement(h5aTickContext, frame)
           // A defected tick stage has already failed the boot; the frame stops there.

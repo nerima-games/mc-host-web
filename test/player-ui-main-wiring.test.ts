@@ -116,7 +116,7 @@ describe('H4b main.ts wiring', () => {
     )
     const deadGate = positionOf(tickInput, '!dead &&')
     const bowGate = positionOf(tickInput, '!context.bowInteractionLocked()')
-    const openInput = positionOf(tickInput, "wasActionJustTriggered('openInventory')")
+    const openInput = positionOf(tickInput, "wasActionJustTriggered('openInventory', frameInput)")
     const runtimeCall = positionOf(tickInput, "context.setInventoryOpen(!state.inventoryOpen.get(), 'player')")
 
     expect(deadGate).toBeLessThan(bowGate)
