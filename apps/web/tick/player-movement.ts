@@ -201,7 +201,7 @@ export const runTickPlayerMovement = (
     }
   }
 
-  if (multiplayer !== undefined) context.drainMultiplayerInbound()
+  if (multiplayer !== undefined) yield* context.drainMultiplayerInbound()
   context.drainCraftingInbound()
   context.drainAnvilInbound()
   context.drainEnchantingInbound()

@@ -177,7 +177,7 @@ const makeHarness = async (multiplayer?: H5aMovementContext['multiplayer']) => {
     requestFurnaceAdvance: (_state, requestId, state, deltaSecs) => Effect.sync(() => {
       furnaceRequests.push({ requestId, state, deltaSecs })
     }),
-    drainMultiplayerInbound: () => drainOrder.push('multiplayer'),
+    drainMultiplayerInbound: () => Effect.sync(() => { drainOrder.push('multiplayer') }),
     drainCraftingInbound: () => drainOrder.push('crafting'),
     drainAnvilInbound: () => drainOrder.push('anvil'),
     drainEnchantingInbound: () => drainOrder.push('enchanting'),

@@ -16,6 +16,7 @@ import {
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
+  BREWING_STALE_RETRY_LIMIT,
   connectMultiplayer,
   makeMultiplayerChatCommand,
   makeMultiplayerCommandIds,
@@ -556,6 +557,32 @@ describe('multiplayer brewing over protocol 12', () => {
       .toBe(countersBefore.versionMismatched + 2)
   })
 
+  it('tells the player when the server speaks another protocol version', async () => {
+    const harness = await makeMultiplayerClientHarness()
+    const reported = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    const mismatched = (revision: number): string => {
+      const frame = encodeFrameAsVersion(PROTOCOL_VERSION - 1, brewingStandDelta(revision, OPEN_STAND, brewingStand()))
+      if (Result.isFailure(frame)) throw new Error('the previous protocol version does not encode the delta')
+      return frame.success
+    }
+
+    harness.deliver(brewingStandDelta(1, OPEN_STAND, brewingStand()))
+    expect(harness.multiplayerStatus.textContent).toBe('Connecting to multiplayer server...')
+    expect(reported).not.toHaveBeenCalled()
+
+    harness.deliverFrame(mismatched(2))
+    const mismatchStatus = 'The multiplayer server and this client use different protocol versions; server updates are not applied.'
+    expect(harness.multiplayerStatus).toEqual({ hidden: false, textContent: mismatchStatus })
+    expect(harness.context.state.multiplayerRejection).toBe('protocol version mismatch')
+    expect(harness.canvasAttributes.get('data-multiplayer-rejection')).toBe('protocol version mismatch')
+    expect(reported.mock.calls[0]?.[1]).toMatchObject({ _tag: 'ServerProtocolVersionMismatch', droppedFrames: 1 })
+
+    // A later status line, such as the handshake's, gives way to the next dropped frame.
+    harness.context.ui.multiplayerStatus.textContent = 'Connected as Local'
+    harness.deliverFrame(mismatched(3))
+    expect(harness.multiplayerStatus.textContent).toBe(mismatchStatus)
+  })
+
   const statusEffects = (harness: Harness) =>
     Effect.runSync(snapshotStatusEffects(harness.context.services.gameplayState, harness.context.services.gameplayCommit))
 
@@ -616,6 +643,7 @@ describe('multiplayer brewing over protocol 12', () => {
 
     expect(Effect.runSync(harness.client.requestBrewing({ _tag: 'insert-bottle', slot: 4, bottleIndex: 2 }))).toBe(true)
     expect(Effect.runSync(harness.client.requestBrewing({ _tag: 'drink', slot: 0 }))).toBe(false)
+    expect(harness.context.state.brewingStatus).toBe('Waiting for the multiplayer server...')
     expect(enqueueOutbound).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
       _tag: 'BrewingCommand', action: { _tag: 'insert-bottle', slot: 4, bottleIndex: 2 }, at: OPEN_STAND, expectedRevision: 0,
     }))
@@ -633,8 +661,130 @@ describe('multiplayer brewing over protocol 12', () => {
     harness.deliver({ _tag: 'BrewingCommandRejected', commandId: harness.commandIds.commandIdFor('brewing', 2), reason: 'no-room', revision: 3 })
     expect(harness.context.state.brewingStatus).toBe('Cannot use brewing stand: no-room')
     expect(harness.canvasAttributes.get('data-multiplayer-revision')).toBe('3')
-    expect(renderBrewingUi).toHaveBeenCalledTimes(2)
+    // Two refusals while waiting, then one render per settled result.
+    expect(renderBrewingUi).toHaveBeenCalledTimes(4)
     expect(Effect.runSync(harness.client.requestBrewing({ _tag: 'drink', slot: 0 }))).toBe(true)
+  })
+
+  it('shows a waiting status instead of sending before the handshake completes', async () => {
+    const harness = await makeMultiplayerClientHarness()
+    const enqueueOutbound = vi.spyOn(runtimeOf(harness).host, 'enqueueOutbound')
+    openStand(harness)
+    harness.context.state.multiplayerHandshakeComplete = false
+
+    expect(Effect.runSync(harness.client.requestBrewing({ _tag: 'drink', slot: 0 }))).toBe(false)
+
+    expect(harness.context.state.brewingStatus).toBe('Waiting for the multiplayer server...')
+    expect(enqueueOutbound).not.toHaveBeenCalled()
+  })
+
+  it('re-sends a stale brewing command with the revision the rejection carried', async () => {
+    const harness = await makeMultiplayerClientHarness()
+    const enqueueOutbound = vi.spyOn(runtimeOf(harness).host, 'enqueueOutbound')
+    openStand(harness)
+    const action: BrewingAction = { _tag: 'insert-bottle', slot: 4, bottleIndex: 1 }
+
+    expect(Effect.runSync(harness.client.requestBrewing(action))).toBe(true)
+    // The server ticks a brewing stand between the send and its receipt.
+    harness.deliver(brewingStandDelta(5, OTHER_STAND, brewingStand()))
+    harness.deliver({ _tag: 'BrewingCommandRejected', commandId: harness.commandIds.commandIdFor('brewing', 1), reason: 'stale-revision', revision: 6 })
+
+    expect(enqueueOutbound.mock.calls.map(([command]) => command)).toEqual([
+      expect.objectContaining({ action, commandId: harness.commandIds.commandIdFor('brewing', 1), expectedRevision: 0 }),
+      expect.objectContaining({ action, commandId: harness.commandIds.commandIdFor('brewing', 2), expectedRevision: 6 }),
+    ])
+    expect(harness.context.state.brewingStatus).toBe('')
+
+    harness.deliver({ _tag: 'BrewingCommandAccepted', commandId: harness.commandIds.commandIdFor('brewing', 2), revision: 7 })
+    expect(harness.context.state.brewingStatus).toBe('')
+    expect(Effect.runSync(harness.client.requestBrewing({ _tag: 'collect', bottleIndex: 1 }))).toBe(true)
+  })
+
+  it('stops re-sending a stale brewing command at the limit and shows the rejection', async () => {
+    const harness = await makeMultiplayerClientHarness()
+    const enqueueOutbound = vi.spyOn(runtimeOf(harness).host, 'enqueueOutbound')
+    openStand(harness)
+
+    expect(Effect.runSync(harness.client.requestBrewing({ _tag: 'collect', bottleIndex: 0 }))).toBe(true)
+    for (let attempt = 1; attempt <= BREWING_STALE_RETRY_LIMIT + 1; attempt += 1) {
+      harness.deliver({
+        _tag: 'BrewingCommandRejected',
+        commandId: harness.commandIds.commandIdFor('brewing', attempt),
+        reason: 'stale-revision',
+        revision: attempt,
+      })
+    }
+
+    expect(enqueueOutbound).toHaveBeenCalledTimes(BREWING_STALE_RETRY_LIMIT + 1)
+    expect(harness.context.state.brewingStatus).toBe('Cannot use brewing stand: stale-revision')
+
+    // A fresh request gets the full retry budget again.
+    expect(Effect.runSync(harness.client.requestBrewing({ _tag: 'collect', bottleIndex: 0 }))).toBe(true)
+    harness.deliver({
+      _tag: 'BrewingCommandRejected',
+      commandId: harness.commandIds.commandIdFor('brewing', BREWING_STALE_RETRY_LIMIT + 2),
+      reason: 'stale-revision',
+      revision: 20,
+    })
+    expect(enqueueOutbound).toHaveBeenCalledTimes(BREWING_STALE_RETRY_LIMIT + 3)
+  })
+
+  it('does not re-send a brewing command rejected for another reason', async () => {
+    const harness = await makeMultiplayerClientHarness()
+    const enqueueOutbound = vi.spyOn(runtimeOf(harness).host, 'enqueueOutbound')
+    openStand(harness)
+
+    expect(Effect.runSync(harness.client.requestBrewing({ _tag: 'drink', slot: 0 }))).toBe(true)
+    harness.deliver({ _tag: 'BrewingCommandRejected', commandId: harness.commandIds.commandIdFor('brewing', 1), reason: 'missing-ingredients', revision: 1 })
+
+    expect(enqueueOutbound).toHaveBeenCalledOnce()
+    expect(harness.context.state.brewingStatus).toBe('Cannot use brewing stand: missing-ingredients')
+  })
+
+  it('shows an empty stand while loading one the server has not described', async () => {
+    const harness = await makeMultiplayerClientHarness()
+    openStand(harness)
+    harness.deliver(brewingStandDelta(1, OPEN_STAND, brewingStand()))
+    expect(slotNames(brewingOwner(harness).state).ingredient).toEqual(['nether_wart', 1])
+
+    openStand(harness, OTHER_STAND)
+    expect(Effect.runSync(harness.client.requestBrewing({ _tag: 'open' }))).toBe(true)
+
+    expect(slotNames(brewingOwner(harness).state)).toEqual({
+      bottles: [null, null, null], ingredient: null, fuel: null, fuelCharges: 0, brewProgressSecs: 0,
+    })
+    expect(harness.context.state.brewingStatus).toBe('Loading brewing stand...')
+
+    harness.deliver(brewingStandDelta(1, OTHER_STAND, brewingStand({ ingredient: { item: 'sugar', count: 1 }, brewProgressSecs: 0 })))
+    expect(slotNames(brewingOwner(harness).state).ingredient).toEqual(['sugar', 1])
+    expect(harness.context.state.brewingStatus).toBe('')
+  })
+
+  it('forgets the brewing stands it learnt before a realm transfer', async () => {
+    const harness = await makeMultiplayerClientHarness()
+    harness.deliver(brewingStandDelta(1, OPEN_STAND, brewingStand()))
+    const transfer = (from: WorldId, to: WorldId): NetworkMessage => ({
+      _tag: 'RealmTransferSnapshot',
+      commandId: CommandId.make(`portal-${String(to)}`),
+      player: harness.localPlayer,
+      fromWorld: from,
+      destinationWorld: to,
+      at: { x: 8, y: 70, z: 8 },
+      facing: { yawRadians: 0, pitchRadians: 0 },
+      worldSnapshot: { _tag: 'WorldSnapshot', revision: 3, seed: 1, world: to, blocks: [], levers: [], players: [], poweredRails: [] },
+      authoritativeSnapshot: { ...authoritativeSnapshot(harness.localPlayer, []), world: to },
+    })
+
+    harness.deliver(transfer(OVERWORLD, NETHER))
+    harness.deliver(transfer(NETHER, OVERWORLD))
+    expect(Effect.runSync(harness.world.player.dimension)).toBe('overworld')
+    expect(harness.context.state.multiplayerRejection).toBe('')
+
+    openStand(harness)
+    expect(Effect.runSync(harness.client.requestBrewing({ _tag: 'open' }))).toBe(true)
+
+    expect(slotNames(brewingOwner(harness).state).bottles).toEqual([null, null, null])
+    expect(harness.context.state.brewingStatus).toBe('Loading brewing stand...')
   })
 
   it.each<[string, BrewingAction]>([

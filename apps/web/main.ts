@@ -3980,7 +3980,7 @@ const bootGame = async (
         if (multiplayerInboundStage !== undefined && multiplayerOutboundStage !== undefined) {
           frameBoundary.enqueue(Effect.gen(function* () {
             yield* multiplayerInboundStage.run(DeltaTimeSecs(0)).pipe(Effect.provide(BrowserClockLayer))
-            drainMultiplayerInbound()
+            yield* drainMultiplayerInbound()
             drainCraftingInbound()
             drainAnvilInbound()
             drainEnchantingInbound()

@@ -176,7 +176,7 @@ export type H5aTickContext = {
     furnace: FurnaceState,
     deltaSecs: number,
   ) => Effect.Effect<void>
-  readonly drainMultiplayerInbound: () => void
+  readonly drainMultiplayerInbound: () => Effect.Effect<void>
   readonly drainCraftingInbound: () => void
   readonly drainAnvilInbound: () => void
   readonly drainEnchantingInbound: () => void

@@ -284,7 +284,7 @@ export const makeMultiplayerClientHarness = async (): Promise<MultiplayerClientH
       monotonicSecs: MonotonicTimeSecs(0),
       wallClockEpochMillis: EpochMillis(0),
     }))))
-    client.drainMultiplayerInbound()
+    Effect.runSync(client.drainMultiplayerInbound())
   }
 
   const deliver = (message: NetworkMessage): void => {

@@ -207,12 +207,6 @@
     "count": 1,
     "file": "apps/web/multiplayer-client.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runSync(Effect.flatMap(multiplayer.host.drainInbound, (messages) => Effect.forEach(messages, (message) => applyNetworkMessage(multiplayer, message), { discard: true })))"
-  },
-  {
-    "count": 1,
-    "file": "apps/web/multiplayer-client.ts",
-    "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(clientContext.multiplayer.host.enqueueOutbound( command._tag === 'ThrowEyeOfEnderCommand' ? { _tag: command._tag, ...header } : { _tag: command._tag, ...header, frame: command.frame }, ))"
   },
   {
