@@ -2190,7 +2190,7 @@
     "text": "Effect.runSync(weather.applyTransition(weatherAdvanced))"
   },
   {
-    "count": 2,
+    "count": 1,
     "file": "apps/web/tick/post-frame-gameplay.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
     "text": "Effect.runSync(weather.snapshot)"
