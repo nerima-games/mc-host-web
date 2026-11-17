@@ -5,9 +5,19 @@ vi.mock('../apps/web/session-persistence', () => ({ SESSION_FORMAT_VERSION: 3 })
 import { Effect, Layer, Result, Schema } from 'effect'
 import { QaNamespaceNameSchema, QaOperationNameSchema, ModuleContractIdSchema, ModuleContractKindSchema, WorldIdSchema, itemStack, StackCount } from '@nerima-games/mc-kernel'
 import { makeWeatherService, makeBrewingService, makeBrewingServiceRegistration, makeReplicatedOwnerId, makeWorldCommitCoordinator, brewingState } from '@nerima-games/mc-sim'
-import { weatherLightScale } from '@nerima-games/mx-gameplay'
+import {
+  GAMEPLAY_VILLAGER_TRADES_OWNER_ID,
+  GameplayVillagerTradeSnapshotSchema,
+  addVillager,
+  emptyVillagerTradeState,
+  gameplayOwnerRegistrations,
+  makeVillager,
+  useVillagerOffer,
+  weatherLightScale,
+  type VillagerTradeState,
+} from '@nerima-games/mx-gameplay'
 import { composeGame, DuplicateModuleContract, QA_GLOBAL_KEY } from '@nerima-games/mc-compose'
-import { installQaDispatch, makeQaNamespaces, makeQaOperation, makeQaSurface, makeQaRenderCommands, makeQaWeatherCommand, observeQaBrewing, type QaDispatchTransport } from '../apps/web/qa-surface'
+import { composeQaBridge, installQaDispatch, makeQaNamespaces, makeQaOperation, makeQaSurface, makeQaRenderCommands, makeQaWeatherCommand, observeQaBrewing, seedQaVillagerRestock, type QaDispatchTransport } from '../apps/web/qa-surface'
 
 const namespaceName = Schema.decodeUnknownSync(QaNamespaceNameSchema)
 const operationName = Schema.decodeUnknownSync(QaOperationNameSchema)
@@ -194,5 +204,125 @@ describe('C1 QA dispatch transport', () => {
     expect(result).toEqual(rejected)
     if (Result.isFailure(result)) expect(result.failure).toBe(failure)
     expect(attempts).toBe(1)
+  })
+})
+
+// The same composition main.ts performs: module registrations first, then host namespaces.
+const makeComposition = (modules: ReturnType<typeof makeQaNamespaces>) =>
+  (namespaces: ReturnType<typeof makeQaNamespaces>) => Effect.runSync(Effect.result(Effect.map(
+    composeGame([...modules, ...namespaces].map((qa) => ({ name: qa.name, layers: Layer.empty, frameStages: [], qa }))),
+    ({ qaBridge, qaNamespaces }) => ({ qaBridge, qaNamespaces }),
+  )))
+
+describe('H13-b runtime.qaCatalog', () => {
+  it('lists every composed operation, including module registrations and itself, without running any', async () => {
+    let calls = 0
+    const counted = (name: string) => makeQaOperation(name, Schema.Null, () => { calls += 1; return null })
+    const modules = makeQaNamespaces([{ namespace: 'ui', observe: { snapshot: counted('snapshot') }, command: { focus: counted('focus') } }])
+    const host = makeQaNamespaces([
+      { namespace: 'gameplay', observe: { snapshot: counted('snapshot') }, command: { setPose: counted('setPose') } },
+      { namespace: 'persistence', observe: {}, command: { flush: counted('flush') } },
+    ])
+    const bridge = composeQaBridge(makeComposition(modules), host)
+    if (Result.isFailure(bridge)) throw new Error('QA composition failed')
+    const target: { [QA_GLOBAL_KEY]?: QaDispatchTransport } = {}
+    installQaDispatch(target, bridge.success)
+    const result = await target[QA_GLOBAL_KEY]?.dispatch(namespaceName('runtime'), operationName('qaCatalog'), null)
+    expect(result?._tag).toBe('Success')
+    const catalog = result?._tag === 'Success' ? result.value : undefined
+    expect(Array.isArray(catalog) ? [...catalog].sort() : catalog).toEqual([
+      'gameplay.setPose',
+      'gameplay.snapshot',
+      'persistence.flush',
+      'runtime.qaCatalog',
+      'ui.focus',
+      'ui.snapshot',
+    ])
+    expect(calls).toBe(0)
+    const invalid = await target[QA_GLOBAL_KEY]?.dispatch(namespaceName('runtime'), operationName('qaCatalog'), 1)
+    expect(invalid).toMatchObject({ _tag: 'Failure', error: { _tag: 'SchemaError' } })
+  })
+
+  it('returns the composition failure when a module already owns the runtime namespace', () => {
+    const modules = makeQaNamespaces([{ namespace: 'runtime', observe: {}, command: {} }])
+    const bridge = composeQaBridge(makeComposition(modules), [])
+    expect(bridge).toMatchObject({ _tag: 'Failure', failure: { _tag: 'DuplicateModuleContract', id: 'runtime' } })
+  })
+})
+
+describe('H13-b gameplay.seedVillagerRestockPersistence', () => {
+  const traded = (): VillagerTradeState => {
+    const villager = makeVillager('villager-qa', 'farmer')
+    const offer = villager.offers[0]
+    if (offer === undefined) throw new Error('farmer has no offer')
+    const state = useVillagerOffer(addVillager(emptyVillagerTradeState(), villager), villager.id, offer.id)
+    if (state === undefined) throw new Error('offer could not be used')
+    return state
+  }
+  const makeOwners = (villagerTrades: VillagerTradeState) => {
+    const registrations = Result.getOrThrow(gameplayOwnerRegistrations({ villagerTrades }))
+    const coordinator = Effect.runSync(makeWorldCommitCoordinator({
+      world: Schema.decodeUnknownSync(WorldIdSchema)('qa-restock'), owners: registrations,
+    }))
+    const ownerStates = () => new Map(registrations.map(({ ownerId }) => [
+      ownerId, Effect.runSync(coordinator.snapshot(ownerId, Schema.Unknown)).state,
+    ]))
+    const trades = () => Effect.runSync(coordinator.snapshot(GAMEPLAY_VILLAGER_TRADES_OWNER_ID, GameplayVillagerTradeSnapshotSchema)).state
+    return { coordinator, ownerStates, trades }
+  }
+  const installRestock = (owners: ReturnType<typeof makeOwners>) => {
+    let dirtyCount = 0
+    const restock = seedQaVillagerRestock({
+      coordinator: owners.coordinator,
+      markSessionDirty: () => { dirtyCount += 1 },
+      snapshot: () => ({ villagerTrades: owners.trades() }),
+    })
+    const { transport } = install(makeQaNamespaces([{
+      namespace: 'gameplay',
+      observe: {},
+      command: {
+        seedVillagerRestockPersistence: {
+          name: operationName('seedVillagerRestockPersistence'),
+          input: Schema.Null,
+          output: Schema.Unknown,
+          run: () => restock,
+        },
+      },
+    }]))
+    return {
+      dispatch: () => transport.dispatch(namespaceName('gameplay'), operationName('seedVillagerRestockPersistence'), null),
+      dirtyCount: () => dirtyCount,
+    }
+  }
+
+  it('advances a zero restock clock by one second and preserves every other owner and offer', async () => {
+    const initial = traded()
+    const owners = makeOwners(initial)
+    const before = owners.ownerStates()
+    const restock = installRestock(owners)
+    expect(await restock.dispatch()).toEqual({
+      _tag: 'Success',
+      value: JSON.parse(JSON.stringify({ villagerTrades: { ...initial, restockElapsedSecs: 1 } })),
+    })
+    expect(owners.trades()).toEqual({ ...initial, restockElapsedSecs: 1 })
+    const after = owners.ownerStates()
+    for (const [ownerId, state] of before) {
+      if (ownerId === GAMEPLAY_VILLAGER_TRADES_OWNER_ID) continue
+      expect(after.get(ownerId)).toEqual(state)
+    }
+    expect(restock.dirtyCount()).toBe(1)
+  })
+
+  it('fails with a typed precondition failure and leaves the owner untouched once the clock has advanced', async () => {
+    const initial = { ...traded(), restockElapsedSecs: 7 }
+    const owners = makeOwners(initial)
+    const restock = installRestock(owners)
+    const result = await restock.dispatch()
+    expect(JSON.parse(JSON.stringify(result))).toEqual({
+      _tag: 'Failure',
+      error: { _tag: 'QaVillagerRestockNotFresh', restockElapsedSecs: 7 },
+    })
+    expect(owners.trades()).toEqual(initial)
+    expect(restock.dirtyCount()).toBe(0)
   })
 })

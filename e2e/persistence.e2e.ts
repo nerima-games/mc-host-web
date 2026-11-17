@@ -472,6 +472,8 @@ test('debounces dirty gameplay into a durable save without an explicit flush', a
   await expect(page.locator('body')).toHaveAttribute('data-mc-compose-boot', 'running')
 
   await seedGroundedMiningEncounter(page)
+  const seededRestock = await callQa<GameplaySnapshot>(page, 'gameplay.seedVillagerRestockPersistence')
+  expect(seededRestock.villagerTrades.restockElapsedSecs).toBe(1)
   const durableEntityRoster = (value: GameplaySnapshot) => value.entities.map((entity) => ({
     id: entity.id,
     kind: entity.kind,

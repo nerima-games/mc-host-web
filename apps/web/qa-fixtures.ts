@@ -111,6 +111,10 @@ export const QA_IGNITION_PORTAL_LAYOUT: { readonly frame: ReadonlyArray<Cell>; r
   ),
 }
 
+// Strictly positive and far below VILLAGER_RESTOCK_INTERVAL_SECS, so advancing
+// a zero clock by it cannot trigger a restock that would reset offer uses.
+export const QA_VILLAGER_RESTOCK_ELAPSED_SECS = 1
+
 export const REDSTONE_PLACEMENT_ITEMS: ReadonlySet<string> = new Set([
   'redstone_dust',
   'redstone_torch',
