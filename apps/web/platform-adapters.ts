@@ -51,7 +51,8 @@ import {
   type PlayerSettingsPersistenceError,
   type PlayerSettingsV1,
 } from './settings'
-import { loadSession, type SessionHead, type SessionMetadata, type SessionState } from './session-persistence'
+import { openSession, type SessionHead, type SessionMetadata, type SessionState } from './session-persistence'
+import { sessionLoadErrorOf, sessionOpenNotice, type SessionLoadError } from './session-restoration'
 import type { SessionRoute } from './session-navigation'
 
 /**
@@ -62,6 +63,20 @@ import type { SessionRoute } from './session-navigation'
 export const DATABASE_NAME: IndexedDbDatabaseName = IndexedDbDatabaseName('nerima-games-minecraft')
 export const MISSING_SESSION_ERROR = 'The requested saved world could not be found.'
 export class RequestedSessionNotFoundError extends Error {}
+
+/**
+ * The requested session exists but could not be opened. The boot catch in
+ * `main.ts` sends the player to the title screen with `loadError`, which names
+ * the failure class.
+ */
+export class RequestedSessionUnavailableError extends Error {
+  readonly loadError: SessionLoadError
+
+  constructor(loadError: SessionLoadError) {
+    super(loadError)
+    this.loadError = loadError
+  }
+}
 
 /**
  * A dependency rejected its own built-in data while the adapters were being
@@ -129,6 +144,8 @@ export type PlatformAdapters = {
   readonly queueEndAudio: (kind: EndAudioEvent['kind'], position: Vec3) => void
   readonly placementAudio: PlacementAudioLatch
   readonly loadedSession: Option.Option<SessionHead>
+  // Set when the session opened from its checkpoint; the host shows it at boot.
+  readonly sessionOpenNotice: Option.Option<string>
   readonly sessionMetadata: SessionMetadata
   readonly isCreativeMode: boolean
   readonly initialDimension: SessionState['dimension']
@@ -263,9 +280,13 @@ export const makePlatformAdapters = async (deps: {
     })
   }
   const placementAudio = makePlacementAudioLatch(audio)
-  const loadedSession = await runStorage(
-    Effect.provide(loadSession(sessionId), storageContext),
-  )
+  const opened = await runStorage(Effect.provide(
+    openSession(sessionId).pipe(Effect.result),
+    storageContext,
+  ))
+  if (Result.isFailure(opened)) throw new RequestedSessionUnavailableError(sessionLoadErrorOf(opened.failure))
+  const loadedSession = Option.map(opened.success, ({ head }) => head)
+  const sessionOpenNoticeText = Option.flatMap(opened.success, sessionOpenNotice)
   if (route.kind === 'load' && Option.isNone(loadedSession)) {
     throw new RequestedSessionNotFoundError(MISSING_SESSION_ERROR)
   }
@@ -462,6 +483,7 @@ export const makePlatformAdapters = async (deps: {
     queueEndAudio,
     placementAudio,
     loadedSession,
+    sessionOpenNotice: sessionOpenNoticeText,
     sessionMetadata,
     isCreativeMode,
     initialDimension,

@@ -2553,7 +2553,7 @@
     "count": 1,
     "file": "apps/web/title-menu.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runPromise(Effect.provide(listSessions(), storageContext))"
+    "text": "Effect.runPromise( Effect.provide(listSessionEntries().pipe(Effect.result), storageContext), )"
   },
   {
     "count": 1,

@@ -1,4 +1,4 @@
-import { Array as Arr, Effect, Layer, Result, Scope } from 'effect'
+import { Array as Arr, Effect, Layer, Option, Result, Scope } from 'effect'
 import { InputAction, KeyCode, WorldId } from '@nerima-games/mc-kernel'
 import { IndexedDbDatabaseName, indexedDbStorageLayer } from '@nerima-games/mc-save'
 import {
@@ -28,7 +28,8 @@ import {
   type PlayerSettingsV1,
 } from './settings'
 import { createSettingsView } from './settings-view'
-import { listSessions } from './session-persistence'
+import { listSessionEntries } from './session-persistence'
+import { sessionLoadErrorMessage, sessionOpenFailureMessage } from './session-restoration'
 import { createSessionHref, createUniqueSessionId, sessionHref } from './session-navigation'
 import {
   DATABASE_NAME,
@@ -168,8 +169,12 @@ export const bootTitleMenu = async (context: TitleMenuContext): Promise<void> =>
   }
   titleScreen.hidden = false
   document.body.setAttribute('data-mc-compose-route', 'title')
-  if (new URLSearchParams(window.location.search).get('loadError') === 'missing-session') {
+  const loadError = new URLSearchParams(window.location.search).get('loadError')
+  if (loadError === 'missing-session') {
     titleStatus.textContent = MISSING_SESSION_ERROR
+  } else {
+    const loadErrorMessage = sessionLoadErrorMessage(loadError)
+    if (Option.isSome(loadErrorMessage)) titleStatus.textContent = loadErrorMessage.value
   }
 
   // DATABASE_NAME is a non-empty literal, the only IndexedDbDatabaseName requirement.
@@ -182,7 +187,26 @@ export const bootTitleMenu = async (context: TitleMenuContext): Promise<void> =>
       scope,
     ),
   )
-  const sessions = await Effect.runPromise(Effect.provide(listSessions(), storageContext))
+  // A world that cannot be opened is not listed. One message says why, unless a
+  // redirect message is already shown. A failed listing shows no worlds and its
+  // own message, and the title screen still boots.
+  const listing = await Effect.runPromise(
+    Effect.provide(listSessionEntries().pipe(Effect.result), storageContext),
+  )
+  const sessions = Result.match(listing, {
+    onFailure: (error) => {
+      titleStatus.textContent = sessionOpenFailureMessage(error)
+      console.error('[mc-compose] saved worlds could not be listed', error)
+      return []
+    },
+    onSuccess: ({ sessions: openable, unavailable }) => {
+      const firstUnavailable = Arr.head(unavailable)
+      if (Option.isSome(firstUnavailable) && titleStatus.textContent === '') {
+        titleStatus.textContent = sessionOpenFailureMessage(firstUnavailable.value.failure)
+      }
+      return openable
+    },
+  })
   const playerSettingsLoad = await Effect.runPromise(
     Effect.provide(loadPlayerSettingsForSession(), storageContext),
   )
