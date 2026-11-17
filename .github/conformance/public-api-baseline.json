@@ -141,7 +141,7 @@
     "count": 1,
     "file": "apps/web/browser-preview.ts",
     "ruleId": "no-effect-run-outside-entrypoints",
-    "text": "Effect.runFork(loop.submitFrame(MonotonicTimeSecs(timestamp / 1_000)))"
+    "text": "Effect.runFork(runFrame(MonotonicTimeSecs(timestamp / 1_000)))"
   },
   {
     "count": 2,

@@ -1,7 +1,7 @@
 /* oxlint-disable curly, func-names, max-statements, no-magic-numbers, no-undefined, no-use-before-define, sort-imports, sort-keys -- Test fixtures favor direct state assertions over production-style decomposition. */
 import { describe, expect, it } from '@effect/vitest'
 import { Deferred, Effect, Option } from 'effect'
-import type { DeltaTimeSecs } from '@nerima-games/mc-kernel'
+import type { MonotonicTimeSecs } from '@nerima-games/mc-kernel'
 import {
   makeBrowserPreview,
   type BrowserFrameScheduler,
@@ -76,7 +76,7 @@ describe('browser preview', () => {
           starts += 1
           surface.onCleanup(() => { listenerCleanup += 1 })
           return {
-            frame: (deltaSeconds) => Effect.sync(() => { frames.push(deltaSeconds) }),
+            frame: (nowSecs) => Effect.sync(() => { frames.push(nowSecs) }),
             stop: Effect.sync(() => { stops += 1 }),
           } satisfies BrowserPreviewRuntime
         }),
@@ -96,11 +96,8 @@ describe('browser preview', () => {
       yield* Effect.yieldNow
       animation.runNext(1_000)
       yield* Effect.yieldNow
-      // mc-sim 0.11.1 GameLoop (dist/application/game-loop.js): the handler runs only when a 0.05 s tick
-      // (mc-kernel 0.17.0 tickDuration) completes, as PHYSICS_SUBSTEPS_PER_TICK = 2 calls of
-      // physicsSubstepDuration = 0.025 s each (dist/domain/time/frame-timing.js).
-      // Accumulated 0.016 + 0.016 + 0.05 (clamped by MAX_FRAME_DELTA_SECS) = 0.082 s: one tick.
-      expect(frames).toStrictEqual([0.025, 0.025])
+      // One frame per animation frame, given its timestamp in seconds.
+      expect(frames).toStrictEqual([0.1, 0.116, 1])
 
       const second = yield* preview.restart
       expect(second).not.toBe(first)
@@ -124,14 +121,14 @@ describe('browser preview', () => {
       const dom = fakeDom()
       const animation = fakeScheduler()
       const firstFrame = yield* Deferred.make<void>()
-      const frames: Array<DeltaTimeSecs> = []
+      const frames: Array<MonotonicTimeSecs> = []
       const preview = yield* makeBrowserPreview({
         container: dom.container,
         createCanvas: () => dom.canvas,
         scheduler: animation.scheduler,
         startRuntime: () => Effect.succeed({
-          frame: (deltaSeconds) => Effect.gen(function* () {
-            frames.push(deltaSeconds)
+          frame: (nowSecs) => Effect.gen(function* () {
+            frames.push(nowSecs)
             if (frames.length === 1) yield* Deferred.await(firstFrame)
           }),
           stop: Effect.void,
@@ -141,24 +138,23 @@ describe('browser preview', () => {
       yield* preview.start
       animation.runNext(100)
       yield* Effect.yieldNow
+      // The first frame is still running, so the animation frames at 150 and
+      // 200 are skipped rather than queued; the loop keeps requesting frames.
       animation.runNext(150)
       yield* Effect.yieldNow
-      // mc-sim 0.11.1 GameLoop (dist/application/game-loop.js): the handler runs only when a 0.05 s tick
-      // (mc-kernel 0.17.0 tickDuration) completes, as PHYSICS_SUBSTEPS_PER_TICK = 2 calls of
-      // physicsSubstepDuration = 0.025 s each (dist/domain/time/frame-timing.js).
-      expect(frames).toStrictEqual([0.025])
+      expect(frames).toStrictEqual([0.1])
       expect(animation.callbacks.size).toBe(1)
 
       animation.runNext(200)
       yield* Effect.yieldNow
-      expect(frames).toStrictEqual([0.025])
+      expect(frames).toStrictEqual([0.1])
       yield* Deferred.succeed(firstFrame, undefined)
       yield* Effect.yieldNow
       expect(animation.callbacks.size).toBe(1)
       animation.runNext(250)
       yield* Effect.yieldNow
-      // Frames at 150, 200 and 250 each complete one tick: three ticks, two substeps each.
-      expect(frames).toStrictEqual([0.025, 0.025, 0.025, 0.025, 0.025, 0.025])
+      // The next frame takes its own timestamp; the runtime's delta covers the skipped time.
+      expect(frames).toStrictEqual([0.1, 0.25])
       yield* preview.stop
     }),
   )
@@ -167,7 +163,7 @@ describe('browser preview', () => {
     Effect.gen(function* () {
       const dom = fakeDom()
       const animation = fakeScheduler()
-      const frames: Array<DeltaTimeSecs> = []
+      const frames: Array<MonotonicTimeSecs> = []
       let frameReads = 0
       const preview = yield* makeBrowserPreview({
         container: dom.container,
@@ -176,7 +172,7 @@ describe('browser preview', () => {
         startRuntime: () => Effect.succeed({
           get frame() {
             frameReads += 1
-            return (deltaSeconds: DeltaTimeSecs) => Effect.sync(() => { frames.push(deltaSeconds) })
+            return (nowSecs: MonotonicTimeSecs) => Effect.sync(() => { frames.push(nowSecs) })
           },
           stop: Effect.void,
         } satisfies BrowserPreviewRuntime),
@@ -188,10 +184,7 @@ describe('browser preview', () => {
       animation.runNext(150)
       yield* Effect.yieldNow
 
-      // mc-sim 0.11.1 GameLoop (dist/application/game-loop.js): the handler runs only when a 0.05 s tick
-      // (mc-kernel 0.17.0 tickDuration) completes, as PHYSICS_SUBSTEPS_PER_TICK = 2 calls of
-      // physicsSubstepDuration = 0.025 s each (dist/domain/time/frame-timing.js).
-      expect(frames).toStrictEqual([0.025, 0.025])
+      expect(frames).toStrictEqual([0.1, 0.15])
       expect(frameReads).toBe(1)
       yield* preview.stop
     }),
@@ -219,9 +212,6 @@ describe('browser preview', () => {
 
       const handle = yield* preview.start
       animation.runNext(100)
-      yield* Effect.yieldNow
-      // A 50 ms gap completes a tick, so the handler starts (mc-sim 0.11.1 GameLoop, see above).
-      animation.runNext(150)
       yield* Effect.yieldNow
       yield* handle.stop
       expect(events).toStrictEqual(['frame:start', 'frame:release', 'runtime:stop'])
@@ -376,9 +366,6 @@ describe('browser preview', () => {
       const handle = yield* preview.start
       animation.runNext(100)
       yield* Effect.yieldNow
-      // A 50 ms gap completes a tick, so the handler runs (mc-sim 0.11.1 GameLoop, see above).
-      animation.runNext(150)
-      yield* Effect.yieldNow
       yield* Effect.yieldNow
       expect(yield* handle.isRunning).toBe(false)
       expect(Option.isNone(yield* preview.current)).toBe(true)
@@ -473,13 +460,13 @@ describe('browser preview', () => {
         },
         cancel: (id) => { cancelled.push(id) },
       }
-      const frames: Array<DeltaTimeSecs> = []
+      const frames: Array<MonotonicTimeSecs> = []
       const preview = yield* makeBrowserPreview({
         container: dom.container,
         createCanvas: () => dom.canvas,
         scheduler,
         startRuntime: () => Effect.succeed({
-          frame: (deltaSeconds) => Effect.sync(() => { frames.push(deltaSeconds) }),
+          frame: (nowSecs) => Effect.sync(() => { frames.push(nowSecs) }),
           stop: Effect.void,
         }),
       })
